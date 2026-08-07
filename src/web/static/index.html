@@ -1,0 +1,1004 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NovelForge Studio</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js"></script>
+<style>
+:root{
+--bg:#0d1117;--bg-card:#161b22;--bg-hover:#1c2128;--bg-elevated:#21262d;
+--text:#e6edf3;--text-muted:#8b949e;--text-dim:#484f58;
+--primary:#e94560;--primary-hover:#d63851;--primary-dim:rgba(233,69,96,.15);
+--secondary:#21262d;--border:#30363d;--border-light:#3d444d;
+--success:#3fb950;--warning:#d29922;--error:#f85149;--accent:#58a6ff;
+--radius:12px;--radius-sm:8px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans SC',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:14px}
+.app{display:flex;height:100vh;overflow:hidden}
+/* Sidebar */
+.sidebar{width:248px;background:var(--bg-card);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+.sidebar-header{padding:18px 20px;border-bottom:1px solid var(--border)}
+.sidebar-header h1{font-size:19px;background:linear-gradient(135deg,#e94560,#58a6ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;font-weight:800}
+.sidebar-header p{font-size:11px;color:var(--text-muted);margin-top:2px}
+.sidebar-nav{flex:1;padding:10px;overflow-y:auto}
+.nav-section{margin:14px 8px 6px;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--text-dim);font-weight:600}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--radius-sm);cursor:pointer;color:var(--text-muted);transition:all .15s;margin-bottom:1px;font-size:13.5px;user-select:none}
+.nav-item:hover{background:var(--bg-hover);color:var(--text)}
+.nav-item.active{background:var(--primary-dim);color:var(--primary);font-weight:600}
+.nav-item svg{width:17px;height:17px;flex-shrink:0}
+.sidebar-footer{padding:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:6px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 6px var(--success)}
+.dot.off{background:var(--text-dim);box-shadow:none}
+/* Main */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.header{padding:15px 26px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;flex-shrink:0;min-height:60px}
+.header h2{font-size:18px;font-weight:700}
+.header .sub{font-size:12px;color:var(--text-muted);margin-top:2px}
+.content{flex:1;overflow-y:auto;padding:24px 26px}
+.content-narrow{max-width:820px}
+/* Buttons */
+.btn{padding:8px 15px;border-radius:var(--radius-sm);border:none;cursor:pointer;font-size:13px;font-weight:600;transition:all .15s;display:inline-flex;align-items:center;gap:6px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover:not(:disabled){background:var(--primary-hover)}
+.btn-secondary{background:var(--secondary);color:var(--text);border:1px solid var(--border)}
+.btn-secondary:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+.btn-ghost{background:transparent;color:var(--text-muted)}
+.btn-ghost:hover{background:var(--bg-hover);color:var(--text)}
+.btn-sm{padding:5px 10px;font-size:12px}
+.btn-danger{background:transparent;color:var(--error);border:1px solid var(--border)}
+.btn-danger:hover{background:rgba(248,81,73,.12);border-color:var(--error)}
+/* Cards */
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+.card-hover{transition:all .15s;cursor:pointer}
+.card-hover:hover{border-color:var(--accent);transform:translateY(-2px)}
+.card h3{font-size:15px;margin-bottom:12px;font-weight:700}
+.card-title-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.card-title-row h3{margin-bottom:0}
+/* Inputs */
+.field{margin-bottom:16px}
+.field label{display:block;margin-bottom:6px;color:var(--text-muted);font-size:12.5px;font-weight:500}
+.input{width:100%;padding:9px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:13.5px;font-family:inherit;transition:border-color .15s}
+.input:focus{outline:none;border-color:var(--accent)}
+.textarea{min-height:110px;resize:vertical;line-height:1.6}
+select.input{cursor:pointer}
+/* Layout */
+.grid{display:grid;gap:16px}
+.grid-2{grid-template-columns:repeat(2,1fr)}
+.grid-3{grid-template-columns:repeat(3,1fr)}
+.grid-4{grid-template-columns:repeat(4,1fr)}
+.row{display:flex;gap:10px;align-items:center}
+.row-wrap{flex-wrap:wrap}
+.spacer{flex:1}
+/* Badges */
+.badge{display:inline-flex;align-items:center;padding:2px 9px;border-radius:20px;font-size:11.5px;font-weight:600}
+.badge-success{background:rgba(63,185,80,.16);color:var(--success)}
+.badge-warning{background:rgba(210,153,34,.16);color:var(--warning)}
+.badge-error{background:rgba(248,81,73,.16);color:var(--error)}
+.badge-info{background:rgba(88,166,255,.16);color:var(--accent)}
+.badge-muted{background:var(--secondary);color:var(--text-muted)}
+/* Progress */
+.progress{height:6px;background:var(--secondary);border-radius:3px;overflow:hidden}
+.progress-bar{height:100%;background:linear-gradient(90deg,var(--primary),#58a6ff);transition:width .4s;border-radius:3px}
+/* Stat */
+.stat-card{text-align:center;padding:22px}
+.stat-value{font-size:30px;font-weight:800;color:var(--primary)}
+.stat-value.accent{color:var(--accent)}
+.stat-value.success{color:var(--success)}
+.stat-label{color:var(--text-muted);margin-top:6px;font-size:12.5px}
+/* Table */
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border);font-size:13px}
+.table th{color:var(--text-muted);font-weight:600;font-size:12px}
+.table tr:hover td{background:var(--bg-hover)}
+/* Empty */
+.empty-state{text-align:center;padding:70px 20px;color:var(--text-muted)}
+.empty-state svg{width:60px;height:60px;margin-bottom:16px;opacity:.25}
+.empty-state h2{font-size:17px;margin-bottom:8px;color:var(--text)}
+/* Spinner */
+.loading{display:flex;align-items:center;justify-content:center;padding:44px;gap:12px;color:var(--text-muted)}
+.spinner{width:22px;height:22px;border:3px solid var(--border);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* Modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:1000;backdrop-filter:blur(2px)}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:16px;padding:24px;max-width:640px;width:92%;max-height:86vh;overflow-y:auto}
+.modal-lg{max-width:900px}
+.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+.modal-header h3{font-size:17px}
+.close-x{cursor:pointer;color:var(--text-muted);font-size:22px;line-height:1;background:none;border:none}
+.close-x:hover{color:var(--text)}
+/* Tabs */
+.tabs{display:flex;gap:4px;margin-bottom:18px;border-bottom:1px solid var(--border);padding-bottom:0;flex-wrap:wrap}
+.tab{padding:8px 15px;cursor:pointer;color:var(--text-muted);font-size:13px;font-weight:500;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--primary);border-bottom-color:var(--primary)}
+/* Toast */
+.toast-wrap{position:fixed;top:18px;right:18px;z-index:2000;display:flex;flex-direction:column;gap:8px}
+.toast{padding:12px 16px;border-radius:var(--radius-sm);background:var(--bg-elevated);border:1px solid var(--border);border-left:3px solid var(--accent);min-width:260px;max-width:380px;font-size:13px;animation:slidein .25s;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.toast.success{border-left-color:var(--success)}
+.toast.error{border-left-color:var(--error)}
+.toast.warning{border-left-color:var(--warning)}
+@keyframes slidein{from{transform:translateX(30px);opacity:0}to{transform:translateX(0);opacity:1}}
+/* Misc */
+.chip{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;background:var(--secondary);border-radius:20px;font-size:12px;margin:2px}
+.divider{height:1px;background:var(--border);margin:16px 0}
+.mono{font-family:'SF Mono',Consolas,monospace;font-size:12.5px}
+.scroll-y{overflow-y:auto}
+.text-muted{color:var(--text-muted)}
+.text-sm{font-size:12.5px}
+.mt8{margin-top:8px}.mt16{margin-top:16px}.mb8{margin-bottom:8px}.mb16{margin-bottom:16px}
+.dim-note{font-size:12px;color:var(--text-dim);line-height:1.5}
+.warn-banner{background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.3);color:var(--warning);padding:12px 14px;border-radius:var(--radius-sm);font-size:13px;line-height:1.5;margin-bottom:16px;display:flex;gap:8px;align-items:flex-start}
+.gate-box{display:flex;gap:10px;margin:10px 0}
+.gate{flex:1;padding:12px;border-radius:var(--radius-sm);border:1px solid var(--border);text-align:center}
+.gate.pass{border-color:var(--success);background:rgba(63,185,80,.08)}
+.gate.fail{border-color:var(--error);background:rgba(248,81,73,.08)}
+.gate .g-label{font-size:11px;color:var(--text-muted)}
+.gate .g-val{font-size:18px;font-weight:700;margin-top:4px}
+.mermaid-box{background:#fff;border-radius:var(--radius);padding:16px;overflow:auto}
+.log-line{padding:5px 10px;border-radius:6px;font-size:12.5px;margin-bottom:3px;font-family:'SF Mono',Consolas,monospace;background:var(--bg);border-left:2px solid var(--border)}
+.log-line.active{border-left-color:var(--accent);background:var(--primary-dim)}
+.timeline-wrap{position:relative;padding-left:24px}
+.timeline-wrap::before{content:'';position:absolute;left:7px;top:0;bottom:0;width:2px;background:var(--border)}
+.tl-node{position:relative;margin-bottom:18px}
+.tl-node::before{content:'';position:absolute;left:-21px;top:4px;width:12px;height:12px;border-radius:50%;background:var(--primary);border:2px solid var(--bg)}
+.editor-layout{display:grid;grid-template-columns:1fr 320px;gap:16px}
+@media(max-width:1100px){.editor-layout{grid-template-columns:1fr}.grid-4{grid-template-columns:repeat(2,1fr)}}
+.score-ring{width:60px;height:60px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:18px}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px dashed var(--border);font-size:13px}
+.kv span{color:var(--text-muted)}
+.kv b{color:var(--text);text-align:right}
+.list-row{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--border);font-size:13px}
+.list-row:last-child{border-bottom:none}
+.muted{color:var(--text-muted)}
+.book-card{cursor:pointer;transition:all .15s}
+.book-card:hover{border-color:var(--accent);transform:translateY(-2px)}
+.book-cover{width:100%;height:88px;border-radius:var(--radius-sm);background:linear-gradient(135deg,var(--primary-dim),rgba(88,166,255,.15));display:flex;align-items:center;justify-content:center;font-size:34px;font-weight:800;color:var(--primary);margin-bottom:12px}
+.card-title{font-size:15px;font-weight:700;margin-bottom:14px}
+.fld{display:block;margin-bottom:14px;font-size:12.5px;color:var(--text-muted);font-weight:500}
+.fld .input,.fld .ta{margin-top:6px}
+.ta{min-height:90px;resize:vertical;line-height:1.6;width:100%;padding:9px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);font-size:13.5px;font-family:inherit}
+.prog{height:8px;background:var(--secondary);border-radius:4px;overflow:hidden;margin-bottom:6px}
+.prog-bar{height:100%;background:linear-gradient(90deg,var(--primary),#58a6ff);transition:width .4s;border-radius:4px}
+.log-box{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px;height:220px;overflow-y:auto;font-size:12px}
+/* extra */
+.muted{color:var(--text-muted)}
+.card-title{font-size:15px;margin-bottom:12px;font-weight:700}
+.fld{display:block;margin-bottom:14px;color:var(--text-muted);font-size:12.5px;font-weight:500}
+.fld .input{margin-top:6px}
+.ta{min-height:90px;resize:vertical;line-height:1.6}
+.prog{height:8px;background:var(--secondary);border-radius:4px;overflow:hidden;margin-bottom:6px}
+.prog-bar{height:100%;background:linear-gradient(90deg,var(--primary),#58a6ff);transition:width .4s;border-radius:4px;width:0}
+.log-box{max-height:260px;overflow-y:auto;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;margin-top:8px}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px}
+.kv:last-child{border-bottom:none}
+.kv span{color:var(--text-muted)}
+.list-row{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+.list-row:last-child{border-bottom:none}
+.book-card{cursor:pointer;transition:all .15s}
+.book-card:hover{border-color:var(--accent);transform:translateY(-2px)}
+.book-cover{width:48px;height:48px;border-radius:var(--radius-sm);background:linear-gradient(135deg,var(--primary),var(--accent));display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:800;color:#fff;margin-bottom:10px}
+.node-tag{display:inline-block;padding:2px 8px;border-radius:6px;background:var(--secondary);font-size:11px;margin-left:6px}
+.fs-card{border-left:3px solid var(--accent);padding:12px 14px;background:var(--bg);border-radius:var(--radius-sm);margin-bottom:10px}
+.fs-card.planted{border-left-color:var(--warning)}
+.fs-card.paid{border-left-color:var(--success)}
+</style>
+</head>
+<body>
+<div class="app">
+<aside class="sidebar">
+<div class="sidebar-header">
+<h1>NovelForge</h1>
+<p>AI 长篇小说创作平台</p>
+</div>
+<nav class="sidebar-nav" id="nav"></nav>
+<div class="sidebar-footer">
+<span class="dot" id="conn-dot"></span>
+<span id="conn-text">实时同步就绪</span>
+</div>
+</aside>
+<main class="main">
+<div id="page" style="display:flex;flex-direction:column;height:100%;overflow:hidden"></div>
+</main>
+</div>
+<div class="toast-wrap" id="toasts"></div>
+<div id="modal-root"></div>
+<script>
+mermaid.initialize({startOnLoad:false,theme:'default',securityLevel:'loose',flowchart:{curve:'basis'}});
+
+// ===== State =====
+const S = { page:'dashboard', book:null, books:[], tab:{}, sse:null, activeTasks:{} };
+
+// ===== Nav definition =====
+const NAV = [
+  {sec:'创作'},
+  {id:'dashboard',label:'我的创作',icon:'M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z'},
+  {id:'create',label:'新建作品',icon:'M12 5v14M5 12h14'},
+  {id:'chat',label:'AI 助手',icon:'M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z'},
+  {sec:'当前作品',bookOnly:true},
+  {id:'book',label:'作品概览',icon:'M2 3h6a4 4 0 014 4v14a3 3 0 00-3-3H2z M22 3h-6a4 4 0 00-4 4v14a3 3 0 013-3h7z',bookOnly:true},
+  {id:'wizard',label:'世界观向导',icon:'M12 2l2.4 7.4H22l-6 4.6 2.3 7.4L12 17l-6.3 4.4L8 14 2 9.4h7.6z',bookOnly:true},
+  {id:'chapters',label:'章节工作台',icon:'M4 19.5A2.5 2.5 0 016.5 17H20 M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z',bookOnly:true},
+  {id:'continuous',label:'连续创作',icon:'M5 3l14 9-14 9V3z',bookOnly:true},
+  {id:'mindmap',label:'思维导图',icon:'M18 8a3 3 0 10-6 0 M6 12a3 3 0 106 0 M18 16a3 3 0 10-6 0 M9 12h6 M15 8l-3 4 3 4',bookOnly:true},
+  {id:'timeline',label:'故事时间轴',icon:'M12 8v4l3 3 M12 2a10 10 0 100 20 10 10 0 000-20z',bookOnly:true},
+  {id:'foreshadowing',label:'伏笔与钩子',icon:'M9 18V5l12-2v13 M6 15a3 3 0 100 6 3 3 0 000-6z M18 13a3 3 0 100 6 3 3 0 000-6z',bookOnly:true},
+  {id:'characters',label:'人物关系',icon:'M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2 M9 11a4 4 0 100-8 4 4 0 000 8 M23 21v-2a4 4 0 00-3-3.87 M16 3.13a4 4 0 010 7.75',bookOnly:true},
+  {id:'analytics',label:'数据分析',icon:'M18 20V10 M12 20V4 M6 20v-6',bookOnly:true},
+  {id:'jointreview',label:'联合审查',icon:'M9 11l3 3L22 4 M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11',bookOnly:true},
+  {id:'truth',label:'真相文件',icon:'M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z M14 2v6h6',bookOnly:true},
+  {id:'export',label:'导出交付',icon:'M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4 M7 10l5 5 5-5 M12 15V3',bookOnly:true},
+  {sec:'系统'},
+  {id:'genres',label:'题材库',icon:'M4 19.5A2.5 2.5 0 016.5 17H20 M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z'},
+  {id:'services',label:'模型配置',icon:'M12 15a3 3 0 100-6 3 3 0 000 6z M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-2.82 1.17V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.65 1.65 0 004.6 15H4.5a2 2 0 110-4h.09A1.65 1.65 0 006.4 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 0011 4.6V4.5a2 2 0 114 0v.09A1.65 1.65 0 0018 6.4l.06-.06a2 2 0 112.83 2.83l-.06.06A1.65 1.65 0 0021 11h.09a2 2 0 110 4H21z'},
+  {id:'settings',label:'创作参数',icon:'M12 20h9 M16.5 3.5a2.12 2.12 0 013 3L7 19l-4 1 1-4z'},
+  {id:'import',label:'导入素材',icon:'M12 3v12 M8 11l4 4 4-4 M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4'},
+  {id:'doctor',label:'系统诊断',icon:'M22 12h-4l-3 9L9 3l-3 9H2'},
+];
+
+// ===== API =====
+async function api(method, path, body, isForm){
+  const opts={method,headers:{}};
+  if(body && !isForm){opts.headers['Content-Type']='application/json';opts.body=JSON.stringify(body);}
+  if(isForm){opts.body=body;}
+  const res=await fetch('/api/v1'+path,opts);
+  if(!res.ok){const e=await res.json().catch(()=>({detail:res.statusText}));throw new Error(e.detail||e.message||'请求失败');}
+  const ct=res.headers.get('content-type')||'';
+  return ct.includes('json')?res.json():res.text();
+}
+
+// ===== Toast =====
+function toast(msg,type){
+  const el=document.createElement('div');
+  el.className='toast '+(type||'');
+  el.textContent=msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(()=>{el.style.opacity='0';el.style.transition='opacity .3s';setTimeout(()=>el.remove(),300);},3600);
+}
+
+// ===== Modal =====
+function modal(html,large){
+  const root=document.getElementById('modal-root');
+  root.innerHTML=`<div class="modal-overlay" onclick="if(event.target===this)closeModal()"><div class="modal ${large?'modal-lg':''}">${html}</div></div>`;
+}
+function closeModal(){document.getElementById('modal-root').innerHTML='';}
+
+// ===== Helpers =====
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function scoreColor(s){return s>=93?'var(--success)':s>=80?'var(--warning)':'var(--error)';}
+function statusBadge(st){
+  const m={approved:['badge-success','已通过'],reviewing:['badge-warning','审查中'],draft:['badge-muted','草稿'],writing:['badge-info','创作中'],revising:['badge-warning','修订中']};
+  const x=m[st]||['badge-muted',st||'—'];return `<span class="badge ${x[0]}">${x[1]}</span>`;
+}
+
+// ===== Nav render =====
+function renderNav(){
+  const nav=document.getElementById('nav');
+  nav.innerHTML=NAV.map(n=>{
+    if(n.sec!==undefined){ if(n.bookOnly && !S.book) return ''; return `<div class="nav-section">${n.sec}</div>`; }
+    if(n.bookOnly && !S.book) return '';
+    return `<div class="nav-item ${S.page===n.id?'active':''}" onclick="go('${n.id}')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${n.icon.split(' M').map((d,i)=>`<path d="${i===0?d:'M'+d}"/>`).join('')}</svg>
+      <span>${n.label}</span></div>`;
+  }).join('');
+}
+
+// ===== Router =====
+function go(page){ S.page=page; renderNav(); render(); }
+
+async function render(){
+  const p=document.getElementById('page');
+  const fn=PAGES[S.page];
+  if(!fn){p.innerHTML='<div class="content"><div class="empty-state"><h2>页面开发中</h2></div></div>';return;}
+  p.innerHTML='<div class="loading"><div class="spinner"></div>加载中...</div>';
+  try{ await fn(p); }
+  catch(e){ p.innerHTML=`<div class="header"><h2>出错了</h2></div><div class="content"><div class="card"><p style="color:var(--error)">${esc(e.message)}</p></div></div>`; }
+}
+
+// ===== SSE =====
+function initSSE(){
+  try{
+    const es=new EventSource('/api/v1/events');
+    S.sse=es;
+    es.addEventListener('task_progress',ev=>{
+      try{const t=JSON.parse(ev.data);S.activeTasks[t.id]=t;window.dispatchEvent(new CustomEvent('task-update',{detail:t}));}catch(_){}
+    });
+    es.onopen=()=>setConn(true);
+    es.onerror=()=>setConn(false);
+  }catch(_){ setConn(false); }
+}
+function setConn(on){
+  document.getElementById('conn-dot').className='dot'+(on?'':' off');
+  document.getElementById('conn-text').textContent=on?'实时同步中':'实时连接断开';
+}
+
+const PAGES={};
+
+// header helper
+function header(title,sub,actions){
+  return `<div class="header"><div><h2>${title}</h2>${sub?`<div class="sub">${sub}</div>`:''}</div><div class="row">${actions||''}</div></div>`;
+}
+function bookName(){ return S.books.find(b=>b.id===S.book)?.title || '作品'; }
+
+// ===== Dashboard =====
+PAGES.dashboard=async(p)=>{
+  const data=await api('GET','/books'); S.books=data.books||[];
+  if(!S.books.length){
+    p.innerHTML=header('我的创作','融合 inkOS 审查引擎与连续创作管线')+
+      `<div class="content"><div class="empty-state">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
+        <h2>还没有作品</h2><p>从零开始，AI 将引导你搭建世界观、埋设伏笔并连续创作。</p>
+        <button class="btn btn-primary" style="margin-top:16px" onclick="go('create')">+ 新建作品</button>
+      </div></div>`;
+    return;
+  }
+  p.innerHTML=header('我的创作',`${S.books.length} 部作品`,`<button class="btn btn-primary" onclick="go('create')">+ 新建作品</button>`)+
+  `<div class="content"><div class="grid grid-3">${S.books.map(b=>`
+    <div class="card book-card" onclick="openBook('${b.id}')">
+      <div class="book-cover">${esc((b.title||'?').slice(0,1))}</div>
+      <h3>${esc(b.title)}</h3>
+      <div class="row" style="margin:8px 0">
+        <span class="badge badge-info">${esc(b.genre||'未分类')}</span>
+        <span class="badge badge-muted">${b.chaptersWritten} 章</span>
+      </div>
+      <div class="row" style="gap:6px;margin-top:12px" onclick="event.stopPropagation()">
+        <button class="btn btn-sm btn-secondary" onclick="openBook('${b.id}')">打开</button>
+        <button class="btn btn-sm btn-secondary" onclick="quickExport('${b.id}')">导出</button>
+        <button class="btn btn-sm btn-ghost" onclick="delBook('${b.id}')">删除</button>
+      </div>
+    </div>`).join('')}</div></div>`;
+};
+async function openBook(id){ S.book=id; try{const d=await api('GET','/books');S.books=d.books||[];}catch(_){}; renderNav(); go('book'); }
+async function delBook(id){ if(!confirm('确认删除该作品？此操作不可撤销。'))return; try{await api('DELETE','/books/'+id);toast('已删除','success');if(S.book===id){S.book=null;renderNav();}go('dashboard');}catch(e){toast(e.message,'error');} }
+function quickExport(id){ modal(exportModalHTML(id)); }
+
+// ===== Create =====
+PAGES.create=async(p)=>{
+  p.innerHTML=header('新建作品','填写基础信息，创建后由向导协同搭建世界观')+
+  `<div class="content"><div class="card" style="max-width:720px">
+    <div class="field"><label>书名 *</label><input class="input" id="c-title" placeholder="例如：星渊之上"></div>
+    <div class="grid grid-2">
+      <div class="field"><label>题材</label><input class="input" id="c-genre" placeholder="玄幻修仙 / 都市异能 / 科幻"></div>
+      <div class="field"><label>语言</label><select class="input" id="c-lang"><option value="zh">中文</option><option value="en">English</option></select></div>
+    </div>
+    <div class="grid grid-2">
+      <div class="field"><label>每章目标字数</label><input class="input" id="c-words" type="number" value="2500"></div>
+      <div class="field"><label>目标总章数</label><input class="input" id="c-target" type="number" value="100"></div>
+    </div>
+    <div class="field"><label>创作简报（可选，用于 AI 初始化世界观）</label>
+      <textarea class="input textarea" id="c-brief" placeholder="主角设定、核心矛盾、想要的风格与爽点节奏……"></textarea></div>
+    <button class="btn btn-primary" onclick="doCreate()">创建作品</button>
+  </div></div>`;
+};
+async function doCreate(){
+  const title=val('c-title'); if(!title)return toast('请输入书名','error');
+  try{
+    const r=await api('POST','/books/create',{title,genre:val('c-genre'),language:val('c-lang'),
+      chapterWords:parseInt(val('c-words'))||2500,targetChapters:parseInt(val('c-target'))||100,brief:val('c-brief')});
+    toast('创建成功','success'); await openBook(r.id);
+    if(val('c-brief')) toast('AI 正在后台初始化世界观…','info');
+  }catch(e){toast(e.message,'error');}
+}
+function val(id){const e=document.getElementById(id);return e?e.value:'';}
+
+// ===== Book overview =====
+PAGES.book=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  const b=await api('GET','/books/'+S.book);
+  const chars=Object.entries(b.characters||{}), facs=Object.entries(b.factions||{}), locs=Object.entries(b.locations||{}), fs=Object.entries(b.foreshadowing||{});
+  p.innerHTML=header(esc(b.title),`<span class="badge badge-info">${esc(b.genre||'未分类')}</span> ${b.chaptersWritten} 章`,
+    `<button class="btn btn-primary" onclick="go('continuous')">连续创作</button>
+     <button class="btn btn-secondary" onclick="go('chapters')">章节工作台</button>
+     <button class="btn btn-secondary" onclick="go('wizard')">世界观向导</button>`)+
+  `<div class="content">
+    <div class="grid grid-4">
+      ${stat(b.chaptersWritten,'章节')}${stat(chars.length,'角色')}${stat(facs.length,'势力')}${stat(fs.length,'伏笔')}
+    </div>
+    <div class="grid grid-2">
+      <div class="card"><h3>世界观核心</h3>
+        <div class="kv"><span>世界名称</span><b>${esc(b.world?.name||'—')}</b></div>
+        <div class="kv"><span>核心矛盾</span><b>${esc(b.world?.core_conflict||b.world?.coreConflict||'—')}</b></div>
+        <div class="kv"><span>力量体系</span><b>${esc(b.world?.power_system||b.world?.powerSystem||'—')}</b></div>
+        <p style="color:var(--text-muted);margin-top:10px;font-size:13px;line-height:1.7">${esc(b.world?.setting_description||b.world?.settingDescription||'尚未设定世界背景，前往世界观向导补全。')}</p>
+      </div>
+      <div class="card"><h3>写作风格 / 作者意图</h3>
+        <p style="color:var(--text-muted);font-size:13px;line-height:1.7">${esc(b.writingStyle||'—')}</p>
+        <p style="color:var(--text-muted);font-size:13px;line-height:1.7;margin-top:8px">${esc(b.authorIntent||'')}</p>
+      </div>
+    </div>
+    <div class="card"><div class="row" style="justify-content:space-between"><h3>角色（${chars.length}）</h3><button class="btn btn-sm btn-secondary" onclick="go('characters')">关系图</button></div>
+      ${chars.length?chars.map(([n,c])=>`<div class="list-row"><b>${esc(n)}</b> <span class="badge badge-info">${esc(c.role||'')}</span><span class="muted">${esc(c.personality||'')}</span></div>`).join(''):'<p class="muted">暂无角色</p>'}
+    </div>
+  </div>`;
+};
+function stat(v,l){return `<div class="card stat-card"><div class="stat-value">${v}</div><div class="stat-label">${l}</div></div>`;}
+
+// ========== 连续创作模式（实时SSE进度） ==========
+PAGES.continuous = async (p) => {
+  if(!S.book){go('dashboard');return;}
+  const b = await api('GET','/books/'+S.book);
+  const next = (b.chaptersWritten||0)+1;
+  p.innerHTML = `<div class="header"><div><h2>连续创作模式</h2><div class="sub">${esc(bookName())} · 双重门禁 + 联合审查</div></div>
+    <button class="btn btn-ghost" onclick="go('book')">← 返回作品</button></div>
+  <div class="content">
+    <div class="warn-banner">⚠️ 连续创作模式会对每一章反复审查、修订、复审，并每5章执行联合审查——将消耗<b>海量 token</b>。请确认模型额度充足。</div>
+    <div class="grid grid-2">
+      <div class="card">
+        <h3 class="card-title">创作规划</h3>
+        <label class="fld">起始章节<input class="input" id="c-start" type="number" value="${next}" min="1"></label>
+        <label class="fld">连续创作篇目 (5 - 200)<input class="input" id="c-count" type="number" value="20" min="5" max="200"></label>
+        <label class="fld">双重门禁通过分<input class="input" id="c-score" type="number" value="${b.passScore||93}" min="60" max="100"></label>
+        <label class="fld">联合审查间隔（章）<input class="input" id="c-interval" type="number" value="5" min="1"></label>
+        <label class="fld">本轮创作指导（可选）<textarea class="input ta" id="c-context" placeholder="本卷重点、节奏安排、要推进的伏笔与钩子..."></textarea></label>
+        <button class="btn btn-primary" id="c-start-btn" onclick="startContinuous()">▶ 开始连续创作</button>
+        <button class="btn btn-secondary" onclick="stopContinuous()">■ 停止监听</button>
+      </div>
+      <div class="card">
+        <h3 class="card-title">实时进度</h3>
+        <div id="c-progress-wrap">
+          <div class="prog"><div class="prog-bar" id="c-bar" style="width:0%"></div></div>
+          <div class="muted" id="c-stat" style="margin:8px 0">尚未开始</div>
+          <div id="c-log" class="log-box"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card"><h3 class="card-title">章节门禁结果</h3>
+      <table class="table" id="c-table"><thead><tr><th>章</th><th>标题</th><th>评分</th><th>修订轮次</th><th>门禁</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>`;
+};
+
+let _contTask=null;
+async function startContinuous(){
+  const count = +val('c-count'), start = +val('c-start');
+  const score = +val('c-score'), interval = +val('c-interval');
+  const context = val('c-context');
+  if(count<5||count>200) return toast('篇目需在 5 到 200 之间','error');
+  if(!confirm(`确认连续创作 ${count} 章？该模式会对每章反复审查、修订、复审并每 ${interval} 章联合审查，将消耗大量 token。`)) return;
+  try{ await api('PUT','/project',{passScore:score,jointReviewInterval:interval}); }catch(e){}
+  const box=document.getElementById('c-log'); if(box) box.innerHTML='';
+  document.getElementById('c-start-btn').disabled=true;
+  logLine('提交连续创作任务...');
+  try{
+    const res = await api('POST','/books/'+S.book+'/continuous',{count,startChapter:start,context});
+    _contTask = res.taskId;
+    logLine('任务已启动: '+res.taskId+' — 开始监听进度');
+    window.addEventListener('task-update',onContUpdate);
+    pollTask(res.taskId);
+  }catch(e){ toast(e.message,'error'); document.getElementById('c-start-btn').disabled=false; }
+}
+function onContUpdate(ev){ const t=ev.detail; if(_contTask && t.id===_contTask) renderTaskProgress(t); }
+function logLine(t){
+  const box=document.getElementById('c-log'); if(!box) return;
+  const d=document.createElement('div'); d.className='log-line';
+  d.textContent='· '+t; box.appendChild(d); box.scrollTop=box.scrollHeight;
+}
+function stopContinuous(){ window.removeEventListener('task-update',onContUpdate); _contTask=null; logLine('已停止监听（后台任务继续运行）'); }
+async function pollTask(id){
+  if(!id) return;
+  try{
+    const t = await api('GET','/tasks/'+id);
+    renderTaskProgress(t);
+    if(t.status==='running'){ setTimeout(()=>pollTask(id),2000); }
+    else if(t.status==='completed'){ logLine('✔ 全部完成'); renderTaskResults(t); }
+    else if(t.status==='failed'){ logLine('✘ 失败: '+(t.error||'')); }
+  }catch(e){ setTimeout(()=>pollTask(id),3000); }
+}
+let _lastProg='';
+function renderTaskProgress(t){
+  const total=t.targetCount||1, done=t.completedCount||0;
+  const bar=document.getElementById('c-bar'); if(bar) bar.style.width=Math.round(done/total*100)+'%';
+  const stat=document.getElementById('c-stat'); if(stat) stat.textContent=`已完成 ${done}/${total} 章`+(t.progress?(' — '+(typeof t.progress==='string'?t.progress:t.progress[t.progress.length-1]||'')):'');
+  const p = typeof t.progress==='string'?t.progress:(Array.isArray(t.progress)?t.progress[t.progress.length-1]:'');
+  if(p && p!==_lastProg){ _lastProg=p; logLine(p); }
+  const tb=document.querySelector('#c-table tbody');
+  if(tb && t.chapters){ tb.innerHTML=t.chapters.map(c=>`<tr><td>${c.number}</td><td>${esc(c.title||'')}</td><td>${c.score??'-'}</td><td>${c.revision_rounds??'-'}</td><td>${c.passed?'<span class="badge badge-success">通过</span>':'<span class="badge badge-warning">保留</span>'}</td></tr>`).join(''); }
+}
+function renderTaskResults(t){
+  const r=t.results; if(!r) return;
+  const tb=document.querySelector('#c-table tbody');
+  if(tb && r.chapters){ tb.innerHTML=r.chapters.map(c=>`<tr><td>${c.number}</td><td>${esc(c.title||'')}</td><td>${c.score??'-'}</td><td>${c.revision_rounds??'-'}</td><td>${c.passed?'<span class="badge badge-success">通过</span>':'<span class="badge badge-warning">保留</span>'}</td></tr>`).join(''); }
+  if(r.joint_reviews && r.joint_reviews.length) logLine('联合审查: '+r.joint_reviews.map(j=>`${j.range}(${j.score})`).join(', '));
+}
+
+// ===== AI 助手 =====
+PAGES.chat=async(p)=>{
+  p.innerHTML=header('AI 助手','与创作助手对话：构思、答疑、生成设定片段')+
+  `<div class="content content-narrow">
+    <div id="chat-log" class="card" style="min-height:320px;max-height:52vh;overflow-y:auto">
+      <p class="muted">你好，我是 NovelForge 创作助手。可以帮你打磨世界观、设计人物弧光、规划伏笔与钩子。${S.book?'当前作品：<b>'+esc(bookName())+'</b>':'（未选择作品，回答将偏通用）'}</p>
+    </div>
+    <div class="row" style="margin-top:12px;align-items:flex-end">
+      <textarea class="input textarea" id="chat-input" style="min-height:60px" placeholder="输入你的问题或指令，Enter 发送，Shift+Enter 换行"></textarea>
+      <button class="btn btn-primary" id="chat-send" onclick="sendChat()">发送</button>
+    </div>
+  </div>`;
+  const ta=document.getElementById('chat-input');
+  ta.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendChat();} });
+};
+function chatBubble(role,text){
+  const log=document.getElementById('chat-log'); if(!log) return null;
+  const d=document.createElement('div');
+  d.style.cssText='margin:10px 0;padding:10px 14px;border-radius:10px;line-height:1.7;'+(role==='user'?'background:var(--primary-dim);border:1px solid rgba(233,69,96,.25)':'background:var(--bg);border:1px solid var(--border)');
+  d.innerHTML=`<div class="text-sm" style="color:var(--text-dim);margin-bottom:4px">${role==='user'?'你':'助手'}</div><div>${esc(text)}</div>`;
+  log.appendChild(d); log.scrollTop=log.scrollHeight; return d;
+}
+async function sendChat(){
+  const ta=document.getElementById('chat-input'); const msg=ta.value.trim(); if(!msg)return;
+  chatBubble('user',msg); ta.value='';
+  const btn=document.getElementById('chat-send'); btn.disabled=true;
+  const holder=chatBubble('assistant','思考中…');
+  try{
+    const r=await api('POST','/chat',{message:msg,bookId:S.book});
+    holder.querySelector('div:last-child').textContent=r.reply||r.message||'（无回复）';
+  }catch(e){ holder.querySelector('div:last-child').textContent='出错：'+e.message; }
+  finally{ btn.disabled=false; document.getElementById('chat-log').scrollTop=1e9; }
+}
+
+// ===== 世界观向导 =====
+PAGES.wizard=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  const b=await api('GET','/books/'+S.book);
+  const w=b.world||{};
+  p.innerHTML=header('世界观向导',`${esc(bookName())} · AI 协同搭建世界观 / 核心矛盾 / 人物 / 地图`,
+    `<button class="btn btn-secondary" onclick="go('mindmap')">查看思维导图</button>`)+
+  `<div class="content">
+    <div class="warn-banner">💡 描述你的构想（题材、主角、核心矛盾、力量体系、地图、想要的爽点节奏），AI 将结构化生成世界观架构、人物关系、势力、地图与初始伏笔，并以思维导图呈现。</div>
+    <div class="editor-layout">
+      <div class="card">
+        <h3>创作构想输入</h3>
+        <div class="field"><label>你的世界观构想</label>
+          <textarea class="input textarea" id="wz-input" style="min-height:180px" placeholder="例如：一个灵气复苏的近未来都市，主角是隐藏身份的觉醒者，核心矛盾是旧秩序修行门派与新兴科技财阀的对抗；力量体系分为炼气—筑基—金丹；地图包含临海市、云顶宗、深渊裂隙……">${esc(b.__brief||'')}</textarea></div>
+        <button class="btn btn-primary" id="wz-run" onclick="runWizard()">🪄 生成世界观架构</button>
+        <p class="dim-note mt8">生成后可在下方查看，并前往「真相文件」精修、「思维导图」查看结构。</p>
+      </div>
+      <div class="card">
+        <h3>当前世界观</h3>
+        <div class="kv"><span>世界名称</span><b>${esc(w.name||'—')}</b></div>
+        <div class="kv"><span>核心矛盾</span><b>${esc(w.core_conflict||w.coreConflict||'—')}</b></div>
+        <div class="kv"><span>力量体系</span><b>${esc(w.power_system||w.powerSystem||'—')}</b></div>
+        <div class="kv"><span>角色</span><b>${Object.keys(b.characters||{}).length}</b></div>
+        <div class="kv"><span>势力</span><b>${Object.keys(b.factions||{}).length}</b></div>
+        <div class="kv"><span>地点</span><b>${Object.keys(b.locations||{}).length}</b></div>
+        <div class="kv"><span>伏笔</span><b>${Object.keys(b.foreshadowing||{}).length}</b></div>
+      </div>
+    </div>
+    <div id="wz-result"></div>
+  </div>`;
+};
+async function runWizard(){
+  const input=val('wz-input'); if(!input)return toast('请先输入你的世界观构想','error');
+  const btn=document.getElementById('wz-run'); btn.disabled=true; btn.textContent='AI 生成中…';
+  const res=document.getElementById('wz-result');
+  res.innerHTML='<div class="loading"><div class="spinner"></div>AI 正在构建世界观（可能耗时较久）…</div>';
+  try{
+    const r=await api('POST','/books/'+S.book+'/wizard',{userInput:input});
+    toast('世界观已生成','success');
+    res.innerHTML=`<div class="card"><h3>生成结果</h3><pre class="mono" style="white-space:pre-wrap;line-height:1.7">${esc(typeof r.data==='string'?r.data:JSON.stringify(r.data,null,2))}</pre>
+      <div class="row mt16"><button class="btn btn-secondary" onclick="go('mindmap')">查看思维导图</button><button class="btn btn-secondary" onclick="go('truth')">精修真相文件</button><button class="btn btn-secondary" onclick="go('book')">返回概览</button></div></div>`;
+  }catch(e){ res.innerHTML=`<div class="card"><p style="color:var(--error)">${esc(e.message)}</p></div>`; }
+  finally{ btn.disabled=false; btn.textContent='🪄 生成世界观架构'; }
+}
+
+// ===== 章节工作台 =====
+PAGES.chapters=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  const b=await api('GET','/books/'+S.book);
+  const n=b.chaptersWritten||0;
+  const rows=[];
+  for(let i=1;i<=n;i++) rows.push(i);
+  p.innerHTML=header('章节工作台',`${esc(bookName())} · 共 ${n} 章 · 单章创作 / 审查 / 修订`,
+    `<button class="btn btn-primary" onclick="writeNext()">✍ 写下一章</button>
+     <button class="btn btn-secondary" onclick="go('continuous')">连续创作</button>`)+
+  `<div class="content">
+    <div id="wn-status"></div>
+    <div class="editor-layout">
+      <div class="card"><h3>章节列表</h3>
+        <table class="table"><thead><tr><th>章</th><th>标题</th><th>字数</th><th>评分</th><th>状态</th><th></th></tr></thead>
+        <tbody id="ch-tbody">${n?'':'<tr><td colspan="6"><p class="muted">还没有章节，点击「写下一章」开始。</p></td></tr>'}</tbody></table>
+      </div>
+      <div class="card"><h3>单章操作</h3>
+        <div class="field"><label>章节号</label><input class="input" id="op-num" type="number" min="1" value="${n||1}"></div>
+        <div class="row row-wrap">
+          <button class="btn btn-sm btn-secondary" onclick="opAudit()">审查打分</button>
+          <button class="btn btn-sm btn-secondary" onclick="opRevise()">修订一轮</button>
+          <button class="btn btn-sm btn-secondary" onclick="opView()">查看内容</button>
+        </div>
+        <div class="dim-note mt8">审查采用 inkOS 双重门禁：无针对性问题且评分 ≥ 通过分。</div>
+        <div id="op-out" class="mt16"></div>
+      </div>
+    </div>
+  </div>`;
+  loadChapterRows(n);
+};
+async function loadChapterRows(n){
+  const tb=document.getElementById('ch-tbody'); if(!tb||!n)return;
+  const cells=[];
+  for(let i=1;i<=n;i++){
+    try{ const c=await api('GET','/books/'+S.book+'/chapters/'+i);
+      const sc=c.review?.overall_score ?? c.review?.overallScore;
+      cells.push(`<tr><td>${i}</td><td>${esc(c.title||'—')}</td><td>${c.wordCount||0}</td>
+        <td>${sc!=null?`<b style="color:${scoreColor(sc)}">${sc.toFixed?sc.toFixed(1):sc}</b>`:'—'}</td>
+        <td>${statusBadge(c.status)}</td>
+        <td><button class="btn btn-sm btn-ghost" onclick="viewChapter(${i})">查看</button></td></tr>`);
+    }catch(_){ cells.push(`<tr><td>${i}</td><td class="muted">加载失败</td><td>—</td><td>—</td><td>—</td><td></td></tr>`); }
+  }
+  tb.innerHTML=cells.join('');
+}
+async function writeNext(){
+  const s=document.getElementById('wn-status');
+  s.innerHTML='<div class="warn-banner">✍ 已提交写作任务，正在规划→写作→审查→修订，直至通过双重门禁…</div>';
+  try{
+    const r=await api('POST','/books/'+S.book+'/write-next',{context:''});
+    const tid=r.taskId;
+    const poll=async()=>{ try{const t=await api('GET','/tasks/'+tid);
+      s.innerHTML=`<div class="warn-banner">✍ ${esc(typeof t.progress==='string'?t.progress:(t.status||'处理中'))}</div>`;
+      if(t.status==='running')setTimeout(poll,2000);
+      else if(t.status==='completed'){toast('新章节完成','success');s.innerHTML='';go('chapters');}
+      else if(t.status==='failed'){s.innerHTML=`<div class="warn-banner" style="border-color:var(--error);color:var(--error)">✘ ${esc(t.error||'失败')}</div>`;}
+    }catch(e){setTimeout(poll,3000);} };
+    poll();
+  }catch(e){ toast(e.message,'error'); s.innerHTML=''; }
+}
+async function opAudit(){
+  const num=+val('op-num'); const out=document.getElementById('op-out');
+  out.innerHTML='<div class="loading"><div class="spinner"></div>审查中…</div>';
+  try{ const r=await api('POST','/books/'+S.book+'/audit/'+num);
+    out.innerHTML=renderAudit(r);
+  }catch(e){ out.innerHTML=`<p style="color:var(--error)">${esc(e.message)}</p>`; }
+}
+function renderAudit(r){
+  return `<div class="gate-box">
+    <div class="gate ${!r.specificIssues||!r.specificIssues.length?'pass':'fail'}"><div class="g-label">针对性问题</div><div class="g-val">${(r.specificIssues||[]).length}</div></div>
+    <div class="gate ${r.score>=93?'pass':'fail'}"><div class="g-label">评分</div><div class="g-val" style="color:${scoreColor(r.score)}">${(r.score??0).toFixed?r.score.toFixed(1):r.score}</div></div>
+    <div class="gate ${r.passed?'pass':'fail'}"><div class="g-label">双重门禁</div><div class="g-val">${r.passed?'通过':'未过'}</div></div>
+  </div>
+  <p class="text-sm text-muted">${esc(r.reason||'')}</p>
+  ${(r.dimensions||[]).length?`<div class="mt16"><b class="text-sm">审查维度</b><table class="table mt8"><tbody>${r.dimensions.map(d=>`<tr><td>${esc(d.name)}</td><td style="color:${scoreColor(d.score)}">${d.score}</td><td class="text-sm text-muted">${esc((d.issues||[]).join('；'))}</td></tr>`).join('')}</tbody></table></div>`:''}
+  ${(r.specificIssues||[]).length?`<div class="mt16"><b class="text-sm">针对性问题</b><ul style="margin:8px 0 0 18px;line-height:1.8">${r.specificIssues.map(i=>`<li>${esc(typeof i==='string'?i:JSON.stringify(i))}</li>`).join('')}</ul></div>`:''}`;
+}
+async function opRevise(){
+  const num=+val('op-num'); const out=document.getElementById('op-out');
+  out.innerHTML='<div class="loading"><div class="spinner"></div>修订中…</div>';
+  try{ const r=await api('POST','/books/'+S.book+'/revise/'+num);
+    out.innerHTML=`<div class="gate-box"><div class="gate ${r.score>=93?'pass':'fail'}"><div class="g-label">评分</div><div class="g-val" style="color:${scoreColor(r.score)}">${(r.score??0).toFixed?r.score.toFixed(1):r.score}</div></div><div class="gate ${r.passed?'pass':'fail'}"><div class="g-label">门禁</div><div class="g-val">${r.passed?'通过':'未过'}</div></div><div class="gate"><div class="g-label">修订轮次</div><div class="g-val">${r.revisionCount??'-'}</div></div></div><p class="text-sm text-muted">${esc(r.reason||'')}</p>`;
+    toast('修订完成','success');
+  }catch(e){ out.innerHTML=`<p style="color:var(--error)">${esc(e.message)}</p>`; }
+}
+function opView(){ viewChapter(+val('op-num')); }
+async function viewChapter(num){
+  try{ const c=await api('GET','/books/'+S.book+'/chapters/'+num);
+    modal(`<div class="modal-header"><h3>第${num}章 ${esc(c.title||'')}</h3><button class="close-x" onclick="closeModal()">×</button></div>
+      <div class="row" style="gap:8px;margin-bottom:10px"><span class="badge badge-muted">${c.wordCount||0} 字</span>${statusBadge(c.status)}</div>
+      <div style="white-space:pre-wrap;line-height:1.9;max-height:60vh;overflow-y:auto">${esc(c.content||'（无内容）')}</div>`,true);
+  }catch(e){ toast(e.message,'error'); }
+}
+// ===== 思维导图 =====
+PAGES.mindmap=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  p.innerHTML=header('思维导图',`${esc(bookName())} · 世界观 / 人物 / 势力 / 地图结构`,
+    `<button class="btn btn-secondary" onclick="openVis('mindmap')">新窗口打开</button>
+     <button class="btn btn-secondary" onclick="go('timeline')">故事时间轴</button>`)+
+  `<div class="content"><div class="card" style="padding:0;overflow:hidden">
+     <iframe src="/api/v1/books/${S.book}/mindmap" style="width:100%;height:72vh;border:none;background:#fff;border-radius:var(--radius)"></iframe>
+   </div></div>`;
+};
+function openVis(kind){ window.open('/api/v1/books/'+S.book+'/'+kind,'_blank'); }
+
+// ===== 故事时间轴（多分支） =====
+PAGES.timeline=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  p.innerHTML=header('故事时间轴',`${esc(bookName())} · 多分支时间轴`,
+    `<button class="btn btn-secondary" onclick="openVis('timeline')">新窗口打开</button>
+     <button class="btn btn-secondary" onclick="go('mindmap')">思维导图</button>`)+
+  `<div class="content"><div class="card" style="padding:0;overflow:hidden">
+     <iframe src="/api/v1/books/${S.book}/timeline" style="width:100%;height:72vh;border:none;background:#fff;border-radius:var(--radius)"></iframe>
+   </div></div>`;
+};
+
+// ===== 伏笔与钩子 =====
+PAGES.foreshadowing=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  const b=await api('GET','/books/'+S.book);
+  const fs=Object.entries(b.foreshadowing||{});
+  const open=fs.filter(([_,f])=>!(f.resolved||f.is_resolved||f.status==='resolved'));
+  const done=fs.filter(([_,f])=>(f.resolved||f.is_resolved||f.status==='resolved'));
+  const card=([k,f])=>`<div class="card" style="margin-bottom:10px">
+    <div class="row" style="justify-content:space-between"><b>${esc(f.name||f.title||k)}</b>
+      ${(f.resolved||f.is_resolved||f.status==='resolved')?'<span class="badge badge-success">已回收</span>':'<span class="badge badge-warning">未回收</span>'}</div>
+    <p class="text-sm text-muted mt8">${esc(f.description||f.content||'')}</p>
+    <div class="row row-wrap mt8">
+      ${f.planted_chapter||f.plantedChapter?`<span class="chip">埋设:第${esc(f.planted_chapter||f.plantedChapter)}章</span>`:''}
+      ${f.payoff_chapter||f.payoffChapter?`<span class="chip">回收:第${esc(f.payoff_chapter||f.payoffChapter)}章</span>`:''}
+      ${f.type?`<span class="chip">${esc(f.type)}</span>`:''}
+    </div></div>`;
+  p.innerHTML=header('伏笔与钩子',`${esc(bookName())} · 埋设与回收追踪`)+
+  `<div class="content">
+    <div class="grid grid-3">
+      ${stat(fs.length,'伏笔总数')}${stat(open.length,'待回收')}${stat(done.length,'已回收')}
+    </div>
+    <div class="warn-banner">🪝 好的长篇靠伏笔与钩子驱动读者黏性。连续创作与向导会自动登记伏笔；此处追踪其埋设/回收状态，避免烂尾与遗忘。</div>
+    <div class="grid grid-2">
+      <div><h3 class="mb8">待回收（${open.length}）</h3>${open.length?open.map(card).join(''):'<p class="muted">暂无未回收伏笔</p>'}</div>
+      <div><h3 class="mb8">已回收（${done.length}）</h3>${done.length?done.map(card).join(''):'<p class="muted">暂无已回收伏笔</p>'}</div>
+    </div>
+  </div>`;
+};
+
+// ===== 人物关系 =====
+PAGES.characters=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  const b=await api('GET','/books/'+S.book);
+  const chars=Object.entries(b.characters||{});
+  const facs=Object.entries(b.factions||{});
+  let graph='graph TD\n';
+  if(chars.length){
+    chars.forEach(([n,c],i)=>{ graph+=`  C${i}["${(n||'').replace(/"/g,'')}<br/>${(c.role||'').replace(/"/g,'')}"]\n`; });
+    // link characters to factions
+    facs.forEach(([fn],fi)=>{ graph+=`  F${fi}(("${(fn||'').replace(/"/g,'')}"))\n`; });
+    chars.forEach(([n,c],i)=>{ const fi=facs.findIndex(([fn])=>fn===(c.faction||c.affiliation)); if(fi>=0) graph+=`  C${i}-->F${fi}\n`; });
+  }else{ graph+='  empty["暂无人物数据"]\n'; }
+  p.innerHTML=header('人物关系',`${esc(bookName())} · ${chars.length} 角色 / ${facs.length} 势力`,
+    `<button class="btn btn-secondary" onclick="go('wizard')">补全人物</button>`)+
+  `<div class="content">
+    <div class="card"><h3>关系图</h3><div class="mermaid-box" id="char-graph"></div></div>
+    <div class="grid grid-2">
+      <div class="card"><h3>角色（${chars.length}）</h3>${chars.length?chars.map(([n,c])=>`<div class="list-row"><b>${esc(n)}</b> <span class="badge badge-info">${esc(c.role||'')}</span><div class="text-sm text-muted">${esc(c.personality||c.description||'')}</div></div>`).join(''):'<p class="muted">暂无角色</p>'}</div>
+      <div class="card"><h3>势力（${facs.length}）</h3>${facs.length?facs.map(([n,f])=>`<div class="list-row"><b>${esc(n)}</b><div class="text-sm text-muted">${esc(f.description||f.ideology||'')}</div></div>`).join(''):'<p class="muted">暂无势力</p>'}</div>
+    </div>
+  </div>`;
+  try{ const el=document.getElementById('char-graph'); const {svg}=await mermaid.render('cg'+Date.now(),graph); el.innerHTML=svg; }catch(e){ document.getElementById('char-graph').innerHTML='<p class="muted">关系图渲染失败</p>'; }
+};
+
+// ===== 数据分析 =====
+PAGES.analytics=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  const a=await api('GET','/books/'+S.book+'/analytics');
+  p.innerHTML=header('数据分析',`${esc(bookName())} · 创作质量总览`)+
+  `<div class="content">
+    <div class="grid grid-4">
+      ${stat(a.totalChapters,'总章节')}${stat(a.approvedChapters,'已通过')}${stat((a.totalWords||0).toLocaleString(),'总字数')}
+      <div class="card stat-card"><div class="stat-value" style="color:${scoreColor(a.averageScore)}">${a.averageScore||0}</div><div class="stat-label">平均分</div></div>
+    </div>
+    <div class="grid grid-4">
+      ${stat(a.openForeshadowing,'待回收伏笔')}${stat(a.characters,'角色')}${stat(a.factions,'势力')}${stat(a.locations,'地点')}
+    </div>
+    <div class="card"><h3>各章评分</h3><div class="mermaid-box" style="background:var(--bg-card)"><canvas id="score-chart" style="max-height:320px"></canvas></div></div>
+  </div>`;
+  drawScoreChart(a.chapterScores||[]);
+};
+function drawScoreChart(scores){
+  const cv=document.getElementById('score-chart'); if(!cv)return;
+  const ctx=cv.getContext('2d'); const W=cv.width=cv.offsetWidth; const H=cv.height=320;
+  ctx.clearRect(0,0,W,H); if(!scores.length){ctx.fillStyle='#8b949e';ctx.fillText('暂无评分数据',20,40);return;}
+  const pad=40, maxN=scores.length, minS=60, maxS=100;
+  const x=i=>pad+(W-2*pad)*(maxN<=1?0.5:i/(maxN-1));
+  const y=s=>H-pad-(H-2*pad)*((Math.max(minS,Math.min(maxS,s))-minS)/(maxS-minS));
+  // gridlines + pass line at 93
+  ctx.strokeStyle='#30363d';ctx.lineWidth=1;
+  [60,70,80,90,100].forEach(g=>{ctx.beginPath();ctx.moveTo(pad,y(g));ctx.lineTo(W-pad,y(g));ctx.stroke();ctx.fillStyle='#484f58';ctx.font='10px sans-serif';ctx.fillText(g,4,y(g)+3);});
+  ctx.strokeStyle='#3fb950';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(pad,y(93));ctx.lineTo(W-pad,y(93));ctx.stroke();ctx.setLineDash([]);
+  ctx.fillStyle='#3fb950';ctx.fillText('通过线 93',W-pad-56,y(93)-4);
+  // line
+  ctx.strokeStyle='#e94560';ctx.lineWidth=2;ctx.beginPath();
+  scores.forEach((s,i)=>{const px=x(i),py=y(s.score);i?ctx.lineTo(px,py):ctx.moveTo(px,py);});ctx.stroke();
+  scores.forEach((s,i)=>{const px=x(i),py=y(s.score);ctx.fillStyle=s.score>=93?'#3fb950':s.score>=80?'#d29922':'#f85149';ctx.beginPath();ctx.arc(px,py,3.5,0,7);ctx.fill();});
+}
+
+// ===== 联合审查 =====
+PAGES.jointreview=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  const b=await api('GET','/books/'+S.book);
+  const n=b.chaptersWritten||0;
+  p.innerHTML=header('联合审查',`${esc(bookName())} · 跨章一致性核查（剧情/人物/势力/地图/风格/技法）`)+
+  `<div class="content">
+    <div class="warn-banner">🔍 联合审查检查一段连续章节的整体一致性：剧情是否跑偏、人物是否 OOC、势力与地图是否符合设定、风格与写作技法是否达标。连续创作每 5 章自动触发。</div>
+    <div class="card">
+      <div class="row row-wrap" style="align-items:flex-end">
+        <div class="field" style="margin:0"><label>起始章</label><input class="input" id="jr-start" type="number" value="1" min="1" style="width:110px"></div>
+        <div class="field" style="margin:0"><label>结束章</label><input class="input" id="jr-end" type="number" value="${n||1}" min="1" style="width:110px"></div>
+        <button class="btn btn-primary" id="jr-run" onclick="runJoint()">开始联合审查</button>
+      </div>
+    </div>
+    <div id="jr-out"></div>
+  </div>`;
+};
+async function runJoint(){
+  const start=+val('jr-start'), end=+val('jr-end');
+  const btn=document.getElementById('jr-run'); btn.disabled=true;
+  const out=document.getElementById('jr-out');
+  out.innerHTML='<div class="loading"><div class="spinner"></div>联合审查中（跨章分析，耗时较久）…</div>';
+  try{ const r=await api('POST','/books/'+S.book+'/joint-review',{startChapter:start,endChapter:end});
+    const dim=(l,v)=>`<div class="card stat-card"><div class="stat-value" style="font-size:22px;color:${scoreColor(v)}">${v??'—'}</div><div class="stat-label">${l}</div></div>`;
+    out.innerHTML=`<div class="card"><h3>综合评分：<span style="color:${scoreColor(r.overallScore)}">${r.overallScore}</span>（第 ${esc(r.chapterRange)} 章）</h3></div>
+      <div class="grid grid-4">${dim('剧情一致',r.plotConsistency)}${dim('人物一致',r.characterConsistency)}${dim('势力一致',r.factionConsistency)}${dim('地图一致',r.mapConsistency)}</div>
+      <div class="grid grid-3">${dim('剧情连贯',r.storyCoherence)}${dim('风格一致',r.styleConsistency)}${dim('写作技法',r.writingTechnique)}</div>
+      ${(r.issues||[]).length?`<div class="card"><h3>发现的问题</h3><ul style="margin-left:18px;line-height:1.9">${r.issues.map(i=>`<li>${esc(typeof i==='string'?i:JSON.stringify(i))}</li>`).join('')}</ul></div>`:''}
+      ${(r.suggestions||[]).length?`<div class="card"><h3>改进建议</h3><ul style="margin-left:18px;line-height:1.9">${r.suggestions.map(i=>`<li>${esc(typeof i==='string'?i:JSON.stringify(i))}</li>`).join('')}</ul></div>`:''}`;
+  }catch(e){ out.innerHTML=`<div class="card"><p style="color:var(--error)">${esc(e.message)}</p></div>`; }
+  finally{ btn.disabled=false; }
+}
+// ===== 真相文件 =====
+PAGES.truth=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  const t=await api('GET','/books/'+S.book+'/truth');
+  const w=t.worldSetting||{};
+  p.innerHTML=header('真相文件',`${esc(bookName())} · 世界底稿与作者意图（AI 创作时的最高事实来源）`)+
+  `<div class="content">
+    <div class="grid grid-2">
+      <div class="card">
+        <div class="card-title-row"><h3>作者意图</h3><button class="btn btn-sm btn-primary" onclick="saveTruth('author_intent','tf-intent')">保存</button></div>
+        <textarea class="input textarea" id="tf-intent" style="min-height:220px">${esc(t.authorIntent||'')}</textarea>
+      </div>
+      <div class="card">
+        <div class="card-title-row"><h3>当前焦点</h3><button class="btn btn-sm btn-primary" onclick="saveTruth('current_focus','tf-focus')">保存</button></div>
+        <textarea class="input textarea" id="tf-focus" style="min-height:220px">${esc(t.currentFocus||'')}</textarea>
+      </div>
+    </div>
+    <div class="card"><h3>世界设定（只读，来自世界观向导）</h3>
+      <div class="kv"><span>世界名称</span><b>${esc(w.name||'—')}</b></div>
+      <div class="kv"><span>核心矛盾</span><b>${esc(w.core_conflict||w.coreConflict||'—')}</b></div>
+      <div class="kv"><span>力量体系</span><b>${esc(w.power_system||w.powerSystem||'—')}</b></div>
+      <p class="text-muted text-sm" style="margin-top:10px;line-height:1.7">${esc(w.setting_description||w.settingDescription||'—')}</p>
+    </div>
+    <div class="grid grid-3">
+      <div class="card"><h3>角色 ${Object.keys(t.characters||{}).length}</h3>${Object.keys(t.characters||{}).map(n=>`<div class="chip">${esc(n)}</div>`).join('')||'<p class="text-muted">—</p>'}</div>
+      <div class="card"><h3>势力 ${Object.keys(t.factions||{}).length}</h3>${Object.keys(t.factions||{}).map(n=>`<div class="chip">${esc(n)}</div>`).join('')||'<p class="text-muted">—</p>'}</div>
+      <div class="card"><h3>伏笔 ${Object.keys(t.foreshadowing||{}).length}</h3>${Object.keys(t.foreshadowing||{}).map(n=>`<div class="chip">${esc(n)}</div>`).join('')||'<p class="text-muted">—</p>'}</div>
+    </div>
+  </div>`;
+};
+async function saveTruth(file,elId){
+  try{ await api('PUT','/books/'+S.book+'/truth/'+file,{content:val(elId)}); toast('已保存','success'); }
+  catch(e){ toast(e.message,'error'); }
+}
+
+// ===== 导出交付 =====
+function exportModalHTML(id){
+  return `<div class="modal-header"><h3>导出交付</h3><button class="close-x" onclick="closeModal()">×</button></div>
+  <div class="field"><label>格式</label><select class="input" id="ex-fmt"><option value="docx">Word (.docx)</option><option value="md" selected>Markdown (.md)</option><option value="txt">纯文本 (.txt)</option></select></div>
+  <div class="field"><label><input type="checkbox" id="ex-approved"> 仅导出已通过双重门禁的章节</label></div>
+  <div class="row"><button class="btn btn-secondary" onclick="doDownload('${id}')">下载文件</button><button class="btn btn-primary" onclick="doExportSave('${id}')">导出并保存到项目</button></div>
+  <div id="ex-out" class="dim-note mt16"></div>`;
+}
+function doDownload(id){
+  const fmt=val('ex-fmt'), ap=document.getElementById('ex-approved').checked;
+  window.open('/api/v1/books/'+id+'/export?format='+fmt+'&approvedOnly='+ap,'_blank');
+}
+async function doExportSave(id){
+  const fmt=val('ex-fmt'), ap=document.getElementById('ex-approved').checked;
+  const out=document.getElementById('ex-out'); out.textContent='导出中…';
+  try{ const r=await api('POST','/books/'+id+'/export-save',{format:fmt,approvedOnly:ap});
+    out.innerHTML=`✔ 已导出：<span class="mono">${esc(r.exportPath)}</span><br>审查报告：<span class="mono">${esc(r.reportPath)}</span>`;
+    toast('导出完成','success');
+  }catch(e){ out.textContent=''; toast(e.message,'error'); }
+}
+PAGES.export=async(p)=>{
+  if(!S.book){go('dashboard');return;}
+  const ev=await api('GET','/books/'+S.book+'/eval');
+  p.innerHTML=header('导出交付',`${esc(bookName())} · 支持 docx / md / txt，可仅导出合格章节`,`<button class="btn btn-primary" onclick="modal(exportModalHTML('${S.book}'))">导出作品</button>`)+
+  `<div class="content">
+    <div class="grid grid-4">${stat(ev.chapters.length,'章节')}${stat(ev.totalWords.toLocaleString(),'总字数')}${stat(ev.chapters.filter(c=>c.status==='approved').length,'已通过')}${stat(esc(ev.genre||'—'),'题材')}</div>
+    <div class="card"><h3>章节清单</h3>
+      <table class="table"><thead><tr><th>#</th><th>标题</th><th>字数</th><th>评分</th><th>修订</th><th>状态</th></tr></thead><tbody>
+      ${ev.chapters.map(c=>`<tr><td>${c.number}</td><td>${esc(c.title||'')}</td><td>${(c.wordCount||0).toLocaleString()}</td><td style="color:${scoreColor(c.score||0)}">${c.score??'—'}</td><td>${c.revisionCount??0}</td><td>${statusBadge(c.status)}</td></tr>`).join('')||'<tr><td colspan="6" class="text-muted">暂无章节</td></tr>'}
+      </tbody></table>
+    </div>
+  </div>`;
+};
+
+// ===== 题材库 =====
+PAGES.genres=async(p)=>{
+  const d=await api('GET','/genres');
+  p.innerHTML=header('题材库','内置题材规则与禁忌，用于约束 AI 创作与审查')+
+  `<div class="content"><div class="grid grid-3">
+    ${(d.genres||[]).map(g=>`<div class="card card-hover" onclick="showGenre('${g.id}')">
+      <h3>${esc(g.name)}</h3>
+      <div class="row" style="margin-top:8px"><span class="badge badge-info">${g.rules} 条规则</span><span class="badge badge-warning">${g.taboos} 禁忌</span></div>
+    </div>`).join('')}
+  </div></div>`;
+};
+async function showGenre(id){
+  try{ const g=await api('GET','/genres/'+id);
+    modal(`<div class="modal-header"><h3>${esc(g.name)}</h3><button class="close-x" onclick="closeModal()">×</button></div>
+      <h4 class="mb8">创作规则</h4><ul style="margin-left:18px;line-height:1.9">${(g.rules||[]).map(r=>`<li>${esc(typeof r==='string'?r:JSON.stringify(r))}</li>`).join('')}</ul>
+      <div class="divider"></div>
+      <h4 class="mb8">禁忌</h4>${(g.taboos||[]).length?`<ul style="margin-left:18px;line-height:1.9">${g.taboos.map(t=>`<li>${esc(typeof t==='string'?t:JSON.stringify(t))}</li>`).join('')}</ul>`:'<p class="text-muted">无</p>'}`,true);
+  }catch(e){ toast(e.message,'error'); }
+}
+
+// ===== 模型配置 =====
+PAGES.services=async(p)=>{
+  const c=await api('GET','/services/config');
+  const block=(role,label,cfg)=>`<div class="card">
+    <div class="card-title-row"><h3>${label}</h3><button class="btn btn-sm btn-secondary" onclick="testSvc('${role}')">测试连接</button></div>
+    <div class="field"><label>Base URL</label><input class="input" id="sv-${role}-url" value="${esc(cfg.base_url||'')}" placeholder="https://api.openai.com/v1"></div>
+    <div class="field"><label>模型</label><input class="input" id="sv-${role}-model" value="${esc(cfg.model||'')}" placeholder="gpt-4o / deepseek-chat ..."></div>
+    <div class="field"><label>API Key（留空则不修改，当前：${esc(cfg.api_key||'未配置')}）</label><input class="input" id="sv-${role}-key" type="password" placeholder="sk-..."></div>
+    <div id="sv-${role}-test" class="dim-note"></div>
+  </div>`;
+  p.innerHTML=header('模型配置','配置主创作模型与审查模型（可分别指向不同服务）',`<button class="btn btn-primary" onclick="saveServices()">保存配置</button>`)+
+  `<div class="content"><div class="grid grid-2">${block('primary','主创作模型',c.primary||{})}${block('review','审查模型',c.review||{})}</div>
+    <div class="warn-banner">💡 审查模型建议使用推理能力更强的模型，以保证双重门禁的判定质量。连续创作会反复调用审查模型，注意 token 消耗。</div>
+  </div>`;
+};
+async function saveServices(){
+  const build=role=>{const o={base_url:val('sv-'+role+'-url'),model:val('sv-'+role+'-model')};const k=val('sv-'+role+'-key');if(k)o.api_key=k;return o;};
+  try{ await api('PUT','/services/config',{primary:build('primary'),review:build('review')}); toast('配置已保存','success'); }
+  catch(e){ toast(e.message,'error'); }
+}
+async function testSvc(role){
+  const el=document.getElementById('sv-'+role+'-test'); el.textContent='测试中…';
+  try{ const r=await api('POST','/services/'+role+'/test'); el.innerHTML=r.connected?`<span style="color:var(--success)">✔ 连接成功：${esc(r.model||'')}</span>`:`<span style="color:var(--error)">✘ ${esc(r.error||'失败')}</span>`; }
+  catch(e){ el.innerHTML=`<span style="color:var(--error)">✘ ${esc(e.message)}</span>`; }
+}
+
+// ===== 创作参数 =====
+PAGES.settings=async(p)=>{
+  const c=await api('GET','/project');
+  p.innerHTML=header('创作参数','全局默认参数：字数区间、双重门禁分、修订轮次、联合审查间隔',`<button class="btn btn-primary" onclick="saveSettings()">保存参数</button>`)+
+  `<div class="content"><div class="card" style="max-width:720px">
+    <div class="grid grid-2">
+      <div class="field"><label>语言</label><select class="input" id="st-lang"><option value="zh" ${c.language==='zh'?'selected':''}>中文</option><option value="en" ${c.language==='en'?'selected':''}>English</option></select></div>
+      <div class="field"><label>双重门禁通过分（>此分且无针对性问题）</label><input class="input" id="st-score" type="number" value="${c.passScore}" min="60" max="100"></div>
+      <div class="field"><label>单章最少字数</label><input class="input" id="st-wmin" type="number" value="${c.chapterWordsMin}"></div>
+      <div class="field"><label>单章最多字数</label><input class="input" id="st-wmax" type="number" value="${c.chapterWordsMax}"></div>
+      <div class="field"><label>最大修订轮次</label><input class="input" id="st-rev" type="number" value="${c.maxRevisionRounds}" min="1" max="10"></div>
+      <div class="field"><label>联合审查间隔（章）</label><input class="input" id="st-jri" type="number" value="${c.jointReviewInterval}" min="1"></div>
+    </div>
+    <p class="dim-note">双重门禁：每章须同时满足「审查系统无针对性问题」且「评分 &gt; ${c.passScore}」才算合格；每 ${c.jointReviewInterval} 章触发一次跨章联合审查。</p>
+  </div></div>`;
+};
+async function saveSettings(){
+  try{ await api('PUT','/project',{language:val('st-lang'),passScore:+val('st-score'),chapterWordsMin:+val('st-wmin'),chapterWordsMax:+val('st-wmax'),maxRevisionRounds:+val('st-rev'),jointReviewInterval:+val('st-jri')});
+    toast('参数已保存','success'); }
+  catch(e){ toast(e.message,'error'); }
+}
+
+// ===== 导入素材 =====
+PAGES.import=async(p)=>{
+  p.innerHTML=header('导入素材','导入已有章节正文（txt / md / docx），按「第N章」自动切分')+
+  `<div class="content"><div class="card" style="max-width:720px">
+    ${S.book?`<div class="dim-note mb16">导入目标作品：<b>${esc(bookName())}</b></div>`:'<div class="warn-banner">请先在「我的创作」中打开一本作品作为导入目标。</div>'}
+    <div class="field"><label>选择文件</label><input class="input" id="imp-file" type="file" accept=".txt,.md,.docx"></div>
+    <button class="btn btn-primary" ${S.book?'':'disabled'} onclick="doImport()">开始导入</button>
+    <div id="imp-out" class="dim-note mt16"></div>
+  </div>
+  <div class="card" style="max-width:720px"><h3>导入长篇世界架构 / 写作技法要求</h3>
+    <p class="dim-note mb16">将世界观、写作技法要求粘贴到下方，AI 会写入作者意图（真相文件），后续创作与审查都会遵循。</p>
+    <textarea class="input textarea" id="imp-doc" style="min-height:160px" placeholder="粘贴世界架构设定 / 写作技法要求…"></textarea>
+    <button class="btn btn-secondary mt8" ${S.book?'':'disabled'} onclick="importDoc()">写入真相文件</button>
+  </div></div>`;
+};
+async function doImport(){
+  const f=document.getElementById('imp-file').files[0]; if(!f)return toast('请选择文件','error');
+  const out=document.getElementById('imp-out'); out.textContent='导入中…';
+  const fd=new FormData(); fd.append('file',f);
+  try{ const r=await api('POST','/books/'+S.book+'/import/chapters',fd,true); out.textContent='✔ '+(r.message||'导入完成'); toast('导入完成','success'); }
+  catch(e){ out.textContent=''; toast(e.message,'error'); }
+}
+async function importDoc(){
+  const txt=val('imp-doc'); if(!txt)return toast('请粘贴内容','error');
+  try{ await api('PUT','/books/'+S.book+'/truth/author_intent',{content:txt}); toast('已写入真相文件','success'); }
+  catch(e){ toast(e.message,'error'); }
+}
+
+// ===== 系统诊断 =====
+PAGES.doctor=async(p)=>{
+  const d=await api('GET','/doctor');
+  const icon=s=>s==='ok'?'<span style="color:var(--success)">✔</span>':s==='warning'?'<span style="color:var(--warning)">⚠</span>':'<span style="color:var(--error)">✘</span>';
+  p.innerHTML=header('系统诊断','检查模型配置、项目目录等运行环境',`<button class="btn btn-secondary" onclick="go('doctor')">重新检测</button>`)+
+  `<div class="content"><div class="card"><table class="table"><tbody>
+    ${(d.checks||[]).map(c=>`<tr><td style="width:40px">${icon(c.status)}</td><td><b>${esc(c.name)}</b></td><td class="text-muted">${esc(c.message)}</td></tr>`).join('')}
+  </tbody></table></div></div>`;
+};
+
+// ===== Boot =====
+renderNav();
+initSSE();
+go('dashboard');
+</script>
+</body>
+</html>

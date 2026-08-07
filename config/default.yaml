@@ -1,0 +1,90 @@
+# NovelForge 默认配置
+
+project:
+  name: ""
+  genre: ""
+  target_chapters: 100
+  chapter_words_min: 2000
+  chapter_words_max: 4000
+  language: "zh-CN"
+
+llm:
+  # 主创作模型
+  primary:
+    provider: "openai"
+    model: "gpt-4o"
+    base_url: "https://api.openai.com/v1"
+    api_key: ""
+    temperature: 0.8
+    max_tokens: 8000
+  # 审查模型（可用更强的模型）
+  review:
+    provider: "openai"
+    model: "gpt-4o"
+    base_url: "https://api.openai.com/v1"
+    api_key: ""
+    temperature: 0.3
+    max_tokens: 4000
+  # 生图模型（可选）
+  image:
+    provider: ""
+    model: ""
+    base_url: ""
+    api_key: ""
+
+review:
+  # 审查通过分数阈值
+  pass_score: 93
+  # 最大修订轮数
+  max_revision_rounds: 3
+  # 联合审查间隔（每N章）
+  joint_review_interval: 5
+  # 审查维度权重
+  dimensions:
+    plot_coherence: 0.15
+    character_consistency: 0.15
+    world_setting: 0.10
+    writing_quality: 0.15
+    pacing: 0.10
+    foreshadowing: 0.10
+    emotional_depth: 0.10
+    language_style: 0.10
+    ai_detection: 0.05
+
+continuous:
+  # 默认连续创作章数
+  default_chapter_count: 10
+  # 最小章数
+  min_chapter_count: 5
+  # 最大章数
+  max_chapter_count: 200
+  # 每章间暂停（秒），用于人工检查
+  pause_between_chapters: 0
+  # 每N章进行联合审查
+  joint_review_interval: 5
+
+export:
+  # 默认导出格式
+  default_format: "md"
+  # 导出目录
+  output_dir: "exports"
+
+memory:
+  # 是否启用向量检索
+  enable_vector: false
+  # 向量模型
+  embedding_model: ""
+  embedding_base_url: ""
+  embedding_api_key: ""
+  # 最大上下文窗口（token数）
+  max_context_tokens: 128000
+  # 每章摘要最大长度
+  summary_max_chars: 500
+
+visualization:
+  # 是否自动生成思维导图
+  auto_mindmap: true
+  # 是否自动生成时间轴
+  auto_timeline: true
+  # 地图生成（需要配置生图模型）
+  auto_map: false

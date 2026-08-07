@@ -1,0 +1,21 @@
+# User-owned runtime and generated data
+projects/
+.references/
+.pytest_cache/
+.reasonix/
+__pycache__/
+*.py[cod]
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Editor and build output
+.idea/
+.vscode/
+dist/
+build/
+*.egg-info/

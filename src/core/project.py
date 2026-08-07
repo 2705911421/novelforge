@@ -1,0 +1,253 @@
+"""项目管理 - 负责项目的创建、加载、保存"""
+
+import json
+import uuid
+import shutil
+from pathlib import Path
+from datetime import datetime
+from typing import Optional
+
+from .models import StoryProject, Chapter, ChapterStatus, WorldSetting, Character, Faction, Location, Foreshadowing, Volume
+from .config import Config
+
+
+class ProjectManager:
+    """项目管理器"""
+
+    def __init__(self, base_dir: str = "."):
+        self.base_dir = Path(base_dir)
+        self.projects_dir = self.base_dir / "projects"
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
+
+    def create_project(self, name: str, genre: str = "", config: Optional[Config] = None) -> StoryProject:
+        """创建新项目"""
+        project_id = str(uuid.uuid4())[:8]
+        project_dir = self.projects_dir / project_id
+        project_dir.mkdir(parents=True, exist_ok=True)
+
+        # 创建项目子目录
+        (project_dir / "chapters").mkdir(exist_ok=True)
+        (project_dir / "exports").mkdir(exist_ok=True)
+        (project_dir / "reviews").mkdir(exist_ok=True)
+        (project_dir / "visualizations").mkdir(exist_ok=True)
+        (project_dir / "world").mkdir(exist_ok=True)
+
+        project = StoryProject(
+            id=project_id,
+            name=name,
+            genre=genre,
+            created_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+        )
+
+        # 保存项目
+        self.save_project(project)
+
+        # 保存项目配置
+        if config:
+            config.save(str(project_dir / "novelforge.yaml"))
+
+        return project
+
+    def _validate_project_id(self, project_id: str) -> bool:
+        """验证project_id安全性，防止路径穿越"""
+        import re
+        # 只允许字母数字和连字符
+        return bool(re.match(r'^[a-zA-Z0-9\-]+$', project_id))
+
+    def load_project(self, project_id: str) -> Optional[StoryProject]:
+        """加载项目"""
+        if not self._validate_project_id(project_id):
+            return None
+        project_file = self.projects_dir / project_id / "project.json"
+        if not project_file.exists():
+            return None
+
+        with open(project_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # 重建项目对象
+        project = self._dict_to_project(data)
+        return project
+
+    def save_project(self, project: StoryProject):
+        """保存项目"""
+        project_dir = self.projects_dir / project.id
+        project_dir.mkdir(parents=True, exist_ok=True)
+
+        project.updated_at = datetime.now().isoformat()
+
+        project_file = project_dir / "project.json"
+        with open(project_file, "w", encoding="utf-8") as f:
+            json.dump(project.to_dict(), f, ensure_ascii=False, indent=2)
+
+    def list_projects(self) -> list:
+        """列出所有项目"""
+        projects = []
+        if not self.projects_dir.exists():
+            return projects
+        for project_dir in self.projects_dir.iterdir():
+            if project_dir.is_dir():
+                project_file = project_dir / "project.json"
+                if project_file.exists():
+                    with open(project_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    projects.append({
+                        "id": data.get("id"),
+                        "name": data.get("name"),
+                        "genre": data.get("genre"),
+                        "chapters": len(data.get("chapters", {})),
+                        "created_at": data.get("created_at"),
+                        "updated_at": data.get("updated_at"),
+                    })
+        return sorted(projects, key=lambda x: x.get("updated_at", ""), reverse=True)
+
+    def delete_project(self, project_id: str) -> bool:
+        """删除项目"""
+        if not self._validate_project_id(project_id):
+            return False
+        project_dir = self.projects_dir / project_id
+        if not project_dir.exists():
+            return False
+        try:
+            shutil.rmtree(project_dir)
+            return True
+        except (PermissionError, OSError):
+            # 某些挂载文件系统不支持基于文件描述符的目录删除，
+            # 退化为自底向上的手动删除（先删文件再删目录）。
+            import os
+            for root, dirs, files in os.walk(project_dir, topdown=False):
+                for name in files:
+                    try:
+                        os.remove(os.path.join(root, name))
+                    except OSError:
+                        pass
+                for name in dirs:
+                    try:
+                        os.rmdir(os.path.join(root, name))
+                    except OSError:
+                        pass
+            try:
+                os.rmdir(project_dir)
+            except OSError:
+                pass
+            return not project_dir.exists()
+
+    def get_project_dir(self, project_id: str) -> Path:
+        """获取项目目录"""
+        if not self._validate_project_id(project_id):
+            raise ValueError(f"Invalid project_id: {project_id}")
+        return self.projects_dir / project_id
+
+    def save_chapter_content(self, project_id: str, chapter_number: int, content: str):
+        """保存章节正文到独立文件"""
+        if not self._validate_project_id(project_id):
+            return
+        chapters_dir = self.projects_dir / project_id / "chapters"
+        chapters_dir.mkdir(parents=True, exist_ok=True)
+        chapter_file = chapters_dir / f"chapter_{chapter_number:04d}.md"
+        with open(chapter_file, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def load_chapter_content(self, project_id: str, chapter_number: int) -> str:
+        """加载章节正文"""
+        if not self._validate_project_id(project_id):
+            return ""
+        chapter_file = self.projects_dir / project_id / "chapters" / f"chapter_{chapter_number:04d}.md"
+        if chapter_file.exists():
+            with open(chapter_file, "r", encoding="utf-8") as f:
+                return f.read()
+        return ""
+
+    def save_review(self, project_id: str, review_data: dict):
+        """保存审查报告"""
+        if not self._validate_project_id(project_id):
+            return
+        reviews_dir = self.projects_dir / project_id / "reviews"
+        reviews_dir.mkdir(parents=True, exist_ok=True)
+        chapter_num = review_data.get("chapter_number", 0)
+        review_file = reviews_dir / f"review_chapter_{chapter_num:04d}.json"
+        with open(review_file, "w", encoding="utf-8") as f:
+            json.dump(review_data, f, ensure_ascii=False, indent=2)
+
+    def save_joint_review(self, project_id: str, chapter_range: str, review_data: dict):
+        """保存联合审查报告"""
+        if not self._validate_project_id(project_id):
+            return
+        import re
+        # 校验chapter_range只允许数字和连字符
+        if not re.match(r'^[0-9\-]+$', chapter_range):
+            return
+        reviews_dir = self.projects_dir / project_id / "reviews"
+        reviews_dir.mkdir(parents=True, exist_ok=True)
+        review_file = reviews_dir / f"joint_review_{chapter_range}.json"
+        with open(review_file, "w", encoding="utf-8") as f:
+            json.dump(review_data, f, ensure_ascii=False, indent=2)
+
+    def _dict_to_project(self, data: dict) -> StoryProject:
+        """将字典转换为StoryProject对象"""
+        project = StoryProject(
+            id=data.get("id", ""),
+            name=data.get("name", ""),
+            genre=data.get("genre", ""),
+            created_at=data.get("created_at", ""),
+            updated_at=data.get("updated_at", ""),
+            writing_style=data.get("writing_style", ""),
+            target_word_count=data.get("target_word_count", 0),
+            author_intent=data.get("author_intent", ""),
+            timeline=data.get("timeline", []),
+        )
+
+        # 恢复世界设定
+        world_data = data.get("world", {})
+        project.world = WorldSetting(**{k: v for k, v in world_data.items() if k in WorldSetting.__dataclass_fields__})
+
+        # 恢复角色
+        for name, char_data in data.get("characters", {}).items():
+            project.characters[name] = Character(**{k: v for k, v in char_data.items() if k in Character.__dataclass_fields__})
+
+        # 恢复势力
+        for name, faction_data in data.get("factions", {}).items():
+            project.factions[name] = Faction(**{k: v for k, v in faction_data.items() if k in Faction.__dataclass_fields__})
+
+        # 恢复地点
+        for name, loc_data in data.get("locations", {}).items():
+            project.locations[name] = Location(**{k: v for k, v in loc_data.items() if k in Location.__dataclass_fields__})
+
+        # 恢复伏笔
+        for fid, fs_data in data.get("foreshadowing", {}).items():
+            project.foreshadowing[fid] = Foreshadowing(**{k: v for k, v in fs_data.items() if k in Foreshadowing.__dataclass_fields__})
+
+        # 恢复章节
+        for num_str, ch_data in data.get("chapters", {}).items():
+            ch = Chapter(number=int(num_str))
+            for k, v in ch_data.items():
+                if k == "status":
+                    ch.status = ChapterStatus(v)
+                elif k == "review" and v:
+                    # 恢复ChapterReview
+                    review = ChapterReview(chapter_number=v.get("chapter_number", int(num_str)))
+                    review.overall_score = v.get("overall_score", 0)
+                    review.specific_issues = v.get("specific_issues", [])
+                    review.revision_suggestions = v.get("revision_suggestions", [])
+                    review.timestamp = v.get("timestamp", "")
+                    verdict_str = v.get("verdict", "needs_revision")
+                    try:
+                        review.verdict = ReviewVerdict(verdict_str)
+                    except ValueError:
+                        review.verdict = ReviewVerdict.NEEDS_REVISION
+                    # 恢复维度评分
+                    for dim_data in v.get("dimensions", []):
+                        dim = ReviewDimension(
+                            name=dim_data.get("name", ""),
+                            score=dim_data.get("score", 0),
+                            issues=dim_data.get("issues", []),
+                            suggestions=dim_data.get("suggestions", []),
+                        )
+                        review.dimensions.append(dim)
+                    ch.review = review
+                elif hasattr(ch, k):
+                    setattr(ch, k, v)
+            project.chapters[int(num_str)] = ch
+
+        return project
