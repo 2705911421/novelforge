@@ -17,3 +17,6 @@ sqlite-utils>=3.35
 markdown>=3.5
 python-multipart>=0.0.6
 websockets>=12.0
+
+# Test tooling used by the repository verification workflow
+pytest>=8.0
