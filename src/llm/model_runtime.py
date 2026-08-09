@@ -95,8 +95,11 @@ class CredentialStore:
         source_buffer = ctypes.create_string_buffer(data)
         source = DataBlob(len(data), ctypes.cast(source_buffer, ctypes.POINTER(ctypes.c_byte)))
         destination = DataBlob()
-        crypt32 = ctypes.windll.crypt32
-        kernel32 = ctypes.windll.kernel32
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            raise CredentialError("MODEL_CREDENTIAL_STORAGE_UNAVAILABLE", "Windows DPAPI is unavailable")
+        crypt32 = windll.crypt32
+        kernel32 = windll.kernel32
         if protect:
             succeeded = crypt32.CryptProtectData(
                 ctypes.byref(source), "NovelForge credential", None, None, None, 1, ctypes.byref(destination)
