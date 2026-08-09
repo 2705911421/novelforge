@@ -18,8 +18,6 @@ Strand Weave节奏系统：
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
-from collections import deque
 
 
 # ========== Strand Weave 节奏系统 ==========

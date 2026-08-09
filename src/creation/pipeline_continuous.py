@@ -15,7 +15,6 @@
 import json
 import asyncio
 from typing import Optional, Callable, Dict, Any
-from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
@@ -263,6 +262,8 @@ class PipelineOrchestrator:
             task.stage = PipelineStage.REVIEWING
 
             try:
+                if task.chapter is None:
+                    raise RuntimeError(f"chapter {ch_num} reached review without a draft")
                 self._report_progress(ch_num, len(self.tasks), "审查中")
 
                 loop = asyncio.get_running_loop()
@@ -283,6 +284,8 @@ class PipelineOrchestrator:
                 task.facts, task.review = await asyncio.gather(observer_task, reviewer_task)
                 task.chapter.review = task.review
 
+                if task.review is None:
+                    raise RuntimeError(f"chapter {ch_num} review returned no result")
                 passed, reason = self.reviewer.check_dual_gate(task.review)
 
                 if passed:

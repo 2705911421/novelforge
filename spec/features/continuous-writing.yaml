@@ -1,0 +1,9 @@
+id: CW-001
+name: Continuous writing workflow
+priority: P0
+requirements:
+  - Continuous writing preserves observable workflow state.
+  - A failed quality gate does not create a false successful completion.
+acceptance_tests:
+  - tests/test_l27_l28_l29.py
+

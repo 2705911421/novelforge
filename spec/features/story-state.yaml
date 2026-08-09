@@ -1,0 +1,9 @@
+id: STORY-001
+name: Durable story state
+priority: P0
+requirements:
+  - Story facts and structured state survive a process restart.
+  - Writes use the authoritative persistence boundary.
+acceptance_tests:
+  - tests/test_phase1_persistence.py
+

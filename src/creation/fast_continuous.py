@@ -15,7 +15,6 @@
 
 import json
 from typing import Optional, Callable
-from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 

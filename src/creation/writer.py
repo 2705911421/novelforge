@@ -1,7 +1,6 @@
 """章节写手"""
 
 import json
-from typing import Optional
 from ..core.models import StoryProject, Chapter, ChapterStatus
 from ..core.memory import MemorySystem
 from ..llm.client import MultiModelManager

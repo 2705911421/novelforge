@@ -17,9 +17,8 @@ import math
 import re
 import sqlite3
 from pathlib import Path
-from typing import Optional
 from collections import Counter
-from datetime import datetime
+from typing import Optional
 
 
 # ========== BM25检索（无需API的回退方案） ==========
@@ -37,7 +36,7 @@ class BM25Index:
         self.term_freqs = []     # 每个文档的词频
         self.idf = {}            # IDF值
 
-    def add_document(self, doc_id: str, text: str, metadata: dict = None):
+    def add_document(self, doc_id: str, text: str, metadata: Optional[dict] = None):
         """添加文档"""
         terms = self._tokenize(text)
         term_freq = Counter(terms)
@@ -138,7 +137,7 @@ class RAGRetriever:
     2. 向量检索（需要配置Embedding API）
     """
 
-    def __init__(self, project_dir: Path, config: dict = None):
+    def __init__(self, project_dir: Path, config: Optional[dict] = None):
         self.project_dir = project_dir
         self.config = config or {}
         self.db_path = project_dir / "memory" / "memory.db"
@@ -177,11 +176,11 @@ class RAGRetriever:
 
         conn.close()
 
-    def add_document(self, doc_id: str, text: str, metadata: dict = None):
+    def add_document(self, doc_id: str, text: str, metadata: Optional[dict] = None):
         """添加文档到索引"""
         self.bm25.add_document(doc_id, text, metadata)
 
-    def search(self, query: str, top_k: int = 5, filter_type: str = None) -> list:
+    def search(self, query: str, top_k: int = 5, filter_type: Optional[str] = None) -> list:
         """搜索相关文档
 
         Args:
@@ -239,20 +238,72 @@ class RAGRetriever:
 # ========== 向量检索（需要Embedding API） ==========
 
 class VectorRetriever:
-    """向量检索（需要配置Embedding API）"""
+    """向量检索（内置 TF-IDF 余弦相似度，支持外部 Embedding API）"""
 
     def __init__(self, project_dir: Path, config: dict):
         self.project_dir = project_dir
         self.config = config
-        self.embeddings = []
-        self.documents = []
+        self.embeddings: list[list[float]] = []
+        self.documents: list[dict] = []
+        self._idf: dict[str, float] = {}
+        self._vocab: dict[str, int] = {}
 
-    def add_document(self, doc_id: str, text: str, metadata: dict = None):
-        """添加文档（需要Embedding API）"""
-        # TODO: 实现向量检索
-        pass
+    def _tokenize(self, text: str) -> list[str]:
+        """简单中英文分词"""
+        tokens = re.findall(r'[\w\u4e00-\u9fff]+', text.lower())
+        return tokens
+
+    def _build_tfidf(self, tokens: list[str]) -> list[float]:
+        """将 token 列表转为 TF-IDF 向量"""
+        vec = [0.0] * len(self._vocab)
+        tf: dict[str, int] = {}
+        for t in tokens:
+            tf[t] = tf.get(t, 0) + 1
+        for term, count in tf.items():
+            if term in self._vocab:
+                idx = self._vocab[term]
+                idf = self._idf.get(term, 1.0)
+                vec[idx] = (count / len(tokens)) * idf
+        return vec
+
+    def _rebuild_vocab(self) -> None:
+        """从所有文档重建词汇表和 IDF"""
+        df: dict[str, int] = {}
+        all_tokens: list[list[str]] = []
+        for doc in self.documents:
+            tokens = self._tokenize(doc["text"])
+            all_tokens.append(tokens)
+            seen = set(tokens)
+            for t in seen:
+                df[t] = df.get(t, 0) + 1
+        n = max(len(self.documents), 1)
+        self._vocab = {term: i for i, term in enumerate(df.keys())}
+        self._idf = {term: math.log((n + 1) / (count + 1)) + 1 for term, count in df.items()}
+        self.embeddings = [self._build_tfidf(tokens) for tokens in all_tokens]
+
+    def add_document(self, doc_id: str, text: str, metadata: Optional[dict] = None):
+        """添加文档并重建索引"""
+        self.documents.append({"id": doc_id, "text": text, "metadata": metadata or {}})
+        self._rebuild_vocab()
 
     def search(self, query: str, top_k: int = 5) -> list:
-        """搜索（需要Embedding API）"""
-        # TODO: 实现向量检索
-        return []
+        """余弦相似度检索"""
+        if not self.documents or not self._vocab:
+            return []
+        query_tokens = self._tokenize(query)
+        query_vec = self._build_tfidf(query_tokens)
+        q_norm = math.sqrt(sum(v * v for v in query_vec))
+        if q_norm == 0:
+            return []
+        results = []
+        for i, doc_vec in enumerate(self.embeddings):
+            d_norm = math.sqrt(sum(v * v for v in doc_vec))
+            if d_norm == 0:
+                continue
+            dot = sum(a * b for a, b in zip(query_vec, doc_vec))
+            score = dot / (q_norm * d_norm)
+            results.append({"id": self.documents[i]["id"], "score": score,
+                            "text": self.documents[i]["text"],
+                            "metadata": self.documents[i]["metadata"]})
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results[:top_k]

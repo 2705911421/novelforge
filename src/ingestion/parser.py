@@ -6,7 +6,7 @@ NovelForge 文档解析器
 import re
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from dataclasses import dataclass
 from enum import Enum
 
@@ -30,7 +30,7 @@ class DocumentChunk:
     document_id: str
     chunk_index: int
     content: str
-    metadata: Dict = None
+    metadata: Optional[Dict] = None
     
     def __post_init__(self):
         if self.metadata is None:
@@ -46,7 +46,7 @@ class ParsedDocument:
     content: str
     word_count: int
     chunks: List[DocumentChunk]
-    metadata: Dict = None
+    metadata: Optional[Dict] = None
     
     def __post_init__(self):
         if self.metadata is None:
@@ -142,7 +142,7 @@ class DocumentParser:
             except UnicodeDecodeError:
                 continue
         
-        raise UnicodeDecodeError(f"无法解码文件: {path}")
+        raise UnicodeDecodeError("novelforge", b"", 0, 0, f"无法解码文件: {path}")
     
     def _read_docx_file(self, path: Path) -> str:
         """读取DOCX文件"""
@@ -289,7 +289,7 @@ class DocumentClassifier:
         
         # 返回得分最高的类型
         if scores:
-            max_type = max(scores, key=scores.get)
+            max_type = max(scores, key=lambda document_type: scores[document_type])
             if scores[max_type] > 0:
                 return max_type
         

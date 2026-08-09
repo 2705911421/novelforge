@@ -55,3 +55,15 @@
 
 Phase 1 只有在上述命令全部通过、迁移不损害现有用户数据、API 使用持久化任务而非内存字典，并更新矩阵/进度文件后才可关闭。
 
+## 实施记录（2026-08-07）
+
+已实现的生产边界：
+
+- migration 1 记录历史 schema，migration 2 原子升级 `schema_migrations`、`story_states`、`story_projections`、`task_events`、`migration_runs`、`legacy_imports` 与 `legacy_artifacts`；对已应用 migration 强制 checksum 不变。
+- `LegacyMigrationService` 仅在 `POST /api/v1/projects/{id}/migration` 提供已确认 fingerprint 后才写入；先复制带 SHA-256 manifest 的备份，JSON/Markdown 正文冲突返回 `needs_author_decision`，并保留 DB-only project 为 `legacy_db/unmanaged`。
+- `StoryRepository` 与 `TaskRuntime` 是新增写路径。Studio `write-next`/`continuous` 不再读取模块级 `tasks` 字典，而是返回由 SQLite task queue 管理的兼容 `taskId`；无法安全恢复的旧写作任务会转入人工决定状态。
+- 新 API 已实现：迁移预检/确认、任务列表/控制/SSE replay 与 Book StoryState。
+
+未关闭项：全仓 Pyright 的既有动态 API 类型债务、以及真实浏览器任务 E2E 仍未满足关闭条件；Phase 2 不应因此启动。
+
+> 历史状态更正（2026-08-07）：本文件保留为早期错误编号的实施记录。编号以 `phase-numbering-reconciliation.md` 为准：上述实现归属 Phase 2；全仓 Pyright 与隔离浏览器任务验收现已通过。Phase 2 仍因 Book/Chapter 的 file-backed compatibility adapter 未替换而保持实施中，详见 `phase-02-database-story-system.md`。

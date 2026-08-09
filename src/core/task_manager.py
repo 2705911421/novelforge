@@ -4,12 +4,11 @@ NovelForge 任务系统
 """
 
 import json
-import uuid
 import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Callable
 from enum import Enum
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from threading import Lock
 
 from .database import get_db, generate_id
@@ -56,7 +55,7 @@ class TaskCheckpoint:
     stage: str
     state: Dict[str, Any]
     chapter_number: int = 0
-    timestamp: str = None
+    timestamp: Optional[str] = None
     
     def __post_init__(self):
         if self.timestamp is None:
@@ -78,8 +77,8 @@ class Task:
     total_steps: int = 0
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
-    created_at: str = None
-    updated_at: str = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
     
     def __post_init__(self):
         if self.created_at is None:

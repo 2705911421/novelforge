@@ -1,8 +1,8 @@
 """世界观向导 - 引导用户与AI协同构建完整世界观"""
 
 import json
-from typing import Optional
 from pathlib import Path
+from typing import Optional
 
 from ..core.models import (
     StoryProject, WorldSetting, Character, Faction,
@@ -22,7 +22,7 @@ class WorldWizard:
         self.prompts = PromptManager()
 
     def build_world(self, user_input: str, project: StoryProject,
-                    existing_data: dict = None) -> dict:
+                    existing_data: Optional[dict] = None) -> dict:
         """构建完整世界观设定
 
         Args:

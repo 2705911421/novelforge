@@ -1,15 +1,13 @@
 """CLI命令行界面"""
 
-import sys
-import json
-import click
+import asyncio
 from pathlib import Path
+from typing import Any, cast
+
+import click
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.markdown import Markdown
-from rich import print as rprint
 
 console = Console()
 
@@ -17,14 +15,16 @@ console = Console()
 def get_managers(project_path=None):
     """获取管理器实例"""
     from ..core.config import Config
+    from ..core.database import Database
     from ..core.project import ProjectManager
-    from ..llm.client import MultiModelManager
-    from ..core.memory import MemorySystem
-    from ..core.state import StateManager
+    from ..core.story_repository import StoryRepository
+    from ..llm.model_runtime import build_model_runtime
 
-    config = Config(project_path=project_path)
-    project_mgr = ProjectManager()
-    model_mgr = MultiModelManager(config)
+    root = Path(project_path or ".").resolve()
+    config = Config(project_path=str(root))
+    database = Database(str(root / "projects" / "novelforge.db"))
+    project_mgr = ProjectManager(str(root), repository=StoryRepository(database))
+    _model_repository, _model_runtime, model_mgr = build_model_runtime(database, root)
     return config, project_mgr, model_mgr
 
 
@@ -54,20 +54,19 @@ def init(ctx, name, genre, import_file):
 
     # 如果有导入文件
     if import_file:
+        from ..core.task_runtime import TaskRuntime
         from ..wizard.guided_setup import WorldWizard
-        wizard = WorldWizard(model_mgr, project_mgr)
+        wizard = WorldWizard(cast(Any, model_mgr), project_mgr)
         content = wizard.import_world_file(import_file)
         console.print(f"📄 已导入设定文件: {import_file}")
         console.print(f"[dim]{content[:200]}...[/]")
-
-        # 向导构建世界观
-        console.print("\n[bold cyan]正在基于导入内容构建世界观...[/]")
-        result = wizard.build_world(content, project)
-        project_mgr.save_project(project)
-        console.print("✅ 世界观构建完成")
+        task = TaskRuntime(project_mgr.story_repository.db).enqueue(
+            "world-bootstrap", project_id=project.id, book_id=project.id, data={"brief": content}
+        )
+        console.print(f"✅ 世界观构建任务已排队 [dim](ID: {task['id']})[/]")
 
     console.print(f"\n项目目录: {project_mgr.get_project_dir(project.id)}")
-    console.print(f"\n下一步:")
+    console.print("\n下一步:")
     console.print(f"  1. [cyan]novelforge wizard {project.id}[/] - 完善世界观设定")
     console.print(f"  2. [cyan]novelforge write {project.id}[/] - 开始创作")
     console.print(f"  3. [cyan]novelforge continuous {project.id} --count 10[/] - 连续创作模式")
@@ -75,19 +74,93 @@ def init(ctx, name, genre, import_file):
 
 @cli.command()
 @click.argument('project_id')
+@click.argument('file_path', type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option('--type', 'doc_type', type=click.Choice(['auto', 'world', 'character', 'style', 'reference', 'chapter', 'other']), default='auto', show_default=True, help='文档用途')
+@click.pass_context
+def ingest(ctx, project_id, file_path, doc_type):
+    """将文档作为附件入队；解析与分块仅由持久化 worker 执行。"""
+    _config, project_mgr, _model_mgr = get_managers(ctx.obj['project_path'])
+    project = project_mgr.load_project(project_id)
+    if not project:
+        raise click.ClickException(f"项目不存在: {project_id}")
+
+    from ..core.task_runtime import TaskRuntime
+    from ..ingestion.service import DEFAULT_MAX_BYTES, DocumentIngestionError, DocumentRepository
+
+    try:
+        if file_path.stat().st_size > DEFAULT_MAX_BYTES:
+            raise DocumentIngestionError("DOCUMENT_TOO_LARGE", "document exceeds the upload size limit")
+        document_repository = DocumentRepository(project_mgr.story_repository.db, project_mgr.projects_dir.parent)
+        document, deduplicated = document_repository.create_upload(
+            project.id, file_path.name, file_path.read_bytes(), doc_type=doc_type
+        )
+        task = TaskRuntime(project_mgr.story_repository.db).enqueue(
+            "ingest-document", project_id=project.id, book_id=project.id, data={"document_id": document["id"]},
+            idempotency_key=f"ingest-document:{document['id']}:{document['source_fingerprint']}",
+        )
+        document_repository.mark_task(document["id"], task["id"])
+    except DocumentIngestionError as exc:
+        raise click.ClickException(f"{exc.code}: {exc}") from exc
+
+    state = "复用已有附件" if deduplicated else "已保存附件"
+    console.print(f"✓ {state}，文档 ID: [cyan]{document['id']}[/]，任务 ID: [cyan]{task['id']}[/]（{task['status']}）")
+    console.print("运行 [cyan]novelforge worker[/] 以解析、分块并建立可追溯索引。")
+
+
+@cli.command("rag-search")
+@click.argument("project_id")
+@click.argument("query")
+@click.option("--top-k", type=click.IntRange(1, 50), default=5, show_default=True)
+@click.option("--type", "doc_type", type=click.Choice(
+    ["auto", "world", "character", "style", "reference", "chapter", "other"]
+), default=None)
+@click.pass_context
+def rag_search(ctx, project_id, query, top_k, doc_type):
+    """Search indexed document chunks from the authoritative SQLite store."""
+    _config, project_mgr, _model_mgr = get_managers(ctx.obj["project_path"])
+    if not project_mgr.load_project(project_id):
+        raise click.ClickException(f"项目不存在: {project_id}")
+    from ..rag.retriever import PersistentRAGRetriever, RAGQueryError
+
+    try:
+        payload = PersistentRAGRetriever(project_mgr.story_repository.db).query(
+            project_id, query, top_k=top_k, doc_type=doc_type
+        )
+    except RAGQueryError as exc:
+        raise click.ClickException(f"{exc.code}: {exc}") from exc
+
+    console.print(
+        f"策略: [cyan]{payload['strategy']}[/] · 降级: "
+        f"[yellow]{'是' if payload['degraded'] else '否'}[/] · 结果: {payload['resultCount']}"
+    )
+    if not payload["results"]:
+        console.print("未找到匹配的已索引分块。")
+        return
+    table = Table("分数", "文档", "类型", "字符范围", "分块", "内容")
+    for result in payload["results"]:
+        preview = result["content"].replace("\n", " ")[:100]
+        table.add_row(
+            f"{result['score']:.4f}", result["document_name"],
+            result.get("resolved_doc_type") or result.get("doc_type") or "-",
+            f"{result['start_char']}–{result['end_char']}", result["chunk_id"], preview,
+        )
+    console.print(table)
+
+
+@cli.command()
+@click.argument('project_id')
 @click.option('--input', '-i', 'user_input', default='', help='额外描述')
 @click.pass_context
 def wizard(ctx, project_id, user_input):
-    """世界观构建向导"""
-    config, project_mgr, model_mgr = get_managers(ctx.obj['project_path'])
+    """将世界观构建请求入队，由独立 worker 执行。"""
+    _config, project_mgr, _model_mgr = get_managers(ctx.obj['project_path'])
     project = project_mgr.load_project(project_id)
 
     if not project:
         console.print(f"[red]项目不存在: {project_id}[/]")
         return
 
-    from ..wizard.guided_setup import WorldWizard
-    wiz = WorldWizard(model_mgr, project_mgr)
+    from ..core.task_runtime import TaskRuntime
 
     console.print(Panel("[bold cyan]🌍 世界观构建向导[/]", border_style="cyan"))
 
@@ -95,25 +168,11 @@ def wizard(ctx, project_id, user_input):
         console.print("请描述你的小说设定（包括世界观、角色、势力、地图等）:")
         user_input = console.input("> ")
 
-    console.print("\n[yellow]正在构建世界观...[/]")
-    result = wiz.build_world(user_input, project)
-    project_mgr.save_project(project)
-
-    # 生成思维导图
-    from ..visualization.mindmap import MindMapGenerator
-    mindmap = MindMapGenerator()
-    vis_dir = project_mgr.get_project_dir(project.id) / "visualizations"
-    mindmap_path = mindmap.generate_from_project(project, str(vis_dir))
-    console.print(f"\n✅ 世界观构建完成")
-    console.print(f"📊 思维导图: {mindmap_path}")
-
-    # 生成项目文档
-    from ..export.exporter import Exporter
-    exporter = Exporter(str(project_mgr.get_project_dir(project.id) / "exports"))
-    docs = exporter.export_project_documents(project)
-    console.print(f"📁 项目文档已生成:")
-    for name, path in docs.items():
-        console.print(f"   - {name}: {path}")
+    task = TaskRuntime(project_mgr.story_repository.db).enqueue(
+        "world-bootstrap", project_id=project.id, book_id=project.id, data={"brief": user_input}
+    )
+    console.print(f"\n✅ 世界观构建任务已排队 [dim](ID: {task['id']})[/]")
+    console.print("运行 [cyan]novelforge worker[/] 以执行任务；状态会保存在 SQLite 中。")
 
 
 @cli.command()
@@ -122,70 +181,27 @@ def wizard(ctx, project_id, user_input):
 @click.option('--context', '-c', default='', help='创作指导')
 @click.pass_context
 def write(ctx, project_id, chapter, context):
-    """写一章"""
-    config, project_mgr, model_mgr = get_managers(ctx.obj['project_path'])
+    """将单章写作请求入队，由独立 worker 执行。"""
+    _config, project_mgr, _model_mgr = get_managers(ctx.obj['project_path'])
     project = project_mgr.load_project(project_id)
 
     if not project:
         console.print(f"[red]项目不存在: {project_id}[/]")
         return
 
-    from ..core.memory import MemorySystem
-    memory = MemorySystem(project_mgr.get_project_dir(project_id))
-
     if chapter == 0:
         chapter = project.get_latest_chapter_number() + 1
-
-    from ..creation.planner import ChapterPlanner
-    from ..creation.writer import ChapterWriter
-    from ..review.reviewer import ChapterReviewer
-
-    planner = ChapterPlanner(model_mgr)
-    writer = ChapterWriter(model_mgr, memory,
-                          chapter_words_min=config.get("project", "chapter_words_min", default=2000),
-                          chapter_words_max=config.get("project", "chapter_words_max", default=4000))
-    reviewer = ChapterReviewer(model_mgr, pass_score=config.get("review", "pass_score", default=93))
-
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}")) as progress:
-        # 规划
-        task = progress.add_task(f"📝 规划第{chapter}章...", total=None)
-        plan = planner.plan_chapter(project, chapter, context)
-        progress.update(task, description=f"✅ 第{chapter}章规划完成")
-
-        # 创作
-        task = progress.add_task(f"✍️ 创作第{chapter}章...", total=None)
-        ch = writer.write_chapter(project, chapter, plan, context)
-        progress.update(task, description=f"✅ 第{chapter}章创作完成 ({ch.word_count}字)")
-
-        # 审查
-        task = progress.add_task(f"🔍 审查第{chapter}章...", total=None)
-        review = reviewer.review_chapter(ch, project)
-        ch.review = review
-        progress.update(task, description=f"✅ 审查完成 - 评分: {review.overall_score:.1f}")
-
-    # 保存
-    project.chapters[chapter] = ch
-    project_mgr.save_chapter_content(project_id, chapter, ch.content)
-    project_mgr.save_review(project_id, review.to_dict())
-    project_mgr.save_project(project)
-
-    # 记忆更新
-    memory.store_chapter_summary(chapter, ch.summary or ch.content[:200],
-                                 ch.key_events, ch.characters_appeared, ch.locations_used)
-
-    # 显示结果
-    console.print(Panel(f"[bold]第{chapter}章: {ch.title}[/]", border_style="green"))
-    console.print(f"字数: {ch.word_count} | 评分: {review.overall_score:.1f}")
-
-    passed, reason = reviewer.check_dual_gate(review)
-    if passed:
-        console.print(f"[bold green]✅ 双重门禁通过[/] - {reason}")
-    else:
-        console.print(f"[bold yellow]⚠️ 未通过[/] - {reason}")
-        if review.specific_issues:
-            console.print("问题:")
-            for issue in review.specific_issues[:3]:
-                console.print(f"  - {issue}")
+    from ..core.task_runtime import TaskRuntime
+    book = project_mgr.story_repository.book_for_project(project.id)
+    if not book:
+        console.print(f"[red]项目没有 authoritative book: {project.id}[/]")
+        return
+    task = TaskRuntime(project_mgr.story_repository.db).enqueue(
+        "write-next", project_id=project.id, book_id=book["id"],
+        data={"chapter_number": chapter, "context": context, "count": 1},
+    )
+    console.print(f"✅ 第{chapter}章写作任务已排队 [dim](ID: {task['id']})[/]")
+    console.print("运行 [cyan]novelforge worker[/] 以执行任务；状态会保存在 SQLite 中。")
 
 
 @cli.command()
@@ -195,25 +211,18 @@ def write(ctx, project_id, chapter, context):
 @click.option('--context', '-c', default='', help='创作指导')
 @click.pass_context
 def continuous(ctx, project_id, start, count, context):
-    """连续创作模式"""
-    config, project_mgr, model_mgr = get_managers(ctx.obj['project_path'])
+    """将连续创作请求入队，由独立 worker 执行。"""
+    config, project_mgr, _model_mgr = get_managers(ctx.obj['project_path'])
     project = project_mgr.load_project(project_id)
 
     if not project:
         console.print(f"[red]项目不存在: {project_id}[/]")
         return
 
-    from ..core.memory import MemorySystem
-    from ..core.state import StateManager
-    from ..creation.continuous import ContinuousCreationMode
-
-    memory = MemorySystem(project_mgr.get_project_dir(project_id))
-    state = StateManager(project_mgr.get_project_dir(project_id))
-
     if start == 0:
         start = project.get_latest_chapter_number() + 1
-
-    count = max(5, min(count, 200))
+    if count < 5 or count > 200:
+        raise click.BadParameter("count must be between 5 and 200", param_hint="--count")
 
     # Token消耗警告
     console.print(Panel(
@@ -228,47 +237,17 @@ def continuous(ctx, project_id, start, count, context):
     if not click.confirm("确认开始连续创作？"):
         return
 
-    continuous_config = {
-        "chapter_words_min": config.get("project", "chapter_words_min", default=2000),
-        "chapter_words_max": config.get("project", "chapter_words_max", default=4000),
-        "pass_score": config.get("review", "pass_score", default=93),
-        "max_revision_rounds": config.get("review", "max_revision_rounds", default=3),
-        "joint_review_interval": config.get("continuous", "joint_review_interval", default=5),
-        "min_chapter_count": 5,
-        "max_chapter_count": 200,
-    }
-
-    mode = ContinuousCreationMode(project, project_mgr, model_mgr, memory, state, continuous_config)
-
-    # 设置回调
-    def on_progress(chapter, total, message):
-        console.print(f"[cyan]第{chapter}章[/] ({chapter-start+1}/{total}) - {message}")
-
-    def on_chapter_complete(chapter, ch, passed):
-        status = "[green]✅通过[/]" if passed else "[yellow]⚠️未通过[/]"
-        console.print(f"  📄 第{chapter}章完成 - {ch.word_count}字 {status}")
-
-    def on_joint_review(start_ch, end_ch, review):
-        console.print(Panel(
-            f"[bold]联合审查: 第{start_ch}-{end_ch}章[/]\n"
-            f"总分: {review.overall_score:.1f}\n"
-            f"问题数: {len(review.issues)}",
-            border_style="magenta"
-        ))
-
-    mode.on_progress = on_progress
-    mode.on_chapter_complete = on_chapter_complete
-    mode.on_joint_review = on_joint_review
-
-    results = mode.run(start, count, context)
-
-    # 显示结果摘要
-    console.print(Panel(
-        f"[bold green]连续创作完成[/]\n\n"
-        f"完成章节: {results['completed']}/{results['target_count']}\n"
-        f"联合审查: {len(results['joint_reviews'])}次",
-        border_style="green"
-    ))
+    from ..core.task_runtime import TaskRuntime
+    book = project_mgr.story_repository.book_for_project(project.id)
+    if not book:
+        console.print(f"[red]项目没有 authoritative book: {project.id}[/]")
+        return
+    task = TaskRuntime(project_mgr.story_repository.db).enqueue(
+        "continuous", project_id=project.id, book_id=book["id"],
+        data={"start": start, "count": count, "context": context},
+    )
+    console.print(f"✅ 连续创作任务已排队 [dim](ID: {task['id']})[/]")
+    console.print("运行 [cyan]novelforge worker[/] 以执行任务；状态会保存在 SQLite 中。")
 
 
 @cli.command()
@@ -388,6 +367,97 @@ def timeline(ctx, project_id):
     console.print(f"✅ 时间轴已生成: {path}")
 
 
+@cli.group()
+@click.argument('project_id')
+@click.pass_context
+def bible(ctx, project_id):
+    """Story Bible 操作"""
+    ctx.obj['bible_project_id'] = project_id
+
+
+@bible.command('show')
+@click.pass_context
+def bible_show(ctx):
+    """显示 Story Bible 工作区状态"""
+    project_id = ctx.obj['bible_project_id']
+    config, project_mgr, model_mgr = get_managers(ctx.obj['project_path'])
+    from ..planning.story_bible import StoryBibleRepository
+    from ..core.database import Database
+    db = Database(str(Path(ctx.obj['project_path']).resolve() / "projects" / "novelforge.db"))
+    repo = StoryBibleRepository(db)
+    result = repo.get(project_id)
+    if result is None:
+        result = repo.ensure(project_id)
+    workspace = result["workspace"]
+    steps = result["steps"]
+    table = Table(title=f"Story Bible - {project_id}")
+    table.add_column("步骤", style="cyan")
+    table.add_column("状态")
+    table.add_column("来源")
+    for step in steps:
+        status = step["status"]
+        color = "green" if status == "confirmed" else "yellow" if status == "draft" else "dim"
+        table.add_row(step["step_key"], f"[{color}]{status}[/]", step["source"])
+    console.print(table)
+    console.print(f"当前步骤: {workspace['current_step']}, 状态: {workspace['status']}")
+
+
+@bible.command('set')
+@click.argument('step_key')
+@click.argument('content')
+@click.pass_context
+def bible_set(ctx, step_key, content):
+    """设置步骤内容"""
+    project_id = ctx.obj['bible_project_id']
+    config, project_mgr, model_mgr = get_managers(ctx.obj['project_path'])
+    from ..planning.story_bible import StoryBibleRepository
+    from ..core.database import Database
+    import json as _json
+    db = Database(str(Path(ctx.obj['project_path']).resolve() / "projects" / "novelforge.db"))
+    repo = StoryBibleRepository(db)
+    try:
+        payload = _json.loads(content)
+    except _json.JSONDecodeError:
+        payload = content
+    result = repo.save_draft(project_id, step_key, payload, source="author")
+    console.print(f"✅ [green]{step_key}[/] 已保存草稿 (版本 {result['workspace']['draft_version']})")
+
+
+@bible.command('confirm')
+@click.argument('step_key')
+@click.pass_context
+def bible_confirm(ctx, step_key):
+    """确认步骤"""
+    project_id = ctx.obj['bible_project_id']
+    config, project_mgr, model_mgr = get_managers(ctx.obj['project_path'])
+    from ..planning.story_bible import StoryBibleRepository, StoryBibleError
+    from ..core.database import Database
+    db = Database(str(Path(ctx.obj['project_path']).resolve() / "projects" / "novelforge.db"))
+    repo = StoryBibleRepository(db)
+    try:
+        result = repo.confirm(project_id, step_key)
+        console.print(f"✅ [green]{step_key}[/] 已确认")
+    except StoryBibleError as exc:
+        console.print(f"[red]错误: {exc}[/]")
+
+
+@bible.command('publish')
+@click.pass_context
+def bible_publish(ctx):
+    """发布 Story Bible（所有 25 步必须已确认）"""
+    project_id = ctx.obj['bible_project_id']
+    config, project_mgr, model_mgr = get_managers(ctx.obj['project_path'])
+    from ..planning.story_bible import StoryBibleRepository, StoryBibleError
+    from ..core.database import Database
+    db = Database(str(Path(ctx.obj['project_path']).resolve() / "projects" / "novelforge.db"))
+    repo = StoryBibleRepository(db)
+    try:
+        result = repo.publish(project_id)
+        console.print(f"✅ [green]Story Bible 已发布[/] (版本 {result['workspace']['draft_version']})")
+    except StoryBibleError as exc:
+        console.print(f"[red]错误: {exc}[/]")
+
+
 @cli.command()
 @click.option('--host', default='127.0.0.1', help='监听地址')
 @click.option('--port', '-P', type=int, default=8000, help='端口')
@@ -403,6 +473,50 @@ def serve(ctx, host, port):
         border_style="green"
     ))
     uvicorn.run("src.web.studio:app", host=host, port=port)
+
+
+@cli.command()
+@click.option('--worker-id', default='novelforge-worker', show_default=True, help='持久 worker 标识')
+@click.option('--poll-interval', type=float, default=0.25, show_default=True, help='空队列轮询间隔（秒）')
+@click.option('--once', is_flag=True, help='最多执行一个已排队任务后退出')
+@click.pass_context
+def worker(ctx, worker_id, poll_interval, once):
+    """运行独立的 SQLite 持久任务 worker。"""
+    from ..core.config import Config
+    from ..core.database import Database
+    from ..core.project import ProjectManager
+    from ..core.story_repository import StoryRepository
+    from ..core.task_runtime import TaskRuntime
+    from ..core.task_worker import PersistentTaskWorker
+    from ..creation.task_handlers import LegacyTaskHandlers
+    from ..llm.model_runtime import build_model_runtime
+
+    root = Path(ctx.obj['project_path']).resolve()
+    database = Database(str(root / 'projects' / 'novelforge.db'))
+    repository = StoryRepository(database)
+    config = Config(project_path=str(root))
+    projects = ProjectManager(str(root), repository=repository)
+    runtime = TaskRuntime(database)
+    _model_repository, _model_runtime, model_manager = build_model_runtime(database, root)
+    handlers = LegacyTaskHandlers(projects, model_manager, config, runtime)
+    durable_worker = PersistentTaskWorker(runtime, handlers.mapping())
+
+    if once:
+        task = asyncio.run(durable_worker.execute_once(worker_id))
+        console.print('没有待执行任务' if task is None else f"任务 {task['id']} 状态：{task['status']}")
+        return
+
+    console.print(Panel(
+        f"[bold green]持久任务 Worker 已启动[/]\n\n"
+        f"数据库: [cyan]{database.db_path}[/]\n"
+        f"Worker: [cyan]{worker_id}[/]\n"
+        "按 Ctrl+C 安全停止；任务状态和 checkpoint 已持久化。",
+        border_style='green',
+    ))
+    try:
+        asyncio.run(durable_worker.run_forever(worker_id, poll_interval=poll_interval))
+    except KeyboardInterrupt:
+        console.print('\n[yellow]Worker 已停止；运行中的任务将在 lease 过期后按恢复策略处理。[/]')
 
 
 def main():

@@ -3,15 +3,24 @@ NovelForge RAG增强模块
 支持BM25 + 向量混合检索
 """
 
-import json
 import math
 import re
 import logging
-from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass
+import json
+from typing import Any
+from typing import List, Dict, Optional
+from dataclasses import dataclass, field
 from collections import Counter
 
 logger = logging.getLogger(__name__)
+
+
+class RAGQueryError(ValueError):
+    """A retrieval request is invalid before it reaches the index."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass
@@ -21,11 +30,177 @@ class SearchResult:
     content: str
     score: float
     source: str = ""
-    metadata: Dict = None
-    
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
+    metadata: Dict = field(default_factory=dict)
+
+
+
+class PersistentRAGRetriever:
+    """SQLite-backed retrieval boundary for Phase 5 document chunks.
+
+    SQLite remains the source of truth.  The BM25 index is deliberately rebuilt
+    from indexed chunks for each query so a fresh process sees exactly the same
+    data and no in-memory state can become authoritative.
+    """
+
+    VALID_TYPES = {"auto", "world", "character", "style", "reference", "chapter", "other"}
+    MAX_TOP_K = 50
+
+    def __init__(self, database: Any):
+        self.database = database
+
+    def clear(self) -> None:
+        """No-op: PersistentRAGRetriever is stateless (SQLite-backed, no in-memory index)."""
+        pass
+
+    def query(
+        self,
+        project_id: str,
+        query: str,
+        *,
+        top_k: int = 5,
+        doc_type: Optional[str] = None,
+    ) -> dict[str, Any]:
+        self._validate(project_id, query, top_k, doc_type)
+        rows = self._rows(project_id, doc_type)
+        index = BM25Index()
+        for row in rows:
+            index.add_document(
+                row["chunk_id"],
+                row["content"],
+                self._metadata(row),
+            )
+        results = index.search(query.strip(), top_k=top_k)
+        # BM25Index's historical ordering is kept for compatibility, but IDs
+        # provide a stable tie-breaker at this persistence boundary.
+        results.sort(key=lambda item: (-item.score, item.id))
+        return {
+            "query": query.strip(),
+            "strategy": "bm25_fallback",
+            "degraded": True,
+            "embedding_available": False,
+            "project_id": project_id,
+            "doc_type": doc_type,
+            "resultCount": len(results),
+            "results": [self._result_dict(result) for result in results],
+        }
+
+    def search(
+        self,
+        project_id: str,
+        query: str,
+        *,
+        top_k: int = 5,
+        doc_type: Optional[str] = None,
+    ) -> list[SearchResult]:
+        """Return typed results for pipeline callers while preserving query metadata."""
+        payload = self.query(project_id, query, top_k=top_k, doc_type=doc_type)
+        return [
+            SearchResult(
+                id=item["chunk_id"],
+                content=item["content"],
+                score=item["score"],
+                source=item["document_name"],
+                metadata=item,
+            )
+            for item in payload["results"]
+        ]
+
+    def stats(self, project_id: str) -> dict[str, Any]:
+        """Expose durable index health without exposing document bodies."""
+        if not isinstance(project_id, str) or not re.fullmatch(r"[A-Za-z0-9-]+", project_id):
+            raise RAGQueryError("PROJECT_INVALID", "invalid project id")
+        row = self.database.fetchone(
+            """SELECT COUNT(DISTINCT d.id) AS documents, COUNT(c.id) AS chunks
+               FROM reference_documents d
+               LEFT JOIN document_chunks c ON c.document_id=d.id
+               WHERE d.project_id=? AND d.status='indexed'""",
+            (project_id,),
+        )
+        return {
+            "project_id": project_id,
+            "indexed_documents": int((row or {}).get("documents", 0)),
+            "indexed_chunks": int((row or {}).get("chunks", 0)),
+            "strategy": "bm25_fallback",
+            "degraded": True,
+        }
+
+    def _rows(self, project_id: str, doc_type: Optional[str]) -> list[dict[str, Any]]:
+        rows = self.database.fetchall(
+            """SELECT c.id AS chunk_id, c.content, c.start_char, c.end_char, c.checksum,
+                      c.metadata AS chunk_metadata, d.id AS document_id, d.name AS document_name,
+                      d.project_id, d.doc_type, d.metadata AS document_metadata, d.source_fingerprint
+               FROM document_chunks c
+               JOIN reference_documents d ON d.id=c.document_id
+               WHERE d.project_id=? AND d.status='indexed'
+               ORDER BY d.id, c.chunk_index""",
+            (project_id,),
+        )
+        if not doc_type:
+            return rows
+        filtered: list[dict[str, Any]] = []
+        for row in rows:
+            metadata = self._json_object(row.get("document_metadata"))
+            if row.get("doc_type") == doc_type or metadata.get("resolved_type") == doc_type:
+                filtered.append(row)
+        return filtered
+
+    @staticmethod
+    def _json_object(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value:
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    def _metadata(self, row: dict[str, Any]) -> dict[str, Any]:
+        document_metadata = self._json_object(row.get("document_metadata"))
+        chunk_metadata = self._json_object(row.get("chunk_metadata"))
+        return {
+            **chunk_metadata,
+            "project_id": row["project_id"] if "project_id" in row else None,
+            "document_id": row["document_id"],
+            "document_name": row["document_name"],
+            "doc_type": row["doc_type"],
+            "resolved_doc_type": document_metadata.get("resolved_type"),
+            "source_fingerprint": row.get("source_fingerprint"),
+            "start_char": row.get("start_char", 0),
+            "end_char": row.get("end_char", 0),
+            "checksum": row.get("checksum"),
+            "strategy": "bm25_fallback",
+        }
+
+    @staticmethod
+    def _result_dict(result: SearchResult) -> dict[str, Any]:
+        metadata = result.metadata or {}
+        return {
+            "chunk_id": result.id,
+            "document_id": metadata.get("document_id"),
+            "document_name": metadata.get("document_name") or result.source,
+            "doc_type": metadata.get("doc_type"),
+            "resolved_doc_type": metadata.get("resolved_doc_type"),
+            "score": round(float(result.score), 8),
+            "content": result.content,
+            "start_char": metadata.get("start_char", 0),
+            "end_char": metadata.get("end_char", 0),
+            "checksum": metadata.get("checksum"),
+            "source_fingerprint": metadata.get("source_fingerprint"),
+            "strategy": "bm25_fallback",
+            "metadata": metadata,
+        }
+
+    def _validate(self, project_id: str, query: str, top_k: int, doc_type: Optional[str]) -> None:
+        if not isinstance(project_id, str) or not re.fullmatch(r"[A-Za-z0-9-]+", project_id):
+            raise RAGQueryError("PROJECT_INVALID", "invalid project id")
+        if not isinstance(query, str) or not query.strip():
+            raise RAGQueryError("QUERY_EMPTY", "query must not be blank")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= self.MAX_TOP_K:
+            raise RAGQueryError("TOP_K_INVALID", f"top_k must be between 1 and {self.MAX_TOP_K}")
+        if doc_type is not None and doc_type not in self.VALID_TYPES:
+            raise RAGQueryError("DOCUMENT_TYPE_INVALID", "unsupported document type")
 
 
 class BM25Index:
@@ -41,7 +216,7 @@ class BM25Index:
         self.term_freqs: List[Counter] = []
         self.idf: Dict[str, float] = {}
     
-    def add_document(self, doc_id: str, text: str, metadata: Dict = None):
+    def add_document(self, doc_id: str, text: str, metadata: Optional[Dict] = None):
         """添加文档"""
         terms = self._tokenize(text)
         term_freq = Counter(terms)
@@ -151,7 +326,7 @@ class VectorIndex:
         self.vectors: List[List[float]] = []
     
     def add_document(self, doc_id: str, text: str, embedding: List[float],
-                     metadata: Dict = None):
+                     metadata: Dict = field(default_factory=dict)):
         """添加文档"""
         self.documents.append({
             "id": doc_id,
@@ -218,7 +393,7 @@ class HybridRetriever:
         """设置嵌入函数"""
         self._embedding_func = func
     
-    def add_document(self, doc_id: str, text: str, metadata: Dict = None):
+    def add_document(self, doc_id: str, text: str, metadata: Optional[Dict] = None):
         """添加文档"""
         self.bm25.add_document(doc_id, text, metadata)
         
@@ -226,7 +401,7 @@ class HybridRetriever:
         if self._embedding_func:
             try:
                 embedding = self._embedding_func(text)
-                self.vector.add_document(doc_id, text, embedding, metadata)
+                self.vector.add_document(doc_id, text, embedding, metadata or {})
             except Exception as e:
                 logger.warning(f"向量嵌入失败: {e}")
     
@@ -274,11 +449,210 @@ class HybridRetriever:
         # 排序并返回
         results = sorted(results_map.values(), key=lambda x: x.score, reverse=True)
         return results[:top_k]
-    
+
     def clear(self):
         """清空索引"""
         self.bm25.clear()
         self.vector.clear()
+
+
+class Reranker:
+    """重排序器 - 对检索结果进行二次排序 (RAG-004)"""
+
+    def __init__(self, strategy: str = "hybrid"):
+        """
+        初始化重排序器
+
+        Args:
+            strategy: 重排序策略 (hybrid/keyword/position/length)
+        """
+        self.strategy = strategy
+
+    def rerank(self, query: str, results: List[SearchResult],
+               top_k: Optional[int] = None) -> List[SearchResult]:
+        """
+        对检索结果进行重排序
+
+        Args:
+            query: 查询文本
+            results: 检索结果列表
+            top_k: 返回数量（None表示返回所有）
+
+        Returns:
+            重排序后的结果列表
+        """
+        if not results:
+            return []
+
+        # 根据策略选择重排序方法
+        if self.strategy == "hybrid":
+            reranked = self._hybrid_rerank(query, results)
+        elif self.strategy == "keyword":
+            reranked = self._keyword_rerank(query, results)
+        elif self.strategy == "position":
+            reranked = self._position_rerank(results)
+        elif self.strategy == "length":
+            reranked = self._length_rerank(results)
+        else:
+            reranked = results
+
+        # 应用top_k限制
+        if top_k is not None:
+            reranked = reranked[:top_k]
+
+        return reranked
+
+    def _hybrid_rerank(self, query: str, results: List[SearchResult]) -> List[SearchResult]:
+        """混合重排序策略"""
+        query_terms = set(query.lower().split())
+
+        for result in results:
+            # 计算关键词匹配分数
+            content_terms = set(result.content.lower().split())
+            keyword_overlap = len(query_terms.intersection(content_terms))
+            keyword_score = keyword_overlap / max(len(query_terms), 1)
+
+            # 计算内容质量分数（基于长度和完整性）
+            content_length = len(result.content)
+            length_score = min(content_length / 200, 1.0)  # 200字符为基准
+
+            # 计算位置分数（如果有元数据）
+            position_score = 0.5  # 默认中等位置
+
+            # 综合分数
+            combined_score = (
+                result.score * 0.5 +  # 原始BM25/向量分数
+                keyword_score * 0.3 +  # 关键词匹配
+                length_score * 0.1 +  # 内容质量
+                position_score * 0.1   # 位置
+            )
+
+            # 更新分数
+            result.score = combined_score
+
+        # 按新分数排序
+        results.sort(key=lambda x: x.score, reverse=True)
+        return results
+
+    def _keyword_rerank(self, query: str, results: List[SearchResult]) -> List[SearchResult]:
+        """关键词重排序策略"""
+        # 对于中文，使用字符级别的匹配
+        query_chars = set(query.lower())
+
+        for result in results:
+            content_chars = set(result.content.lower())
+            keyword_overlap = len(query_chars.intersection(content_chars))
+            keyword_score = keyword_overlap / max(len(query_chars), 1)
+
+            # 关键词匹配权重更高
+            result.score = result.score * 0.4 + keyword_score * 0.6
+
+        results.sort(key=lambda x: x.score, reverse=True)
+        return results
+
+    def _position_rerank(self, results: List[SearchResult]) -> List[SearchResult]:
+        """位置重排序策略（基于文档位置）"""
+        # 按文档位置排序（假设元数据中有位置信息）
+        for result in results:
+            position = result.metadata.get("start_char", 0)
+            # 位置越靠前，分数越高
+            position_score = 1.0 / (1.0 + position / 1000)
+            result.score = result.score * 0.7 + position_score * 0.3
+
+        results.sort(key=lambda x: x.score, reverse=True)
+        return results
+
+    def _length_rerank(self, results: List[SearchResult]) -> List[SearchResult]:
+        """长度重排序策略（基于内容长度）"""
+        for result in results:
+            content_length = len(result.content)
+            # 适中长度的内容得分更高
+            if content_length < 50:
+                length_score = 0.3
+            elif content_length < 200:
+                length_score = 0.8
+            elif content_length < 500:
+                length_score = 1.0
+            else:
+                length_score = 0.6
+
+            result.score = result.score * 0.6 + length_score * 0.4
+
+        results.sort(key=lambda x: x.score, reverse=True)
+        return results
+
+
+class PersistentRAGRetrieverWithReranker:
+    """带重排序的持久化RAG检索器"""
+
+    def __init__(self, database: Any, reranker_strategy: str = "hybrid"):
+        self.retriever = PersistentRAGRetriever(database)
+        self.reranker = Reranker(strategy=reranker_strategy)
+
+    def query(
+        self,
+        project_id: str,
+        query: str,
+        *,
+        top_k: int = 5,
+        doc_type: Optional[str] = None,
+        use_reranker: bool = True,
+    ) -> dict[str, Any]:
+        """查询并重排序"""
+        # 先获取原始结果
+        result = self.retriever.query(project_id, query, top_k=top_k * 2, doc_type=doc_type)
+
+        if use_reranker and result["results"]:
+            # 转换为SearchResult格式
+            search_results = [
+                SearchResult(
+                    id=item["chunk_id"],
+                    content=item["content"],
+                    score=item["score"],
+                    source=item["document_name"],
+                    metadata=item,
+                )
+                for item in result["results"]
+            ]
+
+            # 重排序
+            reranked = self.reranker.rerank(query, search_results, top_k=top_k)
+
+            # 转换回字典格式
+            result["results"] = [
+                self.retriever._result_dict(r) for r in reranked
+            ]
+            result["resultCount"] = len(result["results"])
+            result["reranked"] = True
+            result["reranker_strategy"] = self.reranker.strategy
+
+        return result
+
+    def search(
+        self,
+        project_id: str,
+        query: str,
+        *,
+        top_k: int = 5,
+        doc_type: Optional[str] = None,
+        use_reranker: bool = True,
+    ) -> list[SearchResult]:
+        """搜索并重排序"""
+        # 先获取原始结果
+        results = self.retriever.search(project_id, query, top_k=top_k * 2, doc_type=doc_type)
+
+        if use_reranker and results:
+            results = self.reranker.rerank(query, results, top_k=top_k)
+
+        return results
+
+    def stats(self, project_id: str) -> dict[str, Any]:
+        """获取统计信息"""
+        return self.retriever.stats(project_id)
+
+    def clear(self):
+        """清空索引"""
+        self.retriever.clear()
 
 
 class RAGSystem:
@@ -294,7 +668,7 @@ class RAGSystem:
         self._type_indices: Dict[str, List[str]] = {}
     
     def add_document(self, doc_id: str, text: str, doc_type: str = "general",
-                     metadata: Dict = None):
+                     metadata: Optional[Dict] = None):
         """添加文档"""
         metadata = metadata or {}
         metadata["doc_type"] = doc_type
@@ -316,7 +690,7 @@ class RAGSystem:
                 metadata=chunk.get("metadata", {})
             )
     
-    def search(self, query: str, top_k: int = 5, doc_type: str = None) -> List[SearchResult]:
+    def search(self, query: str, top_k: int = 5, doc_type: Optional[str] = None) -> List[SearchResult]:
         """
         搜索
         

@@ -3,7 +3,6 @@ NovelForge 文档解析器测试
 """
 
 import pytest
-import tempfile
 from pathlib import Path
 
 import sys
@@ -11,8 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.ingestion.parser import (
     DocumentParser, DocumentClassifier, TextCleaner,
-    DocumentType, DocumentChunk, ParsedDocument,
-    parse_document, batch_parse
+    DocumentType, DocumentChunk, parse_document, batch_parse
 )
 
 
@@ -249,6 +247,7 @@ class TestDocumentChunk:
             content="测试",
             metadata={"key": "value"}
         )
+        assert chunk.metadata is not None
         assert chunk.metadata["key"] == "value"
 
 

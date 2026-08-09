@@ -5,11 +5,8 @@ NovelForge 数据库适配器
 
 import json
 import logging
-from pathlib import Path
 from typing import Optional, Dict, Any, List
-from datetime import datetime
 
-from .database import get_db, generate_id
 from .dal import (
     ProjectDAL, BookDAL, ChapterDAL, CharacterDAL,
     FactionDAL, LocationDAL, ForeshadowDAL, StoryFactDAL,
@@ -17,8 +14,7 @@ from .dal import (
 )
 from .models import (
     StoryProject, Chapter, ChapterStatus, Character, Faction, Location,
-    Foreshadowing, Volume, Arc, WorldSetting, ChapterReview, ReviewVerdict,
-    ReviewDimension, JointReview
+    Foreshadowing, WorldSetting
 )
 
 logger = logging.getLogger(__name__)
@@ -58,7 +54,7 @@ class DatabaseAdapter:
         })
         
         # 创建书籍记录
-        book_id = self.book_dal.create({
+        self.book_dal.create({
             'project_id': project_id,
             'title': name,
             'genre': genre,
@@ -119,11 +115,11 @@ class DatabaseAdapter:
         foreshadowing = {}
         if book_id:
             for fs in self.foreshadow_dal.list_by_book(book_id):
-                foreshadowing[fs['title']] = Foreshadowing(
-                    title=fs['title'],
+                foreshadowing[fs['id']] = Foreshadowing(
+                    id=fs['id'],
                     description=fs.get('description', ''),
                     status=fs.get('status', 'open'),
-                    created_chapter=fs.get('created_chapter', 0),
+                    planted_chapter=fs.get('created_chapter') or 0,
                 )
         
         # 获取章节
@@ -157,7 +153,7 @@ class DatabaseAdapter:
             try:
                 world_data = json.loads(project_row['world_setting'])
                 project.world = WorldSetting(**world_data)
-            except:
+            except (TypeError, ValueError, json.JSONDecodeError):
                 pass
         
         return project
@@ -237,7 +233,7 @@ class DatabaseAdapter:
         # 保存地点
         for name, loc in project.locations.items():
             existing = self.location_dal.list_by_book(book_id)
-            loc_row = next((l for l in existing if l['name'] == name), None)
+            loc_row = next((location for location in existing if location['name'] == name), None)
             
             if loc_row:
                 self.location_dal.update(loc_row['id'], {
@@ -425,8 +421,9 @@ class DatabaseAdapter:
     # ========== 记忆操作 ==========
     
     def store_chapter_summary(self, project_id: str, chapter_number: int, 
-                             summary: str, key_events: List[str] = None,
-                             characters: List[str] = None, locations: List[str] = None):
+                              summary: str, key_events: Optional[List[str]] = None,
+                              characters: Optional[List[str]] = None,
+                              locations: Optional[List[str]] = None):
         """存储章节摘要"""
         books = self.book_dal.get_by_project(project_id)
         if not books:
@@ -444,7 +441,7 @@ class DatabaseAdapter:
             })
     
     def store_story_fact(self, project_id: str, chapter_number: int, 
-                        fact_type: str, content: str, entities: List[str] = None):
+                        fact_type: str, content: str, entities: Optional[List[str]] = None):
         """存储故事事实"""
         books = self.book_dal.get_by_project(project_id)
         if not books:
@@ -464,7 +461,7 @@ class DatabaseAdapter:
     
     def store_timeline_event(self, project_id: str, event_time: str, 
                             event_type: str, description: str,
-                            chapter_number: int = None):
+                            chapter_number: Optional[int] = None):
         """存储时间线事件"""
         books = self.book_dal.get_by_project(project_id)
         if not books:
@@ -540,10 +537,10 @@ class DatabaseAdapter:
     
     # ========== 任务日志 ==========
     
-    def log_operation(self, operation: str, entity_type: str = None, 
-                     entity_id: str = None, details: Dict = None,
-                     duration_ms: int = None, token_count: int = None,
-                     model_used: str = None):
+    def log_operation(self, operation: str, entity_type: Optional[str] = None,
+                     entity_id: Optional[str] = None, details: Optional[Dict] = None,
+                     duration_ms: Optional[int] = None, token_count: Optional[int] = None,
+                     model_used: Optional[str] = None):
         """记录操作日志"""
         self.operation_log_dal.log(
             operation=operation,

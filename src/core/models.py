@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
-import json
 from datetime import datetime
 
 
@@ -14,6 +13,7 @@ class ChapterStatus(Enum):
     REVIEWING = "reviewing"     # 审查中
     REVISING = "revising"       # 修订中
     APPROVED = "approved"       # 已通过
+    COMMITTED = "committed"     # 已提交至 Story Commit
     EXPORTED = "exported"       # 已导出
 
 
@@ -144,6 +144,59 @@ class Location:
     faction: str = ""
     significance: str = ""
     first_appearance: int = 0
+    type: str = ""  # world/continent/country/city/building
+
+
+# ========== 状态追踪实体 (CHAR-004, FACTION-004, LOC-004) ==========
+
+@dataclass
+class CharacterState:
+    """角色状态快照 — 按章节追踪角色状态变化
+
+    对应数据库 character_states 表，记录角色在特定章节的状态。
+    """
+    character_id: str
+    chapter_id: str
+    location: str = ""
+    status: str = "alive"  # alive/dead/missing/injured/captured
+    relationships: dict = field(default_factory=dict)
+    knowledge: list = field(default_factory=list)
+    emotional_state: str = ""
+    notes: str = ""
+    created_at: str = ""
+
+
+@dataclass
+class FactionState:
+    """势力状态快照 — 按章节追踪势力状态变化
+
+    对应数据库 faction_states 表，记录势力在特定章节的状态。
+    """
+    faction_id: str
+    chapter_id: str
+    territory: str = ""
+    power_level: str = ""
+    allies: list = field(default_factory=list)
+    enemies: list = field(default_factory=list)
+    resources: str = ""
+    notes: str = ""
+    created_at: str = ""
+
+
+@dataclass
+class LocationState:
+    """地点状态快照 — 按章节追踪地点状态变化
+
+    对应数据库 location_states 表，记录地点在特定章节的状态。
+    """
+    location_id: str
+    chapter_id: str
+    controlling_faction: str = ""
+    events: list = field(default_factory=list)
+    condition: str = ""
+    population: str = ""
+    notes: str = ""
+    created_at: str = ""
 
 
 @dataclass
@@ -241,6 +294,8 @@ class StoryProject:
     chapters: dict = field(default_factory=dict)     # number -> Chapter
     writing_style: str = ""
     target_word_count: int = 0
+    target_chapters: int = 100
+    language: str = "zh-CN"
     author_intent: str = ""
     timeline: list = field(default_factory=list)     # 事件时间轴
 
@@ -267,6 +322,8 @@ class StoryProject:
             "chapters": {str(k): v.__dict__ for k, v in self.chapters.items()},
             "writing_style": self.writing_style,
             "target_word_count": self.target_word_count,
+            "target_chapters": self.target_chapters,
+            "language": self.language,
             "author_intent": self.author_intent,
             "timeline": self.timeline
         }

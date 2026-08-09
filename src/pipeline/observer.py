@@ -12,7 +12,6 @@
 9. Physical State (物理状态) - 伤势、能力变化、身体状态
 """
 
-import json
 from dataclasses import dataclass, field
 from typing import Optional
 from ..llm.client import MultiModelManager
@@ -226,8 +225,8 @@ class Observer:
         self.models = model_manager
 
     def extract_facts(self, chapter_number: int, chapter_content: str,
-                      known_characters: list = None, known_locations: list = None,
-                      known_foreshadowing: list = None) -> ChapterFacts:
+                      known_characters: Optional[list] = None, known_locations: Optional[list] = None,
+                      known_foreshadowing: Optional[list] = None) -> ChapterFacts:
         """从章节正文中提取9类事实
 
         Args:

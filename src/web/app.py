@@ -1,30 +1,29 @@
-"""Web界面 - FastAPI应用"""
+"""Legacy-compatible FastAPI routes backed by the durable Studio runtime."""
 
-import json
+import os
 from pathlib import Path
-from typing import Optional
-from datetime import datetime
 
 try:
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import FastAPI, HTTPException
     from fastapi.responses import HTMLResponse, FileResponse
-    from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
     raise ImportError("需要安装 fastapi 和 uvicorn: pip install fastapi uvicorn")
 
 from ..core.config import Config
+from ..core.database import Database
 from ..core.project import ProjectManager
-from ..llm.client import MultiModelManager
-from ..core.memory import MemorySystem
-from ..core.state import StateManager
+from ..core.story_repository import StoryRepository
+from ..core.task_runtime import TaskRuntime
 
 app = FastAPI(title="NovelForge", description="AI小说创作平台")
 
 # 全局实例
-config = Config()
-project_mgr = ProjectManager()
-model_mgr = MultiModelManager(config)
+workspace_root = Path(os.environ.get("NOVELFORGE_ROOT", Path.cwd())).resolve()
+config = Config(project_path=str(workspace_root))
+story_repository = StoryRepository(Database(str(workspace_root / "projects" / "novelforge.db")))
+project_mgr = ProjectManager(str(workspace_root), repository=story_repository)
+task_runtime = TaskRuntime(story_repository.db)
 
 
 class CreateProjectRequest(BaseModel):
@@ -86,88 +85,64 @@ async def get_project(project_id: str):
 
 @app.post("/api/projects/{project_id}/wizard")
 async def run_wizard(project_id: str, req: WizardRequest):
-    """运行世界观向导"""
+    """Queue world setup; HTTP never executes generation itself."""
     project = project_mgr.load_project(project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
-
-    from ..wizard.guided_setup import WorldWizard
-    wizard = WorldWizard(model_mgr, project_mgr)
-    result = wizard.build_world(req.user_input, project)
-    project_mgr.save_project(project)
-
-    return {"status": "success", "data": result}
+    task = task_runtime.enqueue(
+        "world-bootstrap", project_id=project_id, book_id=project_id, data={"brief": req.user_input}
+    )
+    return {"taskId": task["id"], "status": task["status"], "message": "世界观任务已排队"}
 
 
 @app.post("/api/projects/{project_id}/write")
 async def write_chapter(project_id: str, req: WriteRequest):
-    """写一章"""
+    """Queue chapter generation; a persistent worker owns execution."""
     project = project_mgr.load_project(project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
-
-    memory = MemorySystem(project_mgr.get_project_dir(project_id))
-    chapter = req.chapter or (project.get_latest_chapter_number() + 1)
-
-    from ..creation.planner import ChapterPlanner
-    from ..creation.writer import ChapterWriter
-    from ..review.reviewer import ChapterReviewer
-
-    planner = ChapterPlanner(model_mgr)
-    writer = ChapterWriter(model_mgr, memory)
-    reviewer = ChapterReviewer(model_mgr, pass_score=config.get("review", "pass_score", default=93))
-
-    plan = planner.plan_chapter(project, chapter, req.context)
-    ch = writer.write_chapter(project, chapter, plan, req.context)
-    review = reviewer.review_chapter(ch, project)
-    ch.review = review
-
-    project.chapters[chapter] = ch
-    project_mgr.save_chapter_content(project_id, chapter, ch.content)
-    project_mgr.save_review(project_id, review.to_dict())
-    project_mgr.save_project(project)
-
-    passed, reason = reviewer.check_dual_gate(review)
-
+    book = story_repository.book_for_project(project_id)
+    if not book:
+        raise HTTPException(409, "项目没有 authoritative book")
+    requested_chapter = req.chapter if req.chapter > 0 else project.get_latest_chapter_number() + 1
+    task = task_runtime.enqueue(
+        "write-next",
+        project_id=project_id,
+        book_id=book["id"],
+        data={"chapter_number": requested_chapter, "context": req.context, "count": 1},
+    )
     return {
-        "chapter": chapter,
-        "title": ch.title,
-        "word_count": ch.word_count,
-        "score": review.overall_score,
-        "passed": passed,
-        "reason": reason,
+        "taskId": task["id"], "status": task["status"], "chapter": requested_chapter,
+        "message": "写作任务已排队",
     }
 
 
 @app.post("/api/projects/{project_id}/continuous")
 async def continuous_mode(project_id: str, req: ContinuousRequest):
-    """连续创作模式"""
-    import asyncio
+    """Queue continuous creation; do not host it in FastAPI's event loop."""
     project = project_mgr.load_project(project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
-
-    memory = MemorySystem(project_mgr.get_project_dir(project_id))
-    state = StateManager(project_mgr.get_project_dir(project_id))
-
+    book = story_repository.book_for_project(project_id)
+    if not book:
+        raise HTTPException(409, "项目没有 authoritative book")
     start = req.start_chapter or (project.get_latest_chapter_number() + 1)
-    count = max(5, min(req.count, 200))
+    if req.count < 5 or req.count > 200:
+        raise HTTPException(422, "count must be between 5 and 200")
+    task = task_runtime.enqueue(
+        "continuous", project_id=project_id, book_id=book["id"],
+        data={"start": start, "count": req.count, "context": req.context},
+    )
+    return {"taskId": task["id"], "status": task["status"], "message": "连续创作任务已排队"}
 
-    continuous_config = {
-        "chapter_words_min": config.get("project", "chapter_words_min", default=2000),
-        "chapter_words_max": config.get("project", "chapter_words_max", default=4000),
-        "pass_score": config.get("review", "pass_score", default=93),
-        "max_revision_rounds": config.get("review", "max_revision_rounds", default=3),
-        "joint_review_interval": config.get("continuous", "joint_review_interval", default=5),
-    }
 
-    from ..creation.continuous import ContinuousCreationMode
-    mode = ContinuousCreationMode(project, project_mgr, model_mgr, memory, state, continuous_config)
-
-    # 运行在后台线程，避免阻塞事件循环
-    results = await asyncio.to_thread(mode.run, start, count, req.context)
-
-    return results
+@app.get("/api/tasks/{task_id}")
+async def get_task(task_id: str):
+    """Read durable task state for legacy clients without maintaining browser memory."""
+    task = task_runtime.get(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    return task
 
 
 @app.get("/api/projects/{project_id}/export")
@@ -305,7 +280,42 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const opts = { method, headers: {'Content-Type': 'application/json'} };
             if (body) opts.body = JSON.stringify(body);
             const res = await fetch('/api' + path, opts);
-            return res.json();
+            const payload = await res.json();
+            if (!res.ok) throw new Error(payload.detail || payload.message || `请求失败 (${res.status})`);
+            return payload;
+        }
+        function showResult(title, details) {
+            const resultDiv = document.getElementById('result');
+            resultDiv.style.display = 'block';
+            resultDiv.replaceChildren();
+            const h3 = document.createElement('h3');
+            h3.textContent = title;
+            const pre = document.createElement('pre');
+            pre.textContent = JSON.stringify(details, null, 2);
+            resultDiv.append(h3, pre);
+        }
+        async function monitorTask(taskId, label) {
+            try {
+                const task = await api('GET', `/tasks/${encodeURIComponent(taskId)}`);
+                const checkpoint = task.checkpoint;
+                const state = checkpoint && checkpoint.state ? checkpoint.state : {};
+                const details = {
+                    taskId: task.id,
+                    status: task.status,
+                    stage: task.stage,
+                    message: state.message,
+                    checkpoint: checkpoint,
+                    errorCode: task.error_code,
+                    error: task.error,
+                    result: task.result,
+                };
+                showResult(`${label}：${task.status}`, details);
+                if (['queued', 'running', 'cancelling'].includes(task.status)) {
+                    window.setTimeout(() => monitorTask(taskId, label), 1000);
+                }
+            } catch (error) {
+                showResult(`${label}：无法读取任务状态`, {error: error.message, taskId});
+            }
         }
         async function loadProjects() {
             const projects = await api('GET', '/projects');
@@ -345,51 +355,47 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const name = document.getElementById('projectName').value;
             const genre = document.getElementById('projectGenre').value;
             if (!name) return alert('请输入小说名称');
-            const res = await api('POST', '/projects', {name, genre});
-            alert(res.message + '\\n项目ID: ' + res.id);
-            loadProjects();
+            try {
+                const res = await api('POST', '/projects', {name, genre});
+                alert(res.message + '\\n项目ID: ' + res.id);
+                loadProjects();
+            } catch (error) {
+                alert(error.message);
+            }
         }
         async function runWizard() {
             const id = document.getElementById('wizardProjectId').value;
             const input = document.getElementById('wizardInput').value;
             if (!id || !input) return alert('请填写项目ID和设定描述');
-            const res = await api('POST', `/projects/${id}/wizard`, {project_id: id, user_input: input});
-            const resultDiv = document.getElementById('result');
-            resultDiv.style.display = 'block';
-            const h3 = document.createElement('h3');
-            h3.textContent = '世界观构建结果';
-            const pre = document.createElement('pre');
-            pre.textContent = JSON.stringify(res, null, 2);
-            resultDiv.innerHTML = '';
-            resultDiv.appendChild(h3);
-            resultDiv.appendChild(pre);
+            try {
+                const res = await api('POST', `/projects/${encodeURIComponent(id)}/wizard`, {project_id: id, user_input: input});
+                monitorTask(res.taskId, '世界观构建任务');
+            } catch (error) {
+                showResult('世界观构建任务：未能入队', {error: error.message});
+            }
         }
         async function writeChapter() {
             const id = document.getElementById('writeProjectId').value;
             const chapter = parseInt(document.getElementById('writeChapter').value) || 0;
             if (!id) return alert('请填写项目ID');
-            const res = await api('POST', `/projects/${id}/write`, {project_id: id, chapter});
-            const resultDiv = document.getElementById('result');
-            resultDiv.style.display = 'block';
-            const h3 = document.createElement('h3');
-            h3.textContent = `第${res.chapter}章: ${res.title}`;
-            const p1 = document.createElement('p');
-            p1.textContent = `字数: ${res.word_count} | 评分: ${res.score} | ${res.passed ? '通过' : '未通过'}`;
-            const p2 = document.createElement('p');
-            p2.textContent = res.reason || '';
-            resultDiv.innerHTML = '';
-            resultDiv.appendChild(h3);
-            resultDiv.appendChild(p1);
-            resultDiv.appendChild(p2);
+            try {
+                const res = await api('POST', `/projects/${encodeURIComponent(id)}/write`, {project_id: id, chapter});
+                monitorTask(res.taskId, `第${res.chapter}章写作任务`);
+            } catch (error) {
+                showResult('章节写作任务：未能入队', {error: error.message});
+            }
         }
         async function startContinuous() {
             const id = document.getElementById('contProjectId').value;
             const count = parseInt(document.getElementById('contCount').value) || 10;
             if (!id) return alert('请填写项目ID');
             if (!confirm(`确认开始连续创作${count}章？这将消耗大量token。`)) return;
-            const res = await api('POST', `/projects/${id}/continuous`, {project_id: id, count});
-            document.getElementById('result').style.display = 'block';
-            document.getElementById('result').innerHTML = `<h3>连续创作完成</h3><pre>${JSON.stringify(res, null, 2)}</pre>`;
+            try {
+                const res = await api('POST', `/projects/${encodeURIComponent(id)}/continuous`, {project_id: id, count});
+                monitorTask(res.taskId, '连续创作任务');
+            } catch (error) {
+                showResult('连续创作任务：未能入队', {error: error.message});
+            }
         }
         loadProjects();
     </script>

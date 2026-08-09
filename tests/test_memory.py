@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.memory.engine import (
     MemoryEngine, MemoryStore, MemoryItem,
-    MemoryLayer, MemoryCategory,
+    MemoryCategory,
     create_memory_engine, load_memory_from_file, save_memory_to_file
 )
 
@@ -180,6 +180,7 @@ class TestMemoryEngine:
         engine.resolve_loop(item.id, 5)
         
         updated = engine.store.get(item.id)
+        assert updated is not None
         assert updated.status == "resolved"
     
     def test_add_relationship(self):

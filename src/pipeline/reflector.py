@@ -8,14 +8,11 @@
 5. 生成状态变更日志
 """
 
-import json
 import copy
 from dataclasses import dataclass, field
-from typing import Optional, Any
 from datetime import datetime
 
-from .observer import ChapterFacts, CharacterFact, LocationFact, ResourceFact, \
-    RelationshipFact, ForeshadowingFact, PhysicalStateFact
+from .observer import ChapterFacts
 
 
 # ========== 校验Schema ==========
@@ -31,7 +28,9 @@ class StateValidator:
     # Foreshadowing status 只能是这四种
     VALID_FS_STATUS = {"open", "progressing", "resolved", "deferred"}
     # Chapter number 必须是正整数
-    VALID_CHAPTER_NUM = lambda n: isinstance(n, int) and n > 0
+    @staticmethod
+    def VALID_CHAPTER_NUM(value):
+        return isinstance(value, int) and value > 0
     # 角色 status 只能是这三种
     VALID_CHAR_STATUS = {"alive", "dead", "unknown"}
 

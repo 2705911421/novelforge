@@ -1,7 +1,5 @@
 """审查与打分系统 - 借鉴 inkOS 审计员架构"""
 
-import json
-from typing import Optional
 from ..core.models import ChapterReview, ReviewDimension, ReviewVerdict, StoryProject, Chapter
 from ..llm.client import MultiModelManager
 from ..llm.prompts import PromptManager

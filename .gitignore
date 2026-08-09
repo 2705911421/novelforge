@@ -1,10 +1,26 @@
 # User-owned runtime and generated data
 projects/
 .references/
+.novelforge-backups/
+.phase5-*/
+.playwright-cli/
+output/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
 .reasonix/
 __pycache__/
 *.py[cod]
+*.log
+.coverage
+coverage.xml
+htmlcov/
+.claude/.webnovel-current-project
 
 # Local configuration and secrets
 .env

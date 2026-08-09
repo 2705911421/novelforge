@@ -1,0 +1,9 @@
+id: WRITE-001
+name: Writing pipeline behavior
+priority: P0
+requirements:
+  - Writing pipeline produces and persists domain output through real services.
+  - Failures are observable and do not silently mark work complete.
+acceptance_tests:
+  - tests/test_phase8_writing_pipeline.py
+

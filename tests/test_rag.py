@@ -206,7 +206,7 @@ class TestRAGSystem:
         rag.add_document("doc2", "魔法修炼", doc_type="character")
         
         results = rag.search("魔法", doc_type="world")
-        assert all(r.metadata.get("doc_type") == "world" for r in results)
+        assert all((r.metadata or {}).get("doc_type") == "world" for r in results)
     
     def test_search_for_context(self):
         """测试搜索构建上下文"""
@@ -282,6 +282,7 @@ class TestSearchResult:
             score=0.95,
             metadata={"type": "world"}
         )
+        assert result.metadata is not None
         assert result.metadata["type"] == "world"
 
 

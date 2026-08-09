@@ -3,11 +3,10 @@
 import json
 import sqlite3
 from pathlib import Path
-from typing import Optional
 from datetime import datetime
+from typing import Optional
 from contextlib import contextmanager
 
-from .models import StoryProject, Foreshadowing
 
 
 class MemorySystem:
@@ -70,8 +69,8 @@ class MemorySystem:
             conn.close()
 
     def store_chapter_summary(self, chapter_number: int, summary: str,
-                               key_events: list = None, characters: list = None,
-                               locations: list = None, foreshadowing: list = None):
+                               key_events: Optional[list] = None, characters: Optional[list] = None,
+                               locations: Optional[list] = None, foreshadowing: Optional[list] = None):
         """存储章节摘要"""
         with self._connect() as conn:
             conn.execute("""
@@ -97,7 +96,7 @@ class MemorySystem:
             """, (chapter_number, fact_type, content, datetime.now().isoformat()))
 
     def store_timeline_event(self, chapter_number: int, event: str,
-                              characters: list = None, location: str = ""):
+                              characters: Optional[list] = None, location: str = ""):
         """存储时间线事件"""
         with self._connect() as conn:
             conn.execute("""

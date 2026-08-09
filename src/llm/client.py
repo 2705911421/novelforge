@@ -2,8 +2,8 @@
 
 import json
 import httpx
-from typing import Optional, AsyncGenerator
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -26,8 +26,8 @@ class LLMClient:
         self.temperature = config.get("temperature", 0.8)
         self.max_tokens = config.get("max_tokens", 8000)
 
-    def chat(self, messages: list, system: str = "", temperature: float = None,
-             max_tokens: int = None, json_mode: bool = False) -> LLMResponse:
+    def chat(self, messages: list, system: str = "", temperature: Optional[float] = None,
+             max_tokens: Optional[int] = None, json_mode: bool = False) -> LLMResponse:
         """同步聊天接口"""
         headers = {
             "Content-Type": "application/json",
@@ -72,7 +72,7 @@ class LLMClient:
         except Exception as e:
             raise RuntimeError(f"LLM调用失败: {e}")
 
-    def chat_json(self, messages: list, system: str = "", temperature: float = None) -> dict:
+    def chat_json(self, messages: list, system: str = "", temperature: Optional[float] = None) -> dict:
         """聊天并返回JSON"""
         response = self.chat(messages, system, temperature, json_mode=True)
         try:
@@ -93,7 +93,7 @@ class LLMClient:
                 return {"raw": content, "error": "JSON解析失败"}
 
     async def chat_stream(self, messages: list, system: str = "",
-                    temperature: float = None):
+                    temperature: Optional[float] = None):
         """流式聊天接口（同步包装）"""
         # 简化实现：使用非流式调用，分段返回
         response = self.chat(messages, system, temperature)

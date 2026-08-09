@@ -1,199 +1,153 @@
-# NovelForge（新小说） - AI小说创作平台
+# NovelForge
 
-> 融合 [inkOS](https://github.com/Narcooo/inkos) 与 [webnovel-writer](https://github.com/lingfengQAQ/webnovel-writer) 精华，打造下一代AI长篇小说创作系统
+NovelForge 是一个面向中文长篇小说创作的 Python 工作台：把世界观设定、故事规划、章节写作、记忆检索、质量审查、修订、持续创作和交付导出串成一条可恢复的工作流。
 
-## 核心特性
+项目同时提供命令行入口和 FastAPI/Studio Web 界面。它支持 OpenAI 兼容的模型服务，创作项目数据默认保存在本地，不会随代码仓库提交。
 
-### 双重门禁审查系统
-借鉴 inkOS 审计员架构，每章创作完成后经过：
-1. **审查门禁**: 审查系统不返回任何针对性问题
-2. **评分门禁**: 9维度评分 ≥ 93分
+> 当前项目仍在持续开发。功能范围和验证结论以 `spec/features/`、`tests/`、`scripts/verify_features.py` 及 `docs/IMPLEMENTATION_PROGRESS.md` 为准；不要仅依据 README 的功能描述判断生产就绪状态。
 
-只有同时满足两个条件，章节才视为合格。
+## 主要能力
 
-### 连续创作模式
-用户启动后系统自动根据规划进行连续创作（5-200章）：
-- 每章：规划 → 创作 → 审查 → 修订 → 复审（循环直到双重门禁通过）
-- 每5章：联合审查（剧情/人物/势力/地图/连贯性/风格/技法）
-- 支持暂停、恢复、中断
+- 世界观构建向导：设定、角色、势力、地图、故事结构和伏笔的结构化协作。
+- 写作流水线：规划、生成、事实提取、审查、质量门禁、修订和状态同步。
+- 连续创作：批量章节、checkpoint、暂停/恢复和失败恢复。
+- 记忆与 RAG：基于 SQLite 的章节/事实/时间线存储，以及可追溯的文档分块检索。
+- 审查与联合审查：多维度章节审查和跨章节一致性分析。
+- Studio：作品管理、章节工作台、任务看板、实时 SSE 进度、模型配置和系统诊断。
+- 导入与导出：TXT、Markdown、DOCX 文档导入，以及 Markdown、TXT、DOCX 导出。
+- 备份与恢复：数据库备份、迁移前保护和恢复相关能力。
 
-### 世界观构建向导
-引导用户与AI协同完成：
-- 核心设定与矛盾
-- 力量体系与世界规则
-- 地理地图与势力分布
-- 人物关系与成长弧
-- 故事结构与卷规划
-- 伏笔与钩子设计
+## 环境要求
 
-### 多格式导出
-- **DOCX**: 自动排版（首行缩进、行距、目录）
-- **Markdown**: 结构化文档
-- **TXT**: 纯文本
-
-### 可视化系统
-- **思维导图**: 世界观/角色/势力/地图/故事/伏笔六大分支
-- **时间轴**: 交互式故事时间线
-- **地图生成**: 配置生图模型后可生成势力/人物/剧情位置示意图
+- Python 3.11+
+- SQLite（Python 标准库自带）
+- 一个 OpenAI 兼容的模型服务（执行真实 AI 创作时需要；运行纯本地测试不需要）
 
 ## 快速开始
 
-### 安装
-```bash
-pip install -r requirements.txt
+### 1. 安装
+
+PowerShell：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-### 配置LLM
-```bash
-# 方式1: 环境变量
-export OPENAI_API_KEY="your-key"
-export OPENAI_BASE_URL="https://api.openai.com/v1"
+macOS/Linux：
 
-# 方式2: 项目配置文件 (novelforge.yaml)
-llm:
-  primary:
-    model: "gpt-4o"
-    api_key: "your-key"
-  review:
-    model: "gpt-4o"
-    api_key: "your-key"
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-### CLI使用
+### 2. 配置模型服务
+
+复制环境变量模板，并填写自己的凭据。项目会读取当前进程的环境变量；`.env` 是便于本地保存模板的未跟踪文件，不会被 Python 自动加载：
+
+```powershell
+Copy-Item .env.example .env
+# 根据 .env 中的值设置当前 PowerShell 会话，例如：
+$env:OPENAI_API_KEY = "your-api-key"
+$env:OPENAI_BASE_URL = "https://api.openai.com/v1"
+```
+
+支持的常用变量包括：
+
+```dotenv
+OPENAI_API_KEY=your-api-key
+OPENAI_BASE_URL=https://api.openai.com/v1
+NOVELFORGE_LLM_MODEL=gpt-4o
+NOVELFORGE_REVIEW_MODEL=gpt-4o
+```
+
+也可以编辑 `config/default.yaml`。不要把真实 API Key 写入 YAML、源代码、日志或 Git 提交；`.env` 已被 `.gitignore` 排除。
+
+### 3. 使用 CLI
+
 ```bash
-# 创建项目
+# 查看全部命令
+python run.py --help
+
+# 创建一个本地作品
 python run.py init "我的小说" --genre "玄幻修仙"
 
-# 导入已有设定
+# 导入世界观材料
 python run.py init "我的小说" --import-file world_setting.md
 
-# 世界观向导
+# 启动世界观任务、写作任务或连续创作任务
 python run.py wizard <project_id>
-
-# 写一章
 python run.py write <project_id> 1
-
-# 连续创作模式（10章）
 python run.py continuous <project_id> --count 10
 
-# 导出
+# 运行持久化任务 worker
+python run.py worker
+
+# 搜索已索引的参考材料并导出作品
+python run.py rag-search <project_id> "关键设定"
 python run.py export <project_id> --format docx
-
-# 生成思维导图
-python run.py mindmap <project_id>
-
-# 生成时间轴
-python run.py timeline <project_id>
-
-# 查看状态
-python run.py status <project_id>
 ```
 
-### Web界面（推荐 - 完整对标 inkOS 的可视化 Studio）
-```bash
-# 方式1: 通过 CLI 启动（推荐）
-python run.py serve --port 8000
+`projects/` 是本地运行数据目录，包含作品、SQLite 数据库和附件，默认不会提交到仓库。
 
-# 方式2: 直接用 uvicorn 启动
+### 4. 启动 Studio
+
+```bash
+python run.py serve --host 127.0.0.1 --port 8000
+```
+
+打开 <http://127.0.0.1:8000>。也可以直接使用：
+
+```bash
 python -m uvicorn src.web.studio:app --reload --port 8000
 ```
-访问 http://localhost:8000
 
-Studio 界面涵盖全部功能：我的创作 / 新建作品 / AI 助手 / 世界观向导 /
-章节工作台 / 连续创作 / 思维导图 / 故事时间轴 / 伏笔与钩子 / 人物关系 /
-数据分析 / 联合审查 / 真相文件 / 导出交付 / 题材库 / 模型配置 / 创作参数 /
-导入素材 / 系统诊断。
+## 架构概览
 
-## 架构设计
-
-```
-世界观向导 → 规划器 → 写手 → 审查员 → 修订器 → 状态同步
-                              ↑                        |
-                              └── 不通过（循环）──────┘
-                              ↓ 通过（双重门禁）
-                           每5章联合审查
+```text
+世界观向导 → Story Bible / 规划器 → 写作流水线 → 审查与质量门禁
+      ↑                                      ↓
+      └────── 记忆 / RAG / 状态 / 任务恢复 ← 修订
+                                             ↓
+                                      导出与交付
 ```
 
-### 记忆系统（三层融合）
-| 层 | 用途 |
-|---|---|
-| SQLite | 章节摘要、事实、时间线事件 |
-| JSON | 项目状态、审查报告 |
-| Markdown | 世界观、角色、伏笔（人类可读） |
+权威数据边界以 SQLite 为主，任务运行、章节版本、审查结果、文档索引和恢复状态都通过持久化服务处理。详细设计见：
 
-### 审查维度（9维度）
-| 维度 | 权重 | 说明 |
-|------|------|------|
-| 剧情连贯性 | 15% | 与前文衔接、逻辑通顺 |
-| 人物一致性 | 15% | 角色行为符合设定 |
-| 世界设定 | 10% | 符合世界观、无设定冲突 |
-| 写作质量 | 15% | 文笔、修辞、表达 |
-| 节奏把控 | 10% | 情节推进速度、详略 |
-| 伏笔处理 | 10% | 伏笔推进、新伏笔埋设 |
-| 情感深度 | 10% | 情感表达、代入感 |
-| 语言风格 | 10% | 风格统一、符合目标 |
-| AI痕迹 | 5% | 消除AI生成痕迹 |
+- [`DESIGN.md`](DESIGN.md)：整体设计摘要。
+- [`docs/architecture/`](docs/architecture/)：系统、领域模型、AI 运行时、流水线、记忆、任务、图系统和备份恢复设计。
+- [`docs/phases/`](docs/phases/)：各阶段实施说明和验收背景。
+- [`docs/audit/`](docs/audit/) 与 [`docs/high-end-audit/`](docs/high-end-audit/)：审计、差距和运行证据。
+- [`spec/features/`](spec/features/)：功能合同和验收测试入口。
 
-## 项目结构
+## 开发与验证
 
-```
-新小说/
-├── README.md
-├── DESIGN.md               # 架构设计文档
-├── requirements.txt
-├── run.py                   # 启动入口
-├── setup.py
-├── config/
-│   └── default.yaml         # 默认配置
-├── src/
-│   ├── core/                # 核心引擎
-│   │   ├── models.py        # 数据模型
-│   │   ├── config.py        # 配置管理
-│   │   ├── project.py       # 项目管理
-│   │   ├── memory.py        # 记忆系统
-│   │   └── state.py         # 状态管理
-│   ├── llm/                 # LLM集成
-│   │   ├── client.py        # 统一客户端
-│   │   └── prompts.py       # 提示词管理
-│   ├── wizard/              # 世界观向导
-│   ├── review/              # 审查与打分
-│   │   ├── reviewer.py      # 章节审查（双重门禁）
-│   │   └── joint_reviewer.py # 联合审查
-│   ├── creation/            # 创作引擎
-│   │   ├── planner.py       # 章节规划
-│   │   ├── writer.py        # 章节写作
-│   │   └── continuous.py    # 连续创作模式
-│   ├── export/              # 导出系统
-│   ├── visualization/       # 可视化
-│   │   └── mindmap.py       # 思维导图+时间轴
-│   ├── web/                 # Web界面
-│   └── cli/                 # CLI界面
-└── projects/                # 项目数据（自动创建）
+安装开发依赖后，可按下面的顺序运行检查：
+
+```bash
+python -m pytest -q --tb=short
+ruff check src tests
+pyright src tests
+python verify.py
+python scripts/verify_features.py
+python scripts/generate_progress.py --verify
 ```
 
-## 对比分析
+受保护的验收合同、验证脚本和测试入口见 [`CLAUDE.md`](CLAUDE.md)。修改受保护文件前需要明确的验证需求变更说明；不要通过删除断言、跳过测试或降低阈值来让检查通过。
 
-| 特性 | inkOS | webnovel-writer | NovelForge |
-|------|-------|-----------------|------------|
-| 独立运行 | Node.js CLI/Studio | 依赖Claude Code | **Python独立** |
-| 多模型支持 | OpenAI兼容 | 仅Claude | **OpenAI兼容** |
-| 审查打分 | 审计员系统 | 多维审查 | **双重门禁** |
-| 连续创作 | 有限 | 无 | **完整模式** |
-| 世界观向导 | Architect | /webnovel-init | **深度引导** |
-| 思维导图 | 无 | 无 | **自动生成** |
-| 多格式导出 | txt/md/epub | 无 | **docx/md/txt** |
-| 联合审查 | 无 | 无 | **每5章** |
+## 数据与安全
 
-## 配置说明
+- 作品数据和附件默认只保存在本地 `projects/`。
+- 凭据应通过环境变量或应用提供的受保护配置边界提供；不要提交 `.env`、数据库、备份和日志。
+- 如果误提交了密钥，应立即撤销并轮换该密钥，再清理 Git 历史。
+- 安全问题请参阅 [`SECURITY.md`](SECURITY.md)。
 
-详见 `config/default.yaml`，支持：
-- LLM模型配置（主创作/审查/生图）
-- 审查参数（通过分数、修订轮数、维度权重）
-- 连续创作参数（章数范围、联合审查间隔）
-- 导出格式
-- 记忆系统（向量检索开关）
-- 可视化（自动生图开关）
+## 参与贡献
+
+请先阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)，了解本地检查、提交范围和受保护验证文件约束。提交问题或 Pull Request 时，请同时说明复现步骤、测试命令和已知限制。
 
 ## 许可证
 
-MIT License
+本项目采用 [MIT License](LICENSE)。

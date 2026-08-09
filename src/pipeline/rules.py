@@ -297,7 +297,7 @@ class CompiledRules:
             for r in self.book_rules:
                 parts.append(f"- {r}")
         if self.genre_rules:
-            parts.append(f"## 题材规则")
+            parts.append("## 题材规则")
             for r in self.genre_rules:
                 parts.append(f"- {r}")
         if self.universal_rules:
@@ -314,8 +314,8 @@ class WritingRules:
         self.universal_rules = UNIVERSAL_RULES
         self.genre_rules = GENRE_RULES
 
-    def compile_rules(self, genre: str = "", book_rules: list = None,
-                      chapter_rules: list = None) -> CompiledRules:
+    def compile_rules(self, genre: str = "", book_rules: Optional[list] = None,
+                      chapter_rules: Optional[list] = None) -> CompiledRules:
         """编译规则集
 
         Args:

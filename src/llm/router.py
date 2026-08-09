@@ -4,7 +4,7 @@ NovelForge Model Router
 """
 
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
 from enum import Enum
 
 from .gateway import ModelGateway, LLMResponse, get_gateway
@@ -27,7 +27,7 @@ class AgentRole(str, Enum):
 class ModelRouter:
     """模型路由器 - 按Agent角色路由到最优Provider"""
     
-    def __init__(self, gateway: ModelGateway = None):
+    def __init__(self, gateway: Optional[ModelGateway] = None):
         self.gateway = gateway or get_gateway()
         self._role_mapping: Dict[str, str] = {}
         self._fallback_provider = "primary"
@@ -84,7 +84,7 @@ class ModelRouter:
 class AgentRouter:
     """Agent路由器 - 高层封装，为每个Agent提供专用接口"""
     
-    def __init__(self, router: ModelRouter = None):
+    def __init__(self, router: Optional[ModelRouter] = None):
         self.router = router or ModelRouter()
     
     def get_planner(self) -> 'AgentClient':
@@ -154,7 +154,7 @@ def get_agent_router() -> AgentRouter:
 
 def init_agent_router_from_config(config) -> AgentRouter:
     """从配置初始化Agent路由器"""
-    from .gateway import init_gateway_from_config, ProviderType, LLMConfig
+    from .gateway import init_gateway_from_config
     
     # 初始化网关
     gateway = init_gateway_from_config(config)

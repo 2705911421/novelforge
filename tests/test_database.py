@@ -3,16 +3,14 @@ NovelForge 核心模块测试
 """
 
 import pytest
-import json
-import tempfile
 from pathlib import Path
 
 # 设置测试数据库路径
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.core.database import Database, init_db
-from src.core.task_manager import TaskManager, TaskType, TaskStatus, get_task_manager
+from src.core.database import Database
+from src.core.task_manager import TaskManager, TaskType, TaskStatus
 from src.core.dal import (
     ProjectDAL, BookDAL, ChapterDAL, CharacterDAL,
     ForeshadowDAL, StoryFactDAL, ReviewDAL
@@ -472,6 +470,7 @@ class TestForeshadowDAL:
         dal.resolve(fs_id, 10)
         
         fs = dal.get(fs_id)
+        assert fs is not None
         assert fs['status'] == 'resolved'
         assert fs['resolved_chapter'] == 10
 

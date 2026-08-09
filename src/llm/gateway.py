@@ -7,8 +7,8 @@ import json
 import time
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, AsyncGenerator, Generator
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Generator
 from enum import Enum
 import httpx
 
@@ -135,6 +135,7 @@ class OpenAIProvider(BaseProvider):
             except Exception as e:
                 if not self._handle_error(e, attempt):
                     raise RuntimeError(f"OpenAI调用失败: {e}")
+        raise RuntimeError("OpenAI调用失败: retry loop ended without a response")
     
     def chat_stream(self, messages: List[Dict], system: str = "", **kwargs) -> Generator[str, None, None]:
         headers = self._build_headers()
@@ -231,6 +232,7 @@ class AnthropicProvider(BaseProvider):
             except Exception as e:
                 if not self._handle_error(e, attempt):
                     raise RuntimeError(f"Anthropic调用失败: {e}")
+        raise RuntimeError("Anthropic调用失败: retry loop ended without a response")
     
     def chat_stream(self, messages: List[Dict], system: str = "", **kwargs) -> Generator[str, None, None]:
         headers = {
@@ -331,6 +333,7 @@ class GeminiProvider(BaseProvider):
             except Exception as e:
                 if not self._handle_error(e, attempt):
                     raise RuntimeError(f"Gemini调用失败: {e}")
+        raise RuntimeError("Gemini调用失败: retry loop ended without a response")
     
     def chat_stream(self, messages: List[Dict], system: str = "", **kwargs) -> Generator[str, None, None]:
         headers = {"Content-Type": "application/json"}
@@ -438,7 +441,7 @@ class ModelGateway:
             stats["total_latency_ms"] += response.latency_ms
             
             return response
-        except Exception as e:
+        except Exception:
             self._usage_stats[provider_name]["errors"] += 1
             raise
     
@@ -468,7 +471,7 @@ class ModelGateway:
             except (ValueError, json.JSONDecodeError):
                 return {"raw": content, "error": "JSON解析失败"}
     
-    def get_usage_stats(self, provider_name: str = None) -> Dict:
+    def get_usage_stats(self, provider_name: Optional[str] = None) -> Dict:
         """获取使用统计"""
         if provider_name:
             return self._usage_stats.get(provider_name, {})

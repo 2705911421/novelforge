@@ -1,6 +1,5 @@
 """导出系统 - 支持 docx、md、txt 格式"""
 
-import json
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -109,7 +108,7 @@ class Exporter:
         """导出为DOCX"""
         try:
             from docx import Document
-            from docx.shared import Pt, Inches
+            from docx.shared import Pt
             from docx.enum.text import WD_ALIGN_PARAGRAPH
         except ImportError:
             raise ImportError("需要安装 python-docx: pip install python-docx")
@@ -119,7 +118,7 @@ class Exporter:
 
         # 设置默认字体
         style = doc.styles['Normal']
-        font = style.font
+        font = getattr(style, 'font')
         font.name = '宋体'
         font.size = Pt(12)
 

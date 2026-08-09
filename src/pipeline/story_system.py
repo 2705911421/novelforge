@@ -13,7 +13,6 @@
 """
 
 import json
-import copy
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -98,32 +97,305 @@ class StoryEvent:
 # ========== 防幻觉三定律 ==========
 
 class AntiHallucinationLaws:
-    """防幻觉三定律"""
+    """防幻觉三定律 — STORY-007
+
+    定律1: 大纲即法律 — 章节内容必须遵循预先制定的大纲/计划
+    定律2: 设定即物理 — 角色行为和世界观必须与已确立的设定一致
+    定律3: 发明需识别 — 新出现的实体必须被识别并注册到知识库
+    """
 
     @staticmethod
-    def check_outline_compliance(chapter_content: str, chapter_plan: dict) -> list:
-        """定律1: 大纲即法律 - 检查是否遵循大纲"""
+    def check_outline_compliance(
+        chapter_content: str,
+        chapter_plan: dict,
+        story_facts: list[dict] | None = None,
+    ) -> list[dict]:
+        """定律1: 大纲即法律 - 检查是否遵循大纲
+
+        Args:
+            chapter_content: 章节内容
+            chapter_plan: 章节计划，包含 key_events、characters、locations 等
+            story_facts: 已确立的故事事实列表
+
+        Returns:
+            违规列表，每项包含 severity、rule、description
+        """
         violations = []
-        # 检查关键事件是否在计划中
-        plan_events = set(chapter_plan.get("key_events", []))
-        # 这里可以添加更详细的检查逻辑
+
+        if not chapter_plan:
+            return violations
+
+        content_lower = chapter_content.lower() if chapter_content else ""
+
+        # 检查1: 关键事件覆盖
+        plan_events = chapter_plan.get("key_events", [])
+        if plan_events and content_lower:
+            covered_events = []
+            uncovered_events = []
+            for event in plan_events:
+                event_lower = event.lower()
+                # 对于中文，使用子串匹配而非分词
+                # 将事件拆分为2-gram进行模糊匹配
+                if event_lower in content_lower:
+                    # 精确匹配
+                    covered_events.append(event)
+                else:
+                    # 使用n-gram进行模糊匹配
+                    event_chars = list(event_lower)
+                    if len(event_chars) >= 2:
+                        # 检查2-gram的覆盖率
+                        bigrams = [event_chars[i] + event_chars[i+1] for i in range(len(event_chars) - 1)]
+                        match_count = sum(1 for bg in bigrams if bg in content_lower)
+                        coverage = match_count / len(bigrams) if bigrams else 0
+                        if coverage >= 0.5:
+                            covered_events.append(event)
+                        else:
+                            uncovered_events.append(event)
+                    else:
+                        uncovered_events.append(event)
+
+            if uncovered_events:
+                violations.append({
+                    "severity": "major",
+                    "rule": "outline_compliance",
+                    "description": f"计划中的关键事件未在章节中体现: {', '.join(uncovered_events[:3])}",
+                })
+
+        # 检查2: 计划角色是否出现
+        plan_characters = chapter_plan.get("characters", [])
+        if plan_characters and content_lower:
+            missing_characters = []
+            for char in plan_characters:
+                char_lower = char.lower()
+                if char_lower not in content_lower:
+                    missing_characters.append(char)
+
+            # 只有当超过一半的计划角色缺失时才报告
+            if missing_characters and len(missing_characters) > len(plan_characters) * 0.5:
+                violations.append({
+                    "severity": "minor",
+                    "rule": "outline_compliance",
+                    "description": f"计划中的角色未在章节中出现: {', '.join(missing_characters[:3])}",
+                })
+
+        # 检查3: 章节标题一致性
+        plan_title = chapter_plan.get("title", "")
+        if plan_title and content_lower:
+            title_keywords = [w for w in plan_title.lower().split() if len(w) > 2]
+            if title_keywords:
+                title_match = sum(1 for kw in title_keywords if kw in content_lower)
+                if title_match == 0:
+                    violations.append({
+                        "severity": "minor",
+                        "rule": "outline_compliance",
+                        "description": f"章节内容与计划标题'{plan_title}'关联度低",
+                    })
+
         return violations
 
     @staticmethod
-    def check_setting_consistency(chapter_content: str, world_setting: dict,
-                                   characters: dict) -> list:
-        """定律2: 设定即物理 - 检查设定一致性"""
+    def check_setting_consistency(
+        chapter_content: str,
+        world_setting: dict,
+        characters: dict,
+        story_facts: list[dict] | None = None,
+    ) -> list[dict]:
+        """定律2: 设定即物理 - 检查设定一致性
+
+        Args:
+            chapter_content: 章节内容
+            world_setting: 世界观设定
+            characters: 角色设定字典
+            story_facts: 已确立的故事事实列表
+
+        Returns:
+            违规列表
+        """
         violations = []
-        # 检查角色是否符合设定
-        # 检查世界观是否一致
-        # 这里可以添加更详细的检查逻辑
+
+        if not chapter_content:
+            return violations
+
+        content_lower = chapter_content.lower()
+
+        # 检查1: 已死亡角色不能复活（除非有复活设定）
+        if story_facts:
+            dead_characters: set[str] = set()
+            resurrection_rules: set[str] = set()
+
+            for fact in story_facts:
+                fact_content = fact.get("content", "").lower()
+                fact_type = fact.get("fact_type", "")
+
+                # 检测死亡事件
+                if fact_type == "event" and any(kw in fact_content for kw in ["死亡", "去世", "牺牲", "被杀", "死了"]):
+                    # 提取角色名
+                    entities = fact.get("entities", [])
+                    if isinstance(entities, str):
+                        try:
+                            import json as _json
+                            entities = _json.loads(entities)
+                        except (ValueError, TypeError):
+                            entities = []
+                    for entity in entities:
+                        if isinstance(entity, str):
+                            dead_characters.add(entity.lower())
+
+                # 检测复活规则
+                if fact_type == "rule" and any(kw in fact_content for kw in ["复活", "重生", "转世"]):
+                    resurrection_rules.update(
+                        e.lower() for e in (fact.get("entities", []) or [])
+                        if isinstance(e, str)
+                    )
+
+            # 检查已死亡角色是否在章节中"复活"
+            for dead_char in dead_characters:
+                if dead_char in content_lower and dead_char not in resurrection_rules:
+                    # 检查是否真的在行动（而不只是被提及）
+                    action_patterns = [f"{dead_char}说", f"{dead_char}走", f"{dead_char}看",
+                                       f"{dead_char}笑", f"{dead_char}站", f"{dead_char}坐"]
+                    if any(pattern in content_lower for pattern in action_patterns):
+                        violations.append({
+                            "severity": "critical",
+                            "rule": "setting_consistency",
+                            "description": f"已死亡角色'{dead_char}'在章节中行动，违反设定",
+                        })
+
+        # 检查2: 角色性格一致性（基于角色设定）
+        if characters:
+            for char_name, char_info in characters.items():
+                if not isinstance(char_info, dict):
+                    continue
+
+                char_name_lower = char_name.lower()
+                if char_name_lower not in content_lower:
+                    continue
+
+                # 检查性格标签
+                personality = char_info.get("personality", "")
+                if personality:
+                    # 检查是否有明显的性格冲突
+                    personality_traits = [t.strip() for t in personality.split("，") if t.strip()]
+                    for trait in personality_traits:
+                        trait_lower = trait.lower()
+                        # 检查反义词
+                        antonyms: dict[str, list[str]] = {
+                            "善良": ["残忍", "恶毒", "凶狠"],
+                            "温柔": ["暴躁", "凶悍", "粗暴"],
+                            "聪明": ["愚蠢", "笨拙"],
+                            "勇敢": ["懦弱", "胆小"],
+                            "诚实": ["虚伪", "欺骗"],
+                        }
+                        for positive, negatives in antonyms.items():
+                            if positive in trait_lower:
+                                for neg in negatives:
+                                    if neg in content_lower:
+                                        violations.append({
+                                            "severity": "major",
+                                            "rule": "setting_consistency",
+                                            "description": f"角色'{char_name}'的性格'{trait}'与内容中的'{neg}'冲突",
+                                        })
+
+        # 检查3: 世界观规则违反
+        if world_setting:
+            rules = world_setting.get("rules", [])
+            if isinstance(rules, list):
+                for rule in rules:
+                    if not isinstance(rule, str):
+                        continue
+                    rule_lower = rule.lower()
+                    # 检查禁止事项
+                    if any(kw in rule_lower for kw in ["禁止", "不允许", "不能", "不可"]):
+                        # 提取禁止的关键词
+                        forbidden = rule_lower.replace("禁止", "").replace("不允许", "").replace("不能", "").replace("不可", "").strip()
+                        if forbidden and forbidden in content_lower:
+                            violations.append({
+                                "severity": "critical",
+                                "rule": "setting_consistency",
+                                "description": f"章节内容违反世界观规则: {rule}",
+                            })
+
         return violations
 
     @staticmethod
-    def check_new_entities(chapter_content: str, known_entities: set) -> list:
-        """定律3: 发明需识别 - 检查新实体"""
-        new_entities = []
-        # 这里可以添加实体识别逻辑
+    def check_new_entities(
+        chapter_content: str,
+        known_entities: set,
+        story_facts: list[dict] | None = None,
+    ) -> list[dict]:
+        """定律3: 发明需识别 - 检查新实体
+
+        Args:
+            chapter_content: 章节内容
+            known_entities: 已知实体集合
+            story_facts: 已确立的故事事实列表
+
+        Returns:
+            新实体列表，每项包含 entity_type、entity_name、context
+        """
+        new_entities: list[dict] = []
+
+        if not chapter_content:
+            return new_entities
+
+        # 从故事事实中提取已知实体
+        if story_facts:
+            for fact in story_facts:
+                entities = fact.get("entities", [])
+                if isinstance(entities, str):
+                    try:
+                        import json as _json
+                        entities = _json.loads(entities)
+                    except (ValueError, TypeError):
+                        entities = []
+                for entity in entities:
+                    if isinstance(entity, str):
+                        known_entities.add(entity.lower())
+
+        # 简单的实体识别（基于中文命名模式）
+        import re
+
+        # 检测可能的人名（2-4个汉字的词，后面跟动作或对话）
+        name_pattern = r'[\u4e00-\u9fff]{2,4}(?=[说走看笑站坐跑哭喊叫问道答点头摇头叹气转身])'
+        potential_names = set(re.findall(name_pattern, chapter_content))
+
+        # 检测可能的地名（XX城、XX山、XX国、XX宫、XX府）
+        location_pattern = r'[\u4e00-\u9fff]{2,6}(?:城|山|国|宫|府|村|镇|谷|峰|湖|河|海|岛|森林|沙漠|草原|山脉)'
+        potential_locations = set(re.findall(location_pattern, chapter_content))
+
+        # 检测可能的组织/势力（XX门、XX派、XX帮、XX教、XX盟）
+        faction_pattern = r'[\u4e00-\u9fff]{2,6}(?:门|派|帮|教|盟|会|堂|阁|殿|院)'
+        potential_factions = set(re.findall(faction_pattern, chapter_content))
+
+        # 检查哪些是新实体
+        all_potential: dict[str, set[str]] = {
+            "character": potential_names,
+            "location": potential_locations,
+            "faction": potential_factions,
+        }
+
+        for entity_type, entities in all_potential.items():
+            for entity in entities:
+                entity_lower = entity.lower()
+                if entity_lower not in known_entities and len(entity) >= 2:
+                    # 排除常见词汇
+                    common_words = {
+                        "一个", "这个", "那个", "什么", "怎么", "为什么", "可以",
+                        "不能", "不要", "不是", "没有", "已经", "正在", "突然",
+                        "忽然", "立刻", "马上", "终于", "居然", "竟然", "难道",
+                        "也许", "大概", "可能", "一定", "必须", "需要", "应该",
+                        "他们", "她们", "它们", "我们", "你们", "大家", "自己",
+                        "这里", "那里", "哪里", "现在", "刚才", "以前", "以后",
+                        "今天", "昨天", "明天", "早上", "中午", "晚上", "下午",
+                    }
+                    if entity_lower not in common_words:
+                        new_entities.append({
+                            "entity_type": entity_type,
+                            "entity_name": entity,
+                            "context": chapter_content[max(0, chapter_content.find(entity) - 20):
+                                                       chapter_content.find(entity) + len(entity) + 20],
+                        })
+
         return new_entities
 
 
@@ -197,7 +469,7 @@ class StorySystem:
     # ========== 运行时合同 ==========
 
     def generate_runtime_contract(self, project, chapter_number: int,
-                                   chapter_plan: dict = None) -> RuntimeContract:
+                                   chapter_plan: Optional[dict] = None) -> RuntimeContract:
         """生成运行时合同"""
         contract = RuntimeContract(chapter_number=chapter_number)
 

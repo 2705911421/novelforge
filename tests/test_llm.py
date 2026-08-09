@@ -3,9 +3,8 @@ NovelForge LLM模块测试
 """
 
 import pytest
-import json
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -13,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.llm.gateway import (
     ModelGateway, LLMConfig, ProviderType, LLMResponse,
     OpenAIProvider, AnthropicProvider, GeminiProvider,
-    ProviderFactory, get_gateway
+    ProviderFactory
 )
 from src.llm.router import (
     ModelRouter, AgentRouter, AgentClient, AgentRole

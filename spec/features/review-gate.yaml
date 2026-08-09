@@ -1,0 +1,10 @@
+id: REVIEW-001
+name: Review and revision gate
+priority: P0
+requirements:
+  - Blocking review findings prevent passage.
+  - Exhausted automatic revisions leave work waiting for the user.
+acceptance_tests:
+  - tests/test_phase9_review_pipeline.py
+  - tests/test_phase12_joint_review.py
+

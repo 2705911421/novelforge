@@ -1,8 +1,6 @@
 """章节规划器"""
 
-import json
-from typing import Optional
-from ..core.models import StoryProject, Chapter
+from ..core.models import StoryProject
 from ..llm.client import MultiModelManager
 from ..llm.prompts import PromptManager
 

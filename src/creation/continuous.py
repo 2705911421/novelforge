@@ -11,10 +11,9 @@
 
 import json
 from typing import Optional, Callable
-from pathlib import Path
 from datetime import datetime
 
-from ..core.models import StoryProject, Chapter, ChapterStatus, JointReview
+from ..core.models import StoryProject, Chapter, ChapterStatus
 from ..core.project import ProjectManager
 from ..core.memory import MemorySystem
 from ..core.state import StateManager
@@ -275,7 +274,7 @@ class ContinuousCreationMode:
                             chapter.status = ChapterStatus.REVIEWING
                             self._report_progress(
                                 chapter_number, count,
-                                f"达到最大修订轮数，保留当前版本"
+                                "达到最大修订轮数，保留当前版本"
                             )
 
                 # === 第10步：StorySystem - 提交章节 ===
@@ -425,7 +424,7 @@ class ContinuousCreationMode:
 
     def _apply_state_updates(self, new_state: dict, changelog: list):
         """应用状态更新到项目"""
-        from ..core.models import Character, Faction, Location, Foreshadowing
+        from ..core.models import Character, Location, Foreshadowing
 
         # 更新已有角色
         for name, char_data in new_state.get("characters", {}).items():

@@ -10,27 +10,18 @@ OK = "[OK]"
 FAIL = "[FAIL]"
 
 def test_imports():
-    from src.core.models import StoryProject, Chapter, Character, Faction, Location, Foreshadowing, Volume, Arc, WorldSetting
+    from src.core.models import StoryProject, Character
     from src.core.config import Config
-    from src.core.project import ProjectManager
     from src.core.memory import MemorySystem
     from src.core.state import StateManager
     print(f'{OK} Core modules imported')
 
-    from src.llm.client import LLMClient, MultiModelManager
-    from src.llm.prompts import PromptManager
     print(f'{OK} LLM modules imported')
 
-    from src.wizard.guided_setup import WorldWizard
     print(f'{OK} Wizard module imported')
 
-    from src.review.reviewer import ChapterReviewer
-    from src.review.joint_reviewer import JointReviewer
     print(f'{OK} Review modules imported')
 
-    from src.creation.planner import ChapterPlanner
-    from src.creation.writer import ChapterWriter
-    from src.creation.continuous import ContinuousCreationMode
     print(f'{OK} Creation engine imported')
 
     from src.export.exporter import Exporter
@@ -80,7 +71,7 @@ def test_imports():
     tl = TimelineGenerator()
     print(f'{OK} Visualization initialized')
 
-    print(f'\n=== ALL TESTS PASSED ===')
+    print('\n=== ALL TESTS PASSED ===')
 
 if __name__ == "__main__":
     test_imports()

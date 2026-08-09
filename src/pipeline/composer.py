@@ -8,11 +8,10 @@
 这是inkOS最核心的差异化——不是简单拼接prompt，而是智能选择上下文。
 """
 
-import json
 from dataclasses import dataclass, field
 from typing import Optional
 from ..llm.client import MultiModelManager
-from .control_surface import ControlSurface, ChapterIntent, RuleStack, ContextTrace, AuthorIntent, CurrentFocus
+from .control_surface import ControlSurface, ChapterIntent, RuleStack, ContextTrace, AuthorIntent
 
 
 # ========== 上下文选择策略 ==========
@@ -221,7 +220,7 @@ class Composer:
         return stack
 
     def compose_context(self, project, chapter_number: int,
-                        token_budget: int = None) -> CompiledContext:
+                        token_budget: Optional[int] = None) -> CompiledContext:
         """编排上下文（对应inkOS的compose chapter）
 
         从结构化状态中按任务选择上下文，控制token预算。

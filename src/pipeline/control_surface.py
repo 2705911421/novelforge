@@ -13,7 +13,6 @@ import json
 import yaml
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional
 from datetime import datetime
 
 
@@ -28,7 +27,7 @@ class AuthorIntent:
     updated_at: str = ""
 
     def to_markdown(self) -> str:
-        parts = [f"# 作者意图\n"]
+        parts = ["# 作者意图\n"]
         if self.content:
             parts.append(f"{self.content}\n")
         if self.themes:
@@ -51,7 +50,7 @@ class CurrentFocus:
     updated_at: str = ""
 
     def to_markdown(self) -> str:
-        parts = [f"# 当前关注点\n"]
+        parts = ["# 当前关注点\n"]
         if self.content:
             parts.append(f"{self.content}\n")
         if self.priority_items:

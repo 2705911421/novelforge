@@ -6,7 +6,6 @@ NovelForge 数据访问层
 import json
 import logging
 from typing import Optional, Dict, Any, List
-from datetime import datetime
 
 from .database import get_db, generate_id
 
@@ -177,7 +176,7 @@ class ChapterDAL:
             "SELECT MAX(version) as max_ver FROM chapter_versions WHERE chapter_id = ?",
             (chapter_id,)
         )
-        version = (row['max_ver'] or 0) + 1
+        version = ((row or {}).get('max_ver') or 0) + 1
         
         version_id = generate_id()
         self.db.insert('chapter_versions', {
@@ -608,9 +607,9 @@ class OperationLogDAL:
     def __init__(self):
         self.db = get_db()
     
-    def log(self, operation: str, entity_type: str = None, entity_id: str = None,
-            details: Dict = None, duration_ms: int = None, token_count: int = None,
-            model_used: str = None) -> str:
+    def log(self, operation: str, entity_type: Optional[str] = None, entity_id: Optional[str] = None,
+            details: Optional[Dict] = None, duration_ms: Optional[int] = None,
+            token_count: Optional[int] = None, model_used: Optional[str] = None) -> str:
         """记录操作日志"""
         log_id = generate_id()
         self.db.insert('operation_logs', {
