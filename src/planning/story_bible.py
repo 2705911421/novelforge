@@ -325,7 +325,15 @@ class StoryBibleRepository:
     def _text_projection(value: Any) -> str:
         if isinstance(value, str):
             return value
-        return json.dumps(value if value is not None else {}, ensure_ascii=False, sort_keys=True)
+        if isinstance(value, list):
+            return "\n".join(item for item in (StoryBibleRepository._text_projection(item) for item in value) if item)
+        if isinstance(value, dict):
+            for key in ("summary", "content", "description", "text", "value", "name"):
+                projected = StoryBibleRepository._text_projection(value.get(key))
+                if projected.strip():
+                    return projected
+            return ""
+        return "" if value is None else str(value)
 
     @classmethod
     def _style_projection(cls, steps: dict[str, Any]) -> str:
@@ -336,14 +344,28 @@ class StoryBibleRepository:
     @classmethod
     def _world_projection(cls, steps: dict[str, Any], snapshot_id: str) -> dict[str, Any]:
         world_value = steps.get("world")
-        result: dict[str, Any] = (
-            dict(world_value) if isinstance(world_value, dict)
-            else {"setting_description": cls._text_projection(world_value)}
-        )
+        world_value = world_value if isinstance(world_value, dict) else {"setting_description": world_value}
+        result: dict[str, Any] = {
+            "name": cls._text_projection(world_value.get("name")) or "架空世界",
+            "genre": cls._text_projection(world_value.get("genre")),
+            "setting_description": cls._text_projection(
+                world_value.get("setting_description") or world_value.get("settingDescription") or world_value.get("content")
+            ),
+        }
         result["core_conflict"] = cls._text_projection(steps.get("core_conflict"))
-        result["world_rules"] = steps.get("world_rules", [])
+        rules = steps.get("world_rules", [])
+        result["world_rules"] = (
+            rules.get("rules") if isinstance(rules, dict) and isinstance(rules.get("rules"), list)
+            else [cls._text_projection(item) for item in rules] if isinstance(rules, list)
+            else [cls._text_projection(rules)] if cls._text_projection(rules) else []
+        )
         result["power_system"] = cls._text_projection(steps.get("power_system"))
         result["history"] = cls._text_projection(steps.get("history"))
-        result["themes"] = steps.get("selling_points", [])
+        selling = steps.get("selling_points", [])
+        result["themes"] = (
+            selling.get("themes") if isinstance(selling, dict) and isinstance(selling.get("themes"), list)
+            else [cls._text_projection(item) for item in selling] if isinstance(selling, list)
+            else [cls._text_projection(selling)] if cls._text_projection(selling) else []
+        )
         result["bible_snapshot_id"] = snapshot_id
         return result

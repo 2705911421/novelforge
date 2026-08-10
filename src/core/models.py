@@ -265,7 +265,7 @@ class Arc:
 @dataclass
 class WorldSetting:
     """世界设定"""
-    name: str = ""
+    name: str = "架空世界"
     genre: str = ""
     setting_description: str = ""
     time_period: str = ""
@@ -275,6 +275,10 @@ class WorldSetting:
     cultures: list = field(default_factory=list)
     history: str = ""
     themes: list = field(default_factory=list)
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name.strip():
+            self.name = "架空世界"
 
 
 @dataclass
@@ -293,8 +297,10 @@ class StoryProject:
     volumes: list = field(default_factory=list)      # List[Volume]
     chapters: dict = field(default_factory=dict)     # number -> Chapter
     writing_style: str = ""
+    style_profile: dict = field(default_factory=dict)
     target_word_count: int = 0
     target_chapters: int = 100
+    target_volumes: int = 5
     language: str = "zh-CN"
     author_intent: str = ""
     timeline: list = field(default_factory=list)     # 事件时间轴
@@ -304,6 +310,10 @@ class StoryProject:
             self.created_at = datetime.now().isoformat()
         if not self.updated_at:
             self.updated_at = datetime.now().isoformat()
+        if not isinstance(self.world, WorldSetting):
+            self.world = WorldSetting()
+        elif not self.world.name.strip():
+            self.world.name = "架空世界"
 
     def to_dict(self) -> dict:
         """序列化为字典"""
@@ -321,8 +331,10 @@ class StoryProject:
             "volumes": [v.__dict__ for v in self.volumes],
             "chapters": {str(k): v.__dict__ for k, v in self.chapters.items()},
             "writing_style": self.writing_style,
+            "style_profile": self.style_profile,
             "target_word_count": self.target_word_count,
             "target_chapters": self.target_chapters,
+            "target_volumes": self.target_volumes,
             "language": self.language,
             "author_intent": self.author_intent,
             "timeline": self.timeline
@@ -338,3 +350,28 @@ class StoryProject:
 
     def get_open_foreshadowing(self) -> list:
         return [f for f in self.foreshadowing.values() if f.status in ("open", "progressing")]
+
+    def style_guidance(self) -> str:
+        """Return the legacy free-text style plus the structured per-book guide."""
+        parts = [self.writing_style.strip()] if isinstance(self.writing_style, str) and self.writing_style.strip() else []
+        labels = {
+            "voice": "叙述声音",
+            "pov": "视角与距离",
+            "rhythm": "句式与节奏",
+            "dialogue": "对白规则",
+            "imagery": "意象与感官",
+            "emotion": "情绪曲线",
+            "techniques": "写作技法",
+            "constraints": "硬性约束",
+            "dos": "必须保留",
+            "donts": "避免事项",
+            "sample": "参考片段",
+        }
+        if isinstance(self.style_profile, dict):
+            for key, label in labels.items():
+                value = self.style_profile.get(key)
+                if isinstance(value, str) and value.strip():
+                    parts.append(f"{label}: {value.strip()}")
+                elif isinstance(value, list) and value:
+                    parts.append(f"{label}: {'、'.join(str(item) for item in value)}")
+        return "\n".join(parts)

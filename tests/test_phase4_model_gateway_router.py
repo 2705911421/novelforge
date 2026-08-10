@@ -75,7 +75,11 @@ def test_invocation_records_generation_run_without_prompt_or_output_body(model_r
     run = repository.runs_for_task(task["id"])[0]
     assert run["status"] == "succeeded"
     assert run["total_tokens"] == 12
-    assert run["input_reference"] == {"message_count": 1, "system_chars": 14, "message_chars": 14}
+    assert run["input_reference"]["message_count"] == 1
+    assert run["input_reference"]["message_chars"] == 14
+    assert run["input_reference"]["system_chars"] > 14
+    assert len(run["input_reference"]["prompt_sha256"]) == 64
+    assert run["input_reference"]["prompt_source"] == "agent-contract+route-override"
     assert run["output_reference"]["content_chars"] == len("private generated text")
     persisted = database.fetchone("SELECT * FROM generation_runs WHERE id=?", (run["id"],))
     assert "private prompt" not in str(dict(persisted))
@@ -124,6 +128,104 @@ def test_durable_provider_check_creates_a_generation_run(model_runtime, tmp_path
     assert completed["status"] == "completed"
     assert completed["result"]["connected"] is True
     assert repository.runs_for_task(task["id"])[0]["status"] == "succeeded"
+
+
+def test_custom_compatible_provider_accepts_alias_and_defaults_model_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMO_API_KEY", "mimo-secret")
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    repository = ModelRepository(database, CredentialStore(tmp_path))
+
+    repository.save_configuration({
+        "providers": [{
+            "id": "mimo-provider",
+            "name": "小米 MiMo",
+            "providerType": "mimo",
+            "baseUrl": "https://api.xiaomimimo.com/v1",
+            "credentialEnv": "MIMO_API_KEY",
+        }],
+        "models": [{
+            "id": "mimo-model",
+            "providerId": "mimo-provider",
+            "modelId": "mimo-v2.5-pro",
+        }],
+        "routes": {},
+    })
+
+    configuration = repository.configuration()
+    assert configuration["providers"][0]["providerType"] == "custom"
+    assert configuration["models"][0]["name"] == "mimo-v2.5-pro"
+
+
+def test_provider_model_discovery_persists_catalog_without_manual_model_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMO_API_KEY", "mimo-secret")
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    repository = ModelRepository(database, CredentialStore(tmp_path))
+    repository.save_configuration({
+        "providers": [{
+            "id": "mimo-provider",
+            "name": "小米 MiMo",
+            "providerType": "custom",
+            "baseUrl": "https://api.xiaomimimo.com/v1",
+            "credentialEnv": "MIMO_API_KEY",
+        }],
+        "models": [],
+        "routes": {},
+    })
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"id": "mimo-v2.5-pro", "owned_by": "xiaomi"}, {"id": "mimo-v2.5"}]}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, url, **kwargs):
+            assert url == "https://api.xiaomimimo.com/v1/models"
+            assert kwargs["headers"]["Authorization"] == "Bearer mimo-secret"
+            return Response()
+
+    from src.llm import model_runtime as model_runtime_module
+
+    monkeypatch.setattr(model_runtime_module.httpx, "Client", Client)
+    runtime = PersistentModelRuntime(repository)
+    discovered = runtime.discover_models("mimo-provider")
+
+    assert [item["modelId"] for item in discovered["models"]] == ["mimo-v2.5", "mimo-v2.5-pro"]
+    assert [item["name"] for item in repository.configuration()["models"]] == ["mimo-v2.5", "mimo-v2.5-pro"]
+
+
+def test_studio_model_discovery_is_queued_without_provider_secret_in_task(tmp_path, monkeypatch):
+    from src.web import studio
+
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    repository = ModelRepository(database, CredentialStore(tmp_path))
+    repository.save_configuration({
+        "providers": [{
+            "id": "custom-provider", "name": "自定义网关", "providerType": "custom",
+            "baseUrl": "https://gateway.example.invalid/v1", "credentialEnv": "MIMO_API_KEY",
+        }],
+        "models": [], "routes": {},
+    })
+    runtime = TaskRuntime(database)
+    monkeypatch.setattr(studio, "model_repository", repository)
+    monkeypatch.setattr(studio, "task_runtime", runtime)
+
+    response = TestClient(studio.app).post("/api/v1/services/custom-provider/models/discover")
+    assert response.status_code == 200
+    task = runtime.get(response.json()["taskId"])
+    assert task["type"] == "model-discovery"
+    assert task["data"] == {"provider_id": "custom-provider"}
+    assert "MIMO_API_KEY" not in str(task)
 
 
 @pytest.mark.integration

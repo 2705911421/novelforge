@@ -3,6 +3,7 @@
 from ..core.models import ChapterReview, ReviewDimension, ReviewVerdict, StoryProject, Chapter
 from ..llm.client import MultiModelManager
 from ..llm.prompts import PromptManager
+from ..pipeline.rules import genre_contract_lines
 
 
 class ChapterReviewer:
@@ -40,6 +41,9 @@ class ChapterReviewer:
             chapter_plan=chapter_plan,
             pass_score=self.pass_score,
         )
+        contract = genre_contract_lines(project.genre)
+        if contract:
+            prompt += "\n\n## 题材契约\n" + "\n".join(f"- {item}" for item in contract)
 
         messages = [{"role": "user", "content": prompt}]
         system = "你是一位严格但公正的小说审稿编辑，专注于提升作品质量。"

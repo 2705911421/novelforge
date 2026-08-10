@@ -1,5 +1,6 @@
 """Legacy-compatible FastAPI routes backed by the durable Studio runtime."""
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from ..core.config import Config
 from ..core.database import Database
 from ..core.project import ProjectManager
 from ..core.story_repository import StoryRepository
-from ..core.task_runtime import TaskRuntime
+from ..core.task_runtime import TaskRuntime, TaskStateError
 
 app = FastAPI(title="NovelForge", description="AI小说创作平台")
 
@@ -127,12 +128,20 @@ async def continuous_mode(project_id: str, req: ContinuousRequest):
     if not book:
         raise HTTPException(409, "项目没有 authoritative book")
     start = req.start_chapter or (project.get_latest_chapter_number() + 1)
+    if start < 1:
+        raise HTTPException(422, "start_chapter must be positive")
     if req.count < 5 or req.count > 200:
         raise HTTPException(422, "count must be between 5 and 200")
-    task = task_runtime.enqueue(
-        "continuous", project_id=project_id, book_id=book["id"],
-        data={"start": start, "count": req.count, "context": req.context},
-    )
+    context_fingerprint = hashlib.sha256(req.context.encode("utf-8")).hexdigest()[:16]
+    try:
+        task = task_runtime.enqueue_continuous(
+            project_id=project_id,
+            book_id=book["id"],
+            data={"start": start, "count": req.count, "context": req.context},
+            idempotency_key=f"continuous:{book['id']}:{start}:{req.count}:{context_fingerprint}",
+        )
+    except TaskStateError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {"taskId": task["id"], "status": task["status"], "message": "连续创作任务已排队"}
 
 

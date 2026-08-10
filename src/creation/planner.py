@@ -3,6 +3,7 @@
 from ..core.models import StoryProject
 from ..llm.client import MultiModelManager
 from ..llm.prompts import PromptManager
+from ..pipeline.rules import genre_contract_lines
 
 
 class ChapterPlanner:
@@ -55,10 +56,15 @@ class ChapterPlanner:
         parts = [f"书名: {project.name}"]
         if project.genre:
             parts.append(f"类型: {project.genre}")
+            contract = genre_contract_lines(project.genre)
+            if contract:
+                parts.append("题材契约:\n" + "\n".join(f"- {item}" for item in contract))
         if project.world.core_conflict:
             parts.append(f"核心矛盾: {project.world.core_conflict}")
         if project.author_intent:
             parts.append(f"作者意图: {project.author_intent}")
+        if project.style_guidance():
+            parts.append(f"本书专属文风: {project.style_guidance()}")
         return "\n".join(parts)
 
     def _build_current_state(self, project: StoryProject, chapter_number: int) -> str:
@@ -99,8 +105,8 @@ class ChapterPlanner:
     def _build_writing_requirements(self, project: StoryProject) -> str:
         """构建写作要求"""
         parts = []
-        if project.writing_style:
-            parts.append(f"写作风格: {project.writing_style}")
+        if project.style_guidance():
+            parts.append(f"写作风格: {project.style_guidance()}")
         if project.world.themes:
             parts.append(f"主题: {', '.join(project.world.themes)}")
         return "\n".join(parts) or "无特殊要求"

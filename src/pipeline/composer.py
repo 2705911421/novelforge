@@ -411,22 +411,40 @@ class Composer:
         return "\n".join(parts)
 
     def _get_genre_rules(self, genre: str) -> list:
+        from src.pipeline.rules import get_genre_profile
+
+        profile = get_genre_profile(genre) or {}
+        planning = profile.get("planning") or {}
+        limits = profile.get("limits") or {}
+        contract_items = [
+            f"题材核心承诺：{planning.get('core_promise', '')}",
+            f"题材结构：{planning.get('structure', [])}",
+            f"章节模板：{planning.get('chapter_template', [])}",
+            f"节奏约束：{planning.get('pacing', {})}",
+            f"必须追踪：{planning.get('must_track', [])}",
+            f"连续创作检查：{planning.get('continuation_checks', [])}",
+            *[f"题材硬限制：{item}" for item in (limits.get("hard") or [])],
+            *[f"题材审查门槛：{item}" for item in (limits.get("review_gates") or [])],
+            *[f"题材禁忌：{item}" for item in (profile.get("taboos") or [])],
+        ]
+        return contract_items + [
+            item.get("rule") for item in profile.get("rules", []) if item.get("rule")
+        ]
         """获取题材规则"""
-        genre_rules = {
-            "玄幻修仙": ["注意修为等级体系一致性", "战斗描写要有层次感", "法宝/功法要符合设定"],
-            "都市异能": ["异能不能过于破坏平衡", "注意现实与异能的界限", "都市背景要真实"],
-            "言情": ["感情线要有起伏", "误会与和解要合理", "配角不能抢戏"],
-            "悬疑": ["线索要前后呼应", "推理要严密", "悬念要层层递进"],
-        }
-        return genre_rules.get(genre, [])
+        from src.pipeline.rules import GENRE_RULES
+
+        profile = GENRE_RULES.get(genre) or {}
+        rules = [item.get("rule") for item in profile.get("rules", []) if item.get("rule")]
+        hard_limits = ((profile.get("limits") or {}).get("hard") or [])
+        return rules + [f"题材硬限制：{item}" for item in hard_limits]
 
     def _get_book_rules(self, project) -> list:
         """获取书级规则"""
         rules = []
         if project.author_intent:
             rules.append(f"作者意图: {project.author_intent}")
-        if project.writing_style:
-            rules.append(f"写作风格: {project.writing_style}")
+        if project.style_guidance():
+            rules.append(f"本书专属文风: {project.style_guidance()}")
         return rules
 
     def _compress_context(self, context: str, max_tokens: int) -> str:

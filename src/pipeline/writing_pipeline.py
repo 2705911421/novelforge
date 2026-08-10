@@ -17,6 +17,7 @@ from src.core.story_repository import StoryRepository
 from src.core.task_runtime import TaskRuntime
 from src.prompts.prompt_repository import PromptRepository
 from src.review.review_repository import ReviewRepository
+from src.pipeline.rules import genre_contract_lines, get_genre_profile
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,11 @@ class WritingPipeline:
         while stage != "DONE":
             current_task = self.runtime.get(task["id"])
             if current_task and current_task["status"] == "cancelling":
-                self.runtime.transition(task["id"], "cancelled", detail={"reason": "cancelled_at_pipeline_boundary"})
+                self._transition(
+                    task,
+                    "cancelled",
+                    detail={"reason": "cancelled_at_pipeline_boundary"},
+                )
                 ctx.update({"completed": False, "cancelled": True})
                 return ctx
             if current_task and current_task["status"] == "paused":
@@ -129,13 +134,43 @@ class WritingPipeline:
             # Checkpoint after every stage transition while the task remains active.
             current_task = self.runtime.get(task["id"])
             if current_task and current_task["status"] in {"running", "cancelling", "paused"}:
-                self.runtime.checkpoint(task["id"], stage, {
-                    "stage": stage,
-                    "context": ctx,
-                })
+                # ``pause()`` deliberately releases the lease. Preserve the
+                # stage checkpoint at that safe boundary without presenting a
+                # stale worker owner as if it still fenced the task.
+                lease_owner = None if current_task["status"] == "paused" else self._lease_owner(task)
+                self.runtime.checkpoint(
+                    task["id"], stage, {"stage": stage, "context": ctx},
+                    lease_owner=lease_owner,
+                )
             logger.info("Pipeline %s stage %s → %s", task["id"], handler.__name__, stage)
 
         return ctx
+
+    @staticmethod
+    def _lease_owner(task: dict[str, Any]) -> Optional[str]:
+        owner = task.get("lease_owner")
+        return owner if isinstance(owner, str) and owner else None
+
+    def _checkpoint(self, task: dict[str, Any], stage: str, state: dict[str, Any]) -> None:
+        self.runtime.checkpoint(
+            task["id"], stage, state, lease_owner=self._lease_owner(task)
+        )
+
+    def _transition(
+        self,
+        task: dict[str, Any],
+        target: str,
+        *,
+        detail: Optional[dict[str, Any]] = None,
+        result: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        return self.runtime.transition(
+            task["id"],
+            target,
+            detail=detail,
+            result=result,
+            lease_owner=self._lease_owner(task),
+        )
 
     # ---- Stage implementations ----
 
@@ -173,6 +208,23 @@ class WritingPipeline:
             (book_id, chapter_number),
         )
         return row["id"] if row else None
+
+    def _attach_genre_contract(self, project_id: str, plan: Any) -> Any:
+        """Carry the complete, traceable genre contract through every stage."""
+        project = self.db.fetchone("SELECT genre FROM projects WHERE id=?", (project_id,))
+        genre = project.get("genre") if project else ""
+        profile = get_genre_profile(genre)
+        contract = genre_contract_lines(genre)
+        if not profile or not contract:
+            return plan
+        next_plan = dict(plan) if isinstance(plan, dict) else {"plan": plan}
+        next_plan["genre_contract"] = {
+            "genre_id": profile.get("id"),
+            "genre": profile.get("name"),
+            "source": "builtin-genre-contract",
+            "rules": contract,
+        }
+        return next_plan
 
     def _precheck(self, task: dict, ctx: dict) -> dict:
         """Validate all prerequisites before starting."""
@@ -231,7 +283,7 @@ class WritingPipeline:
         # Check for an explicit plan in task data.
         plan = data.get("plan")
         if plan:
-            ctx["chapter_plan"] = plan
+            ctx["chapter_plan"] = self._attach_genre_contract(project_id, plan)
             return {"next_stage": "BUILD_CONTEXT", "context": ctx}
 
         # Check for a stored plan in the chapter record (not in DB, skip this step).
@@ -258,6 +310,8 @@ class WritingPipeline:
                 ctx["chapter_plan"] = {"chapter_number": chapter_number, "source": "minimal"}
         else:
             ctx["chapter_plan"] = {"chapter_number": chapter_number, "source": "minimal"}
+
+        ctx["chapter_plan"] = self._attach_genre_contract(project_id, ctx["chapter_plan"])
 
         return {"next_stage": "BUILD_CONTEXT", "context": ctx}
 
@@ -290,6 +344,25 @@ class WritingPipeline:
                     context_parts.append("## Story Bible\n" + "\n".join(summary_parts))
             except (json.JSONDecodeError, TypeError):
                 pass
+
+        # Imported planning documents are durable source material. They are
+        # deliberately kept separate from the editable forecast canvas: the
+        # former is a user-adopted writing reference, while canvas changes are
+        # prediction-only and never enter this context.
+        planning_sources = self.db.fetchall(
+            "SELECT source_type, filename, content FROM planning_sources WHERE project_id=? ORDER BY created_at, id",
+            (project_id,),
+        )
+        if planning_sources:
+            source_parts = []
+            for source in planning_sources:
+                content = str(source.get("content") or "")
+                if content:
+                    source_parts.append(
+                        f"【{source.get('source_type') or 'planning'} / {source.get('filename') or '未命名'}】\n{content[:4_000]}"
+                    )
+            if source_parts:
+                context_parts.append("## 用户导入的作品规划与写作技法（章节参考）\n" + "\n\n".join(source_parts))
 
         # 2. Previous chapter summaries.
         prev_chapters = self.db.fetchall(
@@ -385,7 +458,7 @@ class WritingPipeline:
             extra="\n\n".join(extra_parts),
         )
 
-        self.runtime.checkpoint(task["id"], "GENERATE_DRAFT", {
+        self._checkpoint(task, "GENERATE_DRAFT", {
             "stage": "GENERATE_DRAFT",
             "context": {**ctx, "generating": True},
         })
@@ -659,7 +732,7 @@ class WritingPipeline:
             extra="请直接输出修订后的完整章节正文。不要包含标题或元信息。",
         )
 
-        self.runtime.checkpoint(task["id"], "REVISION", {
+        self._checkpoint(task, "REVISION", {
             "stage": "REVISION",
             "context": {**ctx, "revising": True},
         })
@@ -808,7 +881,7 @@ class WritingPipeline:
                 ctx["completed"] = False
                 ctx["needs_author_decision"] = True
                 ctx["reason"] = "max_revisions_exceeded"
-                self.runtime.transition(task["id"], "needs_author_decision", detail={"reason": ctx["reason"]})
+                self._transition(task, "needs_author_decision", detail={"reason": ctx["reason"]})
                 return {"next_stage": "DONE", "context": ctx}
 
             if ctx.get("quality_gate") != "PASS" or not ctx.get("story_commit_id"):
@@ -832,7 +905,11 @@ class WritingPipeline:
             ctx["status_transition_error"] = str(exc)
             ctx["completed"] = False
             ctx["needs_author_decision"] = True
-            self.runtime.transition(task["id"], "needs_author_decision", detail={"reason": "chapter_status_transition_failed"})
+            self._transition(
+                task,
+                "needs_author_decision",
+                detail={"reason": "chapter_status_transition_failed"},
+            )
             return {"next_stage": "DONE", "context": ctx}
 
         ctx["completed"] = True

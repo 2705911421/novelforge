@@ -90,11 +90,15 @@ class ExportService:
             content = self._export_markdown(book, chapters)
         elif format == "txt":
             content = self._export_txt(book, chapters)
+        elif format == "docx":
+            self._export_docx(book, chapters, file_path)
+            content = None
         else:
             raise ValueError(f"Unsupported format: {format}")
 
         # Write file.
-        file_path.write_text(content, encoding="utf-8")
+        if content is not None:
+            file_path.write_text(content, encoding="utf-8")
 
         # Calculate stats.
         word_count = sum(len(ch.get("content", "")) for ch in chapters)
@@ -122,6 +126,39 @@ class ExportService:
             "word_count": word_count,
             "file_size": file_path.stat().st_size,
         }
+
+    def _export_docx(self, book: dict, chapters: list[dict], path: Path) -> None:
+        """Write a real Word document using the same SQLite read model."""
+        try:
+            from docx import Document
+            from docx.enum.text import WD_ALIGN_PARAGRAPH
+            from docx.shared import Pt
+        except ImportError as exc:
+            raise ValueError("导出 Word 需要安装 python-docx") from exc
+
+        document = Document()
+        normal = document.styles["Normal"]
+        normal.font.name = "宋体"
+        normal.font.size = Pt(12)
+        title = document.add_heading(str(book.get("title") or "未命名作品"), level=0)
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        document.add_paragraph(f"类型: {book.get('genre', '未分类')}")
+        document.add_paragraph(f"总字数: {sum(len(ch.get('content', '')) for ch in chapters)}")
+        document.add_paragraph(f"章节数: {len(chapters)}")
+        document.add_page_break()
+        for index, chapter in enumerate(chapters):
+            document.add_heading(
+                f"第{chapter['number']}章 {chapter.get('title') or '未命名章节'}",
+                level=1,
+            )
+            for paragraph in str(chapter.get("content") or "").splitlines():
+                text = paragraph.strip()
+                if text:
+                    document.add_paragraph(text)
+            if index < len(chapters) - 1:
+                document.add_page_break()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        document.save(str(path))
 
     def get_export_history(self, project_id: str) -> list[dict[str, Any]]:
         """Get export history for a project."""

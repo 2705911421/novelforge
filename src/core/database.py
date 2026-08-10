@@ -940,6 +940,203 @@ def _apply_v14(conn: sqlite3.Connection) -> None:
     _execute_sql_script(conn, PHASE_14_TASK_INTEGRITY_SQL)
 
 
+PHASE_15_PLOT_WORKSPACE_SQL = """
+CREATE TABLE IF NOT EXISTS plot_workspaces (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL UNIQUE REFERENCES books(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL DEFAULT 1,
+    graph JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS plot_workspace_revisions (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES plot_workspaces(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    graph JSON NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plot_workspace_revisions_workspace
+    ON plot_workspace_revisions(workspace_id, revision);
+"""
+
+
+def _apply_v15(conn: sqlite3.Connection) -> None:
+    """Add per-book planning settings and a durable editable plot canvas."""
+    _add_column_if_missing(conn, "projects", "target_volumes INTEGER NOT NULL DEFAULT 5")
+    _add_column_if_missing(conn, "projects", "style_profile JSON NOT NULL DEFAULT '{}'")
+    _execute_sql_script(conn, PHASE_15_PLOT_WORKSPACE_SQL)
+
+
+PHASE_16_CREATION_WORKFLOW_SQL = """
+CREATE TABLE IF NOT EXISTS creation_workflows (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL DEFAULT 'planned',
+    status TEXT NOT NULL DEFAULT 'planning',
+    seed TEXT NOT NULL DEFAULT '',
+    metadata JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS planning_sources (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    metadata JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, source_type, checksum)
+);
+
+CREATE INDEX IF NOT EXISTS idx_planning_sources_project
+    ON planning_sources(project_id, source_type, created_at);
+
+CREATE TABLE IF NOT EXISTS thought_sessions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'questioning',
+    seed TEXT NOT NULL DEFAULT '',
+    turns JSON NOT NULL DEFAULT '[]',
+    current_question TEXT NOT NULL DEFAULT '',
+    question_index INTEGER NOT NULL DEFAULT 0,
+    framework JSON NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS story_architecture_views (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    snapshot_id TEXT,
+    view_type TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    payload JSON NOT NULL DEFAULT '{}',
+    source_manifest JSON NOT NULL DEFAULT '[]',
+    generated_by TEXT NOT NULL DEFAULT 'planning-materials-projection',
+    readonly INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, view_type)
+);
+
+CREATE TABLE IF NOT EXISTS forecast_imports (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source_task_id TEXT,
+    target TEXT NOT NULL DEFAULT 'canvas',
+    branch JSON NOT NULL DEFAULT '{}',
+    canvas_revision INTEGER,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_forecast_imports_project
+    ON forecast_imports(project_id, created_at);
+"""
+
+
+def _apply_v16(conn: sqlite3.Connection) -> None:
+    """Add durable creation modes, planning inputs, read-only projections, and forecast audit."""
+    _execute_sql_script(conn, PHASE_16_CREATION_WORKFLOW_SQL)
+
+
+PHASE_17_AGENT_EXTENSIONS_SQL = """
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    transport TEXT NOT NULL DEFAULT 'stdio',
+    command TEXT NOT NULL DEFAULT '',
+    args JSON NOT NULL DEFAULT '[]',
+    url TEXT NOT NULL DEFAULT '',
+    environment JSON NOT NULL DEFAULT '{}',
+    headers JSON NOT NULL DEFAULT '{}',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    config JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (transport IN ('stdio', 'sse', 'streamable_http'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_enabled
+    ON mcp_servers(enabled, name);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_key
+    ON skills(key) WHERE key IS NOT NULL AND key <> '';
+"""
+
+
+def _apply_v17(conn: sqlite3.Connection) -> None:
+    """Add editable Agent prompts and durable user extension registries."""
+    _add_column_if_missing(conn, "agent_model_routes", "system_prompt TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(conn, "agent_model_routes", "system_prompt_version INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "skills", "key TEXT")
+    _add_column_if_missing(conn, "skills", "version INTEGER NOT NULL DEFAULT 1")
+    _add_column_if_missing(conn, "skills", "source TEXT NOT NULL DEFAULT 'builtin'")
+    _add_column_if_missing(conn, "skills", "config JSON NOT NULL DEFAULT '{}'")
+    _execute_sql_script(conn, PHASE_17_AGENT_EXTENSIONS_SQL)
+
+
+PHASE_18_AGENT_EXTENSION_SCOPE_SQL = """
+CREATE TABLE IF NOT EXISTS agent_extension_overrides (
+    -- Project IDs also identify legacy file-backed novels, so this scope table
+    -- intentionally keeps the string reference without a foreign key.
+    project_id TEXT NOT NULL,
+    extension_type TEXT NOT NULL,
+    extension_id TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(project_id, extension_type, extension_id),
+    CHECK (extension_type IN ('skill', 'mcp'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_extension_overrides_project
+    ON agent_extension_overrides(project_id, extension_type, enabled);
+"""
+
+
+def _apply_v18(conn: sqlite3.Connection) -> None:
+    """Add per-project enablement overrides for global Agent extensions."""
+    _execute_sql_script(conn, PHASE_18_AGENT_EXTENSION_SCOPE_SQL)
+
+
+PHASE_19_DRAFT_IMPORT_ANALYSIS_SQL = """
+CREATE TABLE IF NOT EXISTS draft_imports (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    story_bible_document_id TEXT,
+    language_plan_document_id TEXT,
+    draft_document_ids JSON NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'uploaded',
+    task_id TEXT,
+    report JSON NOT NULL DEFAULT '{}',
+    error_code TEXT,
+    error_detail TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (status IN ('uploaded', 'running', 'completed', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_draft_imports_project
+    ON draft_imports(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_draft_imports_task
+    ON draft_imports(task_id);
+"""
+
+
+def _apply_v19(conn: sqlite3.Connection) -> None:
+    """Persist imported draft batches and their model analysis reports."""
+    _execute_sql_script(conn, PHASE_19_DRAFT_IMPORT_ANALYSIS_SQL)
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -965,6 +1162,11 @@ _MIGRATIONS = (
     _Migration(12, "phase_12_character_themes", _apply_v12, PHASE_12_CHARACTER_THEMES_SCHEMA_SQL),
     _Migration(13, "phase_13_story_commit_integrity", _apply_v13, PHASE_13_STORY_COMMIT_INTEGRITY_SQL),
     _Migration(14, "phase_14_task_idempotency_unique", _apply_v14, PHASE_14_TASK_INTEGRITY_SQL),
+    _Migration(15, "phase_15_per_book_style_and_plot_workspace", _apply_v15, PHASE_15_PLOT_WORKSPACE_SQL),
+    _Migration(16, "phase_16_creation_workflow_and_planning_views", _apply_v16, PHASE_16_CREATION_WORKFLOW_SQL),
+    _Migration(17, "phase_17_agent_extensions", _apply_v17, PHASE_17_AGENT_EXTENSIONS_SQL),
+    _Migration(18, "phase_18_agent_extension_scope", _apply_v18, PHASE_18_AGENT_EXTENSION_SCOPE_SQL),
+    _Migration(19, "phase_19_draft_import_analysis", _apply_v19, PHASE_19_DRAFT_IMPORT_ANALYSIS_SQL),
 )
 
 

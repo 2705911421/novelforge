@@ -3,6 +3,7 @@
 from ..core.models import StoryProject, JointReview
 from ..llm.client import MultiModelManager
 from ..llm.prompts import PromptManager
+from ..pipeline.rules import genre_contract_lines
 
 
 class JointReviewer:
@@ -47,6 +48,9 @@ class JointReviewer:
             locations_info=locations_info,
             writing_requirements=project.writing_style or "无特殊要求",
         )
+        contract = genre_contract_lines(project.genre)
+        if contract:
+            prompt += "\n\n## 题材契约\n" + "\n".join(f"- {item}" for item in contract)
 
         messages = [{"role": "user", "content": prompt}]
         system = "你是一位资深的小说总编辑，负责确保长篇小说的整体质量与一致性。"

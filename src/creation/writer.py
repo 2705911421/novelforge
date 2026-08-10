@@ -5,6 +5,7 @@ from ..core.models import StoryProject, Chapter, ChapterStatus
 from ..core.memory import MemorySystem
 from ..llm.client import MultiModelManager
 from ..llm.prompts import PromptManager
+from ..pipeline.rules import genre_contract_lines
 
 
 class ChapterWriter:
@@ -51,10 +52,13 @@ class ChapterWriter:
             world_setting=world_setting,
             characters_info=characters_info,
             previous_context=previous_context,
-            writing_style=project.writing_style or "流畅自然的网文风格",
+            writing_style=project.style_guidance() or "流畅自然的网文风格",
             word_count_min=self.chapter_words_min,
             word_count_max=self.chapter_words_max,
         )
+        contract = genre_contract_lines(project.genre)
+        if contract:
+            prompt += "\n\n## 题材契约\n" + "\n".join(f"- {item}" for item in contract)
 
         if context:
             prompt += f"\n\n## 额外创作指导\n{context}"
@@ -100,6 +104,9 @@ class ChapterWriter:
             world_setting=world_setting,
             characters_info=characters_info,
         )
+        contract = genre_contract_lines(project.genre)
+        if contract:
+            prompt += "\n\n## 题材契约\n" + "\n".join(f"- {item}" for item in contract)
 
         messages = [{"role": "user", "content": prompt}]
         system = "你是一位专业的小说修订编辑，擅长精准修改而不破坏原有内容。"

@@ -9,6 +9,9 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
+from ..core.task_runtime import TaskStateError
+from ..creation.continuous_service import ContinuousWritingService
+
 console = Console()
 
 
@@ -242,10 +245,20 @@ def continuous(ctx, project_id, start, count, context):
     if not book:
         console.print(f"[red]项目没有 authoritative book: {project.id}[/]")
         return
-    task = TaskRuntime(project_mgr.story_repository.db).enqueue(
-        "continuous", project_id=project.id, book_id=book["id"],
-        data={"start": start, "count": count, "context": context},
-    )
+    runtime = TaskRuntime(project_mgr.story_repository.db)
+    configured_interval = config.get("continuous", "joint_review_interval", default=5)
+    if not isinstance(configured_interval, int) or isinstance(configured_interval, bool):
+        configured_interval = 5
+    try:
+        task = ContinuousWritingService(
+            project_mgr.story_repository.db,
+            _model_mgr,
+            project_mgr.story_repository,
+            runtime,
+            joint_review_interval=configured_interval,
+        ).start_continuous(project.id, book["id"], start, count, context)
+    except (TaskStateError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
     console.print(f"✅ 连续创作任务已排队 [dim](ID: {task['id']})[/]")
     console.print("运行 [cyan]novelforge worker[/] 以执行任务；状态会保存在 SQLite 中。")
 

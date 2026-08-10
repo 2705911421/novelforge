@@ -2,9 +2,13 @@
 projects/
 .references/
 .novelforge-backups/
+.novelforge-secrets/
 .phase5-*/
 .playwright-cli/
 output/
+exports/
+studio/
+test-output/
 *.db
 *.db-*
 *.sqlite
@@ -14,6 +18,8 @@ output/
 .mypy_cache/
 .pyright/
 .reasonix/
+.agents/
+skills-lock.json
 __pycache__/
 *.py[cod]
 *.log

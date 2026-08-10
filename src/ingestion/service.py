@@ -37,7 +37,7 @@ class DocumentRepository:
         self.max_bytes = max_bytes
 
     def create_upload(self, project_id: str, filename: str, payload: bytes, *, doc_type: str = "auto",
-                      mime_type: Optional[str] = None) -> tuple[dict[str, Any], bool]:
+                      mime_type: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> tuple[dict[str, Any], bool]:
         self._validate_project_id(project_id)
         safe_name, suffix = self._validate_filename(filename)
         if len(payload) > self.max_bytes:
@@ -67,7 +67,7 @@ class DocumentRepository:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
                     (document_id, project_id, safe_name, requested_type, attachment_ref.as_posix(), fingerprint,
                      mime_type or self._mime_for_suffix(suffix), len(payload), PARSER_VERSION,
-                     json.dumps({"requested_type": requested_type, "original_name": safe_name}, ensure_ascii=False)),
+                     json.dumps({**(metadata or {}), "requested_type": requested_type, "original_name": safe_name}, ensure_ascii=False)),
                 )
                 row = conn.execute("SELECT * FROM reference_documents WHERE id=?", (document_id,)).fetchone()
             if row is None:

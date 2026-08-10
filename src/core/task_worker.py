@@ -21,10 +21,13 @@ class PersistentTaskWorker:
     """
 
     def __init__(self, runtime: TaskRuntime, handlers: dict[str, Callable[[dict[str, Any]], Any]],
-                 *, lease_seconds: int = 60):
+                 *, lease_seconds: int = 60, retry_delay_seconds: int = 5):
         self.runtime = runtime
         self.handlers = handlers
         self.lease_seconds = lease_seconds
+        if retry_delay_seconds < 0:
+            raise ValueError("retry_delay_seconds must not be negative")
+        self.retry_delay_seconds = retry_delay_seconds
 
     async def execute_once(self, worker_id: str = "studio") -> Optional[dict]:
         task = self.runtime.claim(worker_id, lease_seconds=self.lease_seconds)
@@ -59,12 +62,20 @@ class PersistentTaskWorker:
         except TaskFailure as exc:
             return self.runtime.fail(
                 task["id"], exc.code, str(exc), retryable=exc.retryable,
+                retry_delay_seconds=(
+                    self.retry_delay_seconds
+                    if exc.retry_delay_seconds is None
+                    else exc.retry_delay_seconds
+                ),
                 lease_owner=worker_id
             )
         except Exception as exc:  # Handler errors must be observable and durable.
             code, retryable = self._classify_exception(exc)
-            return self.runtime.fail(task["id"], code, str(exc), retryable=retryable,
-                                     lease_owner=worker_id)
+            return self.runtime.fail(
+                task["id"], code, str(exc), retryable=retryable,
+                retry_delay_seconds=self.retry_delay_seconds,
+                lease_owner=worker_id,
+            )
         finally:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
