@@ -223,6 +223,7 @@ def test_studio_model_discovery_is_queued_without_provider_secret_in_task(tmp_pa
     response = TestClient(studio.app).post("/api/v1/services/custom-provider/models/discover")
     assert response.status_code == 200
     task = runtime.get(response.json()["taskId"])
+    assert task is not None
     assert task["type"] == "model-discovery"
     assert task["data"] == {"provider_id": "custom-provider"}
     assert "MIMO_API_KEY" not in str(task)

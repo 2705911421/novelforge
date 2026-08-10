@@ -73,7 +73,9 @@ def test_planning_import_is_durable_and_generates_read_only_views(tmp_path, monk
         completed = client.post(f"/api/v1/books/{book_id}/planning-sources/complete")
         assert completed.status_code == 200
         assert completed.json()["workflow"]["status"] == "ready"
-        assert runtime.get(completed.json()["aiTaskId"])["type"] == "planning-views-generate"
+        planning_task = runtime.get(completed.json()["aiTaskId"])
+        assert planning_task is not None
+        assert planning_task["type"] == "planning-views-generate"
         assert client.post(f"/api/v1/books/{book_id}/write-next", json={}).status_code == 200
         bible = client.get(f"/api/v1/books/{book_id}/story-bible").json()
         assert len(bible["steps"]) == 25
@@ -117,10 +119,13 @@ def test_thought_creation_questions_and_framework_are_durable(tmp_path):
     manager = ProjectManager(str(tmp_path), repository=repository)
     runtime = TaskRuntime(db)
     project = manager.create_project("念头作品", "科幻")
+    book = repository.book_for_project(project.id)
+    assert book is not None
+    book_id = book["id"]
     workflow = CreationWorkflowRepository(db)
     session = workflow.ensure_thought_session(project.id, "一个人寻找未来丢失的记忆")
     workflow.append_thought_turn(project.id, "user", "他发现记忆是自己主动删除的。")
-    clarify_task = runtime.enqueue("thought-clarify", project_id=project.id, book_id=repository.book_for_project(project.id)["id"], data={})
+    clarify_task = runtime.enqueue("thought-clarify", project_id=project.id, book_id=book_id, data={})
 
     class Response:
         def __init__(self, content):
@@ -135,17 +140,25 @@ def test_thought_creation_questions_and_framework_are_durable(tmp_path):
 
     handlers = LegacyTaskHandlers(manager, Model(), Config(project_path=str(tmp_path)), runtime).mapping()
     runtime.claim("thought-test-worker")
-    clarified = handlers["thought-clarify"](runtime.get(clarify_task["id"]))
+    clarified_task = runtime.get(clarify_task["id"])
+    assert clarified_task is not None
+    clarified = handlers["thought-clarify"](clarified_task)
     assert clarified["question"] == "删除记忆的代价是什么？"
     current = workflow.get_thought_session(project.id)
+    assert current is not None
     assert current["current_question"] == "删除记忆的代价是什么？"
-    framework_task = runtime.enqueue("thought-framework", project_id=project.id, book_id=repository.book_for_project(project.id)["id"], data={})
+    framework_task = runtime.enqueue("thought-framework", project_id=project.id, book_id=book_id, data={})
     runtime.claim("thought-test-worker")
-    result = handlers["thought-framework"](runtime.get(framework_task["id"]))
+    framework_runtime_task = runtime.get(framework_task["id"])
+    assert framework_runtime_task is not None
+    result = handlers["thought-framework"](framework_runtime_task)
     assert result["stepCount"] == 25
     bible = StoryBibleRepository(db).get(project.id)
+    assert bible is not None
     assert all(step["draft"] for step in bible["steps"])
-    assert workflow.get_thought_session(project.id)["status"] == "framework_ready"
+    final_session = workflow.get_thought_session(project.id)
+    assert final_session is not None
+    assert final_session["status"] == "framework_ready"
 
 
 def test_canvas_hide_and_forecast_import_do_not_touch_story_bible(tmp_path):
@@ -153,7 +166,9 @@ def test_canvas_hide_and_forecast_import_do_not_touch_story_bible(tmp_path):
     repository = StoryRepository(db)
     manager = ProjectManager(str(tmp_path), repository=repository)
     project = manager.create_project("预测隔离", "悬疑")
-    book_id = repository.book_for_project(project.id)["id"]
+    book = repository.book_for_project(project.id)
+    assert book is not None
+    book_id = book["id"]
     canvas = PlotWorkspaceRepository(db)
     graph, revision = canvas.load(book_id)
     source_id = graph["nodes"][0]["id"]
@@ -181,6 +196,8 @@ def test_canvas_hide_and_forecast_import_do_not_touch_story_bible(tmp_path):
     handlers = LegacyTaskHandlers(manager, model, Config(project_path=str(tmp_path)), runtime).mapping()
     task = runtime.enqueue("forecast", project_id=project.id, book_id=book_id, data={"branch_count": 1, "node_id": source_id})
     runtime.claim("forecast-test-worker")
-    handlers["forecast"](runtime.get(task["id"]))
+    forecast_task = runtime.get(task["id"])
+    assert forecast_task is not None
+    handlers["forecast"](forecast_task)
     prompt = json.loads(model.messages[-1])
     assert source_id not in {node["id"] for node in prompt["plot_canvas"]["graph"]["nodes"]}

@@ -39,7 +39,9 @@ def test_genre_catalog_contains_planning_and_limits_for_every_profile():
         assert profile["taboos"]
 
     assert resolve_genre_key("xianxia") == "玄幻修仙"
-    assert get_genre_profile("xianxia")["id"] == "xianxia"
+    profile = get_genre_profile("xianxia")
+    assert profile is not None
+    assert profile["id"] == "xianxia"
 
 
 def test_routed_prompts_are_structured_agent_contracts():
@@ -122,6 +124,7 @@ def test_draft_repository_can_attach_adjustment_plan_without_changing_imported_s
     repository.mark_running(record["id"])
     repository.complete(record["id"], {"verdict": "minor_drift"})
     updated = repository.update_report(record["id"], {"adjustment_plan": {"repair_queue": []}}, project_id="project-1", status="completed")
+    assert updated is not None
     assert updated["status"] == "completed"
     assert updated["draft_document_ids"] == ["chapter-1"]
     assert updated["report"]["adjustment_plan"]["repair_queue"] == []
@@ -139,11 +142,13 @@ def test_draft_import_repository_preserves_report_and_retry_state(tmp_path):
     repository.mark_running(record["id"])
     repository.complete(record["id"], {"verdict": "minor_drift", "drift_score": 12})
     completed = repository.get(record["id"], project_id="project-1")
+    assert completed is not None
     assert completed["status"] == "completed"
     assert completed["report"]["drift_score"] == 12
     with pytest.raises(Exception, match="only failed"):
         repository.reset_for_retry(record["id"], project_id="project-1")
     repository.fail(record["id"], "MODEL_FAILED", "provider unavailable")
     retried = repository.reset_for_retry(record["id"], project_id="project-1")
+    assert retried is not None
     assert retried["status"] == "uploaded"
     assert retried["report"] == {}

@@ -63,7 +63,9 @@ def continuous_deps(tmp_path: Path):
     database = Database(str(tmp_path / "authoritative.db"))
     repository = StoryRepository(database, workspace_root=tmp_path)
     project_id = repository.create_native_project("Continuous runtime", "fantasy")
-    book_id = repository.book_for_project(project_id)["id"]
+    book = repository.book_for_project(project_id)
+    assert book is not None
+    book_id = book["id"]
     runtime = TaskRuntime(database)
     return database, repository, runtime, project_id, book_id, tmp_path
 

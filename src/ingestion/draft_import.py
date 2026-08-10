@@ -242,7 +242,8 @@ def build_chapter_manifest(documents: Iterable[dict[str, Any]]) -> list[dict[str
     for index, document in enumerate(documents):
         if not isinstance(document, dict):
             continue
-        metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
+        raw_metadata = document.get("metadata")
+        metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
         relative_path = str(metadata.get("relativePath") or document.get("name") or f"document-{index + 1}")
         full_text = str(document.get("full_text") or document.get("text") or "")
         chapter_number, chapter_title, recognition = _chapter_match(full_text, relative_path)

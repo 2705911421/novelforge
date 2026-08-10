@@ -18,6 +18,7 @@ def test_task_read_model_has_chapter_name_progress_and_newest_first(tmp_path):
     runtime.claim("feature-worker")
     runtime.checkpoint(older["id"], "PRECHECK", {"stage": "PRECHECK"})
     current = runtime.get(older["id"])
+    assert current is not None
     assert current["displayName"] == "第3章-章节写作"
     assert current["progressPercent"] == 5
     assert current["total_steps"] > 0
@@ -30,6 +31,7 @@ def test_author_decision_task_can_continue_or_be_ended(tmp_path):
     runtime.claim("feature-worker")
     runtime.transition(task["id"], "needs_author_decision", error="需要作者检查")
     waiting = runtime.get(task["id"])
+    assert waiting is not None
     assert waiting["status"] == "needs_author_decision"
     assert runtime.retry(task["id"])["status"] == "queued"
 
@@ -51,6 +53,7 @@ def test_first_provider_can_be_saved_and_models_can_be_deleted(tmp_path, monkeyp
     }
 
     saved = repository.save_configuration({"providers": [provider], "models": [], "routes": {}})
+    assert saved is not None
     assert [item["id"] for item in saved["providers"]] == ["feature-provider"]
 
     saved = repository.save_configuration({
@@ -58,6 +61,7 @@ def test_first_provider_can_be_saved_and_models_can_be_deleted(tmp_path, monkeyp
         "models": [{"id": "feature-model", "providerId": "feature-provider", "name": "测试模型", "modelId": "feature-1"}],
         "routes": {},
     })
+    assert saved is not None
     assert len(saved["models"]) == 1
     repository.delete_model("feature-model")
     assert repository.configuration()["models"] == []

@@ -133,9 +133,11 @@ def test_studio_create_and_visualization_endpoints_use_new_book_settings(tmp_pat
         canvas = client.get(f"/api/v1/books/{book_id}/plot-canvas")
         assert canvas.status_code == 200
         assert canvas.json()["revision"] == 1
+        canvas_book = repository.book_for_project(book_id)
+        assert canvas_book is not None
         moved = client.post(
             f"/api/v1/books/{book_id}/plot-canvas/delta",
-            json={"delta": {"operations": [{"op": "move_node", "id": f"book:{repository.book_for_project(book_id)['id']}", "x": 640, "y": 80}]}, "expectedRevision": 1},
+            json={"delta": {"operations": [{"op": "move_node", "id": f"book:{canvas_book['id']}", "x": 640, "y": 80}]}, "expectedRevision": 1},
         )
         assert moved.status_code == 200
         stale = client.post(

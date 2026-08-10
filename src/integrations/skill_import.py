@@ -9,6 +9,7 @@ executed.
 from __future__ import annotations
 
 import base64
+import binascii
 import io
 import posixpath
 import re
@@ -352,7 +353,7 @@ def decode_data_url(value: str) -> bytes:
         raise SkillImportError("SKILL_FILE_INVALID", "folder upload content must be base64")
     try:
         data = base64.b64decode(encoded, validate=True)
-    except (ValueError, base64.binascii.Error) as exc:
+    except (ValueError, binascii.Error) as exc:
         raise SkillImportError("SKILL_FILE_INVALID", "folder upload content is not valid base64") from exc
     if len(data) > MAX_DOWNLOAD_BYTES:
         raise SkillImportError("SKILL_FILE_TOO_LARGE", "uploaded Skill file is too large")

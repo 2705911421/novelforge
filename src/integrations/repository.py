@@ -187,6 +187,7 @@ class SkillRepository:
         if not isinstance(payload, dict):
             raise ExtensionConfigurationError("SKILL_INVALID", "skill must be an object")
         skill_id = skill_id or (payload.get("id") if isinstance(payload.get("id"), str) else None) or generate_id()
+        assert skill_id is not None
         name = _string(payload.get("name"), "name", required=True, max_chars=120)
         requested_key = payload.get("key") or payload.get("skillKey")
         if not requested_key and skill_id:
@@ -244,7 +245,7 @@ class SkillRepository:
             raise ExtensionConfigurationError("SKILL_PERSISTENCE", "skill was not persisted")
         return result
 
-    def set_enabled(self, skill_id: str, enabled: bool) -> dict[str, Any]:
+    def set_enabled(self, skill_id: str, enabled: Any) -> dict[str, Any]:
         if not isinstance(enabled, bool):
             raise ExtensionConfigurationError("SKILL_ENABLED_INVALID", "enabled must be a boolean")
         with self.db.transaction() as conn:
@@ -350,6 +351,7 @@ class MCPServerRepository:
         if not isinstance(payload, dict):
             raise ExtensionConfigurationError("MCP_INVALID", "MCP server must be an object")
         server_id = server_id or (payload.get("id") if isinstance(payload.get("id"), str) else None) or generate_id()
+        assert server_id is not None
         name = _string(payload.get("name"), "name", required=True, max_chars=120)
         transport = _string(payload.get("transport") or "stdio", "transport", max_chars=32).lower()
         if transport == "streamable-http" or transport == "http":
@@ -400,7 +402,7 @@ class MCPServerRepository:
             raise ExtensionConfigurationError("MCP_PERSISTENCE", "MCP server was not persisted")
         return result
 
-    def set_enabled(self, server_id: str, enabled: bool) -> dict[str, Any]:
+    def set_enabled(self, server_id: str, enabled: Any) -> dict[str, Any]:
         if not isinstance(enabled, bool):
             raise ExtensionConfigurationError("MCP_ENABLED_INVALID", "enabled must be a boolean")
         with self.db.transaction() as conn:

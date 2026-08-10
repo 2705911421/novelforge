@@ -407,6 +407,8 @@ class PlotWorkspaceRepository:
                     if key in {"id", "source", "metadata"}:
                         continue
                     if key in {"x", "y"}:
+                        if not isinstance(value, (int, float)):
+                            raise PlotWorkspaceError("node coordinates must be numeric")
                         value = float(value)
                     node[key] = value
                 node["customized"] = True

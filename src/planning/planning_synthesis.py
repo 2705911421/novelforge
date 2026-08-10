@@ -37,7 +37,7 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
-def _clip(value: str, limit: int = 2_000) -> str:
+def _clip(value: Any, limit: int = 2_000) -> str:
     value = _text(value)
     return value if len(value) <= limit else value[:limit].rstrip() + "…"
 

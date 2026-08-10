@@ -74,10 +74,12 @@ def test_planning_synthesis_persists_readable_world_and_entities(tmp_path):
     )
     assert "planning-synthesis" in handlers.mapping()
 
+    book = repository.book_for_project(project_id)
+    assert book is not None
     task = runtime.enqueue(
         "planning-synthesis",
         project_id=project_id,
-        book_id=repository.book_for_project(project_id)["id"],
+        book_id=book["id"],
         data={},
     )
     claimed = runtime.claim("synthesis-test-worker")
@@ -89,12 +91,16 @@ def test_planning_synthesis_persists_readable_world_and_entities(tmp_path):
     assert world is not None
     assert "记忆" in world["world_setting"]
     assert '"content"' not in world["world_setting"]
-    assert db.fetchone("SELECT name FROM characters WHERE book_id=?", (repository.book_for_project(project_id)["id"],))["name"] == "陈遥"
+    character = db.fetchone("SELECT name FROM characters WHERE book_id=?", (book["id"],))
+    assert character is not None
+    assert character["name"] == "陈遥"
 
 
 def test_analytics_uses_latest_persisted_review(tmp_path, monkeypatch):
     db, repository, manager, project_id = _seed_planning(tmp_path)
-    book_id = repository.book_for_project(project_id)["id"]
+    book = repository.book_for_project(project_id)
+    assert book is not None
+    book_id = book["id"]
     repository.append_chapter_version(book_id, 1, "一段已经保存的章节正文。")
     ReviewRepository(db).save_review(
         project_id,
@@ -117,7 +123,9 @@ def test_analytics_uses_latest_persisted_review(tmp_path, monkeypatch):
 
 def test_export_read_model_uses_latest_persisted_review(tmp_path, monkeypatch):
     db, repository, manager, project_id = _seed_planning(tmp_path)
-    book_id = repository.book_for_project(project_id)["id"]
+    book = repository.book_for_project(project_id)
+    assert book is not None
+    book_id = book["id"]
     repository.append_chapter_version(book_id, 1, "用于导出统计的章节正文。")
     ReviewRepository(db).save_review(
         project_id,
@@ -142,7 +150,9 @@ def test_export_read_model_uses_latest_persisted_review(tmp_path, monkeypatch):
 
 def test_download_export_supports_docx(tmp_path, monkeypatch):
     db, repository, manager, project_id = _seed_planning(tmp_path)
-    book_id = repository.book_for_project(project_id)["id"]
+    book = repository.book_for_project(project_id)
+    assert book is not None
+    book_id = book["id"]
     repository.append_chapter_version(book_id, 1, "可以写入 Word 文件的章节正文。")
 
     from src.web import studio

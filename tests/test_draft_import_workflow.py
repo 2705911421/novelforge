@@ -66,6 +66,7 @@ def _fixture(tmp_path, model):
     manager = ProjectManager(str(tmp_path), repository=repository)
     project = manager.create_project("Draft workflow", "xianxia")
     book = repository.book_for_project(project.id)
+    assert book is not None
     runtime = TaskRuntime(db)
     handlers = LegacyTaskHandlers(manager, model, Config(project_path=str(tmp_path)), runtime)
     documents = handlers.document_repository
@@ -105,7 +106,9 @@ def _fixture(tmp_path, model):
 def _run_task(runtime, handlers, task):
     claimed = runtime.claim("draft-import-test")
     assert claimed and claimed["id"] == task["id"]
-    return handlers.mapping()["draft-import-analysis"](runtime.get(task["id"]))
+    runtime_task = runtime.get(task["id"])
+    assert runtime_task is not None
+    return handlers.mapping()["draft-import-analysis"](runtime_task)
 
 
 def test_checkpointed_analysis_resumes_failed_window_without_mutating_canon(tmp_path):
@@ -120,6 +123,7 @@ def test_checkpointed_analysis_resumes_failed_window_without_mutating_canon(tmp_
     with pytest.raises(RuntimeError, match="simulated window failure"):
         _run_task(runtime, handlers, first_task)
     failed = handlers.draft_import_repository.get(imported["id"], project_id=project.id)
+    assert failed is not None
     assert failed["status"] == "failed"
     assert failed["report"]["_analysis_checkpoint"]["completed_windows"] == ["window-0001"]
 
@@ -140,7 +144,9 @@ def test_checkpointed_analysis_resumes_failed_window_without_mutating_canon(tmp_
     assert report["source_priority"][1]["priority"] == 90
     assert report["source_priority"][2]["priority"] == 50
     assert db.count("chapters", "book_id=?", (book["id"],)) == 0
-    assert repository.book_for_project(project.id)["id"] == book["id"]
+    persisted_book = repository.book_for_project(project.id)
+    assert persisted_book is not None
+    assert persisted_book["id"] == book["id"]
 
 
 def test_adjustment_plan_is_explicit_and_keeps_imported_sources_unchanged(tmp_path):
@@ -161,8 +167,11 @@ def test_adjustment_plan_is_explicit_and_keeps_imported_sources_unchanged(tmp_pa
     )
     claimed = runtime.claim("draft-import-adjustment-test")
     assert claimed and claimed["id"] == adjustment_task["id"]
-    result = handlers.mapping()["draft-import-adjustment-plan"](runtime.get(adjustment_task["id"]))
+    adjustment_runtime_task = runtime.get(adjustment_task["id"])
+    assert adjustment_runtime_task is not None
+    result = handlers.mapping()["draft-import-adjustment-plan"](adjustment_runtime_task)
     saved = handlers.draft_import_repository.get(imported["id"], project_id=project.id)
+    assert saved is not None
     assert result["status"] == "completed"
     assert saved["report"]["adjustment_plan"]["repair_queue"]
     assert saved["draft_document_ids"] == imported["draft_document_ids"]

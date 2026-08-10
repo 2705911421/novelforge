@@ -357,131 +357,6 @@ class LegacyTaskHandlers:
         return result
 
     def draft_import_analysis(self, task: dict[str, Any]) -> dict[str, Any]:
-        """Compare imported draft evidence against higher-priority planning sources."""
-        project_id = task.get("project_id") or task.get("book_id")
-        import_id = self._text((task.get("data") or {}).get("draft_import_id"))
-        if not isinstance(project_id, str) or not import_id:
-            raise ValueError("draft import analysis requires project and import ids")
-        record = self.draft_import_repository.get(import_id, project_id=project_id)
-        if record is None:
-            raise KeyError(f"draft import not found: {import_id}")
-        self.draft_import_repository.mark_running(import_id)
-        try:
-            source_ids = [
-                item for item in (
-                    record.get("story_bible_document_id"),
-                    record.get("language_plan_document_id"),
-                    *(record.get("draft_document_ids") or []),
-                ) if isinstance(item, str) and item
-            ]
-            documents: dict[str, dict[str, Any]] = {}
-            for document_id in source_ids:
-                document = self.document_repository.get(document_id, project_id=project_id)
-                if document is None:
-                    raise ValueError(f"draft import source document is missing: {document_id}")
-                if document.get("status") != "indexed":
-                    self.runtime.checkpoint(task["id"], "indexing-source", {"document_id": document_id})
-                    self.document_ingestion.ingest(document_id, project_id=project_id)
-                documents[document_id] = self.document_repository.get(document_id, project_id=project_id) or document
-
-            def text_for(document_id: str) -> str:
-                return "\n\n".join(
-                    str(chunk.get("content") or "").strip()
-                    for chunk in self.document_repository.chunks(document_id, project_id=project_id)
-                    if str(chunk.get("content") or "").strip()
-                ).strip()
-
-            story_id = record.get("story_bible_document_id")
-            language_id = record.get("language_plan_document_id")
-            story_text = bounded_excerpt(text_for(story_id), 60_000) if story_id else ""
-            language_text = bounded_excerpt(text_for(language_id), 45_000) if language_id else ""
-            draft_ids = [item for item in (record.get("draft_document_ids") or []) if item in documents]
-            draft_evidence: list[dict[str, Any]] = []
-            omitted = 0
-            for document_id in draft_ids[:300]:
-                document = documents[document_id]
-                full_text = text_for(document_id)
-                metadata = document.get("metadata") or {}
-                draft_evidence.append({
-                    "source": metadata.get("relativePath") or document.get("name") or document_id,
-                    "documentType": document.get("doc_type"),
-                    "characterCount": len(full_text),
-                    "excerpt": bounded_excerpt(full_text, 2_400),
-                })
-            if len(draft_ids) > len(draft_evidence):
-                omitted = len(draft_ids) - len(draft_evidence)
-
-            prompt = {
-                "prioritySources": {
-                    "storyBible": {
-                        "present": bool(story_id),
-                        "filename": documents.get(story_id, {}).get("name") if story_id else None,
-                        "content": story_text,
-                    },
-                    "languageOverview": {
-                        "present": bool(language_id),
-                        "filename": documents.get(language_id, {}).get("name") if language_id else None,
-                        "content": language_text,
-                    },
-                },
-                "draftScope": {
-                    "totalFiles": len(draft_ids),
-                    "sampledFiles": len(draft_evidence),
-                    "omittedFiles": omitted,
-                    "evidence": draft_evidence,
-                },
-                "requiredComparison": ["plot", "character", "world", "timeline", "style", "pacing", "promise"],
-            }
-            self.runtime.checkpoint(
-                task["id"],
-                "analysis-model-call",
-                {"draft_files": len(draft_ids), "sampled_files": len(draft_evidence), "story_bible": bool(story_id), "language_plan": bool(language_id)},
-            )
-            response = self.model_manager.chat(
-                [{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}],
-                system=DRAFT_IMPORT_ANALYSIS_SYSTEM_PROMPT,
-                task_type="draft-import-analysis",
-                max_tokens=12_000,
-            )
-            report = self._parse_json_response(response.content)
-            if not isinstance(report, dict):
-                raise ValueError("draft import analysis model returned no JSON object")
-            verdicts = {"aligned", "minor_drift", "major_drift", "insufficient_evidence"}
-            verdict = report.get("verdict") if report.get("verdict") in verdicts else "insufficient_evidence"
-            score = report.get("drift_score")
-            if isinstance(score, bool) or not isinstance(score, (int, float)):
-                score = None
-            else:
-                score = max(0, min(100, round(float(score))))
-            normalized = {
-                **report,
-                "verdict": verdict,
-                "drift_score": score,
-                "scope": {
-                    **(report.get("scope") if isinstance(report.get("scope"), dict) else {}),
-                    "draft_files": len(draft_ids),
-                    "sampled_files": len(draft_evidence),
-                    "omitted_files": omitted,
-                },
-                "priority_sources": report.get("priority_sources") if isinstance(report.get("priority_sources"), list) else [],
-                "drift_dimensions": report.get("drift_dimensions") if isinstance(report.get("drift_dimensions"), list) else [],
-                "chapter_findings": report.get("chapter_findings") if isinstance(report.get("chapter_findings"), list) else [],
-                "continuation_plan": report.get("continuation_plan") if isinstance(report.get("continuation_plan"), dict) else {"next_chapters": [], "repair_first": [], "do_not_change": []},
-                "limitations": report.get("limitations") if isinstance(report.get("limitations"), list) else [],
-                "analysis_meta": {
-                    "source_priority": ["story_bible", "language_plan", "draft"],
-                    "generated_by": "default-text-model-reviewer-route",
-                    "source_document_ids": source_ids,
-                },
-            }
-            saved = self.draft_import_repository.complete(import_id, normalized)
-            self.runtime.checkpoint(task["id"], "analysis-complete", {"verdict": verdict, "drift_score": score})
-            return {"draftImportId": import_id, "report": saved["report"], "status": saved["status"]}
-        except Exception as exc:
-            self.draft_import_repository.fail(import_id, "DRAFT_ANALYSIS_FAILED", str(exc))
-            raise
-
-    def draft_import_analysis(self, task: dict[str, Any]) -> dict[str, Any]:
         """Run chapter-window drift analysis with durable resume checkpoints."""
         project_id = task.get("project_id") or task.get("book_id")
         import_id = self._text((task.get("data") or {}).get("draft_import_id"))
@@ -759,7 +634,8 @@ class LegacyTaskHandlers:
                     for item in (window_report.get("chapter_findings") or [])
                     if isinstance(item, dict)
                 ]
-            limitations = report.get("limitations") if isinstance(report.get("limitations"), list) else []
+            raw_limitations = report.get("limitations")
+            limitations: list[Any] = raw_limitations if isinstance(raw_limitations, list) else []
             limitations = [*limitations, *coverage_warnings]
             if not story_id:
                 limitations.append("Story Bible/planning source was not supplied; comparison authority is incomplete")

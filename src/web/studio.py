@@ -5,6 +5,7 @@ NovelForge Web Application - 完整对标inkOS Studio
 
 import asyncio
 import base64
+import binascii
 import contextlib
 from copy import deepcopy
 import io
@@ -42,9 +43,7 @@ from src.core.task_worker import PersistentTaskWorker
 from src.creation.task_handlers import LegacyTaskHandlers
 from src.creation.continuous_service import ContinuousWritingService
 from src.core.legacy_migration import LegacyMigrationError, LegacyMigrationService
-from src.core.models import (
-    StoryProject, Chapter, ChapterStatus
-)
+from src.core.models import StoryProject, Chapter
 from src.llm.model_runtime import ModelConfigurationError, build_model_runtime
 from src.ingestion.service import DocumentIngestionError, DocumentRepository, DEFAULT_MAX_BYTES, SUPPORTED_SUFFIXES
 from src.ingestion.draft_import import DraftImportError, DraftImportRepository
@@ -1852,7 +1851,11 @@ async def import_skill(request: Request):
                 package = await import_github_skill(github_url.strip())
                 origin = github_url.strip()
             else:
-                uploads = [value for key, value in form.multi_items() if key in {"file", "package", "files", "folderFiles"} and hasattr(value, "read")]
+                uploads = [
+                    cast(UploadFile, value)
+                    for key, value in form.multi_items()
+                    if key in {"file", "package", "files", "folderFiles"} and hasattr(value, "read")
+                ]
                 if not uploads:
                     raise SkillImportError("SKILL_PACKAGE_EMPTY", "please provide a GitHub URL or Skill package")
                 entries: dict[str, bytes] = {}
@@ -1890,10 +1893,10 @@ async def import_skill(request: Request):
         }
     except SkillImportError as exc:
         raise _skill_import_http_error(exc) from exc
-    except (ValueError, base64.binascii.Error) as exc:
-        raise _skill_import_http_error(SkillImportError("SKILL_FILE_INVALID", "Skill folder content is invalid")) from exc
     except ExtensionConfigurationError as exc:
         raise _extension_http_error(exc) from exc
+    except (ValueError, binascii.Error) as exc:
+        raise _skill_import_http_error(SkillImportError("SKILL_FILE_INVALID", "Skill folder content is invalid")) from exc
 
 
 @app.post("/api/v1/skills")
@@ -2739,7 +2742,8 @@ async def create_draft_import(book_id: str, request: Request):
         story_upload = form.get("storyBible")
         language_upload = form.get("languagePlan")
         raw_draft_uploads = [
-            value for key, value in form.multi_items()
+            cast(UploadFile, value)
+            for key, value in form.multi_items()
             if key in {"draftFiles", "draftFile", "file"} and hasattr(value, "read")
         ]
         if not raw_draft_uploads:
@@ -2749,10 +2753,11 @@ async def create_draft_import(book_id: str, request: Request):
         language_document_id: Optional[str] = None
         draft_entries: list[tuple[str, bytes]] = []
         if story_upload is not None and hasattr(story_upload, "read"):
-            story_payload = await _read_upload(story_upload, max_bytes=DEFAULT_MAX_BYTES)
-            story_name = _safe_draft_relative_path(story_upload.filename or "story-bible.md")
+            story_file = cast(UploadFile, story_upload)
+            story_payload = await _read_upload(story_file, max_bytes=DEFAULT_MAX_BYTES)
+            story_name = _safe_draft_relative_path(story_file.filename or "story-bible.md")
             story_document, _ = document_repository.create_upload(
-                book_id, Path(story_name).name, story_payload, doc_type="world", mime_type=story_upload.content_type,
+                book_id, Path(story_name).name, story_payload, doc_type="world", mime_type=story_file.content_type,
                 metadata={"sourceRole": "story_bible", "relativePath": story_name, "priority": 100},
             )
             story_document_id = story_document["id"]
@@ -2762,10 +2767,11 @@ async def create_draft_import(book_id: str, request: Request):
                     metadata={"documentId": story_document_id, "sourceRole": "story_bible", "priority": 100},
                 )
         if language_upload is not None and hasattr(language_upload, "read"):
-            language_payload = await _read_upload(language_upload, max_bytes=DEFAULT_MAX_BYTES)
-            language_name = _safe_draft_relative_path(language_upload.filename or "language-plan.md")
+            language_file = cast(UploadFile, language_upload)
+            language_payload = await _read_upload(language_file, max_bytes=DEFAULT_MAX_BYTES)
+            language_name = _safe_draft_relative_path(language_file.filename or "language-plan.md")
             language_document, _ = document_repository.create_upload(
-                book_id, Path(language_name).name, language_payload, doc_type="style", mime_type=language_upload.content_type,
+                book_id, Path(language_name).name, language_payload, doc_type="style", mime_type=language_file.content_type,
                 metadata={"sourceRole": "language_plan", "relativePath": language_name, "priority": 90},
             )
             language_document_id = language_document["id"]

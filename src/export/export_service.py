@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from src.core.database import Database, generate_id
 
@@ -132,12 +132,13 @@ class ExportService:
         try:
             from docx import Document
             from docx.enum.text import WD_ALIGN_PARAGRAPH
+            from docx.styles.style import ParagraphStyle
             from docx.shared import Pt
         except ImportError as exc:
             raise ValueError("导出 Word 需要安装 python-docx") from exc
 
         document = Document()
-        normal = document.styles["Normal"]
+        normal = cast(ParagraphStyle, document.styles["Normal"])
         normal.font.name = "宋体"
         normal.font.size = Pt(12)
         title = document.add_heading(str(book.get("title") or "未命名作品"), level=0)

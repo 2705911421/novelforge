@@ -480,7 +480,12 @@ class TaskRuntime:
         task["progress"] = progress
         task["total_steps"] = total_steps
         task["progressPercent"] = progress
-        task["operationLabel"] = TASK_OPERATION_LABELS.get(task.get("type"), "后台处理")
+        task_type = task.get("type")
+        task["operationLabel"] = (
+            TASK_OPERATION_LABELS.get(task_type, "后台处理")
+            if isinstance(task_type, str)
+            else "后台处理"
+        )
         chapter = self._chapter_number(task.get("data", {}))
         task["chapterNumber"] = chapter
         task["displayName"] = (
@@ -493,7 +498,7 @@ class TaskRuntime:
         if not isinstance(data, dict):
             return None
         for key in ("chapter_number", "chapterNumber", "chapter", "current_chapter", "currentChapter", "start_chapter", "startChapter", "start"):
-            value = data.get(key)
+            value: Any = data.get(key)
             try:
                 number = int(value)
             except (TypeError, ValueError):

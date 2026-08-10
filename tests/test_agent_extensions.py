@@ -239,4 +239,5 @@ def test_thought_chat_claims_planner_route_and_completes_durable_task(tmp_path, 
     assert response.json()["reply"] == "规划师提问"
     assert seen_roles == ["planner"]
     task = TaskRuntime(db).get(response.json()["taskId"])
+    assert task is not None
     assert task["status"] == "completed"
