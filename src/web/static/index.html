@@ -215,6 +215,29 @@ select.input{cursor:pointer}
 .fs-card{border-left:3px solid var(--accent);padding:12px 14px;background:var(--bg);border-radius:var(--radius-sm);margin-bottom:10px}
 .fs-card.planted{border-left-color:var(--warning)}
 .fs-card.paid{border-left-color:var(--success)}
+.planning-gate{align-items:flex-start}
+.planning-gate-content{display:flex;flex-direction:column;gap:6px;min-width:0;flex:1}
+.planning-gate-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+.task-detail-modal .kv{align-items:flex-start}
+.task-detail-modal .kv span{flex:0 0 90px}
+.task-detail-modal .kv b{flex:1;max-width:none;text-align:left;white-space:pre-wrap;overflow-wrap:anywhere}
+.task-kv-value{flex:1;min-width:0;text-align:left;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6}
+.task-run{border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;margin-top:12px;background:var(--bg)}
+.task-run:first-child{margin-top:0}
+.task-run-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.task-run-section{margin-top:10px}
+.task-run-label{color:var(--text-muted);font-size:12px;font-weight:700;margin-bottom:6px}
+.task-prompt{margin:0;padding:12px;background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);font:12.5px/1.65 'SF Mono',Consolas,monospace;white-space:pre-wrap;overflow:auto;max-height:360px;text-align:left}
+.task-output{border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;background:var(--bg-card);max-height:560px;overflow:auto;text-align:left}
+.markdown-body{font-size:13.5px;line-height:1.8;text-align:left;overflow-wrap:anywhere}
+.markdown-body h1,.markdown-body h2,.markdown-body h3,.markdown-body h4{margin:14px 0 8px;line-height:1.35}
+.markdown-body h1{font-size:20px}.markdown-body h2{font-size:17px}.markdown-body h3{font-size:15px}.markdown-body h4{font-size:14px}
+.markdown-body p{margin:8px 0}.markdown-body ul,.markdown-body ol{margin:8px 0 8px 22px}.markdown-body li{margin:3px 0}
+.markdown-body blockquote{margin:10px 0;padding:8px 12px;border-left:3px solid var(--accent);color:var(--text-muted);background:rgba(88,166,255,.06)}
+.markdown-body pre{margin:10px 0;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:auto;text-align:left}
+.markdown-body code{font-family:'SF Mono',Consolas,monospace;font-size:.92em}.markdown-body :not(pre)>code{padding:2px 5px;background:var(--secondary);border-radius:4px}
+.markdown-body a{color:var(--accent);text-decoration:underline}
+@media(max-width:700px){.task-detail-modal .kv{display:block}.task-detail-modal .kv span{display:block;margin-bottom:4px}.task-detail-modal .kv b{display:block}.task-run{padding:10px}.task-prompt,.task-output{max-height:420px}}
 </style>
 <link rel="stylesheet" href="/static/studio-theme.css?v=20260811-model-progress-1" onerror="this.onerror=null;this.href='studio-theme.css'">
 </head>
@@ -285,7 +308,7 @@ const NAV = [
   {id:'forecast',label:'剧情推演',navGroup:'创作与审查',icon:'M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z M12 9a3 3 0 100 6 3 3 0 000-6z',bookOnly:true},
   {id:'export',label:'导出交付',navGroup:'交付',icon:'M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4 M7 10l5 5 5-5 M12 15V3',bookOnly:true},
   {sec:'系统'},
-  {id:'tasks',label:'任务管理',icon:'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2 M9 3h6a2 2 0 012 2v0a2 2 0 01-2 2H9a2 2 0 01-2-2v0a2 2 0 012-2z'},
+  {id:'tasks',label:'任务管理',navGroup:'创作与审查',icon:'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2 M9 3h6a2 2 0 012 2v0a2 2 0 01-2 2H9a2 2 0 01-2-2v0a2 2 0 012-2z',bookOnly:true},
   {id:'genres',label:'题材库',icon:'M4 19.5A2.5 2.5 0 016.5 17H20 M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z'},
   {id:'settings',label:'全局创作参数',icon:'M12 20h9 M16.5 3.5a2.12 2.12 0 013 3L7 19l-4 1 1-4z'},
   {id:'import',label:'导入中心',icon:'M12 3v12 M8 11l4 4 4-4 M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4'},
@@ -530,7 +553,16 @@ async function api(method, path, body, isForm){
     if(body && !isForm){opts.headers['Content-Type']='application/json';opts.body=JSON.stringify(body);}
     if(isForm){opts.body=body;}
     const res=await fetch('/api/v1'+path,opts);
-    if(!res.ok){const e=await res.json().catch(()=>({detail:res.statusText}));const detail=e.detail||e.message||'请求失败';throw new Error(typeof detail==='string'?detail:(detail.message||detail.code||'请求失败'));}
+    if(!res.ok){
+      const e=await res.json().catch(()=>({detail:res.statusText}));
+      const detail=e.detail||e.message||'请求失败';
+      const error=new Error(typeof detail==='string'?detail:(detail.message||detail.code||'请求失败'));
+      error.status=res.status;
+      error.code=typeof detail==='object'?(detail.code||''):e.code||'';
+      error.detail=detail;
+      error.payload=e;
+      throw error;
+    }
     const ct=res.headers.get('content-type')||'';
     const data=ct.includes('json')?await res.json():await res.text();
     if(requestId){modelWork.attachTaskIds(data, modelLabel);modelWork.endRequest(requestId);}
@@ -560,6 +592,25 @@ function closeModal(){document.getElementById('modal-root').innerHTML='';}
 // ===== Helpers =====
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function escAttr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function planningReadinessSummary(readiness){
+  if(!readiness)return '';
+  return `25 步 ${Number(readiness.storyBibleConfirmed||0)}/${Number(readiness.storyBibleTotal||25)} · 卷 ${Number(readiness.volumeCount||0)}/${Number(readiness.volumeTarget||0)} · 故事弧 ${Number(readiness.arcCount||0)}/${Number(readiness.arcTarget||0)} · 章节目标 ${Number(readiness.chapterPlanCount||0)}/${Number(readiness.chapterTarget||0)}`;
+}
+function planningGateMarkup(readiness,mode){
+  if(!readiness||readiness.ready)return '';
+  const missingSteps=(readiness.missingStepKeys||[]).slice(0,8).join('、');
+  const missingPlan=(readiness.missingPlan||[]).slice(0,4).join('；');
+  const reasons=[missingSteps?`待完成的 25 步：${missingSteps}`:'',missingPlan].filter(Boolean).join('；')||'规划内容还需要补充并确认。';
+  const lead=mode==='thought'?'念头创作必须先通过 AI 对话和 25 步向导，把念头整理成可执行的完整规划。':'开始正文前必须先完成 25 步向导，并补齐每卷、每段故事弧、每章的目标计划。';
+  return `<div class="warn-banner planning-gate"><div class="planning-gate-content"><b>当前不能开始正文创作</b><span>${esc(lead)}</span><span class="dim-note">${esc(reasons)}</span><span class="dim-note">进度：${esc(planningReadinessSummary(readiness))}</span><div class="planning-gate-actions"><button class="btn btn-sm btn-primary" onclick="go('chat')">与 AI 助手对话</button><button class="btn btn-sm btn-secondary" onclick="go('wizard')">继续 25 步向导</button></div></div></div>`;
+}
+function renderPlanningGate(target,error){
+  if(!target)return false;
+  const detail=error?.detail?.code?error.detail:error?.payload?.detail?.code?error.payload.detail:null;
+  if(error?.code!=='PLANNING_REQUIRED'&&detail?.code!=='PLANNING_REQUIRED')return false;
+  target.innerHTML=planningGateMarkup(detail?.planningReadiness||null,detail?.workflow?.mode||'thought')||'<div class="warn-banner">当前作品尚未完成创作前置规划，请先打开 25 步向导。</div>';
+  return true;
+}
 function scoreColor(s){return s>=93?'var(--success)':s>=80?'var(--warning)':'var(--error)';}
 function statusBadge(st){
   const m={approved:['badge-success','已通过'],committed:['badge-success','已提交'],reviewing:['badge-warning','审查中'],draft:['badge-muted','草稿'],drafted:['badge-info','已写草稿'],writing:['badge-info','创作中'],revising:['badge-warning','修订中'],uploaded:['badge-muted','待分析'],pending:['badge-muted','等待领取'],queued:['badge-info','已排队'],running:['badge-info','运行中'],paused:['badge-warning','已暂停'],cancelling:['badge-warning','取消中'],completed:['badge-success','已完成'],failed:['badge-error','失败'],cancelled:['badge-muted','已取消'],needs_author_decision:['badge-error','需要作者决定']};
@@ -639,10 +690,70 @@ function readableTaskRows(value){
   if(typeof value!=='object')return `<p class="text-sm" style="white-space:pre-wrap;line-height:1.7">${esc(taskValueText(value))}</p>`;
   const hidden=new Set(['raw','metadata','sourceDocuments','sections','events','payload']);
   const rows=Object.entries(value).filter(([key,item])=>!hidden.has(key)&&item!==undefined&&item!==null&&item!=='').slice(0,24);
-  return rows.map(([key,item])=>`<div class="kv"><span>${esc(taskFieldLabel(key))}</span><b style="white-space:pre-wrap;text-align:right;max-width:72%">${esc(taskValueText(item))}</b></div>`).join('')||'<p class="dim-note">没有可展示的结果。</p>';
+  return rows.map(([key,item])=>`<div class="kv"><span>${esc(taskFieldLabel(key))}</span><div class="task-kv-value">${esc(taskValueText(item))}</div></div>`).join('')||'<p class="dim-note">没有可展示的结果。</p>';
 }
 function readableTaskResult(value,title='执行结果'){
   return `<div class="card"><h3>${esc(title)}</h3>${readableTaskRows(value)}</div>`;
+}
+function markdownInline(value){
+  let text=esc(value);
+  const codeTokens=[];
+  text=text.replace(/`([^`\n]+)`/g,(_,content)=>{const index=codeTokens.push(`<code>${content}</code>`)-1;return `\u0000${index}\u0000`;});
+  text=text.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>');
+  text=text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>');
+  text=text.replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>').replace(/__([^_\n]+)__/g,'<strong>$1</strong>');
+  text=text.replace(/_([^_\n]+)_/g,'<em>$1</em>');
+  text=text.replace(/\u0000(\d+)\u0000/g,(_,index)=>codeTokens[Number(index)]||'');
+  return text;
+}
+function markdownToHtml(value){
+  const source=String(value==null?'':value).replace(/\r\n?/g,'\n');
+  if(!source.trim())return '<p class="dim-note">模型没有返回内容。</p>';
+  const lines=source.split('\n');
+  let html='',paragraph=[],listType='',inCode=false,codeLanguage='',codeLines=[];
+  const flushParagraph=()=>{if(paragraph.length){html+=`<p>${paragraph.map(markdownInline).join('<br>')}</p>`;paragraph=[];}};
+  const closeList=()=>{if(listType){html+=`</${listType}>`;listType='';}};
+  lines.forEach(raw=>{
+    const trimmed=raw.trim();
+    if(inCode){
+      if(/^```/.test(trimmed)){html+=`<pre><code${codeLanguage?` class="language-${escAttr(codeLanguage)}"`:''}>${esc(codeLines.join('\n'))}</code></pre>`;inCode=false;codeLanguage='';codeLines=[];}
+      else codeLines.push(raw);
+      return;
+    }
+    if(/^```/.test(trimmed)){flushParagraph();closeList();inCode=true;codeLanguage=trimmed.slice(3).trim();return;}
+    if(!trimmed){flushParagraph();closeList();return;}
+    const heading=trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if(heading){flushParagraph();closeList();const level=heading[1].length;html+=`<h${level}>${markdownInline(heading[2])}</h${level}>`;return;}
+    if(/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)){flushParagraph();closeList();html+='<hr>';return;}
+    const unordered=trimmed.match(/^[-*+]\s+(.+)$/), ordered=trimmed.match(/^\d+[.)]\s+(.+)$/);
+    if(unordered||ordered){flushParagraph();const type=ordered?'ol':'ul';if(listType!==type){closeList();html+=`<${type}>`;listType=type;}html+=`<li>${markdownInline((unordered||ordered)[1])}</li>`;return;}
+    if(/^>\s?/.test(trimmed)){flushParagraph();closeList();html+=`<blockquote>${markdownInline(trimmed.replace(/^>\s?/,''))}</blockquote>`;return;}
+    closeList();paragraph.push(trimmed);
+  });
+  if(inCode)html+=`<pre><code>${esc(codeLines.join('\n'))}</code></pre>`;
+  flushParagraph();closeList();
+  return html;
+}
+function generationReferenceText(reference,kind){
+  if(reference===null||reference===undefined)return '';
+  if(typeof reference==='string')return reference;
+  if(kind==='input'){
+    if(typeof reference.prompt==='string'&&reference.prompt.trim())return reference.prompt;
+    const system=typeof reference.system_prompt==='string'?reference.system_prompt:'';
+    const messages=Array.isArray(reference.messages)?reference.messages:[];
+    if(system||messages.length)return [system?`[system]\n${system}`:'',...messages.map(message=>`[${message?.role||'message'}]\n${message?.content||''}`)].filter(Boolean).join('\n\n');
+  }
+  if(kind==='output'&&typeof reference.content==='string')return reference.content;
+  return '';
+}
+function renderGenerationRun(run,index){
+  const input=run.input_reference||run.inputReference||{};
+  const output=run.output_reference||run.outputReference||{};
+  const prompt=generationReferenceText(input,'input');
+  const content=generationReferenceText(output,'output');
+  const fallbackPrompt=prompt||'历史任务未保存完整输入提示词。';
+  const fallbackOutput=content||'历史任务未保存模型输出正文。';
+  return `<article class="task-run"><div class="task-run-header"><b>模型调用 ${index+1}</b><span class="badge badge-muted">${esc(run.model_id||'未记录模型')}</span><span class="text-sm text-muted">输入 ${run.prompt_tokens||run.tokens_in||0} · 输出 ${run.completion_tokens||run.tokens_out||0} · 耗时 ${run.latency_ms||0} 毫秒</span>${run.error_code?`<span class="badge badge-error">${esc(run.error_code)}</span>`:''}</div><div class="task-run-section"><div class="task-run-label">输入提示词</div><pre class="task-prompt">${esc(fallbackPrompt)}</pre></div><div class="task-run-section"><div class="task-run-label">模型输出（Markdown 渲染）</div><div class="task-output markdown-body">${content?markdownToHtml(content):`<p class="dim-note">${esc(fallbackOutput)}</p>`}</div></div></article>`;
 }
 
 // ===== Nav render =====
@@ -893,7 +1004,7 @@ PAGES.create=async(p)=>{
        <div class="row row-wrap"><button type="button" class="btn btn-primary" id="creation-mode-planned" onclick="setCreationMode('planned')">导入完整规划</button><button type="button" class="btn btn-ghost" id="creation-mode-thought" onclick="setCreationMode('thought')">念头创作</button></div>
      </div>
      <div id="create-thought-card" class="card mt16" style="display:none;background:var(--bg);border-color:var(--border)">
-       <h3>先说出你的念头</h3><p class="dim-note mt8">不用整理成大纲，写下一个场景、人物、冲突、梦境或问题即可。创建后 AI 会一问一答地补齐缺口。</p>
+       <h3>先说出你的念头</h3><p class="dim-note mt8">不用整理成大纲，写下一个场景、人物、冲突、梦境或问题即可。创建后会进入 AI 追问，并强制带你完成 25 步 Story Bible 清单；每卷、每段故事弧、每章目标计划补齐前不能开始正文创作。</p>
        <textarea class="input textarea mt8" id="c-thought-seed" placeholder="例如：一个负责抹除记忆的人，发现自己最想找回的那段记忆来自未来……"></textarea>
      </div>
      <div id="create-planned-fields">
@@ -955,7 +1066,8 @@ PAGES.book=async(p)=>{
   let daemonState={};
   try{ daemonState=await api('GET','/daemon'); }catch(_){ daemonState={}; }
   const workflow=b.creationWorkflow||{};
-  const planningLocked=Boolean(workflow.metadata?.requireCompletePlanning&&workflow.status!=='ready');
+  const planningManaged=Boolean(workflow.metadata?.requireCompletePlanning);
+  const planningLocked=Boolean(planningManaged&&(!b.planningReadiness?.ready||workflow.status!=='ready'));
   const summary=planningState?.summary||b.planningSummary||null;
   const summaryWorld=summary?.world||{};
   const world=summary?summaryWorld:(b.world||{});
@@ -979,11 +1091,11 @@ PAGES.book=async(p)=>{
     :'规划资料理解执行失败。请查看任务详情并重试。';
   p.innerHTML=header(esc(b.title),`<span class="badge badge-info">${esc(b.genre||'未分类')}</span> ${b.chaptersWritten} 章`,
     `<button class="btn btn-primary" onclick="refreshPlanningSummary()">A提炼</button>
-     <button class="btn btn-primary" onclick="go('continuous')">连续创作</button>
+     <button class="btn btn-primary" onclick="go('continuous')" ${planningLocked?'disabled title="请先完成创作规划"':''}>连续创作</button>
      <button class="btn btn-secondary" onclick="go('chapters')">章节工作台</button>
      <button class="btn btn-secondary" onclick="go('${workflow.mode==='thought'?'thought':'wizard'}')">${workflow.mode==='thought'?'念头创作':'完成规划'}</button>`)+
   `<div class="content">
-    ${planningLocked?`<div class="warn-banner">当前作品还没有完成规划。先完成 ${workflow.mode==='thought'?'念头访谈并确认生成的 Story Bible':'完整 Story Bible'}，再开始章节创作；剧情画布仍可用于预测。</div>`:''}
+    ${planningLocked?planningGateMarkup(b.planningReadiness,workflow.mode):''}
     ${summary?`<div class="info-banner"><span class="badge ${summary.generated_by==='ai'?'badge-success':'badge-warning'}">${summary.generated_by==='ai'?'AI 已理解':'资料摘要，待核对'}</span><span>${summary.generated_by==='ai'?'以下内容是模型提炼后的创作摘要，原始资料仍可在向导中查看。':'模型暂不可用，当前显示的是资料摘要；确认无误后可重新运行 AI 理解。'}</span>${summary.generated_by!=='ai'?`<button class="btn btn-sm btn-secondary" onclick="refreshPlanningSummary()">重新理解资料</button>`:''}</div>`:synthesisPending?`<div class="warn-banner">正在理解已导入的规划资料。页面只展示整理后的创作摘要；任务完成后会自动刷新。</div>`:synthesisBlocked?`<div class="warn-banner">${esc(planningBlockerText)} <button class="btn btn-sm btn-secondary" onclick="refreshPlanningSummary()">重新理解资料</button></div>`:''}
     <div class="grid grid-4">
       ${stat(b.chaptersWritten,'章节')}${stat(chars.length,'角色')}${stat(facs.length,'势力')}${stat(fs.length,'伏笔')}
@@ -1035,6 +1147,8 @@ PAGES.continuous = async (p) => {
   if(!S.book){go('dashboard');return;}
   const b = await api('GET','/books/'+S.book);
   const next = (b.chaptersWritten||0)+1;
+  const planningManaged=Boolean(b.creationWorkflow?.metadata?.requireCompletePlanning);
+  const creationBlocked=planningManaged&&!b.planningReadiness?.ready;
   p.innerHTML = `<div class="header"><div><h2>连续创作模式</h2><div class="sub">${esc(bookName())} · 双重门禁 + 联合审查</div></div>
     <button class="btn btn-ghost" onclick="go('book')">← 返回作品</button></div>
   <div class="content">
@@ -1047,7 +1161,7 @@ PAGES.continuous = async (p) => {
         <label class="fld">双重门禁通过分<input class="input" id="c-score" type="number" value="${b.passScore||93}" min="60" max="100"></label>
         <label class="fld">联合审查间隔（章）<input class="input" id="c-interval" type="number" value="5" min="1"></label>
         <label class="fld">本轮创作指导（可选）<textarea class="input ta" id="c-context" placeholder="本卷重点、节奏安排、要推进的伏笔与钩子..."></textarea></label>
-        <button class="btn btn-primary" id="c-start-btn" onclick="startContinuous()">▶ 开始连续创作</button>
+        <button class="btn btn-primary" id="c-start-btn" onclick="startContinuous()" ${creationBlocked?'disabled title="请先完成创作规划"':''}>▶ 开始连续创作</button>
         <button class="btn btn-secondary" onclick="stopContinuous()">■ 停止监听</button>
         <div class="row mt8" id="c-task-actions"></div>
       </div>
@@ -1064,6 +1178,10 @@ PAGES.continuous = async (p) => {
       <table class="table" id="c-table"><thead><tr><th>章</th><th>标题</th><th>评分</th><th>修订轮次</th><th>门禁</th></tr></thead><tbody></tbody></table>
     </div>
   </div>`;
+  if(creationBlocked){
+    const content=document.querySelector('#page .content');
+    if(content)content.insertAdjacentHTML('afterbegin',planningGateMarkup(b.planningReadiness,b.creationWorkflow?.mode));
+  }
   _contTask=localStorage.getItem('novelforge-continuous-'+S.book);
   if(_contTask){ logLine('恢复任务监控：'+_contTask); pollTask(_contTask); }
 };
@@ -1086,7 +1204,10 @@ async function startContinuous(){
     logLine('任务已启动: '+res.taskId+' — 开始监听进度');
     window.addEventListener('task-update',onContUpdate);
     pollTask(res.taskId);
-  }catch(e){ toast(e.message,'error'); document.getElementById('c-start-btn').disabled=false; }
+  }catch(e){
+    if(!renderPlanningGate(document.getElementById('c-log'),e))toast(e.message,'error');
+    document.getElementById('c-start-btn').disabled=false;
+  }
 }
 function onContUpdate(ev){ const t=ev.detail; if(_contTask && t.id===_contTask) renderTaskProgress(t); }
 function logLine(t){
@@ -1095,7 +1216,7 @@ function logLine(t){
   d.textContent='· '+t; box.appendChild(d); box.scrollTop=box.scrollHeight;
 }
 function stopContinuous(){ window.removeEventListener('task-update',onContUpdate); _contTask=null; logLine('已停止监听（后台任务继续运行）'); }
-async function taskAction(action){
+async function continuousTaskAction(action){
   if(!_contTask)return;
   try{await api('POST','/tasks/'+_contTask+'/'+action);toast('任务状态已更新','success');pollTask(_contTask);}
   catch(e){toast(e.message,'error');}
@@ -1103,9 +1224,9 @@ async function taskAction(action){
 function renderTaskActions(t){
   const el=document.getElementById('c-task-actions'); if(!el)return;
   const actions=[];
-  if(t.status==='running') actions.push(`<button class="btn btn-sm btn-secondary" onclick="taskAction('pause')">暂停</button>`,`<button class="btn btn-sm btn-danger" onclick="taskAction('cancel')">取消</button>`);
-  if(t.status==='paused') actions.push(`<button class="btn btn-sm btn-primary" onclick="taskAction('resume')">恢复</button>`,`<button class="btn btn-sm btn-danger" onclick="taskAction('cancel')">取消</button>`);
-  if(t.status==='failed') actions.push(`<button class="btn btn-sm btn-secondary" onclick="taskAction('retry')">重试</button>`);
+  if(t.status==='running') actions.push(`<button class="btn btn-sm btn-secondary" onclick="continuousTaskAction('pause')">暂停</button>`,`<button class="btn btn-sm btn-danger" onclick="continuousTaskAction('cancel')">取消</button>`);
+  if(t.status==='paused') actions.push(`<button class="btn btn-sm btn-primary" onclick="continuousTaskAction('resume')">恢复</button>`,`<button class="btn btn-sm btn-danger" onclick="continuousTaskAction('cancel')">取消</button>`);
+  if(t.status==='failed') actions.push(`<button class="btn btn-sm btn-secondary" onclick="continuousTaskAction('retry')">重试</button>`);
   el.innerHTML=`${statusBadge(t.status)}<span class="dim-note">阶段：${esc(t.stage||'queued')}</span>${actions.join('')}`;
 }
 async function pollTask(id){
@@ -1219,16 +1340,27 @@ async function sendChat(){
 PAGES.wizard=async(p)=>{
   if(!S.book){go('dashboard');return;}
   const state=await api('GET','/books/'+S.book+'/wizard/state');
+  const book=await api('GET','/books/'+S.book);
   window._wizardState=state;
   const steps=state.steps||[];
   const currentNumber=Math.min(Math.max(Number(S._wizardStepNumber||state.current_step||1),1),25);
   const step=steps.find(item=>item.number===currentNumber)||steps[0];
   const confirmed=steps.filter(item=>item.status==='confirmed').length;
+  const workflow=book.creationWorkflow||{};
+  const readiness=book.planningReadiness||null;
+  const planningManaged=Boolean(workflow.metadata?.requireCompletePlanning);
   const draftText=wizardDraftText(step?.draft);
+  const planningStepGuidance={
+    volumes:`每一卷都要写清：卷名、卷级目标、覆盖范围，以及卷末必须发生的变化。当前至少需要 ${readiness?.volumeTarget||book.targetVolumes||1} 卷。`,
+    arcs:`每一段故事弧都要写清：所属卷、起点、转折、终点，以及人物或局势的变化。当前至少需要 ${readiness?.arcTarget||readiness?.volumeTarget||book.targetVolumes||1} 段弧。`,
+    chapter_plan:`每一章都要写清：章号、章节目标、不可逆变化、关键场景或冲突，以及章末钩子。当前至少需要覆盖 ${readiness?.chapterTarget||book.targetChapters||1} 章。`,
+  }[step?.key]||'';
   p.innerHTML=header('世界观向导',`${esc(bookName())} · 用 25 个小决定搭建可写、可检查的 Story Bible`,
     `<button class="btn btn-secondary" onclick="go('mindmap')">查看结构视图</button><button class="btn btn-secondary" onclick="go('book')">返回概览</button>`)+
   `<div class="content">
+    ${workflow.mode==='thought'?`<div class="info-banner"><b>念头创作已进入 25 步清单：</b><span>先在 AI 助手中把念头说完整，再回到这里逐步确认。AI 生成的内容都是草稿，必须由你审阅确认。</span><button class="btn btn-sm btn-secondary" onclick="go('thought')">回到念头访谈</button></div>`:''}
     <div class="info-banner"><b>怎么使用：</b><span>每一步先回答一个小问题，保存后可以让 AI 给建议；你确认后才会进入下一步。你不需要一次想完整本书，先写你确定的部分即可。</span><span class="badge badge-info">${confirmed}/25 已确认</span></div>
+    ${planningManaged&&readiness&&!readiness.ready?planningGateMarkup(readiness,workflow.mode):`<div class="info-banner"><b>创作前规划检查：</b><span>${esc(planningReadinessSummary(readiness)||'已完成规划检查')}</span><span class="badge badge-success">可开始正文创作</span></div>`}
     <div class="wizard-progress"><div class="progress"><div class="progress-bar" style="width:${Math.round(confirmed/25*100)}%"></div></div><div class="dim-note mt8">${state.status==='published'?'已发布，可继续回看并修改。':confirmed===25?'全部步骤已确认，可以发布。':'当前在第 '+currentNumber+' 步'}</div></div>
     <div class="wizard-layout">
       <div class="card wizard-step-list"><h3>25 步清单</h3>${steps.map(s=>`<button class="wizard-step ${s.number===currentNumber?'active':''}" onclick="wizardOpenStep(${s.number})"><span class="wizard-step-number ${s.status==='confirmed'?'done':''}">${s.number}</span><span>${esc(s.label||s.key)}</span><span class="wizard-step-status">${s.status==='confirmed'?'✓':s.status==='draft'?'草稿':'待填写'}</span></button>`).join('')}</div>
@@ -1237,12 +1369,13 @@ PAGES.wizard=async(p)=>{
           <div class="wizard-kicker">第 ${step?.number||1} 步 · ${esc(step?.key||'')}</div>
           <h2>${esc(step?.label||'开始规划')}</h2>
           <p class="text-muted" style="line-height:1.7;margin-bottom:14px">${esc(step?.why||'先写下你目前确定的内容，之后可以随时修改。')}</p>
-          <div class="wizard-question"><b>想一想</b><span>${esc(step?.question||'你希望这一步确定什么？')}</span></div>
-          <div class="field mt16"><label for="wizard-draft">你的答案</label><textarea class="input textarea" id="wizard-draft" style="min-height:220px" placeholder="用自己的话写，几句话也可以。">${esc(draftText)}</textarea></div>
+           <div class="wizard-question"><b>想一想</b><span>${esc(step?.question||'你希望这一步确定什么？')}</span></div>
+           ${planningStepGuidance?`<div class="info-banner planning-step-guide mt16"><b>创作前置计划：</b><span>${esc(planningStepGuidance)}</span><button class="btn btn-sm btn-secondary" onclick="go('chat')">与 AI 助手一起补齐</button></div>`:''}
+           <div class="field mt16"><label for="wizard-draft">你的答案</label><textarea class="input textarea" id="wizard-draft" style="min-height:220px" placeholder="用自己的话写，几句话也可以。">${esc(draftText)}</textarea></div>
           <div class="row row-wrap"><button class="btn btn-secondary" onclick="wizardSave('${escAttr(step?.key||'')}')">保存草稿</button><button class="btn btn-secondary" onclick="wizardGenerate('${escAttr(step?.key||'')}')">让 AI 给一个建议</button><button class="btn btn-primary" onclick="wizardConfirm('${escAttr(step?.key||'')}')" ${step?.status==='confirmed'?'disabled':''}>确认这一步</button></div>
           ${step?.suggestion?`<div class="wizard-suggestion mt16"><div class="row" style="justify-content:space-between"><b>AI 建议</b><span class="badge badge-info">仅供参考</span></div><p class="text-sm text-muted mt8">${esc(wizardDraftText(step.suggestion))}</p><button class="btn btn-sm btn-secondary mt8" onclick="wizardUseSuggestion('${escAttr(step.key)}')">填入编辑框</button></div>`:''}
         </div>
-        <div class="card"><h3>这一步完成后会发生什么</h3><p class="text-sm text-muted" style="line-height:1.8">确认只会保存你的决定，不会自动替你写正文。全部 25 步确认后，发布 Story Bible；概览、角色、时间轴和思维导图都会从发布内容生成只读结构。</p></div>
+        <div class="card"><h3>这一步完成后会发生什么</h3><p class="text-sm text-muted" style="line-height:1.8">确认只会保存你的决定，不会自动替你写正文。全部 25 步确认后，发布 Story Bible；同时还要补齐每一卷、每一段故事弧、每一章的目标计划，正文创作才会解锁。</p></div>
       </div>
     </div>
     <div class="row" style="justify-content:flex-end"><button class="btn btn-primary" onclick="wizardPublish()" ${confirmed<25?'disabled':''}>发布 Story Bible</button></div>
@@ -1292,13 +1425,16 @@ PAGES.chapters=async(p)=>{
   if(!S.book){go('dashboard');return;}
   const b=await api('GET','/books/'+S.book);
   const n=b.chaptersWritten||0;
+  const planningManaged=Boolean(b.creationWorkflow?.metadata?.requireCompletePlanning);
+  const creationBlocked=planningManaged&&!b.planningReadiness?.ready;
   const rows=[];
   for(let i=1;i<=n;i++) rows.push(i);
   p.innerHTML=header('章节工作台',`${esc(b.title||bookName())} · 共 ${n} 章 · 从规划到正文的单章工作区`,
-    `<button class="btn btn-primary" onclick="newManualChapter()">＋ 手动新建章节</button>
-     <button class="btn btn-secondary" onclick="writeNext()">✍ AI 写下一章</button>
-     <button class="btn btn-secondary" onclick="go('continuous')">连续创作</button>`)+
+    `<button class="btn btn-primary" onclick="newManualChapter()" ${creationBlocked?'disabled title="请先完成创作规划"':''}>＋ 手动新建章节</button>
+     <button class="btn btn-secondary" onclick="writeNext()" ${creationBlocked?'disabled title="请先完成创作规划"':''}>✍ AI 写下一章</button>
+     <button class="btn btn-secondary" onclick="go('continuous')" ${creationBlocked?'disabled title="请先完成创作规划"':''}>连续创作</button>`)+
   `<div class="content">
+    ${creationBlocked?planningGateMarkup(b.planningReadiness,b.creationWorkflow?.mode):''}
     <div id="wn-status"></div>
     <div class="editor-layout">
       <div class="card"><div class="card-title-row"><h3>章节列表</h3><span class="dim-note">点击一行查看该章的规划、规则和最近审查</span></div>
@@ -1373,7 +1509,9 @@ async function writeNext(){
     const tid=r.taskId;
     localStorage.setItem(WRITE_TASK_KEY+S.book,tid);
     monitorWriteTask(tid);
-  }catch(e){ toast(e.message,'error'); s.innerHTML=''; }
+  }catch(e){
+    if(!renderPlanningGate(s,e))toast(e.message,'error');
+  }
 }
 async function monitorWriteTask(tid){
   const s=document.getElementById('wn-status'); if(!s)return;
@@ -1519,7 +1657,10 @@ async function saveChapterEditor(){
     if(window._chapterEditorCleanup)window._chapterEditorCleanup();
     clearInterval(window._chapterEditorAutoInterval);
     closeModal(); toast('章节已保存为新版本','success'); go('chapters');
-  }catch(e){ toast(e.message,'error'); button.disabled=false; button.textContent='保存新版本'; }
+  }catch(e){
+    if(!renderPlanningGate(document.getElementById('modal-root'),e))toast(e.message,'error');
+    button.disabled=false; button.textContent='保存新版本';
+  }
 }
 function closeChapterEditorSafe(num){
   if(window._chapterEditorCleanup)window._chapterEditorCleanup();
@@ -2064,12 +2205,16 @@ async function inspectDocument(documentId){
 
 // ===== 任务管理 =====
 PAGES.tasks=async(p)=>{
+  if(!S.book){
+    p.innerHTML=header('任务管理','任务管理已整合到作品下，请先打开一部作品。','<button class="btn btn-primary" onclick="go(\'dashboard\')">选择作品</button>')+'<div class="content"><div class="empty-state"><h2>请选择作品</h2><p>打开作品后，这里只展示该作品的任务、提示词、模型输出与处理记录。</p></div></div>';
+    return;
+  }
   let tasks=[],genRuns={};
-  try{const r=await api('GET','/tasks');tasks=r.tasks||[];}catch(e){tasks=[];}
+  try{const r=await api('GET','/tasks?projectId='+encodeURIComponent(S.book));tasks=r.tasks||[];}catch(e){tasks=[];}
   const daemon=await api('GET','/daemon').catch(()=>({}));
   const statusCounts=tasks.reduce((a,t)=>{a[t.status]=(a[t.status]||0)+1;return a;},{});
   const activeCount=(statusCounts.running||0)+(statusCounts.queued||0)+(statusCounts.paused||0)+(statusCounts.cancelling||0);
-  p.innerHTML=header('任务管理','持久任务队列：写作、审查、修订、连续创作等后台任务实时监控',
+  p.innerHTML=header('任务管理',`${esc(bookName())} · 持久任务队列：写作、审查、修订、连续创作等后台任务实时监控`,
     `<button class="btn btn-secondary" onclick="PAGES.tasks(document.getElementById('page'))">刷新</button>`)+
   `<div class="content">
     ${daemon.disabledByEnvironment?'<div class="warn-banner"><b>Studio Worker 被环境变量禁用。</b><span>排队任务会保留，但不会自动执行。请重启服务并取消 NOVELFORGE_DISABLE_STUDIO_WORKER。</span></div>':daemon.running?'<div class="success-banner">Studio Worker 正在运行，任务会从持久队列领取。</div>':'<div class="warn-banner"><b>没有运行中的 Studio Worker。</b><span>新任务会停留在队列中。</span><button class="btn btn-sm btn-secondary" onclick="startStudioDaemonForPage()">启动 Worker</button></div>'}
@@ -2110,11 +2255,11 @@ function renderTaskList(tasks){
     const progress=taskProgressText(t);
     const created=t.created_at?new Date(t.created_at).toLocaleString('zh-CN'):'—';
     const actions=[];
-    if(t.status==='running'){actions.push(`<button class="btn btn-sm btn-secondary" onclick="taskAction('${t.id}','pause')">暂停</button>`);actions.push(`<button class="btn btn-sm btn-danger" onclick="taskAction('${t.id}','cancel')">取消</button>`);}
-    if(t.status==='paused'){actions.push(`<button class="btn btn-sm btn-primary" onclick="taskAction('${t.id}','resume')">恢复</button>`);actions.push(`<button class="btn btn-sm btn-danger" onclick="taskAction('${t.id}','cancel')">取消</button>`);}
-    if(['failed','needs_author_decision'].includes(t.status)){actions.push(`<button class="btn btn-sm btn-secondary" onclick="taskAction('${t.id}','retry')">从检查点继续</button>`);}
-    if(t.status==='needs_author_decision'){actions.push(`<button class="btn btn-sm btn-danger" onclick="taskAction('${t.id}','cancel')">结束任务</button>`);}
-    if(t.status==='queued'){actions.push(`<button class="btn btn-sm btn-danger" onclick="taskAction('${t.id}','cancel')">取消</button>`);}
+    if(t.status==='running'){actions.push(`<button class="btn btn-sm btn-secondary" onclick="taskQueueAction('${t.id}','pause')">暂停</button>`);actions.push(`<button class="btn btn-sm btn-danger" onclick="taskQueueAction('${t.id}','cancel')">取消</button>`);}
+    if(t.status==='paused'){actions.push(`<button class="btn btn-sm btn-primary" onclick="taskQueueAction('${t.id}','resume')">恢复</button>`);actions.push(`<button class="btn btn-sm btn-danger" onclick="taskQueueAction('${t.id}','cancel')">取消</button>`);}
+    if(['failed','needs_author_decision'].includes(t.status)){actions.push(`<button class="btn btn-sm btn-secondary" onclick="taskQueueAction('${t.id}','retry')">从检查点继续</button>`);}
+    if(t.status==='needs_author_decision'){actions.push(`<button class="btn btn-sm btn-danger" onclick="taskQueueAction('${t.id}','cancel')">结束任务</button>`);}
+    if(t.status==='queued'){actions.push(`<button class="btn btn-sm btn-danger" onclick="taskQueueAction('${t.id}','cancel')">取消</button>`);}
     actions.push(`<button class="btn btn-sm btn-ghost" onclick="showTaskDetail('${t.id}')">详情</button>`);
     return `<tr data-status="${t.status}" data-type="${t.type||''}">
       <td><span class="mono">${esc((t.id||'').slice(0,12))}</span></td>
@@ -2135,12 +2280,12 @@ function filterTasks(){
   if(type)filtered=filtered.filter(t=>t.type===type);
   document.getElementById('task-list-container').innerHTML=renderTaskList(filtered);
 }
-async function taskAction(taskId,action){
+async function taskQueueAction(taskId,action){
   try{
     await api('POST','/tasks/'+taskId+'/'+action);
     const labels={pause:'暂停',resume:'恢复',cancel:'取消',retry:'继续尝试'};
     toast('任务已提交“'+(labels[action]||'更新')+'”操作','success');
-    setTimeout(()=>PAGES.tasks(document.getElementById('page')),1000);
+    await PAGES.tasks(document.getElementById('page'));
   }catch(e){toast(e.message,'error');}
 }
 async function showTaskDetail(taskId){
@@ -2150,7 +2295,7 @@ async function showTaskDetail(taskId){
     const checkpoint=t.checkpoint||{};
     const cpState=checkpoint.state||{};
     let genRuns=[];try{const gr=await api('GET','/tasks/'+taskId+'/generation-runs');genRuns=gr.runs||gr||[];}catch(_){}
-    modal(`<div class="modal-header"><h3>任务详情</h3><button class="close-x" onclick="closeModal()">×</button></div>
+    modal(`<div class="task-detail-modal"><div class="modal-header"><h3>任务详情</h3><button class="close-x" onclick="closeModal()">×</button></div>
       <div class="grid grid-2 mb16">
         <div><div class="kv"><span>任务 ID</span><b class="mono">${esc(t.id)}</b></div>
         <div class="kv"><span>类型</span><b>${esc(taskTypeLabel(t.type,t))}</b></div>
@@ -2164,15 +2309,15 @@ async function showTaskDetail(taskId){
       ${['failed','needs_author_decision'].includes(t.status)?`<div class="warn-banner"><b>${t.status==='needs_author_decision'?'任务已安全停在这里':'任务处理没有完成'}</b><span>${esc(taskErrorText(t))}</span><p class="dim-note mt8">你可以从最近一次检查点继续，也可以结束任务。</p></div>`:''}
       ${t.result?readableTaskResult(t.result,'执行结果'):''}
       ${Object.keys(cpState).length?readableTaskResult(cpState,'当前检查点'):''}
-      ${genRuns.length?`<div class="card"><h3>模型处理记录</h3>${genRuns.map(r=>`<div class="list-row"><span class="mono text-sm">${esc((r.id||'').slice(0,8))}</span><span class="text-sm">${esc(r.model_id||'—')}</span><span class="text-sm">输入 ${r.tokens_in||0} · 输出 ${r.tokens_out||0}</span><span class="text-sm">耗时 ${r.latency_ms||0} 毫秒</span>${r.error?`<span style="color:var(--error)" class="text-sm">${esc(r.error)}</span>`:''}</div>`).join('')}</div>`:''}
+      ${genRuns.length?`<div class="card"><h3>模型处理记录</h3><p class="dim-note mb8">以下内容来自持久化模型调用记录；输入提示词保留原始文本，输出按 Markdown 渲染。</p>${genRuns.map((r,index)=>renderGenerationRun(r,index)).join('')}</div>`:''}
       ${events.length?`<div class="card"><h3>处理记录（${events.length}）</h3><div class="log-box">${events.slice(-50).map(e=>`<div class="log-line"><span class="text-muted text-sm">${e.created_at?new Date(e.created_at).toLocaleTimeString('zh-CN'):''}</span> <b>${esc(taskEventLabel(e.event_type||e.type))}</b> ${esc(taskValueText(e.payload||''))}</div>`).join('')}</div></div>`:''}
       <div class="row mt16">
-        ${t.status==='running'?`<button class="btn btn-secondary" onclick="taskAction('${t.id}','pause');closeModal()">暂停</button><button class="btn btn-danger" onclick="taskAction('${t.id}','cancel');closeModal()">取消</button>`:''}
-        ${t.status==='paused'?`<button class="btn btn-primary" onclick="taskAction('${t.id}','resume');closeModal()">恢复</button><button class="btn btn-danger" onclick="taskAction('${t.id}','cancel');closeModal()">取消</button>`:''}
-        ${['failed','needs_author_decision'].includes(t.status)?`<button class="btn btn-secondary" onclick="taskAction('${t.id}','retry');closeModal()">从检查点继续</button>`:''}
-        ${t.status==='needs_author_decision'?`<button class="btn btn-danger" onclick="taskAction('${t.id}','cancel');closeModal()">结束任务</button>`:''}
+        ${t.status==='running'?`<button class="btn btn-secondary" onclick="taskQueueAction('${t.id}','pause');closeModal()">暂停</button><button class="btn btn-danger" onclick="taskQueueAction('${t.id}','cancel');closeModal()">取消</button>`:''}
+        ${t.status==='paused'?`<button class="btn btn-primary" onclick="taskQueueAction('${t.id}','resume');closeModal()">恢复</button><button class="btn btn-danger" onclick="taskQueueAction('${t.id}','cancel');closeModal()">取消</button>`:''}
+        ${['failed','needs_author_decision'].includes(t.status)?`<button class="btn btn-secondary" onclick="taskQueueAction('${t.id}','retry');closeModal()">从检查点继续</button>`:''}
+        ${t.status==='needs_author_decision'?`<button class="btn btn-danger" onclick="taskQueueAction('${t.id}','cancel');closeModal()">结束任务</button>`:''}
         <button class="btn btn-ghost" onclick="closeModal()">关闭</button>
-      </div>`,true);
+      </div></div>`,true);
   }catch(e){toast(e.message,'error');}
 }
 

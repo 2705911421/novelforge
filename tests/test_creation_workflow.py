@@ -102,6 +102,20 @@ def test_thought_http_entry_persists_answer_and_queues_follow_up(tmp_path, monke
         session = client.get(f"/api/v1/books/{book_id}/thought-session")
         assert session.status_code == 200
         assert session.json()["current_question"]
+        book = client.get(f"/api/v1/books/{book_id}")
+        assert book.status_code == 200
+        assert book.json()["planningReadiness"]["ready"] is False
+        blocked = client.post(f"/api/v1/books/{book_id}/write-next", json={})
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["code"] == "PLANNING_REQUIRED"
+        assert blocked.json()["detail"]["planningReadiness"]["missingStepKeys"]
+        for path in (
+            f"/api/v1/books/{book_id}/plan",
+            f"/api/v1/books/{book_id}/compose",
+            f"/api/v1/books/{book_id}/revise/1",
+            f"/api/v1/books/{book_id}/rewrite/1",
+        ):
+            assert client.post(path, json={}).status_code == 409
         answered = client.post(
             f"/api/v1/books/{book_id}/thought-session/respond",
             json={"answer": "他发现记忆是自己删除的。"},

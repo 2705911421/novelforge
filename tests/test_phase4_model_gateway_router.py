@@ -55,7 +55,7 @@ def test_configuration_is_persistent_and_never_returns_raw_credential(model_runt
     assert fresh.resolve("writer")["model_id"] == "test-model"
 
 
-def test_invocation_records_generation_run_without_prompt_or_output_body(model_runtime):
+def test_invocation_records_generation_run_with_prompt_and_output_body(model_runtime):
     database, repository = model_runtime
 
     class FakeGateway:
@@ -81,9 +81,11 @@ def test_invocation_records_generation_run_without_prompt_or_output_body(model_r
     assert len(run["input_reference"]["prompt_sha256"]) == 64
     assert run["input_reference"]["prompt_source"] == "agent-contract+route-override"
     assert run["output_reference"]["content_chars"] == len("private generated text")
+    assert run["input_reference"]["prompt"].endswith("[user]\nprivate prompt")
+    assert run["output_reference"]["content"] == "private generated text"
     persisted = database.fetchone("SELECT * FROM generation_runs WHERE id=?", (run["id"],))
-    assert "private prompt" not in str(dict(persisted))
-    assert "private generated text" not in str(dict(persisted))
+    assert "private prompt" in str(dict(persisted))
+    assert "private generated text" in str(dict(persisted))
 
 
 def test_missing_route_fails_before_any_provider_call(model_runtime):

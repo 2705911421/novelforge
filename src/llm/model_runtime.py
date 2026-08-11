@@ -507,7 +507,14 @@ class ModelRepository:
             conn.execute(
                 """UPDATE generation_runs SET status='succeeded', output_reference=?, prompt_tokens=?,
                    completion_tokens=?, total_tokens=?, latency_ms=?, completed_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (json.dumps({"content_chars": len(response.content), "finish_reason": response.finish_reason}),
+                (json.dumps({
+                    # Model responses are Markdown in the Studio contract.
+                    # Persist the source text and render it safely in the UI.
+                    "content": response.content,
+                    "content_type": "markdown",
+                    "content_chars": len(response.content),
+                    "finish_reason": response.finish_reason,
+                }, ensure_ascii=False),
                  response.prompt_tokens, response.completion_tokens, response.tokens_used, response.latency_ms, run_id),
             )
 
@@ -691,10 +698,26 @@ class PersistentModelRuntime:
         run_id = self.repository.create_run(
             task_id=task_id, role=role, resolved=resolved,
             prompt_key=prompt_key, prompt_version=prompt_version,
-            input_reference={"message_count": len(messages), "system_chars": len(effective_system),
-                             "message_chars": sum(len(str(message.get("content", ""))) for message in messages),
-                             "prompt_sha256": prompt_sha256,
-                             "prompt_source": "agent-contract+route-override"},
+            input_reference={
+                # Keep the complete prompt alongside its audit metadata. The
+                # Studio task detail view must show the exact model input.
+                "system_prompt": effective_system,
+                "messages": messages,
+                "prompt": "\n\n".join(
+                    [
+                        f"[system]\n{effective_system}" if effective_system else "",
+                        *[
+                            f"[{message.get('role', 'message')}]\n{message.get('content', '')}"
+                            for message in messages
+                        ],
+                    ]
+                ).strip(),
+                "message_count": len(messages),
+                "system_chars": len(effective_system),
+                "message_chars": sum(len(str(message.get("content", ""))) for message in messages),
+                "prompt_sha256": prompt_sha256,
+                "prompt_source": "agent-contract+route-override",
+            },
         )
         try:
             secret = self.repository.credentials.resolve(resolved.get("credential_ref"))

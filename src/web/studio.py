@@ -49,6 +49,7 @@ from src.ingestion.service import DocumentIngestionError, DocumentRepository, DE
 from src.ingestion.draft_import import DraftImportError, DraftImportRepository
 from src.rag.retriever import PersistentRAGRetriever, RAGQueryError
 from src.planning.story_bible import StoryBibleError, StoryBibleRepository, STORY_BIBLE_STEPS
+from src.planning.readiness import evaluate_planning_readiness
 from src.review.review_repository import ReviewRepository
 from src.core.memory import MemorySystem
 from src.export.exporter import Exporter
@@ -388,6 +389,21 @@ def get_story_bible_repository() -> StoryBibleRepository:
     return StoryBibleRepository(story_repository.db)
 
 
+def get_planning_readiness(book_id: str, project: Optional[StoryProject] = None) -> dict[str, Any]:
+    """Return the durable gate used before any new chapter can be created."""
+    current_project = project or get_project(book_id)
+    workflow = get_creation_workflow().get(book_id) or {}
+    metadata = workflow.get("metadata") or {}
+    bible = get_story_bible_repository().get(book_id)
+    steps = (bible or {}).get("steps") or []
+    return evaluate_planning_readiness(
+        steps,
+        target_volumes=current_project.target_volumes,
+        target_chapters=current_project.target_chapters,
+        trusted_import=bool(metadata.get("planningCompleted")),
+    )
+
+
 def _creation_http_error(exc: CreationWorkflowError) -> HTTPException:
     status = {
         "PROJECT_NOT_FOUND": 404,
@@ -409,13 +425,16 @@ def require_complete_planning(book_id: str) -> None:
     workflow = get_creation_workflow().get(book_id)
     if not workflow or not (workflow.get("metadata") or {}).get("requireCompletePlanning"):
         return
-    if workflow.get("status") != "ready":
+    readiness = get_planning_readiness(book_id)
+    if workflow.get("status") != "ready" or not readiness["ready"]:
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "PLANNING_REQUIRED",
-                "message": "请先完成并发布完整规划；念头创作需要先生成并确认 Story Bible。",
+                "message": "请先完成 25 步 Story Bible，并补齐每一卷、每一段故事弧、每一章的目标计划；可先与 AI 助手对话。",
+                "nextAction": "chat",
                 "workflow": workflow,
+                "planningReadiness": readiness,
             },
         )
 
@@ -461,12 +480,14 @@ def _queue_planning_synthesis(book_id: str, source: str) -> dict[str, Any]:
         data={"source": source},
         idempotency_key=idempotency_key,
     )
+    readiness = get_planning_readiness(book_id)
     get_creation_workflow().set_status(
         book_id,
-        "ready",
+        "ready" if readiness["ready"] else "planning",
         metadata={
             "planningSynthesisStatus": "queued" if task.get("status") in {"queued", "running"} else task.get("status"),
             "planningSynthesisTaskId": task.get("id"),
+            "planningReadiness": readiness,
         },
     )
     return task
@@ -610,6 +631,7 @@ async def get_book(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    planning_readiness = get_planning_readiness(book_id, project)
     workflow = get_creation_workflow().get(book_id)
     workflow_metadata = (workflow or {}).get("metadata") or {}
     thought_session = get_creation_workflow().get_thought_session(book_id)
@@ -638,6 +660,7 @@ async def get_book(book_id: str):
         "styleGuidance": project.style_guidance(),
         "authorIntent": project.author_intent,
         "creationWorkflow": workflow,
+        "planningReadiness": planning_readiness,
         "planningSummary": workflow_metadata.get("planningSummary"),
         "planningSynthesisStatus": workflow_metadata.get("planningSynthesisStatus", "not_started"),
         "planningSynthesisTaskId": workflow_metadata.get("planningSynthesisTaskId"),
@@ -710,6 +733,7 @@ async def get_creation_workflow_state(book_id: str):
     workflow = repo.get(book_id) or repo.ensure(book_id)
     return {
         "workflow": workflow,
+        "planningReadiness": get_planning_readiness(book_id),
         "sources": repo.list_sources(book_id),
         "thoughtSession": repo.get_thought_session(book_id),
         "architectureViews": repo.get_architecture_views(book_id),
@@ -1144,6 +1168,9 @@ async def update_chapter(book_id: str, num: int, data: dict):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    current_chapter = project.chapters.get(num)
+    if current_chapter is None:
+        require_complete_planning(book_id)
     if not project_mgr.story_repository.is_authoritative_project(book_id):
         if num not in project.chapters:
             project.chapters[num] = Chapter(number=num)
@@ -1156,7 +1183,6 @@ async def update_chapter(book_id: str, num: int, data: dict):
         project_mgr.save_project(project)
         return {"message": "章节更新成功", "version": 0}
     try:
-        current_chapter = project.chapters.get(num)
         current_content = current_chapter.content if current_chapter is not None else ""
         result = project_mgr.story_repository.save_chapter_content(
             book_id, num, data.get("content", current_content), title=data.get("title", ""),
@@ -1234,6 +1260,7 @@ async def revise_chapter(book_id: str, chapter: int):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    require_complete_planning(book_id)
     if chapter not in project.chapters:
         raise HTTPException(404, f"章节{chapter}不存在")
 
@@ -1289,6 +1316,7 @@ async def rewrite_chapter(book_id: str, chapter: int, req: WriteNextRequest):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_complete_planning(book_id)
     task = task_runtime.enqueue("rewrite-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={
         "chapter": chapter, "context": req.context,
     })
@@ -3127,7 +3155,12 @@ async def publish_story_bible(book_id: str):
     try:
         result = get_story_bible_repository().publish(book_id)
         views = _refresh_architecture_views(book_id)
-        workflow = get_creation_workflow().set_status(book_id, "ready", metadata={"architectureViewCount": len(views)})
+        readiness = get_planning_readiness(book_id)
+        workflow = get_creation_workflow().set_status(
+            book_id,
+            "ready" if readiness["ready"] else "planning",
+            metadata={"architectureViewCount": len(views), "planningReadiness": readiness},
+        )
         task = task_runtime.enqueue(
             "planning-views-generate",
             project_id=book_id,
@@ -3136,6 +3169,7 @@ async def publish_story_bible(book_id: str):
             idempotency_key=f"planning-views:story-bible:{book_id}:{workflow.get('updated_at')}",
         )
         result["architectureViews"] = len(views)
+        result["planningReadiness"] = readiness
         result["aiTaskId"] = task["id"]
         synthesis_task = _queue_planning_synthesis(book_id, "story-bible-publish")
         result["synthesisTaskId"] = synthesis_task["id"]
@@ -4204,7 +4238,12 @@ async def publish_wizard(book_id: str):
         service = WorldBootstrapService(story_repository.db, model_mgr)
         result = service.publish(book_id)
         views = _refresh_architecture_views(book_id)
-        workflow = get_creation_workflow().set_status(book_id, "ready", metadata={"architectureViewCount": len(views)})
+        readiness = get_planning_readiness(book_id)
+        workflow = get_creation_workflow().set_status(
+            book_id,
+            "ready" if readiness["ready"] else "planning",
+            metadata={"architectureViewCount": len(views), "planningReadiness": readiness},
+        )
         task = task_runtime.enqueue(
             "planning-views-generate",
             project_id=book_id,
@@ -4213,6 +4252,7 @@ async def publish_wizard(book_id: str):
             idempotency_key=f"planning-views:wizard:{book_id}:{workflow.get('updated_at')}",
         )
         result["architectureViews"] = len(views)
+        result["planningReadiness"] = readiness
         result["aiTaskId"] = task["id"]
         synthesis_task = _queue_planning_synthesis(book_id, "wizard-publish")
         result["synthesisTaskId"] = synthesis_task["id"]

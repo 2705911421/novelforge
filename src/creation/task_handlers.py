@@ -34,6 +34,7 @@ from src.llm.agent_prompts import (
     DRAFT_IMPORT_ANALYSIS_SYSTEM_PROMPT,
 )
 from src.planning.story_bible import StoryBibleRepository, STORY_BIBLE_STEPS
+from src.planning.readiness import evaluate_planning_readiness
 from src.planning.plot_workspace import PlotWorkspaceRepository, PlotWorkspaceError
 from src.planning.creation_workflow import (
     CreationWorkflowRepository,
@@ -71,6 +72,26 @@ class LegacyTaskHandlers:
         self.draft_import_repository = DraftImportRepository(project_manager.story_repository.db)
         self.bible_repository = StoryBibleRepository(project_manager.story_repository.db)
         self.creation_workflow = CreationWorkflowRepository(project_manager.story_repository.db)
+
+    def _set_planning_status(self, project_id: str, metadata: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Keep background planning projections from bypassing the creation gate."""
+        project = self.project_manager.load_project(project_id)
+        workflow = self.creation_workflow.get(project_id) or {}
+        bible = self.bible_repository.get(project_id)
+        readiness = evaluate_planning_readiness(
+            (bible or {}).get("steps") or [],
+            target_volumes=getattr(project, "target_volumes", 1),
+            target_chapters=getattr(project, "target_chapters", 1),
+            trusted_import=bool((workflow.get("metadata") or {}).get("planningCompleted")),
+        )
+        combined = dict(metadata or {})
+        combined["planningReadiness"] = readiness
+        self.creation_workflow.set_status(
+            project_id,
+            "ready" if readiness["ready"] else "planning",
+            metadata=combined,
+        )
+        return readiness
 
     def mapping(self) -> dict[str, Callable[[dict[str, Any]], dict[str, Any]]]:
         handlers = {
@@ -954,7 +975,7 @@ class LegacyTaskHandlers:
             source_manifest=deterministic["mindmap"].get("sourceManifest", []),
             generated_by="ai",
         )
-        self.creation_workflow.set_status(project_id, "ready", metadata={"architectureViewsGeneratedBy": "ai"})
+        self._set_planning_status(project_id, metadata={"architectureViewsGeneratedBy": "ai"})
         self.runtime.checkpoint(task["id"], "planning-views-saved", {"view_count": len(saved)})
         return {"project_id": project_id, "viewCount": len(saved), "generatedBy": "ai"}
 
@@ -986,9 +1007,8 @@ class LegacyTaskHandlers:
             # working and see exactly why AI refinement is still pending.
             synthesis = build_fallback_synthesis(sources, steps, error=str(exc))
         self.project_manager.story_repository.apply_planning_synthesis(project_id, synthesis)
-        self.creation_workflow.set_status(
+        self._set_planning_status(
             project_id,
-            "ready",
             metadata={
                 "planningSynthesisStatus": synthesis["status"],
                 "planningSynthesisGeneratedBy": synthesis["generated_by"],
