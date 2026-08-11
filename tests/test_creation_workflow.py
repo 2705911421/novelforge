@@ -208,10 +208,65 @@ def test_canvas_hide_and_forecast_import_do_not_touch_story_bible(tmp_path):
     model = Model()
     runtime = TaskRuntime(db)
     handlers = LegacyTaskHandlers(manager, model, Config(project_path=str(tmp_path)), runtime).mapping()
-    task = runtime.enqueue("forecast", project_id=project.id, book_id=book_id, data={"branch_count": 1, "node_id": source_id})
+    task = runtime.enqueue(
+        "forecast",
+        project_id=project.id,
+        book_id=book_id,
+        data={"branch_count": 1, "node_id": source_id, "node_ids": [source_id]},
+    )
     runtime.claim("forecast-test-worker")
     forecast_task = runtime.get(task["id"])
     assert forecast_task is not None
     handlers["forecast"](forecast_task)
     prompt = json.loads(model.messages[-1])
     assert source_id not in {node["id"] for node in prompt["plot_canvas"]["graph"]["nodes"]}
+    assert source_id in {node["id"] for node in prompt["plot_canvas"]["selected_story_graph"]["nodes"]}
+
+
+def test_storyflow_analysis_is_a_durable_non_canon_task(tmp_path):
+    db = Database(str(tmp_path / "storyflow-analysis.db"))
+    repository = StoryRepository(db)
+    manager = ProjectManager(str(tmp_path), repository=repository)
+    project = manager.create_project("分析任务", "悬疑")
+    book = repository.book_for_project(project.id)
+    assert book is not None
+    book_id = book["id"]
+
+    class Response:
+        content = json.dumps({
+            "summary": "选中子图存在一个关系推进机会。",
+            "findings": [{
+                "kind": "relationship_changes",
+                "severity": "warning",
+                "message": "需要明确下一章的关系变化。",
+                "evidenceNodeIds": [f"book:{book_id}"],
+            }],
+            "nextSteps": ["在 Chapter Intent 中写明关系变化"],
+        }, ensure_ascii=False)
+
+    class Model:
+        def __init__(self):
+            self.messages = []
+
+        def chat(self, messages, **kwargs):
+            self.messages.append((messages, kwargs))
+            return Response()
+
+    runtime = TaskRuntime(db)
+    handlers = LegacyTaskHandlers(manager, Model(), Config(project_path=str(tmp_path)), runtime).mapping()
+    task = runtime.enqueue(
+        "storyflow-analyze",
+        project_id=project.id,
+        book_id=book_id,
+        data={"node_ids": [f"book:{book_id}"]},
+    )
+    runtime.claim("storyflow-analysis-worker")
+    running = runtime.get(task["id"])
+    assert running is not None
+    result = handlers["storyflow-analyze"](running)
+    runtime.transition(task["id"], "completed", result=result)
+    persisted = runtime.get(task["id"])
+    assert persisted is not None
+    assert persisted["result"]["source"] == "model"
+    assert persisted["result"]["findings"][0]["evidenceNodeIds"] == [f"book:{book_id}"]
+    assert db.fetchall("SELECT * FROM story_facts WHERE book_id=?", (book_id,)) == []

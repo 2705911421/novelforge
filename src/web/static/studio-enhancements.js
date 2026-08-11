@@ -12,7 +12,7 @@
 
   addNav({ id: 'themes', label: '人物主题', icon: 'M4 4h16v16H4z M8 8h8 M8 12h5 M8 16h8', bookOnly: true });
   addNav({ id: 'flow', label: '交互式关系图', icon: 'M6 4a2 2 0 100 4 2 2 0 000-4 M18 10a2 2 0 100 4 2 2 0 000-4 M8 7l8 5', bookOnly: true });
-  addNav({ id: 'planning', label: '自动规划视图', icon: 'M4 5h16v14H4z M8 9h8 M8 13h5', bookOnly: true });
+  addNav({ id: 'planning', label: '规划总览', navGroup: '规划与结构', icon: 'M4 5h16v14H4z M8 9h8 M8 13h5', bookOnly: true });
   addNav({ id: 'thought', label: '念头创作', icon: 'M12 3a7 7 0 00-4 12c1 1 1 2 1 3h6c0-1 0-2 1-3a7 7 0 00-4-12z M9 21h6', bookOnly: true });
   addNav({ id: 'project-settings', label: '作品设置', icon: 'M12 15a3 3 0 100-6 3 3 0 000 6z M19.4 15a1.65 1.65 0 00.33 1.82l.06.06', bookOnly: true });
 
@@ -25,7 +25,7 @@
   const pretty = (value) => esc(typeof value === 'string' ? value : stringify(value));
   const taskError = (task) => task?.error || task?.checkpoint?.state?.message || (typeof TASK_ERROR_LABELS === 'object' && TASK_ERROR_LABELS[task?.error_code]) || task?.status || '任务未完成';
   const readableProjection = (value) => typeof readableTaskRows === 'function' ? readableTaskRows(value) : `<p class="text-sm" style="white-space:pre-wrap">${esc(taskValueText(value))}</p>`;
-  const activeStatus = new Set(['queued', 'running', 'paused', 'cancelling']);
+  const activeStatus = new Set(['queued', 'running', 'waiting_on_child', 'paused', 'cancelling']);
 
   function isMissingFeatureError(error) {
     return error?.status === 404 || /not found|不存在|NOT_FOUND/i.test(String(error?.message || ''));
@@ -326,7 +326,7 @@
     const decision = status?.decision || {};
     const reasonLabels = { child_chapter_not_accepted: '章节没有通过质量门禁', joint_review_not_passed: '联合审查没有通过', model_unavailable: '模型不可用' };
     const reason = reasonLabels[decision.reason] || decision.reason || status?.error || '';
-    const decisionHtml = status?.status === 'needs_author_decision' ? `<div class="warn-banner mt8"><b>任务已安全停在这里</b><p class="mt8">${decision.chapter ? `第 ${esc(decision.chapter)} 章` : '当前章节'}${esc(reason ? `：${reason}` : '需要作者检查后再继续')}。</p>${decision.message ? `<p class="text-sm mt8">${esc(decision.message)}</p>` : ''}<div class="row row-wrap mt12"><button class="btn btn-sm btn-primary" onclick="continuousTaskAction('retry')">从检查点继续</button><button class="btn btn-sm btn-danger" onclick="continuousTaskAction('cancel')">结束任务</button><button class="btn btn-sm btn-ghost" onclick="go('tasks')">查看任务详情</button></div></div>` : status?.status === 'failed' ? `<div class="warn-banner mt8">${esc(status.error || '任务失败')}<div class="row mt12"><button class="btn btn-sm btn-secondary" onclick="continuousTaskAction('retry')">重新尝试</button></div></div>` : '';
+    const decisionHtml = status?.status === 'needs_author_decision' ? `<div class="warn-banner mt8"><b>任务已安全停在这里</b><p class="mt8">${decision.chapter ? `第 ${esc(decision.chapter)} 章` : '当前章节'}${esc(reason ? `：${reason}` : '需要作者检查后再继续')}。</p>${decision.message ? `<p class="text-sm mt8">${esc(decision.message)}</p>` : ''}<div class="row row-wrap mt12"><button class="btn btn-sm btn-primary" onclick="continuousAuthorDecision('accept')">作者放行当前候选</button><button class="btn btn-sm btn-secondary" onclick="continuousAuthorDecision('reject')">重新审查</button><button class="btn btn-sm btn-danger" onclick="continuousAuthorDecision('cancel')">结束任务</button><button class="btn btn-sm btn-ghost" onclick="go('tasks')">查看任务详情</button></div></div>` : status?.status === 'failed' ? `<div class="warn-banner mt8">${esc(status.error || '任务失败')}<div class="row mt12"><button class="btn btn-sm btn-secondary" onclick="continuousTaskAction('retry')">重新尝试</button></div></div>` : '';
     target.innerHTML = `<div class="card"><div class="row"><b>持久任务状态</b><span class="spacer"></span>${statusBadge(status?.status || 'idle')}</div><div class="progress mt8"><div class="progress-bar" style="width:${total ? Math.min(100, completed / total * 100) : 0}%"></div></div><p class="dim-note mt8">已完成 ${completed}/${total || '—'} 章 · 当前章节 ${esc(status?.currentChapter ?? '—')} · Task ${esc(status?.taskId || '—')}</p>${checkpointText ? `<p class="text-sm text-muted mt8">当前阶段：${esc(typeof checkpointText === 'string' ? checkpointText : workspaceText(checkpointText))}</p>` : ''}${decisionHtml}</div>`;
   }
   async function reloadContinuousStatus() {
@@ -672,9 +672,9 @@
   PAGES.planning = async (p) => {
     if (!S.book) return go('dashboard');
     try {
-      const data = await api('GET', `/books/${S.book}/planning-views`); const views = data.views || [];
+      const [data, book] = await Promise.all([api('GET', `/books/${S.book}/planning-views`), api('GET', `/books/${S.book}`)]); const views = data.views || [];
       const active = views.find(view => view.view_type === planningViewKey) || views[0];
-      p.innerHTML = header('自动规划视图', 'AI 阅读全部规划资料后生成的四类结构资产；本页只读，不能直接编辑', `<button class="btn btn-primary" onclick="completePlanningImport()">一键导入为作品规划</button><button class="btn btn-secondary" onclick="go('plot')">打开交互画布</button><button class="btn btn-secondary" onclick="generatePlanningViews()">AI 重新整理</button>`) + `<div class="content"><div class="warn-banner">这些视图用于理解作品全貌。若要拖拽、新增、删除、隐藏或试演，请进入交互画布；画布调整不会改写这里的规划资料。</div><div class="row row-wrap mb16">${['mindmap','timeline','plot_workflow','character_relationships'].map(key => `<button class="btn btn-sm ${planningViewKey === key ? 'btn-primary' : 'btn-ghost'}" onclick="planningViewKey='${key}';go('planning')">${planningViewLabel(key)}</button>`).join('')}</div><div class="grid grid-2">${views.map(view => { const payload=view.payload||{}; const nodes=payload.nodes||[], edges=payload.edges||[]; return `<div class="card"><div class="card-title-row"><div><h3>${esc(planningViewLabel(view.view_type))}</h3><p class="dim-note">${nodes.length} 个节点 · ${edges.length} 条关系 · 第 ${esc(view.version || '—')} 版</p></div><span class="badge badge-muted">只读</span></div><div class="planning-node-list">${nodes.slice(0,12).map(node => `<div class="list-row"><span class="badge badge-info">${esc(node.kind||node.type||'节点')}</span><span>${esc(node.title||node.label||node.id)}</span></div>`).join('') || '<p class="dim-note">当前资料还没有可识别的节点。</p>'}</div><p class="dim-note mt8">来源：${esc((view.source_manifest||[]).map(item=>item.filename).join('、')||'尚未导入文件')}；已整理 ${edges.length} 条关系。</p></div>`; }).join('')}</div><div id="planning-task-state" class="mt16"></div></div>`;
+      p.innerHTML = header('规划总览', '完整 25 步清单发布后，这里展示卷、故事弧、章节计划及四类只读结构示意图', `<button class="btn btn-primary" onclick="completePlanningImport()">进入 25 步规划审阅</button><button class="btn btn-secondary" onclick="go('plot')">打开交互画布</button><button class="btn btn-secondary" onclick="generatePlanningViews()">AI 重新整理</button>`) + `<div class="content"><div class="info-banner"><b>规划覆盖：</b><span>${esc(planningReadinessSummary(book.planningReadiness) || '尚未开始规划')}</span><button class="btn btn-sm btn-secondary" onclick="go('wizard')">打开卷 / 弧 / 章节计划</button></div><div class="warn-banner">这些视图用于理解作品全貌；“进入 25 步规划审阅”只会准备草稿，不会确认或发布任何步骤。审阅完成后，请从世界观向导逐步确认。</div><div class="row row-wrap mb16">${['mindmap','timeline','plot_workflow','character_relationships'].map(key => `<button class="btn btn-sm ${planningViewKey === key ? 'btn-primary' : 'btn-ghost'}" onclick="planningViewKey='${key}';go('planning')">${planningViewLabel(key)}</button>`).join('')}</div><div class="grid grid-2">${views.map(view => { const payload=view.payload||{}; const nodes=payload.nodes||[], edges=payload.edges||[]; return `<div class="card"><div class="card-title-row"><div><h3>${esc(planningViewLabel(view.view_type))}</h3><p class="dim-note">${nodes.length} 个节点 · ${edges.length} 条关系 · 第 ${esc(view.version || '—')} 版</p></div><span class="badge badge-muted">只读示意</span></div><div class="planning-node-list">${nodes.slice(0,12).map(node => `<div class="list-row"><span class="badge badge-info">${esc(node.kind||node.type||'节点')}</span><span>${esc(node.title||node.label||node.id)}</span></div>`).join('') || '<p class="dim-note">当前资料还没有可识别的节点。</p>'}</div><p class="dim-note mt8">来源：${esc((view.source_manifest||[]).map(item=>item.filename).join('、')||'尚未导入文件')}；已整理 ${edges.length} 条关系。</p></div>`; }).join('')}</div><div id="planning-task-state" class="mt16"></div></div>`;
       if (active) { const card=[...p.querySelectorAll('.card')].find(item => item.querySelector('h3')?.textContent === planningViewLabel(active.view_type)); card?.classList.add('planning-view-active'); }
     } catch (error) { renderFeatureEmpty(p, '自动规划视图', error.message, '<button class="btn btn-primary" onclick="go(\'create\')">返回新建作品</button>'); }
    };
@@ -697,7 +697,18 @@
     try { const queued=await api('POST',`/books/${S.book}/planning-views/generate`,{}); const task=await waitForTask(queued.taskId,current=>renderTaskState(target,current,'自动规划视图')); if(task.status==='completed')go('planning'); } catch(error) { if(target)target.innerHTML=`<div class="warn-banner">${esc(error.message)}</div>`; }
   };
   window.completePlanningImport = async function () {
-    try { await api('POST',`/books/${S.book}/planning-sources/complete`,{}); toast('已一键导入为作品规划','success'); go('planning'); } catch(error) { toast(error.message,'error'); }
+    try { await api('POST',`/books/${S.book}/planning-sources/prepare`,{}); toast('已准备 25 步规划草稿，请逐步审阅确认','success'); go('wizard'); } catch(error) { toast(error.message,'error'); }
+  };
+  window.continuousAuthorDecision = async function (decision) {
+    const taskId = enhancedContinuousTask || localStorage.getItem('novelforge-continuous-' + S.book);
+    if (!taskId) return toast('没有可操作的连续创作任务', 'warning');
+    const reason = decision === 'accept' ? (window.prompt('请记录作者放行理由') || '') : '';
+    try {
+      await api('POST', `/tasks/${taskId}/author-decision`, { decision, reason });
+      await reloadContinuousStatus();
+      continuousPoll(taskId);
+      toast('作者决策已记录，任务将从安全检查点恢复', 'success');
+    } catch (error) { toast(error.message, 'error'); }
   };
   PAGES.thought = async (p) => {
     if (!S.book) return go('dashboard');
@@ -1770,6 +1781,16 @@
   };
   PAGES.create = async (p) => {
     await legacyCreatePage(p);
+    try {
+      const preflight = await api('GET', '/creation/preflight?mode=planned');
+      if (!preflight.ready) {
+        const content = p.querySelector('.content');
+        const gate = document.createElement('div');
+        gate.className = 'warn-banner planning-gate mb16';
+        gate.innerHTML = '<div class="planning-gate-content"><b>开始前请先配置 LLM 供应商</b><span>' + esc(preflight.modelReadiness?.message || '三种创作入口都必须先接入可用的模型。') + '</span><span class="dim-note">缺少路由：' + esc((preflight.modelReadiness?.missingRoles || []).join('、') || '供应商 / 模型') + '</span><div class="planning-gate-actions"><button class="btn btn-sm btn-primary" onclick="go(\'agent-config\')">打开 AI 配置</button></div></div>';
+        content?.prepend(gate);
+      }
+    } catch (_) {}
     const field = p.querySelector('#c-genre')?.closest('.field');
     if (!field) return;
     let genres = [];

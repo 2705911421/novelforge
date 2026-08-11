@@ -69,7 +69,10 @@ def test_invocation_records_generation_run_with_prompt_and_output_body(model_run
     task = TaskRuntime(database).enqueue("model-connection-test", data={"provider_id": "provider-a"})
     runtime = PersistentModelRuntime(repository, gateway=FakeGateway())
     with runtime.task_scope(task["id"]):
-        response = runtime.invoke("writer", [{"role": "user", "content": "private prompt"}], "private system")
+        response = runtime.invoke(
+            "writer", [{"role": "user", "content": "private prompt"}], "private system",
+            context_manifest={"schemaVersion": 1, "items": [{"sourceType": "story_fact", "sourceId": "fact-1"}]},
+        )
 
     assert response.content == "private generated text"
     run = repository.runs_for_task(task["id"])[0]
@@ -80,6 +83,9 @@ def test_invocation_records_generation_run_with_prompt_and_output_body(model_run
     assert run["input_reference"]["system_chars"] > 14
     assert len(run["input_reference"]["prompt_sha256"]) == 64
     assert run["input_reference"]["prompt_source"] == "agent-contract+route-override"
+    assert run["input_reference"]["context_manifest"]["schemaVersion"] == 1
+    assert run["input_reference"]["context_manifest"]["generationRunId"] == run["id"]
+    assert run["input_reference"]["context_manifest"]["items"][0]["sourceId"] == "fact-1"
     assert run["output_reference"]["content_chars"] == len("private generated text")
     assert run["input_reference"]["prompt"].endswith("[user]\nprivate prompt")
     assert run["output_reference"]["content"] == "private generated text"

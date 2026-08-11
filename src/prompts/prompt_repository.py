@@ -79,6 +79,45 @@ class PromptRepository:
             "is_default": True,
         }
 
+    def get_prompt_version(
+        self,
+        task_type: str,
+        version: int,
+        project_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Load an immutable prompt version for a pinned writing run.
+
+        Project prompts take precedence over global prompts, matching
+        :meth:`get_prompt`.  Version ``0`` is the built-in prompt and has no
+        database row, so the normal built-in fallback is returned for it.
+        """
+        try:
+            version = int(version)
+        except (TypeError, ValueError):
+            return None
+        if version == 0:
+            return self.get_prompt(task_type, project_id) if not self.get_prompt(task_type, project_id).get("version") else {
+                "task_type": task_type,
+                "system_prompt": DEFAULT_PROMPTS.get(task_type, {}).get("system", ""),
+                "user_template": DEFAULT_PROMPTS.get(task_type, {}).get("user_template", ""),
+                "version": 0,
+                "is_default": True,
+            }
+        if project_id:
+            row = self.db.fetchone(
+                """SELECT * FROM prompt_templates
+                   WHERE task_type=? AND project_id=? AND version=?""",
+                (task_type, project_id, version),
+            )
+            if row:
+                return row
+        row = self.db.fetchone(
+            """SELECT * FROM prompt_templates
+               WHERE task_type=? AND project_id IS NULL AND version=?""",
+            (task_type, version),
+        )
+        return row
+
     def save_prompt(
         self,
         task_type: str,

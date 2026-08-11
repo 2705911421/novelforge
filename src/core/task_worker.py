@@ -46,6 +46,19 @@ class PersistentTaskWorker:
             result = await asyncio.to_thread(handler, task)
             if inspect.isawaitable(result):
                 result = await result
+            # A parent orchestrator may have durably scheduled a child and
+            # released its own lease.  Do not let the generic worker turn
+            # that safe hand-off into a false completed parent task.
+            if isinstance(result, dict) and result.get("_defer"):
+                child_task_id = result.get("child_task_id")
+                if not isinstance(child_task_id, str) or not child_task_id:
+                    raise RuntimeError("deferred task did not provide child_task_id")
+                return self.runtime.defer_until_child(
+                    task["id"],
+                    child_task_id,
+                    detail=result.get("detail") if isinstance(result.get("detail"), dict) else None,
+                    lease_owner=worker_id,
+                )
             current = self.runtime.get(task["id"])
             if current and current["status"] == "cancelling":
                 self.runtime.checkpoint(task["id"], current.get("stage") or "cancelled",

@@ -451,6 +451,8 @@ class StoryRepository:
         review_score: Optional[float] = None,
         blocking_issues: int = 0,
         chapter_version_id: Optional[str] = None,
+        author_override: bool = False,
+        override_reason: str = "",
     ) -> str:
         commit_id = generate_id()
         with self.db.transaction() as conn:
@@ -472,14 +474,15 @@ class StoryRepository:
 
             conn.execute(
                 """INSERT INTO story_commits(id, chapter_id, status, facts_extracted, state_changes,
-                   review_score, blocking_issues, chapter_version_id)
-                   VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)""",
+                   review_score, blocking_issues, chapter_version_id, author_override, override_reason)
+                   VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
                 (commit_id, chapter_id, _json(list(facts)), _json(state_changes), review_score,
-                 blocking_issues, chapter_version_id),
+                 blocking_issues, chapter_version_id, bool(author_override), (override_reason or "")[:2000]),
             )
         return commit_id
 
-    def accept_story_commit(self, commit_id: str) -> dict[str, Any]:
+    def accept_story_commit(self, commit_id: str, *, author_override: bool = False,
+                            override_reason: str = "") -> dict[str, Any]:
         """Accept a pending commit and atomically advance the book projection."""
         result: dict[str, Any]
         backup_target: tuple[str, str] | None = None
@@ -491,8 +494,15 @@ class StoryRepository:
                 return {"commit_id": commit_id, "accepted": True, "idempotent": True}
             if commit["status"] != "pending":
                 raise ValueError(f"cannot accept {commit['status']} story commit")
-            if commit["blocking_issues"]:
+            effective_override = bool(commit["author_override"] or author_override)
+            if commit["blocking_issues"] and not effective_override:
                 raise ValueError("cannot accept a commit with blocking review issues")
+            if author_override and not commit["author_override"]:
+                reason = (override_reason or "author override")[:2000]
+                conn.execute(
+                    "UPDATE story_commits SET author_override=TRUE, override_reason=? WHERE id=? AND status='pending'",
+                    (reason, commit_id),
+                )
             chapter = conn.execute(
                 """SELECT c.book_id, b.project_id FROM chapters c
                    JOIN books b ON b.id = c.book_id WHERE c.id = ?""",

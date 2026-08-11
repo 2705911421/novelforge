@@ -1,6 +1,5 @@
 """Legacy-compatible FastAPI routes backed by the durable Studio runtime."""
 
-import hashlib
 import os
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from ..core.database import Database
 from ..core.project import ProjectManager
 from ..core.story_repository import StoryRepository
 from ..core.task_runtime import TaskRuntime, TaskStateError
+from ..creation.continuous_service import ContinuousWritingService
 
 app = FastAPI(title="NovelForge", description="AI小说创作平台")
 
@@ -25,6 +25,11 @@ config = Config(project_path=str(workspace_root))
 story_repository = StoryRepository(Database(str(workspace_root / "projects" / "novelforge.db")))
 project_mgr = ProjectManager(str(workspace_root), repository=story_repository)
 task_runtime = TaskRuntime(story_repository.db)
+
+
+def _config_int(section: str, key: str, default: int) -> int:
+    value = config.get(section, key, default=default)
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
 
 
 class CreateProjectRequest(BaseModel):
@@ -132,13 +137,24 @@ async def continuous_mode(project_id: str, req: ContinuousRequest):
         raise HTTPException(422, "start_chapter must be positive")
     if req.count < 5 or req.count > 200:
         raise HTTPException(422, "count must be between 5 and 200")
-    context_fingerprint = hashlib.sha256(req.context.encode("utf-8")).hexdigest()[:16]
     try:
-        task = task_runtime.enqueue_continuous(
-            project_id=project_id,
-            book_id=book["id"],
-            data={"start": start, "count": req.count, "context": req.context},
-            idempotency_key=f"continuous:{book['id']}:{start}:{req.count}:{context_fingerprint}",
+        task = ContinuousWritingService(
+            story_repository.db,
+            None,
+            story_repository,
+            task_runtime,
+            score_threshold=_config_int("review", "pass_score", 93),
+            max_revisions=_config_int("review", "max_revision_rounds", 3),
+        ).start_continuous(
+            project_id,
+            book["id"],
+            start,
+            req.count,
+            req.context,
+            # This route is the documented legacy/unmanaged adapter.  The
+            # managed Studio route below requires a published planning
+            # snapshot; keeping this explicit preserves old API clients.
+            strict_planning=False,
         )
     except TaskStateError as exc:
         raise HTTPException(409, str(exc)) from exc

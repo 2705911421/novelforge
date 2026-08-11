@@ -240,6 +240,7 @@ select.input{cursor:pointer}
 @media(max-width:700px){.task-detail-modal .kv{display:block}.task-detail-modal .kv span{display:block;margin-bottom:4px}.task-detail-modal .kv b{display:block}.task-run{padding:10px}.task-prompt,.task-output{max-height:420px}}
 </style>
 <link rel="stylesheet" href="/static/studio-theme.css?v=20260811-model-progress-1" onerror="this.onerror=null;this.href='studio-theme.css'">
+<link rel="stylesheet" href="/static/storyflow.css?v=20260811-storyflow-1" onerror="this.onerror=null;this.href='storyflow.css'">
 </head>
 <body>
 <button class="mobile-nav-toggle" id="mobile-nav-toggle" type="button" aria-controls="studio-sidebar" aria-expanded="false"><span class="mobile-nav-icon" aria-hidden="true"></span><span>导航</span></button>
@@ -297,6 +298,7 @@ const NAV = [
   {id:'chapters',label:'章节工作台',icon:'M4 19.5A2.5 2.5 0 016.5 17H20 M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z',bookOnly:true},
   {id:'continuous',label:'连续创作',navGroup:'创作与审查',icon:'M5 3l14 9-14 9V3z',bookOnly:true},
   {id:'mindmap',label:'思维导图',navGroup:'规划与结构',icon:'M18 8a3 3 0 10-6 0 M6 12a3 3 0 106 0 M18 16a3 3 0 10-6 0 M9 12h6 M15 8l-3 4 3 4',bookOnly:true},
+  {id:'storyflow',label:'StoryFlow 故事画布',navGroup:'规划与结构',icon:'M5 5h5v5H5z M14 14h5v5h-5z M10 7h4v10h-4z',bookOnly:true},
   {id:'timeline',label:'故事时间轴',navGroup:'规划与结构',icon:'M12 8v4l3 3 M12 2a10 10 0 100 20 10 10 0 000-20z',bookOnly:true},
   {id:'plot',label:'剧情工作流',navGroup:'规划与结构',icon:'M5 5h5v5H5z M14 14h5v5h-5z M10 7h4v10h-4z',bookOnly:true},
   {id:'world-map',label:'世界地图',navGroup:'规划与结构',icon:'M3 6l6-3 6 3 6-3v15l-6 3-6-3-6 3z M9 3v15 M15 6v15',bookOnly:true},
@@ -336,8 +338,11 @@ const modelWork = (() => {
   const items = new Map();
   let sequence = 0;
   let restoredScope = null;
+  const collapsedKey = 'novelforge-model-work-collapsed';
+  let collapsed = false;
+  try { collapsed = window.localStorage.getItem(collapsedKey) === '1'; } catch (_) {}
 
-  const activeStatuses = new Set(['queued', 'running', 'paused', 'cancelling']);
+  const activeStatuses = new Set(['queued', 'running', 'waiting_on_child', 'paused', 'cancelling']);
   const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'needs_author_decision']);
 
   function routeLabel(method, path, body) {
@@ -350,7 +355,7 @@ const modelWork = (() => {
     if (/\/dialogue\/write$/.test(route)) return '正在生成角色对白';
     if (/\/story-bible\/steps\/[^/]+\/suggest$/.test(route)) return '正在生成 Story Bible 建议';
     if (/\/planning-summary\/generate$/.test(route)) return '正在理解规划资料';
-    if (/\/planning-views\/generate$|\/planning-sources\/complete$/.test(route)) return '正在整理规划视图';
+    if (/\/planning-views\/generate$|\/planning-sources\/(?:complete|prepare)$/.test(route)) return '正在整理规划视图';
     if (/\/thought-session\/respond$/.test(route)) return '正在追问创作念头';
     if (/\/thought-session\/framework$/.test(route)) return '正在整理小说框架';
     if (/\/write-next$|\/draft$/.test(route)) return '正在规划并生成章节';
@@ -364,7 +369,7 @@ const modelWork = (() => {
     if (/\/services\/[^/]+\/test$/.test(route)) return '正在测试模型连接';
     if (/\/services\/[^/]+\/models\/discover$/.test(route)) return '正在获取模型列表';
     if (/\/translations\/[^/]+\/run$/.test(route)) return '正在翻译文本';
-    if (/\/draft-imports(?:\/[^/]+\/(?:retry|adjustment-plan))?$/.test(route)) return '正在分析初稿';
+    if (/\/draft-imports(?:\/[^/]+\/(?:retry|adjustment-plan|prepare-planning))?$/.test(route)) return '正在分析初稿';
     if (/\/projects\/[^/]+\/story-graph\/generate$/.test(route)) return '正在生成互动影像图谱';
     if (/\/projects\/[^/]+\/nodes\/[^/]+\/image$/.test(route)) return '正在生成节点配图';
     if (/\/books\/[^/]+\/cover\/generate$/.test(route)) return '正在生成封面图片';
@@ -437,6 +442,39 @@ const modelWork = (() => {
     </div>`;
   }
 
+  function requestDetail(item) {
+    if (typeof modal !== 'function') return;
+    modal(`<div class="modal-header"><div><h3>模型请求详情</h3><p class="dim-note">${esc(item.label || '模型请求')}</p></div><button class="close-x" onclick="closeModal()">×</button></div>
+      <div class="card"><div class="kv"><span>状态</span><b>正在等待服务器返回持久任务</b></div><p class="dim-note mt8">这个请求尚未获得可控制的 Task ID。返回后会自动接入暂停、停止和任务详情操作。</p></div>
+      <div class="row mt16"><button class="btn btn-ghost" onclick="closeModal()">关闭</button><button class="btn btn-secondary" onclick="go('tasks');closeModal()">打开任务管理</button></div>`, true);
+  }
+
+  async function controlTask(taskId, action) {
+    if (!taskId || String(taskId).startsWith('model-request-')) return;
+    const item = items.get(taskId);
+    try {
+      await api('POST', `/tasks/${encodeURIComponent(taskId)}/${action}`);
+      const latest = await api('GET', `/tasks/${encodeURIComponent(taskId)}`);
+      if (item) item.task = latest;
+      render();
+      if (activeStatuses.has(latest.status)) attachTask(taskId, item?.label || '', latest);
+    } catch (error) {
+      if (typeof toast === 'function') toast(error.message, 'error');
+    }
+  }
+
+  function taskControls(item) {
+    const task = item.task;
+    const detail = item.request
+      ? `<button type="button" class="btn btn-sm btn-ghost" onclick="modelWork.requestDetail('${escAttr(item.id)}')">详情</button>`
+      : `<button type="button" class="btn btn-sm btn-ghost" onclick="showTaskDetail('${escAttr(item.id)}')">详情</button>`;
+    if (!task || item.request) return detail;
+    if (task.status === 'running') return `<button type="button" class="btn btn-sm btn-secondary" onclick="modelWork.controlTask('${escAttr(item.id)}','pause')">暂停</button><button type="button" class="btn btn-sm btn-danger" onclick="modelWork.controlTask('${escAttr(item.id)}','cancel')">停止</button>${detail}`;
+    if (task.status === 'paused') return `<button type="button" class="btn btn-sm btn-primary" onclick="modelWork.controlTask('${escAttr(item.id)}','resume')">继续</button><button type="button" class="btn btn-sm btn-danger" onclick="modelWork.controlTask('${escAttr(item.id)}','cancel')">停止</button>${detail}`;
+    if (task.status === 'queued') return `<button type="button" class="btn btn-sm btn-primary" onclick="modelWork.controlTask('${escAttr(item.id)}','start')">开始</button><button type="button" class="btn btn-sm btn-danger" onclick="modelWork.controlTask('${escAttr(item.id)}','cancel')">停止</button>${detail}`;
+    return detail;
+  }
+
   function render() {
     const root = document.getElementById('model-work-indicator');
     if (!root) return;
@@ -447,8 +485,8 @@ const modelWork = (() => {
       return;
     }
     root.setAttribute('aria-hidden', 'false');
-    root.innerHTML = `<section class="model-work-panel" aria-label="大模型工作进度">
-      <div class="model-work-header"><span class="model-work-pulse" aria-hidden="true"></span><div><b>AI 正在工作</b><span>页面不会卡住，完成后会自动更新</span></div><span class="model-work-count">${visible.length} 项</span></div>
+    root.innerHTML = `<section class="model-work-panel${collapsed ? ' is-collapsed' : ''}" aria-label="大模型工作进度">
+      <div class="model-work-header"><span class="model-work-pulse" aria-hidden="true"></span><div><b>AI 正在工作</b><span>${collapsed ? '已折叠，任务仍在后台运行' : '页面不会卡住，完成后会自动更新'}</span></div><span class="model-work-count">${visible.length} 项</span><button type="button" class="btn btn-sm btn-ghost model-work-collapse" aria-expanded="${collapsed ? 'false' : 'true'}" aria-label="${collapsed ? '展开工作卡片' : '折叠工作卡片'}" onclick="modelWork.toggleCollapsed()">${collapsed ? '展开' : '折叠'}</button></div>
       <div class="model-work-list">${visible.slice(0, 5).map((item) => {
         const task = item.task;
         const progress = taskProgress(task);
@@ -458,7 +496,7 @@ const modelWork = (() => {
         const status = taskStatus(task);
         return `<div class="model-work-item"><div class="model-work-item-head"><b>${esc(taskLabel(task, item.label))}</b><span>${esc(status)}</span></div>
           <div class="model-work-track" role="progressbar" aria-label="${esc(taskLabel(task, item.label))}" aria-valuemin="0" aria-valuemax="100"${isDeterminate ? ` aria-valuenow="${width}"` : ' aria-valuetext="模型正在处理"'}><div class="model-work-fill${isDeterminate ? '' : ' is-indeterminate'}" style="width:${isDeterminate ? width : 36}%"></div></div>
-          <div class="model-work-item-foot"><span>${esc(stage)}</span><span>${isDeterminate ? `${width}%` : '处理中'}</span></div></div>`;
+          <div class="model-work-item-foot"><span>${esc(stage)}</span><span>${isDeterminate ? `${width}%` : '处理中'}</span></div><div class="model-work-actions">${taskControls(item)}</div></div>`;
       }).join('')}</div>
       ${visible.length > 5 ? '<div class="model-work-more">还有任务在后台运行，可在「任务管理」中查看全部。</div>' : ''}
     </section>`;
@@ -540,6 +578,13 @@ const modelWork = (() => {
     finishTask: finish,
     renderInline,
     restoreActiveTasks,
+    controlTask,
+    requestDetail,
+    toggleCollapsed() {
+      collapsed = !collapsed;
+      try { window.localStorage.setItem(collapsedKey, collapsed ? '1' : '0'); } catch (_) {}
+      render();
+    },
   };
 })();
 window.modelWork = modelWork;
@@ -607,13 +652,18 @@ function planningGateMarkup(readiness,mode){
 function renderPlanningGate(target,error){
   if(!target)return false;
   const detail=error?.detail?.code?error.detail:error?.payload?.detail?.code?error.payload.detail:null;
+  if(error?.code==='LLM_PROVIDER_REQUIRED'||detail?.code==='LLM_PROVIDER_REQUIRED'){
+    const readiness=detail?.modelReadiness||{};
+    target.innerHTML=`<div class="warn-banner planning-gate"><div class="planning-gate-content"><b>请先配置 LLM 供应商</b><span>${esc(detail?.message||'开始创作前必须配置可用的供应商、模型和角色路由。')}</span><span class="dim-note">${readiness.missingRoles?.length?'还缺少角色路由：'+readiness.missingRoles.join('、'):''}</span><div class="planning-gate-actions"><button class="btn btn-sm btn-primary" onclick="go('agent-config')">打开 AI 配置</button></div></div></div>`;
+    return true;
+  }
   if(error?.code!=='PLANNING_REQUIRED'&&detail?.code!=='PLANNING_REQUIRED')return false;
   target.innerHTML=planningGateMarkup(detail?.planningReadiness||null,detail?.workflow?.mode||'thought')||'<div class="warn-banner">当前作品尚未完成创作前置规划，请先打开 25 步向导。</div>';
   return true;
 }
 function scoreColor(s){return s>=93?'var(--success)':s>=80?'var(--warning)':'var(--error)';}
 function statusBadge(st){
-  const m={approved:['badge-success','已通过'],committed:['badge-success','已提交'],reviewing:['badge-warning','审查中'],draft:['badge-muted','草稿'],drafted:['badge-info','已写草稿'],writing:['badge-info','创作中'],revising:['badge-warning','修订中'],uploaded:['badge-muted','待分析'],pending:['badge-muted','等待领取'],queued:['badge-info','已排队'],running:['badge-info','运行中'],paused:['badge-warning','已暂停'],cancelling:['badge-warning','取消中'],completed:['badge-success','已完成'],failed:['badge-error','失败'],cancelled:['badge-muted','已取消'],needs_author_decision:['badge-error','需要作者决定']};
+  const m={approved:['badge-success','已通过'],committed:['badge-success','已提交'],reviewing:['badge-warning','审查中'],draft:['badge-muted','草稿'],drafted:['badge-info','已写草稿'],writing:['badge-info','创作中'],revising:['badge-warning','修订中'],uploaded:['badge-muted','待分析'],pending:['badge-muted','等待领取'],queued:['badge-info','已排队'],running:['badge-info','运行中'],waiting_on_child:['badge-warning','等待章节子任务'],paused:['badge-warning','已暂停'],cancelling:['badge-warning','取消中'],completed:['badge-success','已完成'],failed:['badge-error','失败'],cancelled:['badge-muted','已取消'],needs_author_decision:['badge-error','需要作者决定']};
   const x=m[st]||['badge-muted',st||'—'];return `<span class="badge ${x[0]}">${x[1]}</span>`;
 }
 
@@ -629,7 +679,10 @@ const TASK_FIELD_LABELS={
   'locationCount':'地点数','viewCount':'视图数','wordCount':'字数','score':'评分','overallScore':'综合分',
   'passed':'门禁结果','verdict':'结论','summary':'摘要','reason':'原因','remaining':'剩余章节',
   'current_chapter':'当前章节','chapter':'章节','chapterRange':'章节范围','errorCode':'错误码',
-  'source_count':'资料数','step_count':'步骤数','count':'数量','message':'说明','status':'状态'
+  'source_count':'资料数','step_count':'步骤数','count':'数量','message':'说明','status':'状态',
+  'prompt_a1':'提示词 A1','prompt_a2':'提示词 A2','prompt_a':'提示词 A','prompt_b':'提示词 B',
+  'score_n':'得分 n','alpha':'α 初稿','beta1':'β1 修订稿','beta':'β 通过稿','beta_n':'βn 未通过稿',
+  'accepted_candidate':'Candidate result','author_decision':'Author decision','author_approved':'Author approved'
 };
 const TASK_STAGE_LABELS={
   'queued':'排队中','pending':'等待 Worker 领取','running':'运行中','paused':'已暂停','cancelling':'取消中',
@@ -638,10 +691,10 @@ const TASK_STAGE_LABELS={
   'write_chapter':'章节写作','world-bootstrap':'世界观构建','joint-review':'联合审查','provider-test':'连接检查中','model-discovery':'模型列表整理中',
   'planning-synthesis-model-call':'正在理解规划资料','planning-views-model-call':'正在整理规划视图','forecast-complete':'推演结果已整理',
   'parsing':'正在读取资料','indexed':'资料已整理','PRECHECK':'准备故事资料','LOAD_CHAPTER_PLAN':'读取章节计划','BUILD_CONTEXT':'编排创作上下文',
-  'RETRIEVE_MEMORY':'整理相关记忆','GENERATE_DRAFT':'生成章节草稿','QUALITY_GATE':'检查章节质量','REVISION':'修订章节','EXTRACT_FACTS':'提取故事事实',
+  'RETRIEVE_MEMORY':'整理相关记忆','PLAN_CHAPTER':'生成提示词 A1','EXTRACT_REQUIREMENTS':'生成提示词 A2','COMPOSE_WRITING_PROMPT':'合成提示词 A','GENERATE_DRAFT':'生成 α 章节草稿','QUALITY_GATE':'检查章节质量','REVISION':'生成 β1 修订稿','EXTRACT_FACTS':'提取故事事实',
   'CREATE_STORY_COMMIT':'保存章节事实','DONE':'已完成','COMPLETE':'即将完成','plan':'整理章节计划','draft':'生成草稿','re-review':'再次审查','rewrite':'重写章节','compose':'编排上下文'
 };
-const TASK_EVENT_LABELS={queued:'已排队',claimed:'已开始处理',checkpoint:'已保存进度',lease_renewed:'已续接任务',paused:'已暂停',running:'开始处理',cancelling:'正在取消',cancelled:'已取消',completed:'已完成',failed:'处理失败',needs_author_decision:'等待作者决定',retry_scheduled:'已安排重试',model_call:'已调用模型'};
+const TASK_EVENT_LABELS={queued:'已排队',claimed:'已开始处理',checkpoint:'已保存进度',lease_renewed:'已续接任务',paused:'已暂停',running:'开始处理',waiting_on_child:'等待章节子任务',cancelling:'正在取消',cancelled:'已取消',completed:'已完成',failed:'处理失败',needs_author_decision:'等待作者决定',retry_scheduled:'已安排重试',model_call:'已调用模型'};
 const TASK_ERROR_LABELS={MODEL_ROUTE_UNAVAILABLE:'没有可用的模型路由',MODEL_CREDENTIAL_UNAVAILABLE:'模型访问密钥不可用',MODEL_TASK_CONTEXT_REQUIRED:'模型任务上下文缺失',QUALITY_GATE_FAILED:'章节未通过质量检查',STORY_COMMIT_FAILED:'章节事实保存失败',JOINT_REVIEW_NOT_PASS:'联合审查未通过'};
 function taskChapterNumber(task){
   const data=task?.data||{};
@@ -1000,12 +1053,17 @@ PAGES.create=async(p)=>{
      </div>
      <div class="field"><label>目标卷数</label><input class="input" id="c-volumes" type="number" value="5" min="1" max="100"><div class="dim-note">用于规划卷级故事弧；后续仍可在作品设置中调整。</div></div>
      <div class="card mt16" style="background:var(--bg);border-color:var(--border)">
-       <div class="card-title-row"><div><h3>选择创作入口</h3><p class="dim-note mt8">完整规划适合已有故事圣经；念头创作适合只有一句话、一个画面或一个问题。</p></div><span class="badge badge-info" id="creation-mode-badge">完整规划</span></div>
-       <div class="row row-wrap"><button type="button" class="btn btn-primary" id="creation-mode-planned" onclick="setCreationMode('planned')">导入完整规划</button><button type="button" class="btn btn-ghost" id="creation-mode-thought" onclick="setCreationMode('thought')">念头创作</button></div>
+       <div class="card-title-row"><div><h3>选择创作入口</h3><p class="dim-note mt8">无论从规划、念头还是已有小说初稿开始，都必须先配置 LLM，并完成 25 步清单、分卷、故事弧和章节计划。</p></div><span class="badge badge-info" id="creation-mode-badge">故事圣经 / 技法</span></div>
+       <div class="row row-wrap"><button type="button" class="btn btn-primary" id="creation-mode-planned" onclick="setCreationMode('planned')">故事圣经 / 技法</button><button type="button" class="btn btn-ghost" id="creation-mode-thought" onclick="setCreationMode('thought')">念头创作</button><button type="button" class="btn btn-ghost" id="creation-mode-draft-import" onclick="setCreationMode('draft-import')">现有小说文件夹</button></div>
      </div>
      <div id="create-thought-card" class="card mt16" style="display:none;background:var(--bg);border-color:var(--border)">
        <h3>先说出你的念头</h3><p class="dim-note mt8">不用整理成大纲，写下一个场景、人物、冲突、梦境或问题即可。创建后会进入 AI 追问，并强制带你完成 25 步 Story Bible 清单；每卷、每段故事弧、每章目标计划补齐前不能开始正文创作。</p>
        <textarea class="input textarea mt8" id="c-thought-seed" placeholder="例如：一个负责抹除记忆的人，发现自己最想找回的那段记忆来自未来……"></textarea>
+     </div>
+     <div id="create-draft-import-fields" class="card mt16" style="display:none;background:var(--bg);border-color:var(--border)">
+       <h3>导入已有小说文件夹</h3><p class="dim-note mt8">初稿只作为分析与规划依据，不会直接跳过 25 步清单，也不会自动写入正式章节。分析完成后，系统会生成可审阅的 25 步规划草稿。</p>
+       <div class="grid grid-3 mt8"><label class="fld">故事圣经（可选）<input class="input" id="c-draft-story-bible-file" type="file" accept="text/*,.docx"></label><label class="fld">故事大纲（可选）<input class="input" id="c-draft-outline-file" type="file" accept="text/*,.docx"></label><label class="fld">语言技法 / 文风规则（可选）<input class="input" id="c-draft-language-plan-file" type="file" accept="text/*,.docx"></label></div>
+       <label class="fld mt8">已有小说文件夹（必选）<input class="input" id="c-draft-folder" type="file" multiple webkitdirectory directory accept="text/*,.docx,.zip,.tar,.gz,.tgz"></label>
      </div>
      <div id="create-planned-fields">
      <div class="card mt16" style="background:var(--bg);border-color:var(--border)" id="create-style-card">
@@ -1024,7 +1082,7 @@ PAGES.create=async(p)=>{
       <textarea class="input textarea" id="c-brief" placeholder="主角设定、核心矛盾、想要的风格与爽点节奏……"></textarea></div>
       <div class="card mt16" style="background:var(--bg);border-color:var(--border)">
         <div class="card-title-row"><div><h3>导入现有规划与写作技法</h3><p class="dim-note mt8">支持常见文本和 Word 文档；原文会保留，自动生成的思维导图、时间轴、剧情工作流和人物关系图只读。</p></div><span class="badge badge-muted">可选</span></div>
-        <div class="grid grid-2"><label class="fld">故事圣经 / 总规划<input class="input" id="c-story-bible-file" type="file" accept="text/*,.docx"></label><label class="fld">语言规划 / 写作技法<input class="input" id="c-language-plan-file" type="file" accept="text/*,.docx"></label></div>
+        <div class="grid grid-3"><label class="fld">故事圣经 / 总规划<input class="input" id="c-story-bible-file" type="file" accept="text/*,.docx"></label><label class="fld">故事大纲<input class="input" id="c-story-outline-file" type="file" accept="text/*,.docx"></label><label class="fld">语言规划 / 写作技法<input class="input" id="c-language-plan-file" type="file" accept="text/*,.docx"></label></div>
       </div>
      </div>
     <button class="btn btn-primary" onclick="doCreate()">创建作品</button>
@@ -1033,24 +1091,34 @@ PAGES.create=async(p)=>{
 };
 let creationMode='planned';
 window.setCreationMode=function(mode){
-  creationMode=mode==='thought'?'thought':'planned';
-  const planned=document.getElementById('create-planned-fields'), thought=document.getElementById('create-thought-card');
-  if(planned)planned.style.display=creationMode==='planned'?'block':'none'; if(thought)thought.style.display=creationMode==='thought'?'block':'none';
-  const plannedBtn=document.getElementById('creation-mode-planned'), thoughtBtn=document.getElementById('creation-mode-thought'), badge=document.getElementById('creation-mode-badge');
-  if(plannedBtn)plannedBtn.className='btn '+(creationMode==='planned'?'btn-primary':'btn-ghost'); if(thoughtBtn)thoughtBtn.className='btn '+(creationMode==='thought'?'btn-primary':'btn-ghost'); if(badge)badge.textContent=creationMode==='thought'?'念头创作':'完整规划';
+  creationMode=['thought','draft-import'].includes(mode)?mode:'planned';
+  const planned=document.getElementById('create-planned-fields'), thought=document.getElementById('create-thought-card'), draft=document.getElementById('create-draft-import-fields');
+  if(planned)planned.style.display=creationMode==='planned'?'block':'none'; if(thought)thought.style.display=creationMode==='thought'?'block':'none'; if(draft)draft.style.display=creationMode==='draft-import'?'block':'none';
+  const plannedBtn=document.getElementById('creation-mode-planned'), thoughtBtn=document.getElementById('creation-mode-thought'), draftBtn=document.getElementById('creation-mode-draft-import'), badge=document.getElementById('creation-mode-badge');
+  if(plannedBtn)plannedBtn.className='btn '+(creationMode==='planned'?'btn-primary':'btn-ghost'); if(thoughtBtn)thoughtBtn.className='btn '+(creationMode==='thought'?'btn-primary':'btn-ghost'); if(draftBtn)draftBtn.className='btn '+(creationMode==='draft-import'?'btn-primary':'btn-ghost'); if(badge)badge.textContent=creationMode==='thought'?'念头创作':creationMode==='draft-import'?'现有小说文件夹':'故事圣经 / 技法';
 };
 async function doCreate(){
   const title=val('c-title'); if(!title)return toast('请输入书名','error');
   try{
+     const preflight=await api('GET','/creation/preflight?mode='+encodeURIComponent(creationMode));
+     if(!preflight.ready){toast(preflight.modelReadiness?.message||'请先配置 LLM 供应商','warning');go('agent-config');return;}
      const thoughtSeed=val('c-thought-seed');
      const r=await api('POST','/books/create',{title,genre:val('c-genre'),language:val('c-lang'),
-       chapterWords:parseInt(val('c-words'))||2500,targetChapters:parseInt(val('c-target'))||100,targetVolumes:parseInt(val('c-volumes'))||5,creationMode,brief:creationMode==='thought'?thoughtSeed:val('c-brief'),
+       chapterWords:parseInt(val('c-words'))||2500,targetChapters:parseInt(val('c-target'))||100,targetVolumes:parseInt(val('c-volumes'))||5,creationMode,requireProviderConfigured:true,brief:creationMode==='thought'?thoughtSeed:val('c-brief'),
        styleProfile:{voice:val('c-style-voice'),pov:val('c-style-pov'),rhythm:val('c-style-rhythm'),dialogue:val('c-style-dialogue'),imagery:val('c-style-imagery'),emotion:val('c-style-emotion'),dos:val('c-style-dos'),donts:val('c-style-donts')}});
     toast('创建成功','success'); await openBook(r.id);
     if(creationMode==='planned'){
-      const uploads=[['c-story-bible-file','story_bible'],['c-language-plan-file','language_plan']]; let imported=0;
+      const uploads=[['c-story-bible-file','story_bible'],['c-story-outline-file','reference'],['c-language-plan-file','language_plan']]; let imported=0;
       for(const [id,sourceType] of uploads){const file=document.getElementById(id)?.files?.[0]; if(!file)continue; const form=new FormData(); form.append('file',file); form.append('sourceType',sourceType); form.append('confirmSteps','false'); const response=await fetch('/api/v1/books/'+encodeURIComponent(r.id)+'/planning-sources',{method:'POST',body:form}); if(!response.ok)throw new Error((await response.json().catch(()=>({}))).detail||response.statusText); imported++;}
-      if(imported){const complete=await api('POST','/books/'+r.id+'/planning-sources/complete',{}); toast('规划资料已导入，四类只读视图已生成','success'); if(complete?.views?.length)go('planning');}
+      if(imported){await api('POST','/books/'+r.id+'/planning-sources/prepare',{}); toast('规划资料已导入，请逐步审阅 25 步清单','success');}
+      else toast('作品已创建，请先完成 25 步规划向导','info');
+      go('wizard');
+    } else if(creationMode==='draft-import'){
+      const files=[...(document.getElementById('c-draft-folder')?.files||[])]; if(!files.length){toast('请选择已有小说文件夹','error');go('import');return;}
+      const fd=new FormData(); const bible=document.getElementById('c-draft-story-bible-file')?.files?.[0], outline=document.getElementById('c-draft-outline-file')?.files?.[0], language=document.getElementById('c-draft-language-plan-file')?.files?.[0];
+      if(bible)fd.append('storyBible',bible); if(outline)fd.append('storyOutline',outline); if(language)fd.append('languagePlan',language); files.forEach(file=>fd.append('draftFiles',file,file.webkitRelativePath||file.name));
+      const queued=await api('POST','/books/'+encodeURIComponent(r.id)+'/draft-imports',fd,true); const task=await waitForTask(queued.taskId,()=>{});
+      if(task.status==='completed'){await api('POST','/books/'+encodeURIComponent(r.id)+'/draft-imports/'+encodeURIComponent(queued.draftImportId)+'/prepare-planning',{});toast('初稿分析完成，请逐步审阅 25 步清单','success');go('wizard');}else{toast('初稿分析未完成，请到导入中心查看任务','warning');go('import');}
     } else if(typeof go==='function'){go('thought');}
     if(r.taskId) toast('世界观初始化任务已排队：'+r.taskId,'info');
   }catch(e){toast(e.message,'error');}
@@ -1225,6 +1293,7 @@ function renderTaskActions(t){
   const el=document.getElementById('c-task-actions'); if(!el)return;
   const actions=[];
   if(t.status==='running') actions.push(`<button class="btn btn-sm btn-secondary" onclick="continuousTaskAction('pause')">暂停</button>`,`<button class="btn btn-sm btn-danger" onclick="continuousTaskAction('cancel')">取消</button>`);
+  if(t.status==='waiting_on_child') actions.push(`<button class="btn btn-sm btn-danger" onclick="continuousTaskAction('cancel')">取消</button>`);
   if(t.status==='paused') actions.push(`<button class="btn btn-sm btn-primary" onclick="continuousTaskAction('resume')">恢复</button>`,`<button class="btn btn-sm btn-danger" onclick="continuousTaskAction('cancel')">取消</button>`);
   if(t.status==='failed') actions.push(`<button class="btn btn-sm btn-secondary" onclick="continuousTaskAction('retry')">重试</button>`);
   el.innerHTML=`${statusBadge(t.status)}<span class="dim-note">阶段：${esc(t.stage||'queued')}</span>${actions.join('')}`;
@@ -1236,7 +1305,7 @@ async function pollTask(id){
     if(window.modelWork) window.modelWork.attachTask(id,t.displayName||t.operationLabel||'连续创作',t);
     renderTaskProgress(t);
     renderTaskActions(t);
-    if(['queued','running','cancelling'].includes(t.status)){ setTimeout(()=>pollTask(id),2000); }
+    if(['queued','running','waiting_on_child','cancelling'].includes(t.status)){ setTimeout(()=>pollTask(id),2000); }
     else if(t.status==='completed'){ logLine('✔ 全部完成'); renderTaskResults(t); }
     else if(t.status==='failed'){ logLine('✘ 失败: '+(t.error||'')); }
   }catch(e){ setTimeout(()=>pollTask(id),3000); }
@@ -1349,6 +1418,7 @@ PAGES.wizard=async(p)=>{
   const workflow=book.creationWorkflow||{};
   const readiness=book.planningReadiness||null;
   const planningManaged=Boolean(workflow.metadata?.requireCompletePlanning);
+  const modelReadiness=book.modelReadiness||null;
   const draftText=wizardDraftText(step?.draft);
   const planningStepGuidance={
     volumes:`每一卷都要写清：卷名、卷级目标、覆盖范围，以及卷末必须发生的变化。当前至少需要 ${readiness?.volumeTarget||book.targetVolumes||1} 卷。`,
@@ -1358,6 +1428,7 @@ PAGES.wizard=async(p)=>{
   p.innerHTML=header('世界观向导',`${esc(bookName())} · 用 25 个小决定搭建可写、可检查的 Story Bible`,
     `<button class="btn btn-secondary" onclick="go('mindmap')">查看结构视图</button><button class="btn btn-secondary" onclick="go('book')">返回概览</button>`)+
   `<div class="content">
+    ${workflow.metadata?.enforceProviderGate&&modelReadiness&&!modelReadiness.ready?`<div class="warn-banner planning-gate"><div class="planning-gate-content"><b>AI 补全与审阅前请先配置供应商</b><span>${esc(modelReadiness.message||'请打开 AI 配置完成模型路由。')}</span><div class="planning-gate-actions"><button class="btn btn-sm btn-primary" onclick="go('agent-config')">打开 AI 配置</button></div></div></div>`:''}
     ${workflow.mode==='thought'?`<div class="info-banner"><b>念头创作已进入 25 步清单：</b><span>先在 AI 助手中把念头说完整，再回到这里逐步确认。AI 生成的内容都是草稿，必须由你审阅确认。</span><button class="btn btn-sm btn-secondary" onclick="go('thought')">回到念头访谈</button></div>`:''}
     <div class="info-banner"><b>怎么使用：</b><span>每一步先回答一个小问题，保存后可以让 AI 给建议；你确认后才会进入下一步。你不需要一次想完整本书，先写你确定的部分即可。</span><span class="badge badge-info">${confirmed}/25 已确认</span></div>
     ${planningManaged&&readiness&&!readiness.ready?planningGateMarkup(readiness,workflow.mode):`<div class="info-banner"><b>创作前规划检查：</b><span>${esc(planningReadinessSummary(readiness)||'已完成规划检查')}</span><span class="badge badge-success">可开始正文创作</span></div>`}
@@ -1425,10 +1496,14 @@ PAGES.chapters=async(p)=>{
   if(!S.book){go('dashboard');return;}
   const b=await api('GET','/books/'+S.book);
   const n=b.chaptersWritten||0;
+  const chapterNumbers=Array.isArray(b.chapterNumbers)&&b.chapterNumbers.length
+    ? b.chapterNumbers.map(Number).filter(number=>Number.isInteger(number)&&number>0)
+    : Array.from({length:n},(_,index)=>index+1);
+  const initialChapter=chapterNumbers.length?chapterNumbers[chapterNumbers.length-1]:1;
   const planningManaged=Boolean(b.creationWorkflow?.metadata?.requireCompletePlanning);
   const creationBlocked=planningManaged&&!b.planningReadiness?.ready;
   const rows=[];
-  for(let i=1;i<=n;i++) rows.push(i);
+  chapterNumbers.forEach(number=>rows.push(number));
   p.innerHTML=header('章节工作台',`${esc(b.title||bookName())} · 共 ${n} 章 · 从规划到正文的单章工作区`,
     `<button class="btn btn-primary" onclick="newManualChapter()" ${creationBlocked?'disabled title="请先完成创作规划"':''}>＋ 手动新建章节</button>
      <button class="btn btn-secondary" onclick="writeNext()" ${creationBlocked?'disabled title="请先完成创作规划"':''}>✍ AI 写下一章</button>
@@ -1442,7 +1517,7 @@ PAGES.chapters=async(p)=>{
         <tbody id="ch-tbody">${n?'<tr><td colspan="6" class="muted">正在读取章节…</td></tr>':'<tr><td colspan="6"><p class="muted">还没有章节，点击「写下一章」开始。</p></td></tr>'}</tbody></table>
       </div>
       <div class="card"><h3>单章操作</h3>
-        <div class="field"><label>章节号</label><input class="input" id="op-num" type="number" min="1" value="${n||1}" onchange="loadChapterWorkspace(Number(this.value)||1)"></div>
+         <div class="field"><label>章节号</label><input class="input" id="op-num" type="number" min="1" value="${initialChapter}" onchange="loadChapterWorkspace(Number(this.value)||1)"></div>
         <div class="row row-wrap">
           <button class="btn btn-sm btn-secondary" onclick="opAudit()">审查打分</button>
           <button class="btn btn-sm btn-secondary" onclick="opRevise()">修订一轮</button>
@@ -1455,15 +1530,15 @@ PAGES.chapters=async(p)=>{
       </div>
     </div>
   </div>`;
-  loadChapterRows(n);
+  loadChapterRows(chapterNumbers);
   const taskId=localStorage.getItem(WRITE_TASK_KEY+S.book);
   if(taskId) monitorWriteTask(taskId);
 };
-async function loadChapterRows(n){
-  const tb=document.getElementById('ch-tbody'); if(!tb||!n)return;
-  const results=await Promise.all(Array.from({length:n},(_,index)=>api('GET','/books/'+S.book+'/chapters/'+(index+1)).catch(error=>({number:index+1,error}))));
+async function loadChapterRows(numbers){
+  const tb=document.getElementById('ch-tbody'); if(!tb||!numbers?.length)return;
+  const results=await Promise.all(numbers.map(number=>api('GET','/books/'+S.book+'/chapters/'+number).catch(error=>({number,error}))));
   tb.innerHTML=results.map((c,index)=>{
-    const number=index+1;
+    const number=Number(c.number||numbers[index]);
     if(c.error)return `<tr><td>${number}</td><td class="muted">读取失败</td><td>—</td><td>—</td><td>—</td><td></td></tr>`;
     const sc=c.review?.overall_score ?? c.review?.overallScore;
     return `<tr class="chapter-row" data-chapter="${number}" onclick="loadChapterWorkspace(${number})"><td>${number}</td><td>${esc(c.title||'未命名章节')}</td><td>${(c.wordCount||0).toLocaleString()}</td>
@@ -1471,7 +1546,7 @@ async function loadChapterRows(n){
       <td>${statusBadge(c.status)}</td>
       <td><button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();viewChapter(${number})">编辑</button></td></tr>`;
   }).join('');
-  loadChapterWorkspace(Number(val('op-num'))||1);
+  loadChapterWorkspace(Number(val('op-num'))||numbers[numbers.length-1]||1);
 }
 function workspaceText(value){
   if(value===null||value===undefined)return '';
@@ -1499,7 +1574,12 @@ async function loadChapterWorkspace(number){
       <div class="workspace-section"><span class="dim-note">本章必须遵守的规则</span><ul>${workspaceList(rules.rules||rules.items||rules.constraints)||'<li class="muted">暂无专门规则</li>'}</ul></div>
       <div class="workspace-section"><span class="dim-note">上下文来源</span><p class="text-sm text-muted">${esc(workspaceText(trace.selected_context||trace.selectedContext||trace.summary)||'写作时将从权威故事状态加载上下文。')}</p></div>
       <div class="workspace-section"><span class="dim-note">最近审查</span>${hasReview?`<p class="text-sm"><b style="color:${scoreColor(review.overall_score||0)}">${review.overall_score??'—'} 分</b> · ${esc(review.verdict||'未给出结论')}</p>`:'<p class="text-sm text-muted">尚未审查</p>'}</div>`;
+    out.insertAdjacentHTML('afterbegin', `<div class="row row-wrap mt8"><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('story','${escAttr(w.chapter?.id||'')}')">查看 StoryFlow</button><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('context','${escAttr(w.chapter?.id||'')}')">查看本章 Context</button><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('foreshadow','${escAttr(w.chapter?.id||'')}')">查看相关伏笔</button><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('timeline','${escAttr(w.chapter?.id||'')}')">查看时间线</button></div>`);
   }catch(e){out.innerHTML=`<p style="color:var(--error)">${esc(e.message)}</p>`;}
+}
+function openStoryFlowView(view, focus){
+  go('storyflow');
+  window.setTimeout(()=>window.storyflow?.open(view, focus), 450);
 }
 async function writeNext(){
   const s=document.getElementById('wn-status');
@@ -2288,12 +2368,25 @@ async function taskQueueAction(taskId,action){
     await PAGES.tasks(document.getElementById('page'));
   }catch(e){toast(e.message,'error');}
 }
+async function authorCandidateDecision(taskId,decision){
+  const label=decision==='accept'?'确认 β1 为 β':'退回审查并标记当前稿为 βn';
+  if(!confirm(`确认${label}？`))return;
+  try{
+    const queued=await api('POST','/tasks/'+encodeURIComponent(taskId)+'/author-decision',{decision,reason:''});
+    toast(decision==='accept'?'已确认 β1，正在完成事实提取与提交':'已标记 βn，正在重新进入审查', 'success');
+    closeModal();
+    if(window.modelWork)window.modelWork.attachTask(queued.taskId,'章节作者决定',queued);
+  }catch(e){toast(e.message,'error');}
+}
 async function showTaskDetail(taskId){
   try{
     const t=await api('GET','/tasks/'+taskId);
     let events=[];try{const ev=await api('GET','/tasks/'+taskId+'/events');events=ev.events||[];}catch(_){}
     const checkpoint=t.checkpoint||{};
     const cpState=checkpoint.state||{};
+    const cpContext=cpState.context||{};
+    const canDecideBeta1=t.status==='needs_author_decision'&&['write-next','write'].includes(t.type)&&typeof cpContext.beta1_content==='string'&&cpContext.beta1_content.trim();
+    const candidateDecisionHtml=canDecideBeta1?`<div class="warn-banner"><b>β1 等待作者决定</b><span>请阅读当前修订稿；确认后记作 β，退回后记作 βn 并重新进入审查。</span><div class="row row-wrap mt8"><button class="btn btn-sm btn-primary" onclick="authorCandidateDecision('${t.id}','accept')">确认 β1 为 β</button><button class="btn btn-sm btn-secondary" onclick="authorCandidateDecision('${t.id}','reject')">退回审查并记 βn</button></div></div>`:'';
     let genRuns=[];try{const gr=await api('GET','/tasks/'+taskId+'/generation-runs');genRuns=gr.runs||gr||[];}catch(_){}
     modal(`<div class="task-detail-modal"><div class="modal-header"><h3>任务详情</h3><button class="close-x" onclick="closeModal()">×</button></div>
       <div class="grid grid-2 mb16">
@@ -2311,6 +2404,7 @@ async function showTaskDetail(taskId){
       ${Object.keys(cpState).length?readableTaskResult(cpState,'当前检查点'):''}
       ${genRuns.length?`<div class="card"><h3>模型处理记录</h3><p class="dim-note mb8">以下内容来自持久化模型调用记录；输入提示词保留原始文本，输出按 Markdown 渲染。</p>${genRuns.map((r,index)=>renderGenerationRun(r,index)).join('')}</div>`:''}
       ${events.length?`<div class="card"><h3>处理记录（${events.length}）</h3><div class="log-box">${events.slice(-50).map(e=>`<div class="log-line"><span class="text-muted text-sm">${e.created_at?new Date(e.created_at).toLocaleTimeString('zh-CN'):''}</span> <b>${esc(taskEventLabel(e.event_type||e.type))}</b> ${esc(taskValueText(e.payload||''))}</div>`).join('')}</div></div>`:''}
+      ${candidateDecisionHtml}
       <div class="row mt16">
         ${t.status==='running'?`<button class="btn btn-secondary" onclick="taskQueueAction('${t.id}','pause');closeModal()">暂停</button><button class="btn btn-danger" onclick="taskQueueAction('${t.id}','cancel');closeModal()">取消</button>`:''}
         ${t.status==='paused'?`<button class="btn btn-primary" onclick="taskQueueAction('${t.id}','resume');closeModal()">恢复</button><button class="btn btn-danger" onclick="taskQueueAction('${t.id}','cancel');closeModal()">取消</button>`:''}
@@ -2410,7 +2504,9 @@ go(S.book?bootPage:'dashboard');
     document.body.appendChild(script);
   }
 loadStudioAsset('/static/studio-enhancements.js?v=20260811-model-progress-1','studio-enhancements.js',function(){
-    loadStudioAsset('/static/studio-visual.js?v=20260811-model-progress-1','studio-visual.js');
+    loadStudioAsset('/static/studio-visual.js?v=20260811-model-progress-1','studio-visual.js',function(){
+      loadStudioAsset('/static/studio-storyflow.js?v=20260811-storyflow-1','studio-storyflow.js');
+    });
   });
 })();
 </script>

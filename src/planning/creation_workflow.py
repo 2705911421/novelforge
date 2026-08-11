@@ -25,7 +25,7 @@ from src.core.database import Database, generate_id
 from src.planning.story_bible import STORY_BIBLE_STEPS, StoryBibleRepository
 
 
-CREATION_MODES = {"planned", "thought"}
+CREATION_MODES = {"planned", "thought", "draft-import"}
 SOURCE_TYPES = {"story_bible", "language_plan", "reference"}
 VIEW_TYPES = ("mindmap", "timeline", "plot_workflow", "character_relationships")
 MAX_SOURCE_CHARS = 2_000_000
@@ -182,19 +182,24 @@ def build_imported_story_bible_payloads(
     *,
     story_filename: str = "story-bible.md",
     language_filename: str = "language-plan.md",
+    reference_text: str = "",
+    reference_filename: str = "story-outline.md",
 ) -> dict[str, dict[str, Any]]:
-    """Project planning documents into all 25 draft slots without discarding input."""
+    """Project story-bible, outline, and language material into 25 draft slots."""
     story_sections = extract_markdown_sections(story_text)
     language_sections = extract_markdown_sections(language_text)
-    all_sections = story_sections + language_sections
+    reference_sections = extract_markdown_sections(reference_text)
+    all_sections = story_sections + reference_sections + language_sections
     documents = []
     if story_text.strip():
         documents.append({"filename": story_filename, "sourceType": "story_bible"})
+    if reference_text.strip():
+        documents.append({"filename": reference_filename, "sourceType": "reference"})
     if language_text.strip():
         documents.append({"filename": language_filename, "sourceType": "language_plan"})
     result: dict[str, dict[str, Any]] = {}
     for _, step_key in STORY_BIBLE_STEPS:
-        selected = _matching_sections(story_sections, step_key)
+        selected = _matching_sections(story_sections, step_key) + _matching_sections(reference_sections, step_key)
         if step_key in {"voice", "techniques"} and language_sections:
             selected = (selected if story_sections else []) + _matching_sections(language_sections, step_key)
         if not selected:
@@ -227,6 +232,7 @@ def build_imported_story_bible_payloads(
             result[step_key]["entities"] = _meaningful_lines(body, 30)
     result["references"]["sourceOverview"] = {
         "storyCharacters": len(story_text),
+        "referenceCharacters": len(reference_text),
         "languageCharacters": len(language_text),
     }
     return result
@@ -483,7 +489,7 @@ class CreationWorkflowRepository:
         self._validate_project(project_id)
         mode = (mode or "planned").strip().lower()
         if mode not in CREATION_MODES:
-            raise CreationWorkflowError("MODE_INVALID", "creation mode must be planned or thought")
+            raise CreationWorkflowError("MODE_INVALID", "creation mode must be planned, thought, or draft-import")
         if not self.db.fetchone("SELECT id FROM projects WHERE id=?", (project_id,)):
             raise CreationWorkflowError("PROJECT_NOT_FOUND", "project was not found")
         row = self.db.fetchone("SELECT * FROM creation_workflows WHERE project_id=?", (project_id,))

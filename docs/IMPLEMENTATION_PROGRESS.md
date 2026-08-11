@@ -10,6 +10,41 @@
 > **功能矩阵更新**: NOT_STARTED 从 2 降至 0，TESTED 从 76 增至 77
 > **最终确认**: 所有 NOT_STARTED 功能已实现完毕，NOT_STARTED=0, TESTED=77
 
+## StoryFlow Canvas 迭代（2026-08-11）
+
+本轮目标是把分散的思维导图、剧情工作流、人物关系、时间线和世界地图入口收敛为真实的 StoryFlow Canvas。当前结论是 `PARTIAL`：P0 vertical slice 已接通，但不能宣称完整 StoryFlow 产品。
+
+### 已实现
+
+- 完成全局审查和实现计划：见 [`docs/storyflow-canvas/00-current-state-audit.md`](storyflow-canvas/00-current-state-audit.md) 至 [`06-performance-baseline.md`](storyflow-canvas/06-performance-baseline.md)。
+- `StoryGraphProjector` 从真实 SQLite authoritative tables 投影可重建节点/语义边；不新增平行故事事实源。
+- 新增 Graph API：graph、search、node、neighbors、context、layout、auto-layout；支持 view、focus、depth 1/2/3 和常用过滤。
+- Studio 新增 StoryFlow Canvas：平移、缩放、fit/reset、节点拖动、框选、多选、聚焦、邻域展开、搜索、Inspector、Minimap、右键菜单、自动布局和布局保存/刷新恢复。
+- Story、Character、Timeline、World、Foreshadow、Context 视图共享同一 Graph API，旧 `/flow` 与静态可视化入口保留兼容。
+- 空项目返回真实空图而非演示数据；Context provenance 缺失时明确标记，不伪造 AI 实际 token 输入。
+
+### 尚未实现或仅部分实现
+
+- Story Ports 已进入节点 schema/UI 展示、OUTPUT→INPUT 拖拽、后端 edge-options 查询和基础边校验；`POST .../planning/edge` 已开放受 schema 约束的规划边创建。
+- PlanningNode、Candidate Graph Overlay、候选采纳/废弃、Flow → Chapter Intent、实际 GenerationRun context manifest、持久化 StoryFlow AI 分析任务和 forecast→Candidate 接入已完成；accepted StoryCommit 后 Graph 通过 authoritative SQLite 重建自动反映新事实。
+- AI 分析现已能排队并持久化结果，但仍依赖已配置 Provider，且没有自动把分析结论变成 Canon；Graph 增量缓存、graph diff/history、章节编辑影响分析和冲突/陈旧投影可视化仍未完成。
+- Full Graph 的高级性能能力（viewport culling、增量查询、图缓存）、graph diff/history、章节编辑影响分析、冲突/陈旧投影可视化仍待后续迭代。
+- 当前数据库中的关系、timeline 和空间事实并不完整，因此某些 view 可能只显示一个节点；实现保持事实诚实，不补硬编码关系。
+
+### 本轮证据
+
+| 检查 | 结果 |
+|---|---|
+| `pytest -q` | `784 passed in 117.83s` |
+| StoryGraph / Planning / GenerationRun 定向测试 | `21 passed`；写作与 P0 完整性定向测试 `34 passed` |
+| `ruff check src tests` / `ruff check .` / `pyright` | 均通过；pyright `0 errors, 0 warnings` |
+| `verify.py` / protected-file check | 均通过 |
+| `scripts/verify_features.py` / `generate_progress.py --verify` | 合同 `5/5 VERIFIED`；P0 `5/5` |
+| Browser E2E | 真实作品、空项目、搜索/聚焦、多视图、Inspector、Context 边界、拖动保存/刷新恢复、1366×768 与 1920×1080 已检查 |
+| Synthetic benchmark | 100/500/1000 target nodes 实测记录见 [`06-performance-baseline.md`](storyflow-canvas/06-performance-baseline.md) |
+
+旧 Phase 表和历史验证数字保留为历史记录；本节是本轮 StoryFlow 的最新边界。
+
 ## 当前产品完成度（审计后）
 
 | 指标 | 数值 |

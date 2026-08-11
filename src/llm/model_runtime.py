@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -502,6 +503,23 @@ class ModelRepository:
             )
         return run_id
 
+    def attach_context_manifest(self, run_id: str, manifest: dict[str, Any]) -> None:
+        """Attach the exact source manifest after the run id is allocated."""
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT input_reference FROM generation_runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                raise ModelConfigurationError("GENERATION_RUN_NOT_FOUND", "generation run does not exist")
+            input_reference = json.loads(row["input_reference"] or "{}")
+            if not isinstance(input_reference, dict):
+                input_reference = {}
+            persisted_manifest = deepcopy(manifest)
+            persisted_manifest["generationRunId"] = run_id
+            input_reference["context_manifest"] = persisted_manifest
+            conn.execute(
+                "UPDATE generation_runs SET input_reference=? WHERE id=?",
+                (json.dumps(input_reference, ensure_ascii=False), run_id),
+            )
+
     def finish_run(self, run_id: str, response: LLMResponse) -> None:
         with self.db.transaction() as conn:
             conn.execute(
@@ -691,6 +709,7 @@ class PersistentModelRuntime:
             effective_system = route_system_prompt or caller_system or DEFAULT_AGENT_SYSTEM_PROMPTS.get(role, "")
         prompt_key = kwargs.pop("prompt_key", None) or f"agent-route:{role}:system"
         prompt_version = kwargs.pop("prompt_version", None)
+        context_manifest = kwargs.pop("context_manifest", None)
         if not prompt_version:
             configured_version = int(resolved.get("route_system_prompt_version") or 0)
             prompt_version = str(configured_version) if configured_version else "builtin-1"
@@ -717,8 +736,11 @@ class PersistentModelRuntime:
                 "message_chars": sum(len(str(message.get("content", ""))) for message in messages),
                 "prompt_sha256": prompt_sha256,
                 "prompt_source": "agent-contract+route-override",
+                "context_manifest": deepcopy(context_manifest) if isinstance(context_manifest, dict) else None,
             },
         )
+        if isinstance(context_manifest, dict):
+            self.repository.attach_context_manifest(run_id, context_manifest)
         try:
             secret = self.repository.credentials.resolve(resolved.get("credential_ref"))
         except CredentialError as exc:
@@ -905,6 +927,8 @@ class PersistentMultiModelManager:
     _legacy_roles = {"primary": "writer", "review": "reviewer", "extractor": "fact_extraction"}
     _task_roles = {
         "write-next": "writer",
+        "plan-chapter": "planner",
+        "compose-chapter": "planner",
         "review": "reviewer",
         "revision": "reviser",
         "fact-extraction": "fact_extraction",
@@ -915,6 +939,7 @@ class PersistentMultiModelManager:
         "draft-import-analysis": "reviewer",
         "draft-import-adjustment-plan": "reviewer",
         "forecast": "planner",
+        "storyflow-analyze": "planner",
         "radar": "planner",
         "translation": "writer",
         "interactive-film": "planner",

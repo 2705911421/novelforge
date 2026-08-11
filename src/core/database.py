@@ -1137,6 +1137,23 @@ def _apply_v19(conn: sqlite3.Connection) -> None:
     _execute_sql_script(conn, PHASE_19_DRAFT_IMPORT_ANALYSIS_SQL)
 
 
+PHASE_20_CONTINUOUS_RUN_GOVERNANCE_SQL = """
+-- A continuous parent releases its lease while an independently queued child
+-- is executing.  The runtime uses this pointer to wake the parent only after
+-- the child reaches a terminal state.
+"""
+
+
+def _apply_v20(conn: sqlite3.Connection) -> None:
+    """Add durable parent-child waiting and auditable author overrides."""
+    _add_column_if_missing(conn, "tasks", "waiting_for_task_id TEXT")
+    _add_column_if_missing(conn, "story_commits", "author_override BOOLEAN NOT NULL DEFAULT FALSE")
+    _add_column_if_missing(conn, "story_commits", "override_reason TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_waiting_for_task ON tasks(waiting_for_task_id)"
+    )
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -1167,6 +1184,7 @@ _MIGRATIONS = (
     _Migration(17, "phase_17_agent_extensions", _apply_v17, PHASE_17_AGENT_EXTENSIONS_SQL),
     _Migration(18, "phase_18_agent_extension_scope", _apply_v18, PHASE_18_AGENT_EXTENSION_SCOPE_SQL),
     _Migration(19, "phase_19_draft_import_analysis", _apply_v19, PHASE_19_DRAFT_IMPORT_ANALYSIS_SQL),
+    _Migration(20, "phase_20_continuous_run_governance", _apply_v20, PHASE_20_CONTINUOUS_RUN_GOVERNANCE_SQL),
 )
 
 

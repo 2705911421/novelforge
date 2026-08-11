@@ -240,14 +240,15 @@
 
 | ID | Domain | Feature | InkOS | Webnovel Writer | NovelForge Current | NovelForge Target | Status |
 |----|--------|---------|-------|-----------------|-------------------|-------------------|--------|
-| VIS-001 | Visual | 思维导图 | ❌ | ❌ | ⚠️ 静态Mermaid | 交互式Graph | PARTIAL |
-| VIS-002 | Visual | 时间轴 | ✅ | ✅ | ⚠️ 静态HTML | 交互式时间轴 | PARTIAL |
-| VIS-003 | Visual | 人物关系图 | ❌ | ❌ | ✅ MemoryEngine.add_character_relationship_graph | 交互式Graph | TESTED |
-| VIS-004 | Visual | 势力关系图 | ❌ | ❌ | ✅ MemoryEngine.add_faction_relationship_graph | 交互式Graph | TESTED |
-| VIS-005 | Visual | 剧情结构图 | ❌ | ❌ | ✅ MemoryEngine.add_plot_structure_graph | 交互式Graph | TESTED |
-| VIS-006 | Visual | 伏笔图 | ❌ | ❌ | ✅ MemoryEngine.add_foreshadowing_graph | 交互式Graph | TESTED |
-| VIS-007 | Visual | 地图系统 | ❌ | ❌ | ✅ MemoryEngine.add_map_system_graph | 结构化+AI生图 | TESTED |
+| VIS-001 | Visual | StoryFlow 故事画布 | ❌ | ❌ | ✅ StoryGraphProjector + Graph API + 原生 Canvas；默认 focused subgraph | 统一 Story Graph 工作流 | PARTIAL |
+| VIS-002 | Visual | 时间轴 | ✅ | ✅ | ✅ StoryFlow Timeline view；同时保留 narrative order / story time | 可交互双时间轴 | PARTIAL |
+| VIS-003 | Visual | 人物关系图 | ❌ | ❌ | ✅ StoryFlow Character view；由统一 Graph API 投影 | 交互式人物上下文图 | PARTIAL |
+| VIS-004 | Visual | 势力关系图 | ❌ | ❌ | ✅ StoryGraphProjector 语义边 + Character view | 交互式势力图 | PARTIAL |
+| VIS-005 | Visual | 剧情结构图 | ❌ | ❌ | ✅ StoryFlow Story view；分层布局、章节/事件/伏笔节点 | 可驱动创作的剧情工作流 | PARTIAL |
+| VIS-006 | Visual | 伏笔图 | ❌ | ❌ | ✅ StoryFlow Foreshadow view；Plant/Advance/Resolve projection | 生命周期与回收规划 | PARTIAL |
+| VIS-007 | Visual | 地图系统 | ❌ | ❌ | ✅ StoryFlow World view；无坐标时明确为层级 World Graph | 坐标地图与空间查询 | PARTIAL |
 | VIS-008 | Visual | 数据分析面板 | ✅ analytics | ✅ | ⚠️ 简单统计 | 增强Dashboard | PARTIAL |
+| VIS-009 | Visual | Graph API / semantic validation | ❌ | ❌ | ✅ book-scoped query、focus/depth/filter、typed edge validation | 可扩展 Graph schema 与合法连接 | PARTIAL |
 
 ## 十八、导出系统
 
@@ -305,8 +306,8 @@
 | UI-006 | UI | 世界观向导 | ✅ | ✅ | ✅ | 增强交互 | FUNCTIONAL |
 | UI-007 | UI | 模型配置 | ✅ | ❌ | ✅ 多 Provider/Model、九角色路由、凭据不回显、队列测试；隔离浏览器验证 | 增强多Provider | TESTED |
 | UI-008 | UI | 数据分析 | ✅ | ✅ | ⚠️ 简单统计 | 增强图表 | PARTIAL |
-| UI-009 | UI | 思维导图 | ❌ | ❌ | ⚠️ 静态 | 交互式 | PARTIAL |
-| UI-010 | UI | 时间轴 | ✅ | ✅ | ⚠️ 静态 | 交互式 | PARTIAL |
+| UI-009 | UI | StoryFlow Canvas | ❌ | ❌ | ✅ 原生无限画布、Inspector、搜索、focus/depth、布局持久化；规划/AI 动作未完成 | 统一交互式 StoryFlow | PARTIAL |
+| UI-010 | UI | 时间轴 | ✅ | ✅ | ✅ StoryFlow Timeline view；数据稀疏时不伪造事件 | 交互式双时间轴 | PARTIAL |
 | UI-011 | UI | 系统诊断 | ✅ | ✅ | ⚠️ 简单 | 增强Doctor | PARTIAL |
 | UI-012 | UI | 导出界面 | ✅ | ❌ | ✅ | 保持 | FUNCTIONAL |
 

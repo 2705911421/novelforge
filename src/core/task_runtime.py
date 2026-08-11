@@ -31,13 +31,15 @@ class TaskFailure(RuntimeError):
 
 
 TERMINAL = {"completed", "cancelled", "needs_author_decision"}
+WAITING_ON_CHILD = "waiting_on_child"
 RECOVERY_REQUIRES_AUTHOR = {"world-bootstrap", "write", "write-next"}
 TRANSITIONS = {
     "queued": {"running", "cancelled"},
-    "running": {"paused", "cancelling", "completed", "failed", "needs_author_decision"},
+    "running": {"paused", "cancelling", "completed", "failed", "needs_author_decision", WAITING_ON_CHILD},
     "paused": {"queued", "cancelled"},
     "cancelling": {"cancelled", "needs_author_decision"},
     "failed": {"queued", "needs_author_decision"},
+    WAITING_ON_CHILD: {"queued", "cancelled", "needs_author_decision"},
     "completed": set(),
     "cancelled": set(),
     "needs_author_decision": {"queued", "cancelled"},
@@ -62,6 +64,7 @@ TASK_OPERATION_LABELS = {
     "planning-synthesis": "理解规划资料",
     "planning-views-generate": "整理规划视图",
     "forecast": "剧情推演",
+    "storyflow-analyze": "StoryFlow 分析",
     "draft-import": "初稿分析",
     "document-index": "文档索引",
     "model-connection-test": "测试模型连接",
@@ -76,6 +79,9 @@ _WRITING_PROGRESS = {
     "LOAD_CHAPTER_PLAN": 12,
     "BUILD_CONTEXT": 22,
     "RETRIEVE_MEMORY": 32,
+    "PLAN_CHAPTER": 40,
+    "EXTRACT_REQUIREMENTS": 44,
+    "COMPOSE_WRITING_PROMPT": 48,
     "GENERATE_DRAFT": 52,
     "REVIEW": 68,
     "QUALITY_GATE": 76,
@@ -105,6 +111,7 @@ _TASK_PROGRESS = {
     "model-discovery": {"queued": 0, "model-discovery": 82, "completed": 100},
     "document-index": {"queued": 0, "parsing": 45, "indexed": 88, "completed": 100},
     "forecast": {"queued": 0, "forecast-complete": 92, "completed": 100},
+    "storyflow-analyze": {"queued": 0, "storyflow-selection": 24, "storyflow-model-call": 72, "completed": 100},
 }
 
 
@@ -164,7 +171,7 @@ class TaskRuntime:
             existing = conn.execute(
                 """SELECT id FROM tasks
                    WHERE book_id=? AND type='continuous'
-                     AND status IN ('queued', 'running', 'paused', 'cancelling')
+                     AND status IN ('queued', 'running', 'waiting_on_child', 'paused', 'cancelling')
                    ORDER BY created_at LIMIT 1""",
                 (book_id,),
             ).fetchone()
@@ -210,12 +217,23 @@ class TaskRuntime:
         return [self._task_dict(row) for row in rows]
 
     def claim(self, worker_id: str, *, lease_seconds: int = 60) -> Optional[dict[str, Any]]:
-        """Atomically claim exactly one queued task for a worker lease."""
+        """Atomically claim one runnable task for a worker lease.
+
+        A continuous parent is stored as ``waiting_on_child`` while its child
+        runs.  Once the child is terminal, the same queue claim wakes the
+        parent.  No process-local callback is required, so a restart cannot
+        strand a parent task in memory.
+        """
         now = datetime.now()
         with self.db.transaction() as conn:
             row = conn.execute(
-                """SELECT * FROM tasks WHERE status='queued' AND stage != 'blocked' AND
-                   (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                """SELECT t.* FROM tasks t WHERE
+                   ((t.status='queued' AND t.stage != 'blocked') OR
+                    (t.status='waiting_on_child' AND t.waiting_for_task_id IS NOT NULL AND
+                     EXISTS (SELECT 1 FROM tasks child
+                            WHERE child.id=t.waiting_for_task_id
+                              AND child.status IN ('completed', 'failed', 'needs_author_decision', 'cancelled'))))
+                   AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= ?)
                    ORDER BY created_at LIMIT 1""", (now.isoformat(),)
             ).fetchone()
             if not row:
@@ -223,13 +241,23 @@ class TaskRuntime:
             expires = (now + timedelta(seconds=lease_seconds)).isoformat()
             updated = conn.execute(
                 """UPDATE tasks SET status='running', lease_owner=?, lease_expires_at=?,
-                   attempt=attempt+1, started_at=COALESCE(started_at, ?), updated_at=?
-                   WHERE id=? AND status='queued'""",
+                   attempt=attempt+1, started_at=COALESCE(started_at, ?),
+                   waiting_for_task_id=NULL, updated_at=?
+                   WHERE id=? AND
+                     (status='queued' OR
+                      (status='waiting_on_child' AND waiting_for_task_id IS NOT NULL AND
+                       EXISTS (SELECT 1 FROM tasks child
+                              WHERE child.id=tasks.waiting_for_task_id
+                                AND child.status IN ('completed', 'failed', 'needs_author_decision', 'cancelled'))))""",
                 (worker_id, expires, now.isoformat(), now.isoformat(), row["id"]),
             )
             if updated.rowcount != 1:
                 return None
-            self._append_event(conn, row["id"], "claimed", {"worker_id": worker_id, "lease_expires_at": expires})
+            self._append_event(conn, row["id"], "claimed", {
+                "worker_id": worker_id,
+                "lease_expires_at": expires,
+                "woken_by_child": row["status"] == WAITING_ON_CHILD,
+            })
             claimed = conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
         return self._task_dict(claimed)
 
@@ -336,6 +364,77 @@ class TaskRuntime:
             self._append_event(conn, task_id, "checkpoint", {"checkpoint_id": checkpoint_id, "stage": stage})
         return {"id": checkpoint_id, "stage": stage, "state": state}
 
+    def defer_until_child(
+        self,
+        task_id: str,
+        child_task_id: str,
+        *,
+        detail: Optional[dict[str, Any]] = None,
+        lease_owner: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Release a parent lease while a durable child executes elsewhere."""
+        if not isinstance(child_task_id, str) or not child_task_id:
+            raise ValueError("child_task_id is required")
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            if row["status"] != "running":
+                raise TaskStateError("only a running task can wait for a child")
+            if lease_owner is not None and row["lease_owner"] != lease_owner:
+                raise TaskStateError(
+                    f"lease owner mismatch while deferring: task owned by {row['lease_owner']}"
+                )
+            child = conn.execute("SELECT id FROM tasks WHERE id=?", (child_task_id,)).fetchone()
+            if child is None:
+                raise KeyError(f"child task not found: {child_task_id}")
+            now = datetime.now().isoformat()
+            conn.execute(
+                """UPDATE tasks SET status=?, stage=?, waiting_for_task_id=?,
+                   lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?""",
+                (WAITING_ON_CHILD, WAITING_ON_CHILD, child_task_id, now, task_id),
+            )
+            self._append_event(conn, task_id, WAITING_ON_CHILD, {
+                "child_task_id": child_task_id,
+                **(detail or {}),
+            })
+            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task_dict(updated)
+
+    def update_data(
+        self,
+        task_id: str,
+        data: dict[str, Any],
+        *,
+        waiting_for_task_id: Optional[str] = None,
+        lease_owner: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Replace task input at an author boundary or owned checkpoint."""
+        if not isinstance(data, dict):
+            raise ValueError("task data must be an object")
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            if row["status"] not in {"queued", "paused", "needs_author_decision", WAITING_ON_CHILD, "running"}:
+                raise TaskStateError("task data can only be updated at a safe boundary")
+            if row["status"] == "running" and lease_owner is not None:
+                owner = conn.execute("SELECT lease_owner FROM tasks WHERE id=?", (task_id,)).fetchone()["lease_owner"]
+                if owner != lease_owner:
+                    raise TaskStateError(f"lease owner mismatch while updating data: task owned by {owner}")
+            elif row["status"] == "running":
+                raise TaskStateError("a running task requires its lease owner to update data")
+            now = datetime.now().isoformat()
+            conn.execute(
+                "UPDATE tasks SET data=?, waiting_for_task_id=?, updated_at=? WHERE id=?",
+                (json.dumps(data, ensure_ascii=False), waiting_for_task_id, now, task_id),
+            )
+            self._append_event(conn, task_id, "data_updated", {
+                "waiting_for_task_id": waiting_for_task_id,
+            })
+            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task_dict(updated)
+
     def latest_checkpoint(self, task_id: str) -> Optional[dict[str, Any]]:
         row = self.db.fetchone("SELECT * FROM task_checkpoints WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,))
         if not row:
@@ -357,15 +456,36 @@ class TaskRuntime:
             if row["status"] in {"completed", "cancelled", "failed"}:
                 raise TaskStateError("a terminal task cannot be cancelled")
             now = datetime.now().isoformat()
-            if row["status"] in {"queued", "paused", "needs_author_decision"}:
+            if row["status"] in {"queued", "paused", "needs_author_decision", WAITING_ON_CHILD}:
                 target = "cancelled"
-                conn.execute("UPDATE tasks SET status=?, cancel_requested=TRUE, completed_at=?, updated_at=? WHERE id=?",
+                conn.execute("UPDATE tasks SET status=?, cancel_requested=TRUE, waiting_for_task_id=NULL, completed_at=?, updated_at=? WHERE id=?",
                              (target, now, now, task_id))
             else:
                 target = "cancelling"
                 conn.execute("UPDATE tasks SET status=?, cancel_requested=TRUE, updated_at=? WHERE id=?",
                              (target, now, task_id))
             self._append_event(conn, task_id, target, {"cancel_requested": True})
+            child_id = row["waiting_for_task_id"]
+            if child_id:
+                child = conn.execute("SELECT id, status FROM tasks WHERE id=?", (child_id,)).fetchone()
+                if child and child["status"] in {"queued", "paused", "needs_author_decision"}:
+                    conn.execute(
+                        "UPDATE tasks SET status='cancelled', cancel_requested=TRUE, completed_at=?, updated_at=? WHERE id=?",
+                        (now, now, child_id),
+                    )
+                    self._append_event(conn, child_id, "cancelled", {
+                        "reason": "parent_cancelled",
+                        "parent_task_id": task_id,
+                    })
+                elif child and child["status"] == "running":
+                    conn.execute(
+                        "UPDATE tasks SET status='cancelling', cancel_requested=TRUE, updated_at=? WHERE id=?",
+                        (now, child_id),
+                    )
+                    self._append_event(conn, child_id, "cancelling", {
+                        "reason": "parent_cancelled",
+                        "parent_task_id": task_id,
+                    })
             result = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task_dict(result)
 
@@ -467,6 +587,7 @@ class TaskRuntime:
         for field in ("data", "result"):
             task[field] = json.loads(task[field]) if task.get(field) else {}
         task["cancel_requested"] = bool(task.get("cancel_requested"))
+        task["waitingForTaskId"] = task.get("waiting_for_task_id")
         task["bookId"] = task.get("book_id")
         task["projectId"] = task.get("project_id")
         task["taskId"] = task["id"]

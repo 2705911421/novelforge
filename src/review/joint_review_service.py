@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from src.core.database import Database, generate_id
+from src.prompts.prompt_repository import PromptRepository
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,8 @@ class JointReviewService:
         book_id: str,
         start_chapter: int,
         end_chapter: int,
+        *,
+        prompt_policy_versions: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Perform joint review across multiple chapters.
         
@@ -60,6 +63,35 @@ class JointReviewService:
 
         context = "\n".join(chapter_summaries)
 
+        # Call model for joint review. A continuous run may pin the exact
+        # prompt registry version; render that version instead of silently
+        # falling back to a newer template.
+        prompt_key = "joint-review"
+        prompt_version = "0"
+        prompt_system = "浣犳槸涓€浣嶄笓涓氱殑灏忚瀹＄缂栬緫"
+        prompt_repo = PromptRepository(self.db)
+        pinned = (prompt_policy_versions or {}).get("joint-review") if isinstance(prompt_policy_versions, dict) else None
+        if pinned is not None:
+            pinned_version = pinned.get("version") if isinstance(pinned, dict) else pinned
+            if isinstance(pinned, dict) and pinned.get("id"):
+                prompt_record = self.db.fetchone(
+                    "SELECT * FROM prompt_templates WHERE id=? AND task_type='joint-review'",
+                    (pinned["id"],),
+                )
+            else:
+                version = pinned_version if isinstance(pinned_version, int) and not isinstance(pinned_version, bool) else None
+                prompt_record = (
+                    prompt_repo.get_prompt_version("joint-review", version, project_id)
+                    if version is not None else None
+                )
+            if prompt_record is None:
+                raise ValueError(f"pinned joint-review prompt is unavailable: {pinned_version}")
+        else:
+            prompt_record = prompt_repo.get_prompt("joint-review", project_id)
+        prompt_key = prompt_record.get("task_type", prompt_key)
+        prompt_version = str(prompt_record.get("version", 0))
+        prompt_system = prompt_record.get("system_prompt") or prompt_system
+
         # Call model for joint review.
         prompt = f"""请对以下{len(chapters)}个章节进行联合审查，分析跨章节的一致性。
 
@@ -80,11 +112,39 @@ class JointReviewService:
 
 只返回JSON，不要其他文字。"""
 
+        output_contract = (
+            "Return JSON only with overall_score (0-100), verdict (pass/fail), "
+            "summary, and issues. Each issue must include chapter_numbers, dimension, "
+            "severity (blocking/critical/major/minor), description, suggestion, and priority."
+        )
+        template = prompt_record.get("user_template") if prompt_record else None
+        if template:
+            try:
+                prompt = template.format(
+                    context=context,
+                    extra=output_contract,
+                    start_chapter=start_chapter,
+                    end_chapter=end_chapter,
+                    chapter_count=len(chapters),
+                )
+            except (KeyError, IndexError, ValueError) as exc:
+                raise ValueError(f"invalid joint-review prompt template: {exc}") from exc
+        else:
+            prompt = (
+                f"Review the consistency of these {len(chapters)} chapters.\n"
+                f"## Chapter summaries\n{context}\n\n## Output contract\n{output_contract}"
+            )
+
         try:
+            chat_kwargs = {
+                "system": prompt_system,
+                "task_type": "joint-review",
+            }
+            if prompt_policy_versions:
+                chat_kwargs.update({"prompt_key": prompt_key, "prompt_version": prompt_version})
             response = self.model_manager.chat(
                 [{"role": "user", "content": prompt}],
-                system="你是一位专业的小说审稿编辑，擅长分析跨章节的一致性问题。",
-                task_type="joint-review",
+                **chat_kwargs,
             )
             review_text = response.content.strip()
             if review_text.startswith("```"):

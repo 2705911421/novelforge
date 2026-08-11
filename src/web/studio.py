@@ -44,7 +44,7 @@ from src.creation.task_handlers import LegacyTaskHandlers
 from src.creation.continuous_service import ContinuousWritingService
 from src.core.legacy_migration import LegacyMigrationError, LegacyMigrationService
 from src.core.models import StoryProject, Chapter
-from src.llm.model_runtime import ModelConfigurationError, build_model_runtime
+from src.llm.model_runtime import CredentialStore, ModelConfigurationError, ModelRepository, build_model_runtime
 from src.ingestion.service import DocumentIngestionError, DocumentRepository, DEFAULT_MAX_BYTES, SUPPORTED_SUFFIXES
 from src.ingestion.draft_import import DraftImportError, DraftImportRepository
 from src.rag.retriever import PersistentRAGRetriever, RAGQueryError
@@ -55,7 +55,14 @@ from src.core.memory import MemorySystem
 from src.export.exporter import Exporter
 from src.visualization.mindmap import MindMapGenerator, TimelineGenerator
 from src.visualization.world_map import WorldMapGenerator
-from src.pipeline.control_surface import ControlSurface
+from src.story_graph import (
+    StoryFlowPlanningError,
+    StoryFlowPlanningService,
+    StoryGraphError,
+    StoryGraphProjector,
+    semantic_edge_options,
+)
+from src.pipeline.control_surface import ChapterIntent, ControlSurface
 from src.pipeline.story_system import StorySystem
 from src.translation.service import TranslationError, TranslationStore
 from src.interactive_film.service import InteractiveFilmError, InteractiveFilmStore
@@ -159,11 +166,18 @@ class BookCreateRequest(BaseModel):
     language: str = "zh"
     styleProfile: dict[str, Any] = Field(default_factory=dict)
     creationMode: Optional[str] = None
+    requireProviderConfigured: bool = False
 
 class WriteNextRequest(BaseModel):
     context: str = ""
     words: int = 0
     count: int = 1
+
+
+class AuthorCandidateDecisionRequest(BaseModel):
+    decision: str
+    reason: str = ""
+
 
 class AgentRequest(BaseModel):
     message: str
@@ -211,6 +225,7 @@ class ForecastRequest(BaseModel):
     depth: int = 3
     context: str = ""
     nodeId: str = ""
+    nodeIds: list[str] = Field(default_factory=list)
     canvasRevision: Optional[int] = None
 
 class StyleAnalyzeRequest(BaseModel):
@@ -276,6 +291,63 @@ class PlotBranchApplyRequest(BaseModel):
     branch: dict[str, Any]
     sourceNodeId: str = ""
     expectedRevision: Optional[int] = None
+
+
+class StoryFlowLayoutRequest(BaseModel):
+    view: str = "story"
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    focus: Optional[str] = None
+    depth: int = Field(default=1, ge=1, le=3)
+
+
+class StoryFlowPlanningNodeRequest(BaseModel):
+    title: str
+    summary: str = ""
+    subtype: str = "flow"
+    status: str = "PLANNED"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source: str = "author"
+    expectedRevision: Optional[int] = None
+
+
+class StoryFlowPlanningEdgeRequest(BaseModel):
+    sourceNodeId: str
+    targetNodeId: str
+    edgeType: str
+    label: str = ""
+    status: str = "PLANNED"
+    weight: float = 1.0
+    confidence: float = 1.0
+    sourcePort: Optional[str] = None
+    targetPort: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    expectedRevision: Optional[int] = None
+
+
+class StoryFlowIntentRequest(BaseModel):
+    nodeIds: list[str] = Field(default_factory=list)
+    chapterNumber: Optional[int] = Field(default=None, ge=1)
+    save: bool = True
+    expectedRevision: Optional[int] = None
+
+
+class StoryFlowCandidateDecisionRequest(BaseModel):
+    nodeIds: list[str] = Field(default_factory=list)
+    decision: str
+    expectedRevision: Optional[int] = None
+
+
+class StoryFlowAnalysisRequest(BaseModel):
+    nodeIds: list[str] = Field(default_factory=list)
+    analysisTypes: list[str] = Field(default_factory=list)
+    context: str = ""
+
+
+class StoryFlowEdgeOptionsRequest(BaseModel):
+    sourceType: str
+    targetType: str
+    sourcePort: Optional[str] = None
+    targetPort: Optional[str] = None
 
 class ThoughtResponseRequest(BaseModel):
     answer: str
@@ -354,6 +426,51 @@ def get_authoritative_book_id(project_id: str) -> str:
     return str(book["id"])
 
 
+def get_story_graph_projector() -> StoryGraphProjector:
+    """Bind the projection module to the Studio's current authoritative DB."""
+    return StoryGraphProjector(story_repository.db)
+
+
+def get_storyflow_planning_service() -> StoryFlowPlanningService:
+    """Bind StoryFlow authoring to the existing revisioned plot workspace."""
+    return StoryFlowPlanningService(story_repository.db)
+
+
+def resolve_story_graph_book(value: str) -> dict[str, Any]:
+    """Accept the Studio project id and the public API's book id."""
+    direct = story_repository.db.fetchone(
+        "SELECT id, project_id, title FROM books WHERE id = ?", (value,)
+    )
+    if direct:
+        return direct
+    if not validate_project_id(value):
+        raise HTTPException(400, "invalid book or project id")
+    try:
+        authoritative_id = get_authoritative_book_id(value)
+    except HTTPException as exc:
+        # A newly created project may not have its first authoritative book
+        # yet. StoryFlow should still open with a truthful empty projection.
+        if exc.status_code == 409 and project_mgr.load_project(value):
+            project = project_mgr.load_project(value)
+            return {
+                "id": value,
+                "project_id": value,
+                "title": str(getattr(project, "title", "未命名作品") or "未命名作品"),
+                "_empty": True,
+            }
+        raise
+    book = story_repository.db.fetchone(
+        "SELECT id, project_id, title FROM books WHERE id = ?", (authoritative_id,)
+    )
+    if not book:
+        raise HTTPException(404, "authoritative book not found")
+    return book
+
+
+def story_graph_authoritative_id(book: dict[str, Any]) -> Optional[str]:
+    return None if book.get("_empty") else str(book["id"])
+
+
 def get_creation_workflow() -> CreationWorkflowRepository:
     """Use the current Studio database, including isolated test deployments."""
     if getattr(creation_workflow_repository, "db", None) is story_repository.db:
@@ -389,6 +506,13 @@ def get_story_bible_repository() -> StoryBibleRepository:
     return StoryBibleRepository(story_repository.db)
 
 
+def get_model_repository() -> ModelRepository:
+    """Bind model readiness to the active Studio database in isolated runs."""
+    if getattr(model_repository, "db", None) is story_repository.db:
+        return model_repository
+    return ModelRepository(story_repository.db, CredentialStore(workspace_root))
+
+
 def get_planning_readiness(book_id: str, project: Optional[StoryProject] = None) -> dict[str, Any]:
     """Return the durable gate used before any new chapter can be created."""
     current_project = project or get_project(book_id)
@@ -400,7 +524,72 @@ def get_planning_readiness(book_id: str, project: Optional[StoryProject] = None)
         steps,
         target_volumes=current_project.target_volumes,
         target_chapters=current_project.target_chapters,
-        trusted_import=bool(metadata.get("planningCompleted")),
+        # Legacy API clients may retain the historical trusted-import shortcut;
+        # strict UI-created workflows can never bypass the planning checks.
+        trusted_import=bool(metadata.get("planningCompleted") and not metadata.get("enforceProviderGate")),
+    )
+
+
+REQUIRED_CREATION_MODEL_ROLES = ("planner", "writer", "reviewer", "reviser", "fact_extraction")
+
+
+def get_model_setup_readiness() -> dict[str, Any]:
+    """Return the smallest provider/model contract needed by every creation mode.
+
+    A provider record alone is not enough to run the workflow: it must have a
+    credential, an enabled model, and a route for each role used by planning,
+    writing, review, revision, and fact extraction.  No secret material is
+    returned by this read model.
+    """
+    configuration = get_model_repository().configuration()
+    providers = configuration.get("providers") or []
+    models = configuration.get("models") or []
+    routes = configuration.get("routes") or {}
+    configured_provider_ids = {
+        item.get("id") for item in providers
+        if item.get("id") and item.get("enabled", True) and item.get("credentialConfigured")
+    }
+    usable_model_ids = {
+        item.get("id") for item in models
+        if item.get("id") and item.get("enabled", True) and item.get("providerId") in configured_provider_ids
+    }
+    missing_roles = [
+        role for role in REQUIRED_CREATION_MODEL_ROLES
+        if routes.get(role) not in usable_model_ids
+    ]
+    return {
+        "ready": bool(usable_model_ids) and not missing_roles,
+        "providerConfigured": bool(configured_provider_ids),
+        "configuredProviderCount": len(configured_provider_ids),
+        "enabledModelCount": len(usable_model_ids),
+        "requiredRoles": list(REQUIRED_CREATION_MODEL_ROLES),
+        "missingRoles": missing_roles,
+        "nextAction": "ready" if bool(usable_model_ids) and not missing_roles else "agent-config",
+        "message": (
+            "LLM 供应商、模型和创作角色路由已就绪。"
+            if bool(usable_model_ids) and not missing_roles
+            else "开始创作前，请先配置带凭据的 LLM 供应商、模型，并完成规划/写作/审查角色路由。"
+        ),
+    }
+
+
+def require_model_setup(book_id: str, *, force: bool = False) -> None:
+    """Stop model-backed work when the UI opted into the creation contract."""
+    workflow = get_creation_workflow().get(book_id)
+    metadata = (workflow or {}).get("metadata") or {}
+    if not force and not metadata.get("enforceProviderGate"):
+        return
+    readiness = get_model_setup_readiness()
+    if readiness["ready"]:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "LLM_PROVIDER_REQUIRED",
+            "message": readiness["message"],
+            "nextAction": "agent-config",
+            "modelReadiness": readiness,
+        },
     )
 
 
@@ -413,6 +602,7 @@ def _creation_http_error(exc: CreationWorkflowError) -> HTTPException:
         "SOURCE_EMPTY": 400,
         "SOURCE_TOO_LARGE": 413,
         "THOUGHT_PERSISTENCE": 500,
+        "STRICT_PLANNING_REVIEW_REQUIRED": 409,
         "TURN_EMPTY": 400,
         "TURN_ROLE_INVALID": 422,
         "FORECAST_TARGET_INVALID": 422,
@@ -425,6 +615,7 @@ def require_complete_planning(book_id: str) -> None:
     workflow = get_creation_workflow().get(book_id)
     if not workflow or not (workflow.get("metadata") or {}).get("requireCompletePlanning"):
         return
+    require_model_setup(book_id)
     readiness = get_planning_readiness(book_id)
     if workflow.get("status") != "ready" or not readiness["ready"]:
         raise HTTPException(
@@ -493,26 +684,31 @@ def _queue_planning_synthesis(book_id: str, source: str) -> dict[str, Any]:
     return task
 
 
-def _apply_planning_materials(book_id: str) -> dict[str, Any]:
-    """Load both documents into reviewable drafts and publish only on explicit completion."""
+def _prepare_planning_materials(book_id: str) -> dict[str, Any]:
+    """Project imported material into all 25 reviewable drafts without publishing."""
     repo = get_creation_workflow()
     sources = repo.list_sources(book_id)
     story_source = next((item for item in sources if item.get("source_type") == "story_bible"), None)
+    reference_sources = [item for item in sources if item.get("source_type") == "reference"]
     language_source = next((item for item in sources if item.get("source_type") == "language_plan"), None)
-    if not story_source:
-        raise CreationWorkflowError("SOURCE_EMPTY", "请先导入故事圣经或完整规划资料")
+    if not story_source and not reference_sources:
+        raise CreationWorkflowError("SOURCE_EMPTY", "请先导入故事圣经、故事大纲或完整规划资料")
+    story_text = str(story_source.get("content") or "") if story_source else ""
+    story_filename = story_source.get("filename") if story_source else "story-bible.md"
     payloads = build_imported_story_bible_payloads(
-        story_source.get("content") or "",
+        story_text,
         str(language_source.get("content") or "") if language_source else "",
-        story_filename=story_source.get("filename") or "story-bible.md",
+        story_filename=story_filename or "story-bible.md",
         language_filename=str(language_source.get("filename") or "language-plan.md") if language_source else "language-plan.md",
+        reference_text="\n\n".join(str(item.get("content") or "") for item in reference_sources),
+        reference_filename="；".join(str(item.get("filename") or "story-outline.md") for item in reference_sources) or "story-outline.md",
     )
     bible_repo = get_story_bible_repository()
     for _, step_key in STORY_BIBLE_STEPS:
-        bible_repo.save_draft(book_id, step_key, payloads[step_key], source="author")
-    for _, step_key in STORY_BIBLE_STEPS:
-        bible_repo.confirm(book_id, step_key)
-    published = bible_repo.publish(book_id)
+        # Imported sections are AI-assisted projections.  They are deliberately
+        # left as drafts so the author must inspect and confirm every step in
+        # order; no import path may silently publish Story Bible truth.
+        bible_repo.save_draft(book_id, step_key, payloads[step_key], source="ai")
     project = get_project(book_id)
     if language_source:
         style_profile, writing_style = build_style_profile(
@@ -526,13 +722,53 @@ def _apply_planning_materials(book_id: str) -> dict[str, Any]:
     views = _refresh_architecture_views(book_id)
     workflow = repo.set_status(
         book_id,
+        "planning",
+        metadata={
+            "planningPrepared": True,
+            "planningCompleted": False,
+            "sourceCount": len(sources),
+            "architectureViewCount": len(views),
+        },
+    )
+    readiness = get_planning_readiness(book_id, project)
+    workflow = repo.set_status(book_id, "ready" if readiness["ready"] else "planning", metadata={"planningReadiness": readiness})
+    return {
+        "prepared": True,
+        "published": None,
+        "views": views,
+        "workflow": workflow,
+        "planningReadiness": readiness,
+    }
+
+
+def _apply_planning_materials(book_id: str) -> dict[str, Any]:
+    """Compatibility path: prepare, then explicitly publish imported material."""
+    repo = get_creation_workflow()
+    workflow = repo.get(book_id) or {}
+    if (workflow.get("metadata") or {}).get("enforceProviderGate"):
+        raise CreationWorkflowError("STRICT_PLANNING_REVIEW_REQUIRED", "严格创作流程必须逐步审阅并确认 25 步清单")
+    prepared = _prepare_planning_materials(book_id)
+    bible_repo = get_story_bible_repository()
+    for _, step_key in STORY_BIBLE_STEPS:
+        bible_repo.confirm(book_id, step_key)
+    published = bible_repo.publish(book_id)
+    views = prepared["views"]
+    sources = repo.list_sources(book_id)
+    workflow = repo.set_status(
+        book_id,
         "ready",
-        metadata={"planningCompleted": True, "sourceCount": len(sources), "architectureViewCount": len(views)},
+        metadata={
+            "planningCompleted": True,
+            "planningPrepared": True,
+            "sourceCount": len(sources),
+            "architectureViewCount": len(views),
+        },
     )
     synthesis_task = _queue_planning_synthesis(book_id, "planning-materials-complete")
     workflow = repo.get(book_id) or workflow
     return {
         "published": published,
+        "prepared": True,
         "views": views,
         "workflow": workflow,
         "synthesisTaskId": synthesis_task["id"],
@@ -562,6 +798,8 @@ def enqueue_continuous_task(
     project_id: str, book_id: str, start: int, count: int, context: str
 ) -> dict[str, Any]:
     """Queue one exclusive continuous session through the shared service."""
+    workflow = get_creation_workflow().get(project_id) or {}
+    strict_planning = bool((workflow.get("metadata") or {}).get("requireCompletePlanning"))
     try:
         return ContinuousWritingService(
             story_repository.db,
@@ -569,7 +807,16 @@ def enqueue_continuous_task(
             story_repository,
             task_runtime,
             joint_review_interval=config_int("continuous", "joint_review_interval", 5),
-        ).start_continuous(project_id, book_id, start, count, context)
+            score_threshold=config_int("review", "pass_score", 93),
+            max_revisions=config_int("review", "max_revision_rounds", 3),
+        ).start_continuous(
+            project_id,
+            book_id,
+            start,
+            count,
+            context,
+            strict_planning=strict_planning,
+        )
     except TaskStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
@@ -642,6 +889,10 @@ async def get_book(book_id: str):
         "genre": project.genre,
         "status": "active",
         "chaptersWritten": project.get_chapter_count(),
+        # Chapter numbers are not guaranteed to be contiguous (imports and
+        # deletions can leave intentional gaps). Consumers must not infer
+        # existing chapters from the count alone.
+        "chapterNumbers": sorted(project.chapters),
         "targetChapters": project.target_chapters,
         "targetVolumes": project.target_volumes,
         "targetWordCount": project.target_word_count,
@@ -667,6 +918,7 @@ async def get_book(book_id: str):
         "thoughtSession": thought_session,
         "planningSourceCount": source_count,
         "architectureViewCount": len(get_creation_workflow().get_architecture_views(book_id)),
+        "modelReadiness": get_model_setup_readiness(),
         "passScore": config_int("review", "pass_score", 93),
         "jointReviewInterval": config_int("continuous", "joint_review_interval", 5),
     }
@@ -678,7 +930,18 @@ async def create_book(req: BookCreateRequest):
         raise HTTPException(422, "chapterWords, targetChapters, and targetVolumes must be positive")
     creation_mode = (req.creationMode or "planned").strip().lower()
     if creation_mode not in CREATION_MODES:
-        raise HTTPException(422, "creationMode must be planned or thought")
+        raise HTTPException(422, "creationMode must be planned, thought, or draft-import")
+    provider_readiness = get_model_setup_readiness()
+    if req.requireProviderConfigured and not provider_readiness["ready"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "LLM_PROVIDER_REQUIRED",
+                "message": provider_readiness["message"],
+                "nextAction": "agent-config",
+                "modelReadiness": provider_readiness,
+            },
+        )
     project = project_mgr.create_project(
         req.title,
         req.genre,
@@ -697,7 +960,11 @@ async def create_book(req: BookCreateRequest):
             workflow = workflow_repo.set_status(
                 project.id,
                 workflow.get("status") or ("questioning" if creation_mode == "thought" else "planning"),
-                metadata={"requireCompletePlanning": True},
+                metadata={
+                    "requireCompletePlanning": True,
+                    "enforceProviderGate": bool(req.requireProviderConfigured),
+                    "creationEntry": creation_mode,
+                },
             )
     except CreationWorkflowError as exc:
         raise _creation_http_error(exc) from exc
@@ -720,6 +987,24 @@ async def create_book(req: BookCreateRequest):
         "creationMode": creation_mode,
         "creationWorkflow": workflow,
         "thoughtSessionId": thought_session.get("id") if thought_session else None,
+        "modelReadiness": provider_readiness,
+    }
+
+
+@app.get("/api/v1/creation/preflight")
+async def creation_preflight(mode: str = Query("planned"), bookId: str = Query("")):
+    """Check the provider contract before any of the three creation paths advances."""
+    normalized_mode = (mode or "planned").strip().lower()
+    if normalized_mode not in CREATION_MODES:
+        raise HTTPException(422, "mode must be planned, thought, or draft-import")
+    if bookId:
+        get_project(bookId)
+    readiness = get_model_setup_readiness()
+    return {
+        "mode": normalized_mode,
+        "ready": readiness["ready"],
+        "modelReadiness": readiness,
+        "nextPage": "create" if readiness["ready"] else "agent-config",
     }
 
 
@@ -743,7 +1028,8 @@ async def get_creation_workflow_state(book_id: str):
 def _planning_source_result(book_id: str, source_type: str, filename: str, content: str, confirm_steps: bool) -> dict[str, Any]:
     repo = get_creation_workflow()
     try:
-        repo.ensure(book_id, "planned")
+        existing_workflow = repo.get(book_id)
+        repo.ensure(book_id, (existing_workflow or {}).get("mode", "planned"))
         source = repo.add_source(
             book_id,
             source_type,
@@ -751,19 +1037,22 @@ def _planning_source_result(book_id: str, source_type: str, filename: str, conte
             content,
             metadata={"characters": len(content), "importedAt": datetime.now().isoformat()},
         )
-        if source_type in {"story_bible", "language_plan"}:
+        if source_type in {"story_bible", "language_plan", "reference"}:
             sources = repo.list_sources(book_id)
             story = next((item for item in sources if item.get("source_type") == "story_bible"), None)
+            references = [item for item in sources if item.get("source_type") == "reference"]
             language = next((item for item in sources if item.get("source_type") == "language_plan"), None)
-            if story:
+            if story or references:
                 payloads = build_imported_story_bible_payloads(
-                    story.get("content") or "",
+                    str(story.get("content") or "") if story else "",
                     str(language.get("content") or "") if language else "",
-                    story_filename=story.get("filename") or "story-bible.md",
+                    story_filename=str(story.get("filename") or "story-bible.md") if story else "story-bible.md",
                     language_filename=str(language.get("filename") or "language-plan.md") if language else "language-plan.md",
+                    reference_text="\n\n".join(str(item.get("content") or "") for item in references),
+                    reference_filename="；".join(str(item.get("filename") or "story-outline.md") for item in references) or "story-outline.md",
                 )
                 for _, key in STORY_BIBLE_STEPS:
-                    get_story_bible_repository().save_draft(book_id, key, payloads[key], source="author")
+                    get_story_bible_repository().save_draft(book_id, key, payloads[key], source="ai")
                 if language:
                     project = get_project(book_id)
                     profile, writing_style = build_style_profile(language.get("content") or "", language.get("filename") or "language-plan.md")
@@ -775,7 +1064,13 @@ def _planning_source_result(book_id: str, source_type: str, filename: str, conte
                 _refresh_architecture_views(book_id)
         completed = None
         if confirm_steps:
-            completed = _apply_planning_materials(book_id)
+            workflow = repo.get(book_id) or {}
+            if (workflow.get("metadata") or {}).get("enforceProviderGate"):
+                completed = _prepare_planning_materials(book_id)
+                completed["reviewRequired"] = True
+                completed["message"] = "严格创作流程不会自动确认或发布 25 步清单，请逐步审阅后再发布。"
+            else:
+                completed = _apply_planning_materials(book_id)
         return {
             "source": {key: value for key, value in source.items() if key != "content"},
             "workflow": repo.get(book_id),
@@ -794,6 +1089,7 @@ async def import_planning_source_text(book_id: str, body: PlanningSourceTextRequ
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_model_setup(book_id)
     source_type = (body.sourceType or "reference").strip().lower()
     if source_type not in SOURCE_TYPES:
         raise HTTPException(422, "sourceType must be story_bible, language_plan, or reference")
@@ -811,6 +1107,7 @@ async def import_planning_source_file(
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_model_setup(book_id)
     source_type = (sourceType or "reference").strip().lower()
     if source_type not in SOURCE_TYPES:
         raise HTTPException(422, "sourceType must be story_bible, language_plan, or reference")
@@ -828,7 +1125,14 @@ async def complete_planning_sources(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_model_setup(book_id)
     try:
+        workflow = get_creation_workflow().get(book_id) or {}
+        if (workflow.get("metadata") or {}).get("enforceProviderGate"):
+            prepared = _prepare_planning_materials(book_id)
+            prepared["reviewRequired"] = True
+            prepared["message"] = "严格创作流程不会自动确认或发布 25 步清单，请到世界观向导逐步审阅。"
+            return prepared
         result = _apply_planning_materials(book_id)
         task = task_runtime.enqueue(
             "planning-views-generate",
@@ -839,6 +1143,21 @@ async def complete_planning_sources(book_id: str):
         )
         result["aiTaskId"] = task["id"]
         return result
+    except CreationWorkflowError as exc:
+        raise _creation_http_error(exc) from exc
+    except StoryBibleError as exc:
+        raise _bible_http_error(exc) from exc
+
+
+@app.post("/api/v1/books/{book_id}/planning-sources/prepare")
+async def prepare_planning_sources(book_id: str):
+    """Prepare the full 25-step review surface without confirming or publishing it."""
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "无效的项目ID")
+    get_project(book_id)
+    require_model_setup(book_id)
+    try:
+        return _prepare_planning_materials(book_id)
     except CreationWorkflowError as exc:
         raise _creation_http_error(exc) from exc
     except StoryBibleError as exc:
@@ -865,7 +1184,24 @@ async def get_planning_summary(book_id: str):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
     repo = get_creation_workflow()
-    workflow = repo.get(book_id) or repo.ensure(book_id)
+    workflow = repo.get(book_id)
+    # Legacy file-backed projects can be visible in the Studio book list
+    # without a native SQLite ``projects`` row. Their planning summary is a
+    # valid empty read model, not a server error from ``ensure()``.
+    if workflow is None:
+        native_project = story_repository.db.fetchone(
+            "SELECT id FROM projects WHERE id=?", (book_id,)
+        )
+        if native_project is None:
+            return {
+                "status": "not_started",
+                "taskId": None,
+                "task": None,
+                "decision": None,
+                "summary": None,
+                "sourceCount": 0,
+            }
+        workflow = repo.ensure(book_id)
     metadata = workflow.get("metadata") or {}
     summary = metadata.get("planningSummary")
     task_id = metadata.get("planningSynthesisTaskId")
@@ -906,6 +1242,7 @@ async def generate_planning_summary(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_model_setup(book_id)
     task = _queue_planning_synthesis(book_id, "manual-refresh")
     return {"taskId": task["id"], "status": task["status"]}
 
@@ -916,6 +1253,7 @@ async def generate_planning_views(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_model_setup(book_id)
     task = task_runtime.enqueue(
         "planning-views-generate",
         project_id=book_id,
@@ -945,6 +1283,7 @@ async def respond_to_thought(book_id: str, body: ThoughtResponseRequest):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_model_setup(book_id)
     repo = get_creation_workflow()
     try:
         session = repo.append_thought_turn(book_id, "user", body.answer)
@@ -965,6 +1304,7 @@ async def generate_thought_framework(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_model_setup(book_id)
     repo = get_creation_workflow()
     session = repo.get_thought_session(book_id)
     if not session:
@@ -1144,10 +1484,16 @@ async def get_chapter_workspace(book_id: str, num: int):
 
     ch = project.chapters.get(num)
     content = project_mgr.load_chapter_content(book_id, num) if ch else ""
+    authoritative_book_id = get_authoritative_book_id(book_id)
+    chapter_row = story_repository.db.fetchone(
+        "SELECT id FROM chapters WHERE book_id=? AND number=?",
+        (authoritative_book_id, num),
+    )
 
     return {
         "chapterNumber": num,
         "chapter": {
+            "id": f"chapter:{chapter_row['id']}" if chapter_row else None,
             "number": ch.number if ch else num,
             "title": ch.title if ch else "",
             "summary": ch.summary if ch else "",
@@ -1220,9 +1566,20 @@ async def write_next_chapter(book_id: str, req: WriteNextRequest):
     require_complete_planning(book_id)
     authoritative_book_id = get_authoritative_book_id(book_id)
     chapter_number = project.get_latest_chapter_number() + 1
+    workflow = get_creation_workflow().get(book_id) or {}
+    strict_planning = bool((workflow.get("metadata") or {}).get("requireCompletePlanning"))
+    run_config = ContinuousWritingService(
+        story_repository.db,
+        model_mgr,
+        story_repository,
+        task_runtime,
+        score_threshold=config_int("review", "pass_score", 93),
+        max_revisions=config_int("review", "max_revision_rounds", 3),
+    ).capture_run_configuration(book_id, strict_planning=strict_planning)
     task = task_runtime.enqueue("write-next", project_id=book_id, book_id=authoritative_book_id, data={
         "chapter_number": chapter_number,
         "context": req.context, "words": req.words, "count": req.count,
+        **run_config,
     })
     return {
         "taskId": task["id"], "chapter": chapter_number,
@@ -1726,6 +2083,7 @@ async def create_forecast(book_id: str, req: ForecastRequest):
             "depth": req.depth,
             "context": req.context.strip(),
             "node_id": req.nodeId.strip(),
+            "node_ids": [item.strip() for item in req.nodeIds if isinstance(item, str) and item.strip()],
             "canvas_revision": req.canvasRevision,
         },
     )
@@ -2230,6 +2588,155 @@ def _task_control(task_id: str, operation: str):
     except TaskStateError as exc:
         raise HTTPException(409, str(exc)) from exc
 
+
+@app.post("/api/v1/tasks/{task_id}/start")
+async def start_task(task_id: str):
+    """Make the card's Start action explicit while preserving queue ownership."""
+    task = task_runtime.get(task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    if task["status"] == "paused":
+        return _task_control(task_id, "resume")
+    if task["status"] in {"queued", "running"}:
+        return task
+    raise HTTPException(409, "只有排队或暂停中的任务可以开始")
+
+@app.post("/api/v1/tasks/{task_id}/author-decision")
+async def author_candidate_decision(task_id: str, req: AuthorCandidateDecisionRequest):
+    """Continue a stopped writing task from an author's beta1 decision."""
+    task = task_runtime.get(task_id)
+    if not task:
+        raise HTTPException(404, "浠诲姟涓嶅瓨鍦?")
+    if task.get("type") == "continuous":
+        decision = (req.decision or "").strip().lower()
+        if decision == "accept":
+            decision = "override"
+        elif decision == "reject":
+            decision = "retry"
+        if decision not in {"override", "retry", "cancel"}:
+            raise HTTPException(422, "continuous decision must be accept, reject, retry, override, or cancel")
+        if decision != "cancel":
+            model_project_id = task.get("project_id") or task.get("book_id")
+            if not isinstance(model_project_id, str) or not model_project_id:
+                raise HTTPException(422, "task has no project id")
+            require_model_setup(model_project_id)
+        try:
+            result = ContinuousWritingService(
+                story_repository.db,
+                model_mgr,
+                story_repository,
+                task_runtime,
+                joint_review_interval=config_int("continuous", "joint_review_interval", 5),
+                score_threshold=config_int("review", "pass_score", 93),
+                max_revisions=config_int("review", "max_revision_rounds", 3),
+            ).author_decision(task_id, decision, req.reason)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except TaskStateError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return result
+    if task.get("type") not in {"write-next", "write"}:
+        raise HTTPException(409, "只有章节写作任务支持 β1 作者决定")
+    if task.get("status") != "needs_author_decision":
+        raise HTTPException(409, "任务当前不在等待作者决定状态")
+
+    decision = (req.decision or "").strip().lower()
+    if decision not in {"accept", "reject"}:
+        raise HTTPException(422, "decision must be accept or reject")
+    checkpoint = task_runtime.latest_checkpoint(task_id) or {}
+    state = checkpoint.get("state") if isinstance(checkpoint, dict) else {}
+    context = dict((state or {}).get("context") or {}) if isinstance(state, dict) else {}
+    beta1 = (
+        context.get("beta1_content")
+        or context.get("beta_n_content")
+        or context.get("current_candidate")
+    )
+    if not isinstance(beta1, str) or not beta1.strip():
+        raise HTTPException(409, "当前任务没有可供作者决定的 β1 修订稿")
+
+    project_id = task.get("project_id") or context.get("project_id")
+    book_id = task.get("book_id") or context.get("book_id") or project_id
+    chapter_number = context.get("chapter_number") or (task.get("data") or {}).get("chapter_number")
+    if not isinstance(project_id, str) or not isinstance(chapter_number, int) or chapter_number < 1:
+        raise HTTPException(409, "任务缺少可恢复的章节上下文")
+    require_model_setup(project_id)
+
+    latest = story_repository.db.fetchone(
+        """SELECT c.id AS chapter_id, cv.id AS version_id, cv.version, cv.content
+           FROM chapters c JOIN chapter_versions cv ON cv.chapter_id=c.id
+           WHERE c.book_id=? AND c.number=?
+           ORDER BY cv.version DESC LIMIT 1""",
+        (book_id, chapter_number),
+    )
+    author_candidate = beta1
+    if latest and isinstance(latest.get("content"), str):
+        author_candidate = latest["content"]
+        context.update({
+            "chapter_id": latest["chapter_id"],
+            "draft_version_id": latest["version_id"],
+            "draft_version": latest["version"],
+        })
+
+    resumed = dict(context)
+    resumed.update({
+        "author_decision": decision,
+        "author_decision_reason": (req.reason or "").strip()[:2_000],
+        "current_candidate": author_candidate,
+    })
+    if decision == "accept":
+        resumed.update({
+            "author_approved": True,
+            "author_override": True,
+            "quality_gate": "AUTHOR_OVERRIDE",
+            "beta": author_candidate,
+            "beta_content": author_candidate,
+            "accepted_candidate": "β",
+        })
+        resume_stage = "EXTRACT_FACTS"
+        resumed["accepted_candidate"] = "author_override"
+    else:
+        resumed.update({
+            "author_approved": False,
+            "author_override": False,
+            "beta_n": author_candidate,
+            "beta_n_content": author_candidate,
+            "accepted_candidate": "βn",
+        })
+        resume_stage = "REVIEW"
+        resumed["accepted_candidate"] = "beta_n"
+
+    data = {
+        "chapter_number": chapter_number,
+        "book_id": book_id,
+        "resume_stage": resume_stage,
+        "resume_context": resumed,
+        "author_source_task_id": task_id,
+    }
+    for key in ("strict_planning", "planning_snapshot_id", "planning_snapshot_version",
+                "planning_snapshot_checksum", "prompt_policy_versions", "quality_policy"):
+        if key in (task.get("data") or {}):
+            data[key] = (task.get("data") or {})[key]
+    try:
+        resumed_task = task_runtime.enqueue(
+            "write-next",
+            project_id=project_id,
+            book_id=book_id,
+            data=data,
+            idempotency_key=f"author-decision:{task_id}:{decision}",
+        )
+    except TaskStateError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "sourceTaskId": task_id,
+        "decision": decision,
+        "taskId": resumed_task["id"],
+        "status": resumed_task["status"],
+        "resumeStage": resume_stage,
+    }
+
+
 @app.post("/api/v1/tasks/{task_id}/pause")
 async def pause_task(task_id: str):
     return _task_control(task_id, "pause")
@@ -2427,6 +2934,321 @@ async def radar_history(limit: int = Query(20, ge=1, le=100)):
                 "result": payload,
             })
     return {"history": items, "count": len(items)}
+
+
+def _split_graph_query(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in (value or "").split(",") if item.strip())
+
+
+@app.get("/api/v1/books/{book_id}/story-graph")
+async def get_story_graph(
+    book_id: str,
+    view: str = Query("story"),
+    focus: str = Query(""),
+    depth: int = Query(1, ge=1, le=3),
+    chapter_from: Optional[int] = Query(None, alias="chapter_from"),
+    chapter_to: Optional[int] = Query(None, alias="chapter_to"),
+    types: str = Query(""),
+    statuses: str = Query(""),
+    plot_thread: str = Query("", alias="plot_thread"),
+    time_from: str = Query("", alias="time_from"),
+    time_to: str = Query("", alias="time_to"),
+    limit: int = Query(240, ge=1, le=2000),
+):
+    """Return a bounded, semantic Story Graph projection from SQLite."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().project(
+            str(book["id"]),
+            view=view,
+            focus=focus or None,
+            depth=depth,
+            types=_split_graph_query(types),
+            statuses=_split_graph_query(statuses),
+            chapter_from=chapter_from,
+            chapter_to=chapter_to,
+            plot_thread=plot_thread or None,
+            time_from=time_from or None,
+            time_to=time_to or None,
+            limit=limit,
+        )
+    except StoryGraphError as exc:
+        raise HTTPException(status_code=422, detail={"code": "STORY_GRAPH_QUERY", "message": str(exc)}) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/search")
+async def search_story_graph(
+    book_id: str,
+    q: str = Query(""),
+    view: str = Query("all"),
+    limit: int = Query(30, ge=1, le=100),
+):
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().search(str(book["id"]), q, view=view, limit=limit)
+    except StoryGraphError as exc:
+        raise HTTPException(status_code=422, detail={"code": "STORY_GRAPH_SEARCH", "message": str(exc)}) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/context/{chapter_id}")
+async def get_story_graph_context(book_id: str, chapter_id: str):
+    book = resolve_story_graph_book(book_id)
+    try:
+        return get_story_graph_projector().context(str(book["id"]), chapter_id)
+    except StoryGraphError as exc:
+        status = 404 if "not found" in str(exc).lower() else 422
+        raise HTTPException(status_code=status, detail={"code": "STORY_GRAPH_CONTEXT", "message": str(exc)}) from exc
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/layout")
+async def get_story_graph_layout(book_id: str, view: str = Query("story")):
+    book = resolve_story_graph_book(book_id)
+    try:
+        items = get_story_graph_projector().read_layout(str(book["id"]), view)
+    except StoryGraphError as exc:
+        raise HTTPException(status_code=422, detail={"code": "STORY_GRAPH_LAYOUT", "message": str(exc)}) from exc
+    return {"bookId": book_id, "authoritativeBookId": story_graph_authoritative_id(book), "view": view, "items": items}
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/layout")
+async def save_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
+    book = resolve_story_graph_book(book_id)
+    try:
+        items = get_story_graph_projector().save_layout(str(book["id"]), body.view, body.items)
+    except StoryGraphError as exc:
+        raise HTTPException(status_code=422, detail={"code": "STORY_GRAPH_LAYOUT", "message": str(exc)}) from exc
+    return {"bookId": book_id, "authoritativeBookId": story_graph_authoritative_id(book), "view": body.view, "items": items}
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/layout/auto")
+async def auto_layout_story_graph(book_id: str, body: StoryFlowLayoutRequest):
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().auto_layout(str(book["id"]), view=body.view, focus=body.focus, depth=body.depth)
+    except StoryGraphError as exc:
+        raise HTTPException(status_code=422, detail={"code": "STORY_GRAPH_LAYOUT", "message": str(exc)}) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/nodes/{node_id}")
+async def get_story_graph_node(book_id: str, node_id: str):
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().node_detail(str(book["id"]), node_id)
+    except StoryGraphError as exc:
+        status = 404 if "not found" in str(exc).lower() else 422
+        raise HTTPException(status_code=status, detail={"code": "STORY_GRAPH_NODE", "message": str(exc)}) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/neighbors/{node_id}")
+async def get_story_graph_neighbors(book_id: str, node_id: str):
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().node_detail(str(book["id"]), node_id)
+    except StoryGraphError as exc:
+        status = 404 if "not found" in str(exc).lower() else 422
+        raise HTTPException(status_code=status, detail={"code": "STORY_GRAPH_NEIGHBORS", "message": str(exc)}) from exc
+    return {
+        "bookId": book_id,
+        "authoritativeBookId": story_graph_authoritative_id(book),
+        "nodeId": result["node"]["id"],
+        "neighbors": result["neighbors"],
+    }
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/edge-options")
+async def get_story_graph_edge_options(
+    book_id: str,
+    source_type: str = Query("", alias="sourceType"),
+    target_type: str = Query("", alias="targetType"),
+    source_port: Optional[str] = Query(None, alias="sourcePort"),
+    target_port: Optional[str] = Query(None, alias="targetPort"),
+):
+    """Return legal semantic relations for a Story Port drag preview."""
+    resolve_story_graph_book(book_id)
+    try:
+        options = semantic_edge_options(source_type, target_type, source_port, target_port)
+    except (StoryGraphError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "STORY_GRAPH_EDGE_OPTIONS", "message": str(exc)},
+        ) from exc
+    return {
+        "bookId": book_id,
+        "sourceType": source_type,
+        "targetType": target_type,
+        "sourcePort": source_port,
+        "targetPort": target_port,
+        "options": options,
+    }
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/planning")
+async def get_storyflow_planning(book_id: str):
+    """Return the durable planning overlay and its optimistic revision."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        graph, revision = get_storyflow_planning_service().load(str(book["id"]))
+    except StoryFlowPlanningError as exc:
+        raise HTTPException(status_code=422, detail={"code": "STORYFLOW_PLANNING", "message": str(exc)}) from exc
+    return {
+        "bookId": book_id,
+        "authoritativeBookId": story_graph_authoritative_id(book),
+        "revision": revision,
+        "graph": graph,
+        "canonicalSource": "sqlite.plot_workspaces",
+    }
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/planning/node")
+async def create_storyflow_planning_node(book_id: str, body: StoryFlowPlanningNodeRequest):
+    book = resolve_story_graph_book(book_id)
+    try:
+        graph, revision, node = get_storyflow_planning_service().add_node(
+            str(book["id"]),
+            title=body.title,
+            summary=body.summary,
+            subtype=body.subtype,
+            status=body.status,
+            metadata=body.metadata,
+            source=body.source,
+            expected_revision=body.expectedRevision,
+        )
+    except StoryFlowPlanningError as exc:
+        status = 409 if "revision conflict" in str(exc).lower() else 422
+        raise HTTPException(status_code=status, detail={"code": "STORYFLOW_PLANNING_NODE", "message": str(exc)}) from exc
+    return {"bookId": book_id, "revision": revision, "node": node, "graph": graph}
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/planning/edge")
+async def create_storyflow_planning_edge(book_id: str, body: StoryFlowPlanningEdgeRequest):
+    book = resolve_story_graph_book(book_id)
+    try:
+        graph, revision, edge = get_storyflow_planning_service().add_edge(
+            str(book["id"]),
+            source_node_id=body.sourceNodeId,
+            target_node_id=body.targetNodeId,
+            edge_type=body.edgeType,
+            label=body.label,
+            status=body.status,
+            weight=body.weight,
+            confidence=body.confidence,
+            source_port=body.sourcePort,
+            target_port=body.targetPort,
+            metadata=body.metadata,
+            expected_revision=body.expectedRevision,
+        )
+    except StoryFlowPlanningError as exc:
+        status = 409 if "revision conflict" in str(exc).lower() else 422
+        raise HTTPException(status_code=status, detail={"code": "STORYFLOW_PLANNING_EDGE", "message": str(exc)}) from exc
+    return {"bookId": book_id, "revision": revision, "edge": edge, "graph": graph}
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/planning/intent")
+async def create_storyflow_chapter_intent(book_id: str, body: StoryFlowIntentRequest):
+    """Turn a selected real StoryFlow into a durable Chapter Intent."""
+    book = resolve_story_graph_book(book_id)
+    service = get_storyflow_planning_service()
+    try:
+        if body.save:
+            intent, revision, plan_node, graph = service.save_intent_from_flow(
+                str(book["id"]), body.nodeIds,
+                chapter_number=body.chapterNumber,
+                expected_revision=body.expectedRevision,
+            )
+            model = ChapterIntent(
+                chapter_number=int(intent["chapter_number"]),
+                goals=list(intent.get("goals") or []),
+                foreshadowing_to_advance=list(intent.get("foreshadowing_to_advance") or []),
+                required_characters=list(intent.get("required_characters") or []),
+                required_locations=list(intent.get("required_locations") or []),
+                preconditions=list(intent.get("preconditions") or []),
+                required_outcomes=list(intent.get("required_outcomes") or []),
+                plot_threads=list(intent.get("plot_threads") or []),
+                source_node_ids=list(intent.get("source_node_ids") or []),
+                provenance=list(intent.get("provenance") or []),
+                status="PLANNED",
+            )
+            project_dir = project_mgr.get_project_dir(str(book.get("project_id") or book_id))
+            ControlSurface(project_dir).save_chapter_intent(model)
+            return {
+                "bookId": book_id,
+                "intent": model.to_dict(),
+                "revision": revision,
+                "planningNode": plan_node,
+                "graph": graph,
+                "savedTo": "control/runtime/chapter-intent + plot_workspaces",
+            }
+        return {"bookId": book_id, "intent": service.intent_from_flow(str(book["id"]), body.nodeIds, chapter_number=body.chapterNumber), "saved": False}
+    except StoryFlowPlanningError as exc:
+        status = 409 if "revision conflict" in str(exc).lower() else 422
+        raise HTTPException(status_code=status, detail={"code": "STORYFLOW_INTENT", "message": str(exc)}) from exc
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/planning/decision")
+async def decide_storyflow_candidate(book_id: str, body: StoryFlowCandidateDecisionRequest):
+    book = resolve_story_graph_book(book_id)
+    try:
+        graph, revision = get_storyflow_planning_service().decide(
+            str(book["id"]), node_ids=body.nodeIds, decision=body.decision,
+            expected_revision=body.expectedRevision,
+        )
+    except StoryFlowPlanningError as exc:
+        status = 409 if "revision conflict" in str(exc).lower() else 422
+        raise HTTPException(status_code=status, detail={"code": "STORYFLOW_CANDIDATE", "message": str(exc)}) from exc
+    return {"bookId": book_id, "revision": revision, "decision": body.decision, "graph": graph}
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/actions/analyze")
+async def analyze_storyflow_selection(book_id: str, body: StoryFlowAnalysisRequest):
+    """Queue a model-backed analysis for the selected StoryFlow subgraph."""
+    book = resolve_story_graph_book(book_id)
+    selected = [str(item).strip() for item in body.nodeIds if str(item).strip()]
+    if not selected:
+        raise HTTPException(status_code=422, detail={"code": "STORYFLOW_ANALYSIS", "message": "nodeIds is required"})
+    authoritative_book_id = story_graph_authoritative_id(book)
+    if not authoritative_book_id:
+        raise HTTPException(status_code=409, detail={"code": "STORYFLOW_ANALYSIS", "message": "empty project has no authoritative book for AI analysis"})
+    task = task_runtime.enqueue(
+        "storyflow-analyze",
+        project_id=str(book.get("project_id") or book_id),
+        book_id=authoritative_book_id,
+        data={
+            "node_ids": selected[:24],
+            "analysis_types": [str(item).strip() for item in body.analysisTypes if str(item).strip()],
+            "context": body.context.strip(),
+        },
+        idempotency_key=f"storyflow-analyze:{book_id}:{','.join(selected[:24])}:{datetime.now().strftime('%Y%m%d%H%M%S')}",
+    )
+    return {"bookId": book_id, "taskId": task["id"], "status": task["status"], "persistedIn": "tasks.result"}
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/actions/analyze/{task_id}")
+async def get_storyflow_analysis(book_id: str, task_id: str):
+    """Read a durable StoryFlow analysis task without fabricating a report."""
+    resolve_story_graph_book(book_id)
+    task = task_runtime.get(task_id)
+    if not task or task.get("type") != "storyflow-analyze":
+        raise HTTPException(status_code=404, detail={"code": "STORYFLOW_ANALYSIS", "message": "analysis task not found"})
+    return {
+        "bookId": book_id,
+        "taskId": task_id,
+        "status": task.get("status"),
+        "result": task.get("result"),
+        "error": task.get("error"),
+        "errorCode": task.get("error_code"),
+    }
 
 
 @app.get("/api/v1/books/{book_id}/flow")
@@ -2765,9 +3587,11 @@ async def create_draft_import(book_id: str, request: Request):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_model_setup(book_id)
     try:
         form = await request.form()
         story_upload = form.get("storyBible")
+        outline_upload = form.get("storyOutline")
         language_upload = form.get("languagePlan")
         raw_draft_uploads = [
             cast(UploadFile, value)
@@ -2778,6 +3602,7 @@ async def create_draft_import(book_id: str, request: Request):
             raise DraftImportError("DRAFT_FILES_REQUIRED", "请选择初稿文件夹、文件或压缩包")
 
         story_document_id: Optional[str] = None
+        outline_document_id: Optional[str] = None
         language_document_id: Optional[str] = None
         draft_entries: list[tuple[str, bytes]] = []
         if story_upload is not None and hasattr(story_upload, "read"):
@@ -2790,9 +3615,23 @@ async def create_draft_import(book_id: str, request: Request):
             )
             story_document_id = story_document["id"]
             if Path(story_name).suffix.lower() in {".txt", ".md"}:
-                creation_workflow_repository.add_source(
+                get_creation_workflow().add_source(
                     book_id, "story_bible", Path(story_name).name, decode_text(story_payload),
                     metadata={"documentId": story_document_id, "sourceRole": "story_bible", "priority": 100},
+                )
+        if outline_upload is not None and hasattr(outline_upload, "read"):
+            outline_file = cast(UploadFile, outline_upload)
+            outline_payload = await _read_upload(outline_file, max_bytes=DEFAULT_MAX_BYTES)
+            outline_name = _safe_draft_relative_path(outline_file.filename or "story-outline.md")
+            outline_document, _ = document_repository.create_upload(
+                book_id, Path(outline_name).name, outline_payload, doc_type="reference", mime_type=outline_file.content_type,
+                metadata={"sourceRole": "story_outline", "relativePath": outline_name, "priority": 95},
+            )
+            outline_document_id = outline_document["id"]
+            if Path(outline_name).suffix.lower() in {".txt", ".md"}:
+                get_creation_workflow().add_source(
+                    book_id, "reference", Path(outline_name).name, decode_text(outline_payload),
+                    metadata={"documentId": outline_document_id, "sourceRole": "story_outline", "priority": 95},
                 )
         if language_upload is not None and hasattr(language_upload, "read"):
             language_file = cast(UploadFile, language_upload)
@@ -2804,7 +3643,7 @@ async def create_draft_import(book_id: str, request: Request):
             )
             language_document_id = language_document["id"]
             if Path(language_name).suffix.lower() in {".txt", ".md"}:
-                creation_workflow_repository.add_source(
+                get_creation_workflow().add_source(
                     book_id, "language_plan", Path(language_name).name, decode_text(language_payload),
                     metadata={"documentId": language_document_id, "sourceRole": "language_plan", "priority": 90},
                 )
@@ -2858,8 +3697,8 @@ async def create_draft_import(book_id: str, request: Request):
             "draftImportId": record["id"],
             "taskId": task["id"],
             "status": task["status"],
-            "documentIds": [item for item in [story_document_id, language_document_id, *draft_document_ids] if item],
-            "priority": {"storyBible": 100, "languagePlan": 90, "draft": 50},
+            "documentIds": [item for item in [story_document_id, outline_document_id, language_document_id, *draft_document_ids] if item],
+            "priority": {"storyBible": 100, "storyOutline": 95, "languagePlan": 90, "draft": 50},
         }
     except DraftImportError as exc:
         raise _draft_import_http_error(exc) from exc
@@ -2888,12 +3727,53 @@ async def get_draft_import(book_id: str, import_id: str):
     return {"draftImport": record}
 
 
+@app.post("/api/v1/books/{book_id}/draft-imports/{import_id}/prepare-planning")
+async def prepare_draft_import_planning(book_id: str, import_id: str):
+    """Turn a completed folder analysis into reviewable 25-step planning drafts."""
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "invalid project id")
+    get_project(book_id)
+    require_model_setup(book_id)
+    record = get_draft_import_repository().get(import_id, project_id=book_id)
+    if record is None:
+        raise HTTPException(404, "draft import not found")
+    if record.get("status") != "completed":
+        raise HTTPException(409, "draft analysis must complete before planning preparation")
+    workflow_repo = get_creation_workflow()
+    workflow = workflow_repo.get(book_id)
+    workflow_repo.ensure(book_id, (workflow or {}).get("mode", "draft-import"))
+    sources = workflow_repo.list_sources(book_id)
+    if not any(item.get("source_type") == "story_bible" for item in sources):
+        report = record.get("report") or {}
+        report_text = (
+            "# 已有小说初稿分析与规划依据\n\n"
+            "以下内容来自已完成的初稿分析任务，仅作为 25 步 Story Bible 的 AI 草稿依据，必须由作者逐步审阅。\n\n"
+            + json.dumps(report, ensure_ascii=False, indent=2)
+        )
+        workflow_repo.add_source(
+            book_id,
+            "story_bible",
+            f"draft-import-{import_id}-planning-report.json",
+            report_text,
+            metadata={"draftImportId": import_id, "sourceRole": "draft_analysis", "priority": 80},
+        )
+    try:
+        result = _prepare_planning_materials(book_id)
+    except CreationWorkflowError as exc:
+        raise _creation_http_error(exc) from exc
+    except StoryBibleError as exc:
+        raise _bible_http_error(exc) from exc
+    result["draftImportId"] = import_id
+    return result
+
+
 @app.post("/api/v1/books/{book_id}/draft-imports/{import_id}/adjustment-plan")
 async def create_draft_adjustment_plan(book_id: str, import_id: str):
     """Queue an author-reviewable continuation plan without mutating story state."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_model_setup(book_id)
     repo = get_draft_import_repository()
     record = repo.get(import_id, project_id=book_id)
     if record is None:
@@ -2924,6 +3804,7 @@ async def retry_draft_import(book_id: str, import_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_model_setup(book_id)
     try:
         repo = get_draft_import_repository()
         record = repo.reset_for_retry(import_id, project_id=book_id, preserve_checkpoint=True)
@@ -3152,6 +4033,7 @@ async def publish_story_bible(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_model_setup(book_id)
     try:
         result = get_story_bible_repository().publish(book_id)
         views = _refresh_architecture_views(book_id)
@@ -3184,6 +4066,7 @@ async def suggest_story_bible_step(book_id: str, step_key: str, body: StoryBible
     """Queue an AI suggestion task for a Story Bible step."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
+    require_model_setup(book_id)
     # Validate step_key is a valid Story Bible step.
     valid_steps = {key for _, key in STORY_BIBLE_STEPS}
     if step_key not in valid_steps:
@@ -3759,6 +4642,8 @@ async def chat_with_ai(req: ChatRequest):
         raise HTTPException(400, "消息不能为空")
     if req.bookId and not validate_project_id(req.bookId):
         raise HTTPException(400, "invalid project id")
+    if req.bookId:
+        require_model_setup(req.bookId)
 
     # Build context from selected book
     context_parts = []
@@ -4191,6 +5076,7 @@ async def submit_wizard_step(book_id: str, step_key: str, body: WizardStepReques
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_model_setup(book_id)
     try:
         from src.wizard.world_bootstrap_service import WorldBootstrapService
         service = WorldBootstrapService(story_repository.db, model_mgr)
@@ -4205,6 +5091,7 @@ async def confirm_wizard_step(book_id: str, step_key: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_model_setup(book_id)
     try:
         from src.wizard.world_bootstrap_service import WorldBootstrapService
         service = WorldBootstrapService(story_repository.db, model_mgr)
@@ -4219,6 +5106,7 @@ async def generate_wizard_step(book_id: str, step_key: str, body: WizardGenerate
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_model_setup(book_id)
     try:
         from src.wizard.world_bootstrap_service import WorldBootstrapService
         service = WorldBootstrapService(story_repository.db, model_mgr)
@@ -4233,6 +5121,7 @@ async def publish_wizard(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_model_setup(book_id)
     try:
         from src.wizard.world_bootstrap_service import WorldBootstrapService
         service = WorldBootstrapService(story_repository.db, model_mgr)

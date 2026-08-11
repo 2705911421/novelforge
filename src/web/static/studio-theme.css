@@ -865,6 +865,21 @@ body::before {
   margin-bottom: 12px;
 }
 
+.model-work-panel.is-collapsed {
+  padding-bottom: 10px;
+}
+
+.model-work-panel.is-collapsed .model-work-list,
+.model-work-panel.is-collapsed .model-work-more {
+  display: none;
+}
+
+.model-work-collapse {
+  margin-left: 4px;
+  padding: 4px 7px;
+  font-size: 10px;
+}
+
 .model-work-header > div {
   min-width: 0;
   display: grid;
@@ -956,6 +971,18 @@ body::before {
 
 .model-work-item-foot {
   margin-top: 5px;
+}
+
+.model-work-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 5px;
+  margin-top: 7px;
+}
+
+.model-work-actions .btn {
+  padding: 4px 7px;
+  font-size: 10px;
 }
 
 .model-work-more {

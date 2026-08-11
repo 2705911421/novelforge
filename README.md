@@ -17,6 +17,7 @@ NovelForge 默认把作品数据和运行状态保存在本地 SQLite 与项目�
 
 - [适合谁使用](#适合谁使用)
 - [核心能力](#核心能力)
+- [StoryFlow 故事画布](#storyflow-故事画布)
 - [快速开始](#快速开始)
 - [完整使用教程](#完整使用教程)
 - [工作原理](#工作原理)
@@ -73,6 +74,18 @@ NovelForge 适合希望把“写小说”变成长期、可恢复工程的人，
 - Provider、Model、Agent role、Prompt、Skill 和 MCP 扩展管理。
 - Markdown、TXT、DOCX、Story Bible、审查报告和伏笔数据导出。
 - 备份清单、恢复任务、健康检查和运行日志查询。
+
+## StoryFlow 故事画布
+
+StoryFlow 是 NovelForge 将“思维导图、剧情工作流、人物关系、时间线和世界地图”逐步收敛到同一 Story Graph 的统一入口。当前已完成一个真实可用的 P0 vertical slice：
+
+- 数据链路是 `SQLite authoritative domain → StoryGraphProjector → Graph API → StoryFlow Canvas`，画布不维护第二套故事事实。
+- 默认打开 focused subgraph；支持 depth 1/2/3、节点类型/状态/章节范围过滤和搜索聚焦，不默认加载 Full Graph。
+- Story、Character、Timeline、World、Foreshadow、Context 六种 view 共享同一 Graph API，并按视图采用分层、径向、时间序、层级和生命周期布局。
+- 选择 Chapter、Character、Location 或 Foreshadow 后，右侧 Inspector 展示来源、状态、章节、邻居和可追溯元数据；章节可跳转到写作工作台，Context view 会明确区分“候选来源”与尚未记录的真实 GenerationRun 上下文。
+- 画布支持平移、缩放、框选、多选、节点拖动、隐藏、聚焦、展开邻域、自动布局、Minimap 和布局保存；布局只属于 UI workspace，不写入 StoryFact。
+
+本轮仍是 `PARTIAL`，不是完整 StoryFlow 产品：已接入 PlanningNode/Candidate overlay、语义规划边、Story Port 拖拽连接、Flow → Chapter Intent、持久化 StoryFlow AI 分析任务、forecast→Candidate 分支接入、GenerationRun context manifest 和 accepted StoryCommit 的重建投影；增量缓存以及高级 diff/history/impact analysis 尚未完成，AI 任务仍依赖已配置 Provider。详细边界、迁移策略和证据见 [`docs/storyflow-canvas/`](docs/storyflow-canvas/)。
 
 ## 快速开始
 

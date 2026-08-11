@@ -77,6 +77,15 @@ class ChapterIntent:
     emotional_arc: str = ""                              # 情感弧线
     pacing: str = ""                                     # 节奏要求
 
+    required_characters: list = field(default_factory=list)
+    required_locations: list = field(default_factory=list)
+    preconditions: list = field(default_factory=list)
+    required_outcomes: list = field(default_factory=list)
+    plot_threads: list = field(default_factory=list)
+    source_node_ids: list = field(default_factory=list)
+    provenance: list = field(default_factory=list)
+    status: str = "PLANNED"
+
     def to_dict(self) -> dict:
         return {
             "chapter_number": self.chapter_number,
@@ -88,6 +97,14 @@ class ChapterIntent:
             "foreshadowing_to_plant": self.foreshadowing_to_plant,
             "emotional_arc": self.emotional_arc,
             "pacing": self.pacing,
+            "required_characters": self.required_characters,
+            "required_locations": self.required_locations,
+            "preconditions": self.preconditions,
+            "required_outcomes": self.required_outcomes,
+            "plot_threads": self.plot_threads,
+            "source_node_ids": self.source_node_ids,
+            "provenance": self.provenance,
+            "status": self.status,
         }
 
     def to_markdown(self) -> str:
@@ -116,6 +133,18 @@ class ChapterIntent:
                 parts.append(f"- {f}\n")
         if self.emotional_arc:
             parts.append(f"## 情感弧线\n{self.emotional_arc}\n")
+        if self.required_characters:
+            parts.append("## 必须出现的人物\n")
+            parts.extend(f"- {item}\n" for item in self.required_characters)
+        if self.required_locations:
+            parts.append("## 主要地点\n")
+            parts.extend(f"- {item}\n" for item in self.required_locations)
+        if self.preconditions:
+            parts.append("## 前置事实\n")
+            parts.extend(f"- {item}\n" for item in self.preconditions)
+        if self.required_outcomes:
+            parts.append("## 必须产生的结果\n")
+            parts.extend(f"- {item}\n" for item in self.required_outcomes)
         if self.pacing:
             parts.append(f"## 节奏\n{self.pacing}\n")
         return "\n".join(parts)

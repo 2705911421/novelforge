@@ -117,6 +117,7 @@ class LegacyTaskHandlers:
             "planning-views-generate": self.planning_views_generate,
             "planning-synthesis": self.planning_synthesis,
             "forecast": self.forecast,
+            "storyflow-analyze": self.storyflow_analyze,
             "radar-scan": self.radar_scan,
             "translation-run": self.translation_run,
             "interactive-film-generate": self.interactive_film_generate,
@@ -142,11 +143,25 @@ class LegacyTaskHandlers:
 
         # Use the new WritingPipeline for SQLite-authoritative workflow.
         from src.pipeline.writing_pipeline import WritingPipeline
+        quality_policy = data.get("quality_policy") if isinstance(data.get("quality_policy"), dict) else {}
+        score_threshold = quality_policy.get(
+            "score_threshold", self._config_int("review", "pass_score", 93)
+        )
+        max_revisions = quality_policy.get(
+            "max_revisions", self._config_int("review", "max_revision_rounds", 3)
+        )
+        try:
+            score_threshold = int(score_threshold)
+            max_revisions = int(max_revisions)
+        except (TypeError, ValueError):
+            raise ValueError("invalid pinned quality policy")
         pipeline = WritingPipeline(
             db=self.project_manager.story_repository.db,
             model_manager=self.model_manager,
             story_repository=self.project_manager.story_repository,
             task_runtime=self.runtime,
+            score_threshold=score_threshold,
+            max_revisions=max_revisions,
         )
 
         chapter_number = data.get("chapter_number") or project.get_latest_chapter_number() + 1
@@ -162,6 +177,18 @@ class LegacyTaskHandlers:
             "facts_committed": result.get("facts_committed", 0),
             "revision_count": result.get("revision_count", 0),
             "completed": result.get("completed", False),
+            "prompt_a1": result.get("prompt_a1", ""),
+            "prompt_a2": result.get("prompt_a2", ""),
+            "prompt_a": result.get("prompt_a", ""),
+            "prompt_b": result.get("prompt_b", ""),
+            "score_n": result.get("score_n", result.get("review_score", 0)),
+            "alpha": result.get("alpha_content", ""),
+            "beta1": result.get("beta1_content", ""),
+            "beta": result.get("beta_content", ""),
+            "beta_n": result.get("beta_n_content", ""),
+            "accepted_candidate": result.get("accepted_candidate", ""),
+            "author_decision": result.get("author_decision", ""),
+            "author_approved": result.get("author_approved", False),
         }
 
     def continuous(self, task: dict[str, Any]) -> dict[str, Any]:
@@ -187,8 +214,12 @@ class LegacyTaskHandlers:
                 5,
                 data.get("joint_review_interval"),
             ),
+            score_threshold=self._config_int("review", "pass_score", 93),
+            max_revisions=self._config_int("review", "max_revision_rounds", 3),
         )
         
+        if hasattr(service, "advance"):
+            return service.advance(task)
         return service.execute_batch(task)
 
     def draft_chapter(self, task: dict[str, Any]) -> dict[str, Any]:
@@ -333,7 +364,11 @@ class LegacyTaskHandlers:
         if not isinstance(book_id, str):
             raise ValueError("task has no authoritative book id")
         review = JointReviewService(self.project_manager.story_repository.db, self.model_manager).review_chapters(
-            project.id, book_id, start, end
+            project.id,
+            book_id,
+            start,
+            end,
+            prompt_policy_versions=data.get("prompt_policy_versions"),
         )
         return {
             "chapterRange": f"{start}-{end}",
@@ -1046,9 +1081,17 @@ class LegacyTaskHandlers:
         depth = min(max(self._positive_int(data.get("depth"), 3), 1), 12)
         context = self._text(data.get("context"))
         node_id = self._text(data.get("node_id")).strip()
+        selected_node_ids = [
+            str(item).strip()
+            for item in (data.get("node_ids") or [])
+            if str(item).strip()
+        ]
+        if node_id and node_id not in selected_node_ids:
+            selected_node_ids.insert(0, node_id)
         canvas_revision = data.get("canvas_revision")
         canvas_context: dict[str, Any] = {}
         canvas_graph: dict[str, Any] = {}
+        selected_story_graph: dict[str, Any] = {"nodes": [], "edges": []}
         actual_canvas_revision = canvas_revision
         if isinstance(task.get("book_id"), str):
             try:
@@ -1083,6 +1126,27 @@ class LegacyTaskHandlers:
                 # The selected node may have been removed in another tab. The
                 # forecast remains useful from the authoritative story facts.
                 canvas_context = {}
+        if selected_node_ids and isinstance(task.get("book_id"), str):
+            from src.story_graph import StoryGraphError, StoryGraphProjector
+
+            projector = StoryGraphProjector(self.project_manager.story_repository.db)
+            selected_nodes: list[dict[str, Any]] = []
+            selected_edges: dict[str, dict[str, Any]] = {}
+            for selected_id in selected_node_ids[:24]:
+                try:
+                    detail = projector.node_detail(task["book_id"], selected_id)
+                except StoryGraphError as exc:
+                    raise ValueError(f"forecast selection node not found: {selected_id}") from exc
+                selected_nodes.append(detail["node"])
+                for neighbor in detail.get("neighbors", []):
+                    edge = neighbor.get("edge")
+                    if isinstance(edge, dict) and edge.get("id"):
+                        selected_edges[str(edge["id"])] = edge
+            selected_story_graph = {
+                "nodes": selected_nodes,
+                "edges": list(selected_edges.values()),
+                "source": "sqlite.story_graph_projection",
+            }
         recent = []
         for number, chapter in sorted(project.chapters.items(), reverse=True)[:5]:
             recent.append({
@@ -1110,6 +1174,8 @@ class LegacyTaskHandlers:
             "plot_canvas": {
                 "selected_node": canvas_context.get("node"),
                 "neighbors": canvas_context.get("neighbors", []),
+                "selected_node_ids": selected_node_ids,
+                "selected_story_graph": selected_story_graph,
                 "graph": canvas_graph,
                 "revision": canvas_context.get("revision", actual_canvas_revision),
                 "adjusted_canvas_only": True,
@@ -1161,8 +1227,145 @@ class LegacyTaskHandlers:
             "depth": depth,
             "guidance": context,
             "sourceNodeId": node_id,
+            "sourceNodeIds": selected_node_ids,
             "canvasRevision": canvas_context.get("revision", actual_canvas_revision),
         }
+
+    def storyflow_analyze(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Run a durable AI analysis over a selected StoryFlow subgraph.
+
+        The task result is stored by ``TaskRuntime``.  This handler never
+        writes StoryFact, StoryState, or planning nodes; the report is an
+        inspectable analysis artifact until an author explicitly acts on it.
+        """
+        project = self._project(task)
+        data = task.get("data") or {}
+        selected_node_ids = [
+            str(item).strip()
+            for item in (data.get("node_ids") or [])
+            if str(item).strip()
+        ][:24]
+        if not selected_node_ids:
+            raise ValueError("StoryFlow analysis requires at least one selected node")
+        analysis_types = [
+            str(item).strip()
+            for item in (data.get("analysis_types") or [])
+            if str(item).strip()
+        ] or [
+            "pace",
+            "relationship_changes",
+            "logic_conflicts",
+            "stale_plot_threads",
+            "foreshadowing_progress",
+            "timeline_anomalies",
+            "repetition",
+            "next_steps",
+        ]
+        book_id = task.get("book_id")
+        if not isinstance(book_id, str) or not book_id:
+            raise ValueError("StoryFlow analysis task has no authoritative book id")
+        from src.story_graph import StoryGraphError, StoryGraphProjector
+
+        projector = StoryGraphProjector(self.project_manager.story_repository.db)
+        nodes: list[dict[str, Any]] = []
+        edges: dict[str, dict[str, Any]] = {}
+        for node_id in selected_node_ids:
+            try:
+                detail = projector.node_detail(book_id, node_id)
+            except StoryGraphError as exc:
+                raise ValueError(f"StoryFlow analysis node not found: {node_id}") from exc
+            nodes.append(detail["node"])
+            for neighbor in detail.get("neighbors", []):
+                edge = neighbor.get("edge")
+                if isinstance(edge, dict) and edge.get("id"):
+                    edges[str(edge["id"])] = edge
+        selection = {"nodes": nodes, "edges": list(edges.values()), "source": "sqlite.story_graph_projection"}
+        self.runtime.checkpoint(
+            task["id"],
+            "storyflow-selection",
+            {"node_count": len(nodes), "edge_count": len(edges), "analysis_types": analysis_types},
+        )
+        user_context = self._text(data.get("context"))
+        prompt_payload = {
+            "book": project.name,
+            "analysis_types": analysis_types,
+            "author_context": user_context,
+            "selection": selection,
+            "output_schema": {
+                "summary": "one concise evidence-based paragraph",
+                "findings": [
+                    {
+                        "kind": "one requested analysis type",
+                        "severity": "info|warning|critical",
+                        "message": "specific finding",
+                        "evidenceNodeIds": ["selected node ids only"],
+                    }
+                ],
+                "nextSteps": ["concrete author actions"],
+            },
+        }
+        context_manifest = {
+            "schemaVersion": 1,
+            "source": "storyflow.selection",
+            "projectId": task.get("project_id") or project.id,
+            "bookId": book_id,
+            "items": [
+                {
+                    "sourceType": "story_graph_node",
+                    "sourceId": node.get("id"),
+                    "label": node.get("title"),
+                    "included": True,
+                    "contentChars": len(str(node.get("summary") or "")),
+                    "reason": "author-selected StoryFlow analysis input",
+                }
+                for node in nodes
+            ],
+            "selectionNodeIds": selected_node_ids,
+        }
+        self.runtime.checkpoint(task["id"], "storyflow-model-call", {"node_count": len(nodes)})
+        response = self.model_manager.chat(
+            [{"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)}],
+            system=(
+                "You are a rigorous long-form fiction continuity analyst. "
+                "Use only the supplied StoryFlow evidence. Do not invent canon, "
+                "and return JSON matching the requested schema."
+            ),
+            task_type="storyflow-analyze",
+            context_manifest=context_manifest,
+            max_tokens=5000,
+        )
+        payload = self._parse_json_response(response.content)
+        if not isinstance(payload, dict):
+            raise ValueError("StoryFlow analysis model returned no JSON object")
+        findings = payload.get("findings")
+        if not isinstance(findings, list):
+            raise ValueError("StoryFlow analysis model returned no findings array")
+        normalized_findings = []
+        selected_ids = set(selected_node_ids)
+        for finding in findings:
+            if not isinstance(finding, dict) or not str(finding.get("message") or "").strip():
+                continue
+            evidence = [
+                str(item) for item in (finding.get("evidenceNodeIds") or [])
+                if str(item) in selected_ids
+            ]
+            normalized_findings.append({
+                "kind": str(finding.get("kind") or "observation"),
+                "severity": str(finding.get("severity") or "info").lower(),
+                "message": str(finding["message"]),
+                "evidenceNodeIds": evidence,
+            })
+        result = {
+            "analysisId": task["id"],
+            "source": "model",
+            "selectedNodeIds": selected_node_ids,
+            "analysisTypes": analysis_types,
+            "summary": str(payload.get("summary") or ""),
+            "findings": normalized_findings,
+            "nextSteps": [str(item) for item in (payload.get("nextSteps") or []) if item is not None],
+        }
+        self.runtime.checkpoint(task["id"], "storyflow-model-call", {"finding_count": len(normalized_findings)})
+        return result
 
     def radar_scan(self, task: dict[str, Any]) -> dict[str, Any]:
         """Produce a persisted, model-backed market/genre scan for Studio."""

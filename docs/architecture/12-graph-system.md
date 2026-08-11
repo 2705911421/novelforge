@@ -1,6 +1,20 @@
 # NovelForge Architecture V2：Graph、Timeline 与地图
 
-Graph Engine 从 Character、Faction、Location、Relationship、Arc、Chapter、Foreshadow、TimelineEvent 和 StoryFact 投影节点边；所有节点都带实体 id、版本、来源 commit 和可导航目标。Phase 13/14 的 React Flow UI 可缩放、拖动、折叠、编辑和连接，但编辑必须走对应领域 API，图不是第二数据源。
+StoryFlow 的当前实现以 `StoryGraphProjector` 为唯一读模型边界：
 
-Timeline Engine 保存世界历史时间、故事时间、章节顺序、人物/地点/势力变化和伏笔状态；允许按实体筛选并跳转章节。地图结构是地点层级/坐标/连接/控制势力，视觉生成图只关联 `ImageAsset`，永不反向覆盖结构化地点数据。
+```text
+SQLite authoritative domain
+  ├─ Chapter / ChapterVersion / StoryCommit / StoryFact / StoryState
+  ├─ Character / CharacterState / Faction / Location / Relationship
+  ├─ TimelineEvent / Foreshadow / Story Bible / Planning
+  ↓
+StoryGraphProjector（可重建、只读 canonical projection）
+  ↓
+GET /api/v1/books/{book_id}/story-graph*
+  ↓
+StoryFlow Canvas（view / filter / focus / layout projection）
+```
 
+节点和边携带 `source_type`、`source_id`、版本、状态和 provenance；语义边不是通用 `related_to`。前端拖动产生的坐标、折叠、固定和隐藏状态写入独立的 `storyflow_layouts` UI workspace 表，不进入 `StoryFact`、`StoryState` 或 `StoryCommit`。canonical 故事事实仍只能通过现有 StoryRepository/StoryCommit 边界改变。
+
+Timeline 同时保留 narrative order 与 story time；World view 在没有真实坐标时明确呈现为 Location hierarchy 的 World Graph，而不是伪装成空间地图。旧 `/flow`、静态 Mind Map、Timeline 和 World Map 入口继续保留兼容，统一入口和实现边界详见 [`docs/storyflow-canvas/`](../storyflow-canvas/)。
