@@ -2,9 +2,15 @@
 projects/
 .references/
 .novelforge-backups/
+.novelforge-secrets/
 .phase5-*/
 .playwright-cli/
 output/
+exports/
+studio/
+test-output/
+.agents/
+skills-lock.json
 *.db
 *.db-*
 *.sqlite
