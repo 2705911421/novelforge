@@ -9,6 +9,8 @@ output/
 exports/
 studio/
 test-output/
+.agents/
+skills-lock.json
 *.db
 *.db-*
 *.sqlite
@@ -18,8 +20,6 @@ test-output/
 .mypy_cache/
 .pyright/
 .reasonix/
-.agents/
-skills-lock.json
 __pycache__/
 *.py[cod]
 *.log
