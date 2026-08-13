@@ -36,6 +36,16 @@ Canvas 是单独的原生 JS module `src/web/static/studio-storyflow.js`，样�
 - `transform`: 当前 viewport，可丢失；节点位置持久化。
 - `error`: 可见的 API 或网络错误。
 
+## Server-side viewport read boundary
+
+Full Graph / All evidence mode can encode the current world-coordinate window
+as `x_from`, `x_to`, `y_from`, `y_to`, and `viewport_padding`. The projector
+lays out the complete filtered candidate set first, applies saved workspace
+positions, and returns `meta.viewport` for the bounded slice. The browser
+debounces this request after Canvas pan/zoom; returned nodes still use native
+HTML/SVG DOM culling. This is a read-side projection, not Canon and not a
+claim of GPU rendering or complete virtualization.
+
 ## Node interaction
 
 - 单击：选择并在 Inspector 展示真实摘要、状态、邻居和来源。
@@ -53,4 +63,3 @@ Canvas 是单独的原生 JS module `src/web/static/studio-storyflow.js`，样�
 使用 NovelForge 现有温暖米白和橙红 accent，画布使用低对比点阵，状态同时使用 badge、边线型、文字和 icon。新 UI 不引入渐变堆叠、黑色专业软件皮肤或装饰性节点。
 
 设计审计取值：`DESIGN_VARIANCE=5`、`MOTION_INTENSITY=3`、`VISUAL_DENSITY=6`。这是创作工具，不是营销页；动效只用于拖动反馈、焦点变化和加载状态，并尊重 reduced motion。
-

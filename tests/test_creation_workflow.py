@@ -200,9 +200,11 @@ def test_canvas_hide_and_forecast_import_do_not_touch_story_bible(tmp_path):
     class Model:
         def __init__(self):
             self.messages = []
+            self.context_manifests = []
 
         def chat(self, messages, **kwargs):
             self.messages.append(messages[0]["content"])
+            self.context_manifests.append(kwargs.get("context_manifest"))
             return Response()
 
     model = Model()
@@ -217,10 +219,33 @@ def test_canvas_hide_and_forecast_import_do_not_touch_story_bible(tmp_path):
     runtime.claim("forecast-test-worker")
     forecast_task = runtime.get(task["id"])
     assert forecast_task is not None
-    handlers["forecast"](forecast_task)
+    forecast_result = handlers["forecast"](forecast_task)
+    assert forecast_result["candidateSetId"] == f"forecast:{task['id']}"
+    runtime.transition(task["id"], "completed", result=forecast_result)
+    persisted_forecast = runtime.get(task["id"])
+    assert persisted_forecast is not None
+    assert persisted_forecast["result"]["candidateSetId"] == forecast_result["candidateSetId"]
     prompt = json.loads(model.messages[-1])
     assert source_id not in {node["id"] for node in prompt["plot_canvas"]["graph"]["nodes"]}
     assert source_id in {node["id"] for node in prompt["plot_canvas"]["selected_story_graph"]["nodes"]}
+    manifest = model.context_manifests[-1]
+    assert manifest["source"] == "storyflow.forecast"
+    assert manifest["candidateSetId"] == forecast_result["candidateSetId"]
+    assert manifest["selectionNodeIds"] == [source_id]
+    assert any(
+        item["sourceType"] == "story_graph_node" and item["sourceId"] == source_id
+        for item in manifest["items"]
+    )
+    snapshot = manifest["contextGraphSnapshot"]
+    assert snapshot["scope"] == "generation_run_context"
+    assert snapshot["nodeCount"] >= 1
+    assert len(snapshot["graphSha256"]) == 64
+    assert all(edge["source"] != edge["target"] for edge in snapshot["edges"])
+    assert all(
+        "secret prompt prose" not in json.dumps(node, ensure_ascii=False).lower()
+        for node in snapshot["nodes"]
+    )
+    assert any(item["sourceType"] == "author_guidance" for item in manifest["items"]) is False
 
 
 def test_storyflow_analysis_is_a_durable_non_canon_task(tmp_path):
@@ -232,6 +257,31 @@ def test_storyflow_analysis_is_a_durable_non_canon_task(tmp_path):
     assert book is not None
     book_id = book["id"]
 
+    source_character_id = "analysis-character-01"
+    target_character_id = "analysis-character-02"
+    db.insert(
+        "characters",
+        {"id": source_character_id, "book_id": book_id, "name": "Analysis Character 01"},
+    )
+    db.insert(
+        "characters",
+        {"id": target_character_id, "book_id": book_id, "name": "Analysis Character 02"},
+    )
+    db.insert(
+        "relationships",
+        {
+            "id": "analysis-relationship-01",
+            "book_id": book_id,
+            "source_type": "character",
+            "source_id": source_character_id,
+            "target_type": "character",
+            "target_id": target_character_id,
+            "relationship_type": "hostile",
+            "strength": 7,
+        },
+    )
+    selected_node_id = f"character:{source_character_id}"
+
     class Response:
         content = json.dumps({
             "summary": "选中子图存在一个关系推进机会。",
@@ -239,7 +289,7 @@ def test_storyflow_analysis_is_a_durable_non_canon_task(tmp_path):
                 "kind": "relationship_changes",
                 "severity": "warning",
                 "message": "需要明确下一章的关系变化。",
-                "evidenceNodeIds": [f"book:{book_id}"],
+                "evidenceNodeIds": [selected_node_id],
             }],
             "nextSteps": ["在 Chapter Intent 中写明关系变化"],
         }, ensure_ascii=False)
@@ -252,13 +302,14 @@ def test_storyflow_analysis_is_a_durable_non_canon_task(tmp_path):
             self.messages.append((messages, kwargs))
             return Response()
 
+    model = Model()
     runtime = TaskRuntime(db)
-    handlers = LegacyTaskHandlers(manager, Model(), Config(project_path=str(tmp_path)), runtime).mapping()
+    handlers = LegacyTaskHandlers(manager, model, Config(project_path=str(tmp_path)), runtime).mapping()
     task = runtime.enqueue(
         "storyflow-analyze",
         project_id=project.id,
         book_id=book_id,
-        data={"node_ids": [f"book:{book_id}"]},
+        data={"node_ids": [selected_node_id]},
     )
     runtime.claim("storyflow-analysis-worker")
     running = runtime.get(task["id"])
@@ -268,5 +319,23 @@ def test_storyflow_analysis_is_a_durable_non_canon_task(tmp_path):
     persisted = runtime.get(task["id"])
     assert persisted is not None
     assert persisted["result"]["source"] == "model"
-    assert persisted["result"]["findings"][0]["evidenceNodeIds"] == [f"book:{book_id}"]
+    assert persisted["result"]["findings"][0]["evidenceNodeIds"] == [selected_node_id]
+    analysis_manifest = next(
+        kwargs["context_manifest"]
+        for _, kwargs in model.messages
+        if kwargs.get("task_type") == "storyflow-analyze"
+    )
+    assert analysis_manifest["source"] == "storyflow.selection"
+    assert analysis_manifest["selectionNodeIds"] == [selected_node_id]
+    analysis_item = analysis_manifest["items"][0]
+    assert analysis_item["selectionRole"] == "analysisSelection"
+    assert analysis_item["focusNodeId"] == selected_node_id
+    assert analysis_item["depth"] == 0
+    assert analysis_item["edgeTypes"] == ["connects", "hostile_to"]
+    assert analysis_item["provenanceKind"] == "author_selected_storyflow_analysis"
+    assert analysis_manifest["contextGraphSnapshot"]["focusNodeIds"] == [selected_node_id]
+    assert all(
+        edge["source"] != edge["target"]
+        for edge in analysis_manifest["contextGraphSnapshot"]["edges"]
+    )
     assert db.fetchall("SELECT * FROM story_facts WHERE book_id=?", (book_id,)) == []

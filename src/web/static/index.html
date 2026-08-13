@@ -239,8 +239,8 @@ select.input{cursor:pointer}
 .markdown-body a{color:var(--accent);text-decoration:underline}
 @media(max-width:700px){.task-detail-modal .kv{display:block}.task-detail-modal .kv span{display:block;margin-bottom:4px}.task-detail-modal .kv b{display:block}.task-run{padding:10px}.task-prompt,.task-output{max-height:420px}}
 </style>
-<link rel="stylesheet" href="/static/studio-theme.css?v=20260811-model-progress-1" onerror="this.onerror=null;this.href='studio-theme.css'">
-<link rel="stylesheet" href="/static/storyflow.css?v=20260811-storyflow-1" onerror="this.onerror=null;this.href='storyflow.css'">
+<link rel="stylesheet" href="/static/studio-theme.css?v=20260811-model-progress-2" onerror="this.onerror=null;this.href='studio-theme.css'">
+<link rel="stylesheet" href="/static/storyflow.css?v=20260813-storyflow-22" onerror="this.onerror=null;this.href='storyflow.css'">
 </head>
 <body>
 <button class="mobile-nav-toggle" id="mobile-nav-toggle" type="button" aria-controls="studio-sidebar" aria-expanded="false"><span class="mobile-nav-icon" aria-hidden="true"></span><span>导航</span></button>
@@ -1533,6 +1533,18 @@ PAGES.chapters=async(p)=>{
   loadChapterRows(chapterNumbers);
   const taskId=localStorage.getItem(WRITE_TASK_KEY+S.book);
   if(taskId) monitorWriteTask(taskId);
+  const studioIntent=window.__chapterStudioIntent;
+  if(studioIntent){
+    window.__chapterStudioIntent=null;
+    window.setTimeout(()=>{
+      const number=Number(studioIntent.number)||1;
+      const input=document.getElementById('op-num');
+      if(input)input.value=String(number);
+      loadChapterWorkspace(number);
+      if(studioIntent.action==='audit')opAudit();
+      if(studioIntent.action==='rewrite')opRevise();
+    },80);
+  }
 };
 async function loadChapterRows(numbers){
   const tb=document.getElementById('ch-tbody'); if(!tb||!numbers?.length)return;
@@ -1574,12 +1586,24 @@ async function loadChapterWorkspace(number){
       <div class="workspace-section"><span class="dim-note">本章必须遵守的规则</span><ul>${workspaceList(rules.rules||rules.items||rules.constraints)||'<li class="muted">暂无专门规则</li>'}</ul></div>
       <div class="workspace-section"><span class="dim-note">上下文来源</span><p class="text-sm text-muted">${esc(workspaceText(trace.selected_context||trace.selectedContext||trace.summary)||'写作时将从权威故事状态加载上下文。')}</p></div>
       <div class="workspace-section"><span class="dim-note">最近审查</span>${hasReview?`<p class="text-sm"><b style="color:${scoreColor(review.overall_score||0)}">${review.overall_score??'—'} 分</b> · ${esc(review.verdict||'未给出结论')}</p>`:'<p class="text-sm text-muted">尚未审查</p>'}</div>`;
-    out.insertAdjacentHTML('afterbegin', `<div class="row row-wrap mt8"><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('story','${escAttr(w.chapter?.id||'')}')">查看 StoryFlow</button><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('context','${escAttr(w.chapter?.id||'')}')">查看本章 Context</button><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('foreshadow','${escAttr(w.chapter?.id||'')}')">查看相关伏笔</button><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('timeline','${escAttr(w.chapter?.id||'')}')">查看时间线</button></div>`);
+    out.insertAdjacentHTML('afterbegin', `<div class="row row-wrap mt8"><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('story','${escAttr(w.chapter?.id||'')}')">查看 StoryFlow</button><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('context','${escAttr(w.chapter?.id||'')}')">查看本章 Context</button><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('character','${escAttr(w.chapter?.id||'')}')">查看本章关系</button><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('foreshadow','${escAttr(w.chapter?.id||'')}')">查看相关伏笔</button><button class="btn btn-sm btn-secondary" onclick="openStoryFlowView('timeline','${escAttr(w.chapter?.id||'')}')">查看时间线</button></div>`);
   }catch(e){out.innerHTML=`<p style="color:var(--error)">${esc(e.message)}</p>`;}
 }
 function openStoryFlowView(view, focus){
   go('storyflow');
   window.setTimeout(()=>window.storyflow?.open(view, focus), 450);
+}
+function openChapterStudioAction(action, number){
+  const chapterNumber=Number(number);
+  if(!Number.isInteger(chapterNumber)||chapterNumber<1)return toast('无效的章节号','error');
+  if(action==='open')return typeof window.viewChapter==='function'?window.viewChapter(chapterNumber):go('chapters');
+  if(action==='versions')return typeof window.showChapterVersions==='function'?window.showChapterVersions(chapterNumber):go('chapters');
+  if(action==='audit'||action==='rewrite'){
+    window.__chapterStudioIntent={action,number:chapterNumber};
+    go('chapters');
+    return;
+  }
+  toast(`未知的章节工作台动作：${action}`,'error');
 }
 async function writeNext(){
   const s=document.getElementById('wn-status');
@@ -1755,7 +1779,7 @@ async function showChapterVersions(number){
     modal(`<div class="modal-header"><h3>第${number}章版本历史</h3><button class="close-x" onclick="closeModal()">×</button></div>
       <p class="text-sm text-muted">恢复会创建一个新的版本；不会覆盖历史文本。</p>
       <table class="table"><thead><tr><th>版本</th><th>字数</th><th>变更</th><th>时间</th><th>操作</th></tr></thead><tbody>
-      ${versions.map(v=>`<tr><td>v${v.version}</td><td>${v.word_count||0}</td><td>${esc(v.change_summary||'')}</td><td>${esc(v.created_at||'')}</td><td><button class="btn btn-secondary btn-sm" onclick="showChapterVersionDiff(${number},${v.version},${currentVersion})" ${v.version===currentVersion?'disabled':''}>对比当前</button> <button class="btn btn-secondary btn-sm" onclick="restoreChapterVersion(${number},${v.version},${currentVersion})" ${v.version===currentVersion?'disabled':''}>恢复此版</button></td></tr>`).join('')}</tbody></table>`,true);
+      ${versions.length?versions.map(v=>`<tr><td>v${v.version}</td><td>${v.word_count||0}</td><td>${esc(v.change_summary||'')}</td><td>${esc(v.created_at||'')}</td><td><button class="btn btn-secondary btn-sm" onclick="showChapterVersionDiff(${number},${v.version},${currentVersion})" ${v.version===currentVersion?'disabled':''}>对比当前</button> <button class="btn btn-secondary btn-sm" onclick="restoreChapterVersion(${number},${v.version},${currentVersion})" ${v.version===currentVersion?'disabled':''}>恢复此版</button></td></tr>`).join(''):'<tr><td colspan="5" class="muted">该章目前没有持久化版本历史；当前内容仍来自 SQLite 章节事实。</td></tr>'}</tbody></table>`,true);
   }catch(e){toast(e.message,'error');}
 }
 async function showChapterVersionDiff(number,fromVersion,toVersion){
@@ -2503,9 +2527,9 @@ go(S.book?bootPage:'dashboard');
     };
     document.body.appendChild(script);
   }
-loadStudioAsset('/static/studio-enhancements.js?v=20260811-model-progress-1','studio-enhancements.js',function(){
+loadStudioAsset('/static/studio-enhancements.js?v=20260812-model-progress-2','studio-enhancements.js',function(){
     loadStudioAsset('/static/studio-visual.js?v=20260811-model-progress-1','studio-visual.js',function(){
-      loadStudioAsset('/static/studio-storyflow.js?v=20260811-storyflow-1','studio-storyflow.js');
+      loadStudioAsset('/static/studio-storyflow.js?v=20260813-storyflow-33','studio-storyflow.js');
     });
   });
 })();

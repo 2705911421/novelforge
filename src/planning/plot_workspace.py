@@ -11,7 +11,7 @@ import json
 import uuid
 from copy import deepcopy
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional, overload
 
 from src.core.database import Database, generate_id
 
@@ -243,28 +243,383 @@ class PlotWorkspaceRepository:
             )
         return graph, next_revision
 
-    def apply_branch(self, book_id: str, branch: dict[str, Any], source_node_id: str = "",
-                     expected_revision: Optional[int] = None) -> tuple[dict[str, Any], int]:
+    @overload
+    def apply_branch(
+        self,
+        book_id: str,
+        branch: dict[str, Any],
+        source_node_id: str = "",
+        expected_revision: Optional[int] = None,
+        *,
+        return_metadata: Literal[True],
+    ) -> tuple[dict[str, Any], int, dict[str, Any]]: ...
+
+    @overload
+    def apply_branch(
+        self,
+        book_id: str,
+        branch: dict[str, Any],
+        source_node_id: str = "",
+        expected_revision: Optional[int] = None,
+        *,
+        return_metadata: Literal[False] = False,
+    ) -> tuple[dict[str, Any], int]: ...
+
+    def apply_branch(
+        self,
+        book_id: str,
+        branch: dict[str, Any],
+        source_node_id: str = "",
+        expected_revision: Optional[int] = None,
+        *,
+        return_metadata: bool = False,
+    ) -> tuple[dict[str, Any], int] | tuple[dict[str, Any], int, dict[str, Any]]:
         if not isinstance(branch, dict):
             raise PlotWorkspaceError("forecast branch must be an object")
         graph, _ = self.load(book_id)
+        operations, candidate_metadata = self._build_branch_operations(
+            graph,
+            branch,
+            source_node_id,
+        )
+        result_graph, result_revision = self.apply_delta(
+            book_id,
+            {"operations": operations},
+            expected_revision,
+        )
+        if not return_metadata:
+            return result_graph, result_revision
+        return result_graph, result_revision, self._branch_metadata(
+            operations,
+            candidate_metadata,
+        )
+
+    def apply_candidate_set(
+        self,
+        book_id: str,
+        branches: list[dict[str, Any]],
+        source_node_id: str = "",
+        expected_revision: Optional[int] = None,
+    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        """Atomically persist one forecast result as a candidate set."""
+        graph, revision, candidate_set, _ = self._apply_candidate_set_transaction(
+            book_id,
+            branches,
+            source_node_id,
+            expected_revision=expected_revision,
+        )
+        return graph, revision, candidate_set
+
+    def apply_candidate_set_with_audit(
+        self,
+        book_id: str,
+        project_id: str,
+        branches: list[dict[str, Any]],
+        source_node_id: str = "",
+        expected_revision: Optional[int] = None,
+    ) -> tuple[dict[str, Any], int, dict[str, Any], list[dict[str, Any]]]:
+        """Persist a candidate set and its forecast audit rows in one transaction.
+
+        Candidate nodes are planning data, while ``forecast_imports`` is the
+        audit trail for the explicit adoption action.  They are separate
+        concerns, but an adoption request must not commit one without the
+        other.  The returned audit rows are limited to branches created by
+        this call, so replaying an external branch id remains idempotent.
+        """
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise PlotWorkspaceError("forecast audit project is required")
+        return self._apply_candidate_set_transaction(
+            book_id,
+            branches,
+            source_node_id,
+            expected_revision=expected_revision,
+            audit_project_id=project_id,
+        )
+
+    def _apply_candidate_set_transaction(
+        self,
+        book_id: str,
+        branches: list[dict[str, Any]],
+        source_node_id: str,
+        *,
+        expected_revision: Optional[int],
+        audit_project_id: Optional[str] = None,
+    ) -> tuple[dict[str, Any], int, dict[str, Any], list[dict[str, Any]]]:
+        """Plan and persist a candidate set while holding one SQLite transaction."""
+        if not isinstance(branches, list) or not branches:
+            raise PlotWorkspaceError("candidate set requires at least one branch")
+        if len(branches) > 8:
+            raise PlotWorkspaceError("candidate set cannot contain more than 8 branches")
+        if any(not isinstance(branch, dict) for branch in branches):
+            raise PlotWorkspaceError("candidate set branches must be objects")
+
+        # Preserve the historical lazy-initialization behavior before entering
+        # the locked transaction.  All candidate writes and audit writes then
+        # happen on the same connection.
+        self.load(book_id)
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM plot_workspaces WHERE book_id=?", (book_id,)).fetchone()
+            if row is None:
+                raise PlotWorkspaceError("plot workspace is not initialized")
+            actual_revision = int(row["revision"] or 1)
+            if expected_revision is not None and int(expected_revision) != actual_revision:
+                raise PlotRevisionConflict(int(expected_revision), actual_revision)
+            graph = self._normalize_graph(_json_load(row["graph"], {}))
+            candidate_set_id, normalized_branches = self._normalize_candidate_set_branches(
+                branches, source_node_id
+            )
+            operations, branch_metadata = self._plan_candidate_set(
+                graph,
+                normalized_branches,
+                source_node_id,
+                candidate_set_id,
+            )
+            result_revision = actual_revision
+            if operations:
+                self._apply_operations(graph, operations)
+                graph["updatedAt"] = datetime.now().isoformat()
+                result_revision = actual_revision + 1
+                encoded = json.dumps(graph, ensure_ascii=False)
+                conn.execute(
+                    "UPDATE plot_workspaces SET revision=?, graph=?, updated_at=CURRENT_TIMESTAMP WHERE book_id=?",
+                    (result_revision, encoded, book_id),
+                )
+                conn.execute(
+                    "INSERT INTO plot_workspace_revisions(id, workspace_id, revision, graph) VALUES (?, ?, ?, ?)",
+                    (generate_id(), row["id"], result_revision, encoded),
+                )
+
+            candidate_set = {
+                "candidateSetId": candidate_set_id,
+                "sourceNodeId": source_node_id or None,
+                "branchCount": len(branch_metadata),
+                "createdBranchCount": sum(1 for item in branch_metadata if item.get("created", True)),
+                "branches": branch_metadata,
+            }
+            imported: list[dict[str, Any]] = []
+            if audit_project_id:
+                for branch, metadata in zip(normalized_branches, branch_metadata, strict=False):
+                    if not metadata.get("created", True):
+                        continue
+                    imported_branch = {
+                        **branch,
+                        "candidateBranchId": metadata["candidateBranchId"],
+                        "candidateNodeIds": metadata["nodeIds"],
+                        "candidateRootNodeId": metadata["rootNodeId"],
+                        "candidateSetId": candidate_set_id,
+                    }
+                    source_task_id = imported_branch.get("sourceTaskId") or imported_branch.get("source_task_id") or ""
+                    if not isinstance(source_task_id, str):
+                        source_task_id = ""
+                    import_id = generate_id()
+                    conn.execute(
+                        """INSERT INTO forecast_imports
+                           (id, project_id, source_task_id, target, branch, canvas_revision)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            import_id,
+                            audit_project_id,
+                            source_task_id or None,
+                            "canvas",
+                            json.dumps(imported_branch, ensure_ascii=False),
+                            result_revision,
+                        ),
+                    )
+                    imported_row = conn.execute(
+                        "SELECT * FROM forecast_imports WHERE id=?", (import_id,)
+                    ).fetchone()
+                    if imported_row is not None:
+                        imported.append(self._forecast_import_dict(imported_row))
+            return graph, result_revision, candidate_set, imported
+
+    @staticmethod
+    def _normalize_candidate_set_branches(
+        branches: list[dict[str, Any]], source_node_id: str
+    ) -> tuple[str, list[dict[str, Any]]]:
+        candidate_set_id = PlotWorkspaceRepository._candidate_set_id(branches[0], source_node_id)
+        normalized_branches: list[dict[str, Any]] = []
+        for index, branch in enumerate(branches, start=1):
+            branch_set_id = branch.get("candidateSetId") or branch.get("candidate_set_id")
+            if branch_set_id not in (None, "") and str(branch_set_id) != candidate_set_id:
+                raise PlotWorkspaceError("all candidate branches must use one candidateSetId")
+            normalized = dict(branch)
+            normalized.setdefault("candidateSetId", candidate_set_id)
+            normalized.setdefault("branchIndex", index)
+            normalized.setdefault("branchCount", len(branches))
+            normalized_branches.append(normalized)
+        return candidate_set_id, normalized_branches
+
+    def _plan_candidate_set(
+        self,
+        graph: dict[str, Any],
+        normalized_branches: list[dict[str, Any]],
+        source_node_id: str,
+        candidate_set_id: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        existing_by_external_id: dict[str, dict[str, Any]] = {}
+        for node in graph.get("nodes", []):
+            metadata = node.get("metadata") or {}
+            if metadata.get("candidateSetId") != candidate_set_id:
+                continue
+            if metadata.get("branchRootId") is not None:
+                continue
+            external_id = metadata.get("externalBranchId")
+            if external_id not in (None, ""):
+                existing_by_external_id[str(external_id)] = {
+                    "rootNodeId": node.get("id"),
+                    "candidateBranchId": metadata.get("candidateBranchId"),
+                    "nodeIds": [
+                        item.get("id")
+                        for item in graph.get("nodes", [])
+                        if (item.get("metadata") or {}).get("candidateBranchId") == metadata.get("candidateBranchId")
+                    ],
+                    "edgeIds": [
+                        item.get("id")
+                        for item in graph.get("edges", [])
+                        if (item.get("metadata") or {}).get("candidateBranchId") == metadata.get("candidateBranchId")
+                    ],
+                    "title": node.get("title") or node.get("label") or external_id,
+                    "originNodeId": metadata.get("originNodeId"),
+                    "candidateSetId": candidate_set_id,
+                    "generationRunId": metadata.get("generationRunId"),
+                    "sourceAnalysisTaskId": metadata.get("sourceAnalysisTaskId"),
+                    "sourceAnalysisGenerationRunId": metadata.get("sourceAnalysisGenerationRunId"),
+                    "sourceCandidateSetId": metadata.get("sourceCandidateSetId"),
+                    "sourceCandidateBranchId": metadata.get("sourceCandidateBranchId"),
+                    "sourceCandidateRootNodeId": metadata.get("sourceCandidateRootNodeId"),
+                    "created": False,
+                }
+
+        operations: list[dict[str, Any]] = []
+        branch_metadata: list[dict[str, Any]] = []
+        for branch in normalized_branches:
+            external_id = branch.get("branchId") or branch.get("id")
+            existing = existing_by_external_id.get(str(external_id)) if external_id not in (None, "") else None
+            if existing:
+                branch_metadata.append(existing)
+                continue
+            branch_operations, metadata = self._build_branch_operations(
+                graph,
+                branch,
+                source_node_id,
+                candidate_set_id=candidate_set_id,
+            )
+            operations.extend(branch_operations)
+            branch_metadata.append(self._branch_metadata(branch_operations, metadata))
+        return operations, branch_metadata
+
+    @staticmethod
+    def _forecast_import_dict(row: Any) -> dict[str, Any]:
+        result = dict(row)
+        result["branch"] = _json_load(result.get("branch"), {})
+        return result
+
+    @staticmethod
+    def _candidate_set_id(branch: dict[str, Any], source_node_id: str) -> str:
+        candidate_set_id = branch.get("candidateSetId") or branch.get("candidate_set_id")
+        if isinstance(candidate_set_id, str) and candidate_set_id.strip():
+            return candidate_set_id.strip()
+        source_task_id = branch.get("sourceTaskId") or branch.get("taskId") or ""
+        generation_run_id = branch.get("generationRunId") or branch.get("generation_run_id") or ""
+        candidate_set_id = "|".join(
+            str(value or "") for value in (source_task_id, generation_run_id, source_node_id)
+        ).strip("|")
+        return candidate_set_id or f"manual:{source_node_id or 'unanchored'}"
+
+    @staticmethod
+    def _branch_metadata(
+        operations: list[dict[str, Any]],
+        candidate_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "candidateBranchId": candidate_metadata["candidateBranchId"],
+            "rootNodeId": next(
+                operation["node"]["id"]
+                for operation in operations
+                if operation.get("op") == "add_node"
+                and operation["node"].get("metadata", {}).get("branchRootId") is None
+            ),
+            "nodeIds": [
+                operation["node"]["id"]
+                for operation in operations
+                if operation.get("op") == "add_node"
+            ],
+            "edgeIds": [
+                operation["edge"]["id"]
+                for operation in operations
+                if operation.get("op") == "add_edge"
+            ],
+            "title": candidate_metadata["candidateBranchTitle"],
+            "originNodeId": candidate_metadata["originNodeId"],
+            "candidateSetId": candidate_metadata["candidateSetId"],
+            "generationRunId": candidate_metadata["generationRunId"],
+            "sourceAnalysisTaskId": candidate_metadata.get("sourceAnalysisTaskId"),
+            "sourceAnalysisGenerationRunId": candidate_metadata.get("sourceAnalysisGenerationRunId"),
+            "sourceCandidateSetId": candidate_metadata.get("sourceCandidateSetId"),
+            "sourceCandidateBranchId": candidate_metadata.get("sourceCandidateBranchId"),
+            "sourceCandidateRootNodeId": candidate_metadata.get("sourceCandidateRootNodeId"),
+            "created": True,
+        }
+
+    def _build_branch_operations(
+        self,
+        graph: dict[str, Any],
+        branch: dict[str, Any],
+        source_node_id: str = "",
+        *,
+        candidate_set_id: Optional[str] = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         source = next((node for node in graph["nodes"] if node["id"] == source_node_id), None)
         base_x = float(source.get("x", 520)) if source else 520.0
         base_y = float(source.get("y", 260)) if source else 260.0
         branch_id = f"forecast:{uuid.uuid4().hex}"
+        candidate_branch_id = f"candidate-branch:{uuid.uuid4().hex}"
         title = str(branch.get("title") or branch.get("id") or "AI 推演分支")
+        source_task_id = branch.get("sourceTaskId") or branch.get("taskId") or None
+        generation_run_id = branch.get("generationRunId") or branch.get("generation_run_id") or None
+        source_analysis_task_id = branch.get("sourceAnalysisTaskId") or branch.get("source_analysis_task_id") or None
+        source_analysis_run_id = branch.get("sourceAnalysisGenerationRunId") or branch.get("source_analysis_generation_run_id") or None
+        source_candidate_set_id = branch.get("sourceCandidateSetId") or branch.get("source_candidate_set_id") or None
+        source_candidate_branch_id = branch.get("sourceCandidateBranchId") or branch.get("source_candidate_branch_id") or None
+        source_candidate_root_node_id = branch.get("sourceCandidateRootNodeId") or branch.get("source_candidate_root_node_id") or None
+        candidate_set_id = candidate_set_id or self._candidate_set_id(branch, source_node_id)
+        candidate_metadata = {
+            "candidateBranchId": candidate_branch_id,
+            "candidateSetId": candidate_set_id,
+            "candidateBranchStatus": "CANDIDATE",
+            "candidateBranchTitle": title,
+            "originNodeId": source_node_id or None,
+            "sourceTaskId": source_task_id,
+            "generationRunId": generation_run_id,
+            "sourceAnalysisTaskId": source_analysis_task_id,
+            "sourceAnalysisGenerationRunId": source_analysis_run_id,
+            "sourceCandidateSetId": source_candidate_set_id,
+            "sourceCandidateBranchId": source_candidate_branch_id,
+            "sourceCandidateRootNodeId": source_candidate_root_node_id,
+            "externalBranchId": branch.get("branchId") or branch.get("id") or None,
+            "branchIndex": branch.get("branchIndex"),
+            "branchCount": branch.get("branchCount"),
+        }
         operations: list[dict[str, Any]] = [{
             "op": "add_node", "node": {
                 "id": branch_id, "kind": "forecast", "type": "forecast", "label": title,
                 "title": title, "summary": str(branch.get("summary") or ""),
                 "description": str(branch.get("narrative") or ""), "x": base_x + 270, "y": base_y,
-                "source": "ai", "status": "draft", "customized": True,
-                "metadata": {"risks": branch.get("risks") or [], "score": branch.get("score")},
+                "source": "ai", "status": "candidate", "customized": True,
+                "metadata": {
+                    **candidate_metadata,
+                    "risks": branch.get("risks") or [],
+                    "score": branch.get("score"),
+                },
             },
         }]
         if source_node_id:
             operations.append({"op": "add_edge", "edge": {
                 "id": f"edge:{uuid.uuid4().hex}", "source": source_node_id, "target": branch_id,
+                "status": "candidate",
+                "metadata": {
+                    **candidate_metadata,
+                },
                 "label": "AI 推演", "kind": "forecast", "sourceRef": "ai",
             }})
         for index, point in enumerate(branch.get("plot_points") or [], start=1):
@@ -272,14 +627,20 @@ class PlotWorkspaceRepository:
             operations.append({"op": "add_node", "node": {
                 "id": point_id, "kind": "forecast-step", "type": "forecast-step", "label": str(point),
                 "title": str(point), "summary": "", "description": "", "x": base_x + 520,
-                "y": base_y + (index - 1) * 105, "source": "ai", "status": "draft",
-                "customized": True, "metadata": {"branchId": branch_id, "step": index},
+                "y": base_y + (index - 1) * 105, "source": "ai", "status": "candidate",
+                "customized": True, "metadata": {
+                    **candidate_metadata,
+                    "branchRootId": branch_id,
+                    "step": index,
+                },
             }})
             operations.append({"op": "add_edge", "edge": {
                 "id": f"edge:{uuid.uuid4().hex}", "source": branch_id, "target": point_id,
+                "status": "candidate",
+                "metadata": {**candidate_metadata, "step": index},
                 "label": f"第{index}步", "kind": "forecast", "sourceRef": "ai",
             }})
-        return self.apply_delta(book_id, {"operations": operations}, expected_revision)
+        return operations, candidate_metadata
 
     def node_context(self, book_id: str, node_id: str = "") -> dict[str, Any]:
         graph, revision = self.load(book_id)
@@ -404,7 +765,15 @@ class PlotWorkspaceRepository:
                 if not isinstance(patch, dict):
                     raise PlotWorkspaceError("node patch must be an object")
                 for key, value in patch.items():
-                    if key in {"id", "source", "metadata"}:
+                    if key in {"id", "source"}:
+                        continue
+                    if key == "metadata":
+                        if not isinstance(value, dict):
+                            raise PlotWorkspaceError("node metadata patch must be an object")
+                        current_metadata = node.get("metadata")
+                        if not isinstance(current_metadata, dict):
+                            current_metadata = {}
+                        node["metadata"] = {**current_metadata, **deepcopy(value)}
                         continue
                     if key in {"x", "y"}:
                         if not isinstance(value, (int, float)):
@@ -443,6 +812,25 @@ class PlotWorkspaceRepository:
                 node["hidden"] = op == "hide_node"
                 node["customized"] = True
                 node["source"] = node.get("source") if node.get("source") == "ai" else "author"
+            elif op == "update_edge":
+                edge = edges.get(operation.get("id"))
+                if not edge:
+                    raise PlotWorkspaceError("plot edge not found")
+                patch = operation.get("patch", {})
+                if not isinstance(patch, dict):
+                    raise PlotWorkspaceError("edge patch must be an object")
+                for key, value in patch.items():
+                    if key in {"id", "source", "target"}:
+                        continue
+                    if key == "metadata":
+                        if not isinstance(value, dict):
+                            raise PlotWorkspaceError("edge metadata patch must be an object")
+                        current_metadata = edge.get("metadata")
+                        if not isinstance(current_metadata, dict):
+                            current_metadata = {}
+                        edge["metadata"] = {**current_metadata, **deepcopy(value)}
+                        continue
+                    edge[key] = deepcopy(value)
             elif op == "add_edge":
                 edge = operation.get("edge")
                 if not isinstance(edge, dict) or edge.get("source") not in nodes or edge.get("target") not in nodes:

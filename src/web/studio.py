@@ -227,6 +227,10 @@ class ForecastRequest(BaseModel):
     nodeId: str = ""
     nodeIds: list[str] = Field(default_factory=list)
     canvasRevision: Optional[int] = None
+    sourceAnalysisTaskId: str = ""
+    sourceCandidateSetId: str = ""
+    sourceCandidateBranchId: str = ""
+    sourceCandidateRootNodeId: str = ""
 
 class StyleAnalyzeRequest(BaseModel):
     text: str
@@ -293,6 +297,17 @@ class PlotBranchApplyRequest(BaseModel):
     expectedRevision: Optional[int] = None
 
 
+class PlotCandidateSetApplyRequest(BaseModel):
+    branches: list[dict[str, Any]] = Field(default_factory=list)
+    sourceNodeId: str = ""
+    expectedRevision: Optional[int] = None
+
+
+class StoryFlowCandidateTaskImportRequest(BaseModel):
+    sourceNodeId: str = ""
+    expectedRevision: Optional[int] = None
+
+
 class StoryFlowLayoutRequest(BaseModel):
     view: str = "story"
     items: list[dict[str, Any]] = Field(default_factory=list)
@@ -328,6 +343,13 @@ class StoryFlowIntentRequest(BaseModel):
     nodeIds: list[str] = Field(default_factory=list)
     chapterNumber: Optional[int] = Field(default=None, ge=1)
     save: bool = True
+    expectedRevision: Optional[int] = None
+
+
+class StoryFlowGenerateRequest(BaseModel):
+    nodeIds: list[str] = Field(default_factory=list)
+    chapterNumber: Optional[int] = Field(default=None, ge=1)
+    context: str = ""
     expectedRevision: Optional[int] = None
 
 
@@ -780,6 +802,24 @@ def get_memory(project_id: str) -> MemorySystem:
 
 def get_control_surface(project_id: str) -> ControlSurface:
     return ControlSurface(project_mgr.get_project_dir(project_id))
+
+
+def storyflow_chapter_intent_model(intent: dict[str, Any]) -> ChapterIntent:
+    """Convert a StoryFlow intent read model into the existing control-plane type."""
+    return ChapterIntent(
+        chapter_number=int(intent["chapter_number"]),
+        goals=list(intent.get("goals") or []),
+        foreshadowing_to_advance=list(intent.get("foreshadowing_to_advance") or []),
+        required_characters=list(intent.get("required_characters") or []),
+        required_locations=list(intent.get("required_locations") or []),
+        preconditions=list(intent.get("preconditions") or []),
+        required_outcomes=list(intent.get("required_outcomes") or []),
+        plot_threads=list(intent.get("plot_threads") or []),
+        source_node_ids=list(intent.get("source_node_ids") or []),
+        provenance=list(intent.get("provenance") or []),
+        status="PLANNED",
+    )
+
 
 def get_story_system(project_id: str) -> StorySystem:
     return StorySystem(project_mgr.get_project_dir(project_id))
@@ -1415,9 +1455,16 @@ async def list_chapter_versions(book_id: str, num: int):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
     versions = story_repository.chapter_versions(book_id, num)
-    if not versions:
+    chapter_exists = num in project.chapters
+    if not chapter_exists:
+        authoritative_book_id = get_authoritative_book_id(book_id)
+        chapter_exists = story_repository.db.fetchone(
+            "SELECT id FROM chapters WHERE book_id=? AND number=?",
+            (authoritative_book_id, num),
+        ) is not None
+    if not chapter_exists:
         raise HTTPException(404, f"章节{num}不存在")
-    return {"chapterNumber": num, "versions": versions}
+    return {"chapterNumber": num, "versions": versions, "historyAvailable": bool(versions)}
 
 
 @app.get("/api/v1/books/{book_id}/chapters/{num}/versions/diff")
@@ -1951,21 +1998,241 @@ async def apply_plot_canvas_branch(book_id: str, body: PlotBranchApplyRequest):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
     try:
-        graph, revision = plot_workspace_repository.apply_branch(
+        graph, revision, candidate_branch = plot_workspace_repository.apply_branch(
             get_authoritative_book_id(book_id), body.branch, body.sourceNodeId,
             expected_revision=body.expectedRevision,
+            return_metadata=True,
         )
+        imported_branch = {
+            **body.branch,
+            "candidateBranchId": candidate_branch["candidateBranchId"],
+            "candidateNodeIds": candidate_branch["nodeIds"],
+            "candidateRootNodeId": candidate_branch["rootNodeId"],
+        }
+        source_task_id = imported_branch.get("sourceTaskId") or imported_branch.get("source_task_id") or ""
+        if not isinstance(source_task_id, str):
+            source_task_id = ""
         imported = get_creation_workflow().record_forecast_import(
             book_id,
-            body.branch,
+            imported_branch,
             target="canvas",
+            source_task_id=source_task_id,
             canvas_revision=revision,
         )
-        return {"graph": graph, "revision": revision, "sourceNodeId": body.sourceNodeId, "forecastImport": imported}
+        return {
+            "graph": graph,
+            "revision": revision,
+            "sourceNodeId": body.sourceNodeId,
+            "candidateBranch": candidate_branch,
+            "forecastImport": imported,
+        }
     except PlotWorkspaceError as exc:
         raise _plot_http_error(exc) from exc
     except CreationWorkflowError as exc:
         raise _creation_http_error(exc) from exc
+
+
+@app.post("/api/v1/books/{book_id}/plot-canvas/apply-candidate-set")
+async def apply_plot_canvas_candidate_set(book_id: str, body: PlotCandidateSetApplyRequest):
+    """Import one forecast response atomically as a planning-only candidate set."""
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "invalid project id")
+    get_project(book_id)
+    try:
+        graph, revision, candidate_set, imported = plot_workspace_repository.apply_candidate_set_with_audit(
+            get_authoritative_book_id(book_id),
+            book_id,
+            body.branches,
+            body.sourceNodeId,
+            expected_revision=body.expectedRevision,
+        )
+        return {
+            "graph": graph,
+            "revision": revision,
+            "sourceNodeId": body.sourceNodeId,
+            "candidateSet": candidate_set,
+            "forecastImports": imported,
+            "atomic": True,
+        }
+    except PlotWorkspaceError as exc:
+        raise _plot_http_error(exc) from exc
+    except CreationWorkflowError as exc:
+        raise _creation_http_error(exc) from exc
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/candidates/recoverable-tasks")
+async def list_storyflow_recoverable_candidate_tasks(book_id: str):
+    """List completed forecast tasks whose candidate overlay is not present.
+
+    This is deliberately a safe task summary rather than a second result
+    store.  The task result remains the durable source for recovery, while the
+    current SQLite planning projection suppresses entries that have already
+    been imported.  Prompt bodies and branch narrative are never returned.
+    """
+    book = resolve_story_graph_book(book_id)
+    authoritative_book_id = story_graph_authoritative_id(book)
+    if authoritative_book_id is None:
+        return {
+            "bookId": book_id,
+            "authoritativeBookId": None,
+            "revision": 0,
+            "tasks": [],
+            "canonicalSource": "sqlite.tasks+plot_workspaces",
+        }
+    try:
+        candidate_sets, revision = get_storyflow_planning_service().candidate_sets(
+            str(book["id"])
+        )
+    except StoryFlowPlanningError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "STORYFLOW_CANDIDATE_RECOVERY", "message": str(exc)},
+        ) from exc
+    existing_set_ids = {
+        str(item.get("candidateSetId"))
+        for item in candidate_sets
+        if item.get("candidateSetId")
+    }
+    recoverable: list[dict[str, Any]] = []
+    for task in task_runtime.list(project_id=book_id, limit=200):
+        if task.get("type") != "forecast" or task.get("status") != "completed":
+            continue
+        task_book_id = str(task.get("book_id") or task.get("bookId") or "")
+        if task_book_id and task_book_id not in {str(authoritative_book_id), str(book.get("id"))}:
+            continue
+        raw_result = task.get("result")
+        result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
+        branches = result.get("branches") if isinstance(result.get("branches"), list) else []
+        if not branches:
+            continue
+        raw_candidate_import = result.get("candidateImport")
+        candidate_import: dict[str, Any] = (
+            raw_candidate_import if isinstance(raw_candidate_import, dict) else {}
+        )
+        candidate_set_id = str(
+            result.get("candidateSetId")
+            or candidate_import.get("candidateSetId")
+            or f"forecast:{task['id']}"
+        )
+        if candidate_set_id in existing_set_ids:
+            continue
+        source_node_ids = result.get("sourceNodeIds") if isinstance(result.get("sourceNodeIds"), list) else []
+        source_node_id = result.get("sourceNodeId") or (source_node_ids[0] if source_node_ids else "")
+        recoverable.append({
+            "taskId": task["id"],
+            "status": task["status"],
+            "createdAt": task.get("created_at") or task.get("createdAt"),
+            "completedAt": task.get("completed_at") or task.get("completedAt"),
+            "candidateSetId": candidate_set_id,
+            "sourceNodeId": str(source_node_id or ""),
+            "branchCount": len(branches),
+            "generationRunId": result.get("generationRunId") or candidate_import.get("generationRunId"),
+            "importStatus": candidate_import.get("status") or "unimported",
+            "importError": candidate_import.get("error") if candidate_import.get("status") == "failed" else None,
+            "legacyIdentity": not bool(result.get("candidateSetId") or candidate_import.get("candidateSetId")),
+            "canonicalMutation": False,
+        })
+    return {
+        "bookId": book_id,
+        "authoritativeBookId": authoritative_book_id,
+        "revision": revision,
+        "tasks": recoverable[:8],
+        "canonicalSource": "sqlite.tasks+plot_workspaces",
+    }
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/candidates/recoverable-tasks/{task_id}/import")
+async def import_storyflow_recoverable_candidate_task(
+    book_id: str,
+    task_id: str,
+    body: StoryFlowCandidateTaskImportRequest,
+):
+    """Re-import a completed forecast result without invoking a model."""
+    book = resolve_story_graph_book(book_id)
+    task = task_runtime.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "forecast task not found"})
+    authoritative_book_id = story_graph_authoritative_id(book)
+    if authoritative_book_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "STORYFLOW_EMPTY_BOOK", "message": "an empty project has no authoritative book"},
+        )
+    task_project_id = str(task.get("project_id") or task.get("projectId") or "")
+    task_book_id = str(task.get("book_id") or task.get("bookId") or "")
+    if task_project_id != str(book_id) and task_book_id not in {str(authoritative_book_id), str(book.get("id"))}:
+        raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND", "message": "forecast task not found"})
+    if task.get("type") != "forecast":
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "STORYFLOW_CANDIDATE_TASK_TYPE", "message": "task is not a StoryFlow forecast"},
+        )
+    if task.get("status") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "STORYFLOW_CANDIDATE_TASK_NOT_COMPLETED",
+                "message": "only a completed forecast task can be imported",
+                "status": task.get("status"),
+            },
+        )
+    raw_result = task.get("result")
+    result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
+    raw_branches = result.get("branches")
+    if not isinstance(raw_branches, list) or not raw_branches:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "STORYFLOW_CANDIDATE_RESULT_EMPTY", "message": "forecast task has no branches"},
+        )
+    raw_candidate_import = result.get("candidateImport")
+    candidate_import: dict[str, Any] = (
+        raw_candidate_import if isinstance(raw_candidate_import, dict) else {}
+    )
+    candidate_set_id = str(
+        result.get("candidateSetId")
+        or candidate_import.get("candidateSetId")
+        or f"forecast:{task_id}"
+    )
+    generation_run_id = result.get("generationRunId") or candidate_import.get("generationRunId")
+    source_node_ids = result.get("sourceNodeIds") if isinstance(result.get("sourceNodeIds"), list) else []
+    source_node_id = str(body.sourceNodeId or result.get("sourceNodeId") or (source_node_ids[0] if source_node_ids else ""))
+    branches: list[dict[str, Any]] = []
+    for index, branch in enumerate(raw_branches[:8], start=1):
+        if not isinstance(branch, dict):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "STORYFLOW_CANDIDATE_RESULT_INVALID", "message": "forecast branch must be an object"},
+            )
+        branches.append({
+            **branch,
+            "candidateSetId": branch.get("candidateSetId") or candidate_set_id,
+            "sourceTaskId": branch.get("sourceTaskId") or task_id,
+            "generationRunId": branch.get("generationRunId") or generation_run_id,
+            "branchIndex": branch.get("branchIndex") or index,
+            "branchCount": branch.get("branchCount") or min(len(raw_branches), 8),
+        })
+    try:
+        graph, revision, candidate_set, imported = plot_workspace_repository.apply_candidate_set_with_audit(
+            authoritative_book_id,
+            book_id,
+            branches,
+            source_node_id,
+            expected_revision=body.expectedRevision,
+        )
+        return {
+            "graph": graph,
+            "revision": revision,
+            "sourceNodeId": source_node_id,
+            "candidateSet": candidate_set,
+            "forecastImports": imported,
+            "atomic": True,
+            "recovered": True,
+            "taskId": task_id,
+            "candidateSetId": candidate_set_id,
+            "canonicalMutation": False,
+        }
+    except PlotWorkspaceError as exc:
+        raise _plot_http_error(exc) from exc
 
 
 @app.get("/api/v1/books/{book_id}/plot-canvas/context/{node_id}")
@@ -2085,6 +2352,10 @@ async def create_forecast(book_id: str, req: ForecastRequest):
             "node_id": req.nodeId.strip(),
             "node_ids": [item.strip() for item in req.nodeIds if isinstance(item, str) and item.strip()],
             "canvas_revision": req.canvasRevision,
+            "source_analysis_task_id": req.sourceAnalysisTaskId.strip(),
+            "source_candidate_set_id": req.sourceCandidateSetId.strip(),
+            "source_candidate_branch_id": req.sourceCandidateBranchId.strip(),
+            "source_candidate_root_node_id": req.sourceCandidateRootNodeId.strip(),
         },
     )
     return {
@@ -2948,12 +3219,20 @@ async def get_story_graph(
     depth: int = Query(1, ge=1, le=3),
     chapter_from: Optional[int] = Query(None, alias="chapter_from"),
     chapter_to: Optional[int] = Query(None, alias="chapter_to"),
+    volume_number: Optional[int] = Query(None, alias="volume", ge=1),
     types: str = Query(""),
     statuses: str = Query(""),
     plot_thread: str = Query("", alias="plot_thread"),
     time_from: str = Query("", alias="time_from"),
     time_to: str = Query("", alias="time_to"),
+    presentation: str = Query("expanded"),
     limit: int = Query(240, ge=1, le=2000),
+    edge_limit: int = Query(600, alias="edge_limit", ge=1, le=6000),
+    viewport_x_from: Optional[float] = Query(None, alias="x_from"),
+    viewport_x_to: Optional[float] = Query(None, alias="x_to"),
+    viewport_y_from: Optional[float] = Query(None, alias="y_from"),
+    viewport_y_to: Optional[float] = Query(None, alias="y_to"),
+    viewport_padding: float = Query(0.0, alias="viewport_padding", ge=0, le=2000),
 ):
     """Return a bounded, semantic Story Graph projection from SQLite."""
     book = resolve_story_graph_book(book_id)
@@ -2967,10 +3246,18 @@ async def get_story_graph(
             statuses=_split_graph_query(statuses),
             chapter_from=chapter_from,
             chapter_to=chapter_to,
+            volume_number=volume_number,
             plot_thread=plot_thread or None,
             time_from=time_from or None,
             time_to=time_to or None,
+            presentation=presentation,
             limit=limit,
+            edge_limit=edge_limit,
+            viewport_x_from=viewport_x_from,
+            viewport_x_to=viewport_x_to,
+            viewport_y_from=viewport_y_from,
+            viewport_y_to=viewport_y_to,
+            viewport_padding=viewport_padding,
         )
     except StoryGraphError as exc:
         raise HTTPException(status_code=422, detail={"code": "STORY_GRAPH_QUERY", "message": str(exc)}) from exc
@@ -2996,14 +3283,86 @@ async def search_story_graph(
     return result
 
 
-@app.get("/api/v1/books/{book_id}/story-graph/context/{chapter_id}")
-async def get_story_graph_context(book_id: str, chapter_id: str):
+@app.get("/api/v1/books/{book_id}/story-graph/health")
+async def get_story_graph_health(
+    book_id: str,
+    lookback: int = Query(8, ge=1, le=200),
+    chapter_to: Optional[int] = Query(None, alias="chapterTo", ge=1),
+    types: str = Query(""),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Return deterministic, read-only StoryFlow stagnation signals."""
     book = resolve_story_graph_book(book_id)
     try:
-        return get_story_graph_projector().context(str(book["id"]), chapter_id)
+        result = get_story_graph_projector().story_health(
+            str(book["id"]),
+            lookback=lookback,
+            chapter_to=chapter_to,
+            types=_split_graph_query(types),
+            limit=limit,
+        )
+    except StoryGraphError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "STORY_GRAPH_HEALTH", "message": str(exc)},
+        ) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/context/{chapter_id}")
+async def get_story_graph_context(
+    book_id: str,
+    chapter_id: str,
+    generation_run_id: Optional[str] = Query(default=None, max_length=160),
+    depth: int = Query(1, ge=1, le=3),
+):
+    book = resolve_story_graph_book(book_id)
+    try:
+        return get_story_graph_projector().context(
+            str(book["id"]),
+            chapter_id,
+            generation_run_id=generation_run_id,
+            depth=depth,
+        )
     except StoryGraphError as exc:
         status = 404 if "not found" in str(exc).lower() else 422
         raise HTTPException(status_code=status, detail={"code": "STORY_GRAPH_CONTEXT", "message": str(exc)}) from exc
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/generation-runs/{generation_run_id}")
+async def get_story_graph_generation_run(book_id: str, generation_run_id: str):
+    """Return safe GenerationRun provenance for a StoryFlow planning artifact."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        return get_story_graph_projector().generation_run_trace_by_id(
+            str(book["id"]), generation_run_id
+        )
+    except StoryGraphError as exc:
+        message = str(exc)
+        status = 404 if "not found" in message.lower() else 422
+        raise HTTPException(
+            status_code=status,
+            detail={"code": "STORY_GRAPH_GENERATION_RUN", "message": message},
+        ) from exc
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/generation-runs/{generation_run_id}/context-graph")
+async def get_story_graph_generation_run_context_graph(book_id: str, generation_run_id: str):
+    """Return the safe metadata-only Context Graph captured by one AI run."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        return get_story_graph_projector().generation_run_context_graph_by_id(
+            str(book["id"]), generation_run_id
+        )
+    except StoryGraphError as exc:
+        message = str(exc)
+        status = 404 if "not found" in message.lower() else 422
+        raise HTTPException(
+            status_code=status,
+            detail={"code": "STORY_GRAPH_CONTEXT_GRAPH", "message": message},
+        ) from exc
 
 
 @app.get("/api/v1/books/{book_id}/story-graph/layout")
@@ -3016,6 +3375,20 @@ async def get_story_graph_layout(book_id: str, view: str = Query("story")):
     return {"bookId": book_id, "authoritativeBookId": story_graph_authoritative_id(book), "view": view, "items": items}
 
 
+@app.get("/api/v1/books/{book_id}/story-graph/layout/history")
+async def get_story_graph_layout_history(
+    book_id: str,
+    view: str = Query("story"),
+    limit: int = Query(50, ge=1, le=100),
+):
+    book = resolve_story_graph_book(book_id)
+    try:
+        history = get_story_graph_projector().layout_history(str(book["id"]), view, limit=limit)
+    except StoryGraphError as exc:
+        raise HTTPException(status_code=422, detail={"code": "STORY_GRAPH_LAYOUT_HISTORY", "message": str(exc)}) from exc
+    return {"bookId": book_id, "authoritativeBookId": story_graph_authoritative_id(book), **history}
+
+
 @app.post("/api/v1/books/{book_id}/story-graph/layout")
 async def save_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
     book = resolve_story_graph_book(book_id)
@@ -3023,7 +3396,28 @@ async def save_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
         items = get_story_graph_projector().save_layout(str(book["id"]), body.view, body.items)
     except StoryGraphError as exc:
         raise HTTPException(status_code=422, detail={"code": "STORY_GRAPH_LAYOUT", "message": str(exc)}) from exc
-    return {"bookId": book_id, "authoritativeBookId": story_graph_authoritative_id(book), "view": body.view, "items": items}
+    history = get_story_graph_projector().layout_history(str(book["id"]), body.view)
+    return {"bookId": book_id, "authoritativeBookId": story_graph_authoritative_id(book), "view": body.view, "items": items, "history": history}
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/layout/undo")
+async def undo_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().undo_layout(str(book["id"]), body.view)
+    except StoryGraphError as exc:
+        raise HTTPException(status_code=409, detail={"code": "STORY_GRAPH_LAYOUT_UNDO", "message": str(exc)}) from exc
+    return {"bookId": book_id, "authoritativeBookId": story_graph_authoritative_id(book), **result}
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/layout/redo")
+async def redo_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().redo_layout(str(book["id"]), body.view)
+    except StoryGraphError as exc:
+        raise HTTPException(status_code=409, detail={"code": "STORY_GRAPH_LAYOUT_REDO", "message": str(exc)}) from exc
+    return {"bookId": book_id, "authoritativeBookId": story_graph_authoritative_id(book), **result}
 
 
 @app.post("/api/v1/books/{book_id}/story-graph/layout/auto")
@@ -3052,10 +3446,25 @@ async def get_story_graph_node(book_id: str, node_id: str):
 
 
 @app.get("/api/v1/books/{book_id}/story-graph/neighbors/{node_id}")
-async def get_story_graph_neighbors(book_id: str, node_id: str):
+async def get_story_graph_neighbors(
+    book_id: str,
+    node_id: str,
+    limit: int = Query(60, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    direction: str = Query("both"),
+    types: str = Query(""),
+):
+    """Return one paged neighbor slice for incremental StoryFlow expansion."""
     book = resolve_story_graph_book(book_id)
     try:
-        result = get_story_graph_projector().node_detail(str(book["id"]), node_id)
+        result = get_story_graph_projector().neighbors(
+            str(book["id"]),
+            node_id,
+            limit=limit,
+            offset=offset,
+            direction=direction,
+            node_types=_split_graph_query(types),
+        )
     except StoryGraphError as exc:
         status = 404 if "not found" in str(exc).lower() else 422
         raise HTTPException(status_code=status, detail={"code": "STORY_GRAPH_NEIGHBORS", "message": str(exc)}) from exc
@@ -3064,7 +3473,186 @@ async def get_story_graph_neighbors(book_id: str, node_id: str):
         "authoritativeBookId": story_graph_authoritative_id(book),
         "nodeId": result["node"]["id"],
         "neighbors": result["neighbors"],
+        "pagination": result["pagination"],
+        "canonicalSource": result["canonicalSource"],
     }
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/impact/{node_id}")
+async def get_story_graph_impact(
+    book_id: str,
+    node_id: str,
+    depth: int = Query(2, ge=1, le=3),
+    limit: int = Query(120, ge=1, le=500),
+):
+    """Return read-only downstream impact from semantic Story Graph edges."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().impact(str(book["id"]), node_id, depth=depth, limit=limit)
+    except StoryGraphError as exc:
+        status = 404 if "not found" in str(exc).lower() else 422
+        raise HTTPException(status_code=status, detail={"code": "STORY_GRAPH_IMPACT", "message": str(exc)}) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/chapter-impact/{node_id}")
+async def get_story_graph_chapter_impact(
+    book_id: str,
+    node_id: str,
+    version_id: Optional[str] = Query(None, alias="versionId"),
+    depth: int = Query(3, ge=1, le=3),
+    limit: int = Query(120, ge=1, le=500),
+):
+    """Explain recorded downstream dependencies of a ChapterVersion edit."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().chapter_edit_impact(
+            str(book["id"]),
+            node_id,
+            version_id=version_id,
+            depth=depth,
+            limit=limit,
+        )
+    except StoryGraphError as exc:
+        status = 404 if "not found" in str(exc).lower() else 422
+        raise HTTPException(
+            status_code=status,
+            detail={"code": "STORY_GRAPH_CHAPTER_IMPACT", "message": str(exc)},
+        ) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/chapter-version-compare/{node_id}")
+async def get_story_graph_chapter_version_compare(
+    book_id: str,
+    node_id: str,
+    from_version_id: str = Query("", alias="fromVersionId"),
+    to_version_id: str = Query("", alias="toVersionId"),
+    depth: int = Query(3, ge=1, le=3),
+    limit: int = Query(120, ge=1, le=500),
+):
+    """Compare immutable chapter text and report the current recorded impact surface."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().chapter_version_compare(
+            str(book["id"]),
+            node_id,
+            from_version_id=from_version_id,
+            to_version_id=to_version_id,
+            depth=depth,
+            limit=limit,
+        )
+    except StoryGraphError as exc:
+        status = 404 if "not found" in str(exc).lower() else 422
+        raise HTTPException(
+            status_code=status,
+            detail={"code": "STORY_GRAPH_CHAPTER_VERSION_COMPARE", "message": str(exc)},
+        ) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/history")
+async def get_story_graph_history(
+    book_id: str,
+    node_id: Optional[str] = Query(None, alias="nodeId"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Return durable node/commit history without fabricating graph snapshots."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().history(str(book["id"]), node_id, limit=limit)
+    except StoryGraphError as exc:
+        status = 404 if "not found" in str(exc).lower() else 422
+        raise HTTPException(status_code=status, detail={"code": "STORY_GRAPH_HISTORY", "message": str(exc)}) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/diff")
+async def get_story_graph_snapshot_diff(
+    book_id: str,
+    from_snapshot: str = Query("", alias="fromSnapshot"),
+    to_snapshot: str = Query("", alias="toSnapshot"),
+    node_id: Optional[str] = Query(None, alias="nodeId"),
+):
+    """Compare two immutable observed StoryFlow projection snapshots."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().snapshot_diff(
+            str(book["id"]),
+            from_snapshot,
+            to_snapshot,
+            node_id=node_id,
+        )
+    except StoryGraphError as exc:
+        message = str(exc)
+        status = 404 if "not found" in message.lower() else 422
+        raise HTTPException(status_code=status, detail={"code": "STORY_GRAPH_DIFF", "message": message}) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/canonical-replay")
+async def get_story_graph_canonical_replay(
+    book_id: str,
+    commit_id: Optional[str] = Query(None, alias="commitId"),
+    node_id: Optional[str] = Query(None, alias="nodeId"),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Replay immutable accepted StoryCommit/StoryFact/StoryState evidence."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_story_graph_projector().canonical_replay(
+            str(book["id"]), commit_id, node_id, limit=limit
+        )
+    except StoryGraphError as exc:
+        message = str(exc)
+        status = 404 if "not found" in message.lower() else 422
+        raise HTTPException(
+            status_code=status,
+            detail={"code": "STORY_GRAPH_CANONICAL_REPLAY", "message": message},
+        ) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/canonical-diff")
+async def get_story_graph_canonical_diff(
+    book_id: str,
+    to_commit: str = Query("", alias="toCommit"),
+    from_commit: Optional[str] = Query(None, alias="fromCommit"),
+    node_id: Optional[str] = Query(None, alias="nodeId"),
+):
+    """Compare two accepted Canon commit boundaries without mutating SQLite."""
+    book = resolve_story_graph_book(book_id)
+    if not to_commit.strip():
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "STORY_GRAPH_CANONICAL_DIFF", "message": "toCommit is required"},
+        )
+    try:
+        result = get_story_graph_projector().canonical_diff(
+            str(book["id"]), from_commit, to_commit, node_id=node_id
+        )
+    except StoryGraphError as exc:
+        message = str(exc)
+        status = 404 if "not found" in message.lower() else 422
+        raise HTTPException(
+            status_code=status,
+            detail={"code": "STORY_GRAPH_CANONICAL_DIFF", "message": message},
+        ) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
 
 
 @app.get("/api/v1/books/{book_id}/story-graph/edge-options")
@@ -3107,6 +3695,103 @@ async def get_storyflow_planning(book_id: str):
         "authoritativeBookId": story_graph_authoritative_id(book),
         "revision": revision,
         "graph": graph,
+        "canonicalSource": "sqlite.plot_workspaces",
+    }
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/candidates")
+async def list_storyflow_candidate_sets(
+    book_id: str,
+    status: Optional[str] = Query(None),
+    candidate_set_id: Optional[str] = Query(None, alias="candidateSetId"),
+    source_task_id: Optional[str] = Query(None, alias="sourceTaskId"),
+):
+    """Return comparable AI branch alternatives from the planning overlay."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        candidate_sets, revision = get_storyflow_planning_service().candidate_sets(
+            str(book["id"]),
+            status=status,
+            candidate_set_id=candidate_set_id,
+            source_task_id=source_task_id,
+        )
+    except StoryFlowPlanningError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "STORYFLOW_CANDIDATES", "message": str(exc)},
+        ) from exc
+    return {
+        "bookId": book_id,
+        "authoritativeBookId": story_graph_authoritative_id(book),
+        "revision": revision,
+        "candidateSets": candidate_sets,
+        "canonicalSource": "sqlite.plot_workspaces",
+    }
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/candidates/compare")
+async def compare_storyflow_candidate_set(
+    book_id: str,
+    candidate_set_id: str = Query("", alias="candidateSetId"),
+    branch_ids: Optional[str] = Query(None, alias="branchIds"),
+):
+    """Compare candidate alternatives without mutating the planning overlay."""
+    book = resolve_story_graph_book(book_id)
+    selected_branch_ids = [
+        item.strip()
+        for item in str(branch_ids or "").split(",")
+        if item.strip()
+    ]
+    try:
+        comparison, revision = get_storyflow_planning_service().compare_candidate_set(
+            str(book["id"]),
+            candidate_set_id=candidate_set_id,
+            branch_ids=selected_branch_ids,
+        )
+    except StoryFlowPlanningError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "STORYFLOW_CANDIDATE_COMPARE", "message": str(exc)},
+        ) from exc
+    return {
+        "bookId": book_id,
+        "authoritativeBookId": story_graph_authoritative_id(book),
+        "revision": revision,
+        "comparison": comparison,
+        "canonicalSource": "sqlite.plot_workspaces",
+    }
+
+
+@app.get("/api/v1/books/{book_id}/story-graph/candidates/lineage")
+async def get_storyflow_candidate_lineage(
+    book_id: str,
+    candidate_set_id: Optional[str] = Query(None, alias="candidateSetId"),
+    candidate_branch_id: Optional[str] = Query(None, alias="candidateBranchId"),
+    root_node_id: Optional[str] = Query(None, alias="rootNodeId"),
+    depth: int = Query(3, ge=0, le=8),
+    direction: str = Query("both"),
+):
+    """Return a read-only parent/child projection of planning candidates."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        lineage, revision = get_storyflow_planning_service().candidate_lineage(
+            str(book["id"]),
+            candidate_set_id=candidate_set_id,
+            candidate_branch_id=candidate_branch_id,
+            root_node_id=root_node_id,
+            depth=depth,
+            direction=direction,
+        )
+    except StoryFlowPlanningError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "STORYFLOW_CANDIDATE_LINEAGE", "message": str(exc)},
+        ) from exc
+    return {
+        "bookId": book_id,
+        "authoritativeBookId": story_graph_authoritative_id(book),
+        "revision": revision,
+        "lineage": lineage,
         "canonicalSource": "sqlite.plot_workspaces",
     }
 
@@ -3167,19 +3852,7 @@ async def create_storyflow_chapter_intent(book_id: str, body: StoryFlowIntentReq
                 chapter_number=body.chapterNumber,
                 expected_revision=body.expectedRevision,
             )
-            model = ChapterIntent(
-                chapter_number=int(intent["chapter_number"]),
-                goals=list(intent.get("goals") or []),
-                foreshadowing_to_advance=list(intent.get("foreshadowing_to_advance") or []),
-                required_characters=list(intent.get("required_characters") or []),
-                required_locations=list(intent.get("required_locations") or []),
-                preconditions=list(intent.get("preconditions") or []),
-                required_outcomes=list(intent.get("required_outcomes") or []),
-                plot_threads=list(intent.get("plot_threads") or []),
-                source_node_ids=list(intent.get("source_node_ids") or []),
-                provenance=list(intent.get("provenance") or []),
-                status="PLANNED",
-            )
+            model = storyflow_chapter_intent_model(intent)
             project_dir = project_mgr.get_project_dir(str(book.get("project_id") or book_id))
             ControlSurface(project_dir).save_chapter_intent(model)
             return {
@@ -3194,6 +3867,128 @@ async def create_storyflow_chapter_intent(book_id: str, body: StoryFlowIntentReq
     except StoryFlowPlanningError as exc:
         status = 409 if "revision conflict" in str(exc).lower() else 422
         raise HTTPException(status_code=status, detail={"code": "STORYFLOW_INTENT", "message": str(exc)}) from exc
+
+
+@app.post("/api/v1/books/{book_id}/story-graph/planning/generate")
+async def generate_storyflow_chapter(book_id: str, body: StoryFlowGenerateRequest):
+    """Save a Flow-derived intent and queue the existing managed writing pipeline."""
+    book = resolve_story_graph_book(book_id)
+    authoritative_book_id = story_graph_authoritative_id(book)
+    if not authoritative_book_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "STORYFLOW_GENERATION_EMPTY_BOOK",
+                "message": "empty project has no authoritative book for chapter generation",
+            },
+        )
+
+    selected = [str(node_id).strip() for node_id in body.nodeIds if str(node_id).strip()]
+    if not selected:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "STORYFLOW_GENERATION", "message": "nodeIds is required"},
+        )
+
+    project_id = str(book.get("project_id") or book_id)
+    get_project(project_id)
+    require_complete_planning(project_id)
+
+    next_chapter_row = story_repository.db.fetchone(
+        "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE book_id=?",
+        (authoritative_book_id,),
+    )
+    next_chapter = int((next_chapter_row or {}).get("max_number") or 0) + 1
+    if body.chapterNumber is not None and body.chapterNumber != next_chapter:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "STORYFLOW_CHAPTER_NOT_NEXT",
+                "message": f"StoryFlow generation only appends the next chapter ({next_chapter}); it cannot overwrite chapter {body.chapterNumber}",
+                "nextChapter": next_chapter,
+            },
+        )
+
+    active_task = story_repository.db.fetchone(
+        """SELECT id, status FROM tasks
+           WHERE book_id=? AND type='write-next'
+             AND status IN ('queued', 'running', 'paused', 'waiting_on_child', 'cancelling')
+           ORDER BY created_at DESC LIMIT 1""",
+        (authoritative_book_id,),
+    )
+    if active_task:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "STORYFLOW_GENERATION_ALREADY_QUEUED",
+                "message": f"chapter generation is already {active_task['status']}: {active_task['id']}",
+                "taskId": active_task["id"],
+            },
+        )
+
+    workflow = get_creation_workflow().get(project_id) or {}
+    strict_planning = bool((workflow.get("metadata") or {}).get("requireCompletePlanning"))
+    try:
+        run_config = ContinuousWritingService(
+            story_repository.db,
+            model_mgr,
+            story_repository,
+            task_runtime,
+            score_threshold=config_int("review", "pass_score", 93),
+            max_revisions=config_int("review", "max_revision_rounds", 3),
+        ).capture_run_configuration(project_id, strict_planning=strict_planning)
+        service = get_storyflow_planning_service()
+        intent, revision, plan_node, graph = service.save_intent_from_flow(
+            authoritative_book_id,
+            selected,
+            chapter_number=next_chapter,
+            expected_revision=body.expectedRevision,
+        )
+        model = storyflow_chapter_intent_model(intent)
+        ControlSurface(project_mgr.get_project_dir(project_id)).save_chapter_intent(model)
+        task = task_runtime.enqueue(
+            "write-next",
+            project_id=project_id,
+            book_id=authoritative_book_id,
+            data={
+                "chapter_number": next_chapter,
+                "context": body.context.strip(),
+                "count": 1,
+                "plan": model.to_dict(),
+                "storyflow_plan_node_id": plan_node["id"],
+                "storyflow_source_node_ids": list(model.source_node_ids),
+                "storyflow_planning_revision": revision,
+                **run_config,
+            },
+        )
+    except StoryFlowPlanningError as exc:
+        status = 409 if "revision conflict" in str(exc).lower() else 422
+        raise HTTPException(
+            status_code=status,
+            detail={"code": "STORYFLOW_GENERATION", "message": str(exc)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "STORYFLOW_GENERATION_NOT_READY", "message": str(exc)},
+        ) from exc
+
+    return {
+        "bookId": book_id,
+        "projectId": project_id,
+        "taskId": task["id"],
+        "status": task["status"],
+        "chapter": next_chapter,
+        "intent": model.to_dict(),
+        "revision": revision,
+        "planningNode": plan_node,
+        "graph": graph,
+        "persistedIn": [
+            "plot_workspaces",
+            "control/runtime/chapter-intent",
+            "tasks.data.plan",
+        ],
+    }
 
 
 @app.post("/api/v1/books/{book_id}/story-graph/planning/decision")
@@ -3234,13 +4029,72 @@ async def analyze_storyflow_selection(book_id: str, body: StoryFlowAnalysisReque
     return {"bookId": book_id, "taskId": task["id"], "status": task["status"], "persistedIn": "tasks.result"}
 
 
+@app.get("/api/v1/books/{book_id}/story-graph/actions/analyze")
+async def list_storyflow_analyses(
+    book_id: str,
+    limit: int = Query(12, ge=1, le=50),
+):
+    """List durable StoryFlow analysis reports for this authoritative book."""
+    book = resolve_story_graph_book(book_id)
+    authoritative_book_id = story_graph_authoritative_id(book)
+    if not authoritative_book_id:
+        return {"bookId": book_id, "tasks": [], "canonicalSource": "sqlite"}
+    task_project_id = str(book.get("project_id") or book_id)
+    projector = get_story_graph_projector()
+    tasks = task_runtime.list(project_id=task_project_id, limit=limit * 3)
+    reports = []
+    for task in tasks:
+        if task.get("type") != "storyflow-analyze":
+            continue
+        data_raw: Any = task.get("data")
+        data: dict[str, Any] = data_raw if isinstance(data_raw, dict) else {}
+        report = {
+            "taskId": task.get("id"),
+            "status": task.get("status"),
+            "stage": task.get("stage"),
+            "createdAt": task.get("created_at"),
+            "updatedAt": task.get("updated_at"),
+            "nodeIds": [str(item) for item in data.get("node_ids", []) if str(item).strip()],
+            "analysisTypes": [str(item) for item in data.get("analysis_types", []) if str(item).strip()],
+            "result": task.get("result") if isinstance(task.get("result"), dict) else {},
+            "error": task.get("error"),
+            "errorCode": task.get("error_code"),
+        }
+        task_book_id = str(task.get("book_id") or task.get("bookId") or "")
+        if task_book_id == authoritative_book_id:
+            report["generationRun"] = projector.generation_run_trace(
+                authoritative_book_id,
+                str(task.get("id")),
+            )
+        else:
+            report["generationRun"] = {
+                "available": False,
+                "canonicalSource": "sqlite.generation_runs",
+                "reason": "analysis task is not attached to this authoritative book",
+            }
+        reports.append(report)
+        if len(reports) >= limit:
+            break
+    return {"bookId": book_id, "tasks": reports, "canonicalSource": "sqlite"}
+
+
 @app.get("/api/v1/books/{book_id}/story-graph/actions/analyze/{task_id}")
 async def get_storyflow_analysis(book_id: str, task_id: str):
     """Read a durable StoryFlow analysis task without fabricating a report."""
-    resolve_story_graph_book(book_id)
+    book = resolve_story_graph_book(book_id)
+    authoritative_book_id = story_graph_authoritative_id(book)
     task = task_runtime.get(task_id)
-    if not task or task.get("type") != "storyflow-analyze":
+    if (
+        not task
+        or task.get("type") != "storyflow-analyze"
+        or not authoritative_book_id
+        or str(task.get("book_id") or task.get("bookId") or "") != authoritative_book_id
+    ):
         raise HTTPException(status_code=404, detail={"code": "STORYFLOW_ANALYSIS", "message": "analysis task not found"})
+    generation_run = get_story_graph_projector().generation_run_trace(
+        authoritative_book_id,
+        task_id,
+    )
     return {
         "bookId": book_id,
         "taskId": task_id,
@@ -3248,6 +4102,7 @@ async def get_storyflow_analysis(book_id: str, task_id: str):
         "result": task.get("result"),
         "error": task.get("error"),
         "errorCode": task.get("error_code"),
+        "generationRun": generation_run,
     }
 
 

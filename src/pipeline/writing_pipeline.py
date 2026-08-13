@@ -113,6 +113,7 @@ class WritingPipeline:
         ctx.setdefault("project_id", project_id)
         ctx.setdefault("book_id", task.get("book_id") or data.get("book_id", project_id))
         ctx.setdefault("chapter_number", data.get("chapter_number"))
+        ctx.setdefault("storyflow_plan_node_id", data.get("storyflow_plan_node_id"))
         ctx.setdefault("revision_count", 0)
 
         stage_map = {
@@ -531,6 +532,701 @@ class WritingPipeline:
 
         return {"next_stage": "BUILD_CONTEXT", "context": ctx}
 
+    @staticmethod
+    def _decorate_context_manifest(manifest: dict[str, Any], context_parts: list[str]) -> None:
+        """Bind manifest items to the exact context sections sent to the writer.
+
+        The manifest deliberately records section hashes and source bindings,
+        not invented token offsets. Provider-reported prompt tokens remain the
+        only authoritative token totals in ``GenerationRun``. Character ranges
+        are relative to the assembled context and are only promoted to the
+        persisted prompt after the final prompt has been rendered.
+        """
+        items = manifest.get("items")
+        if not isinstance(items, list):
+            items = []
+            manifest["items"] = items
+        source_hints = {
+            "story_bible": ("story bible",),
+            "planning_source": ("用户导入", "planning reference"),
+            "chapter_summary": ("前文摘要", "previous chapter"),
+            "story_fact": ("已确立的事实", "story facts"),
+            "rag_chunk": ("参考资料", "reference material"),
+            "story_graph_node": ("story graph", "故事图"),
+            "planning_node": ("storyflow", "chapter intent", "章节计划"),
+        }
+        sections: list[dict[str, Any]] = []
+        non_empty_parts = [
+            (index, str(raw_part or ""))
+            for index, raw_part in enumerate(context_parts)
+            if str(raw_part or "")
+        ]
+        assembled_offset = 0
+        for part_position, (index, part) in enumerate(non_empty_parts):
+            heading = part.splitlines()[0].strip() if part.splitlines() else "context"
+            section_id = f"context-section:{index}"
+            lowered_heading = heading.casefold()
+            source_types = {
+                str(item.get("sourceType"))
+                for item in items
+                if isinstance(item, dict)
+                and any(
+                    hint.casefold() in lowered_heading
+                    for hint in source_hints.get(str(item.get("sourceType")), ())
+                )
+            }
+            section_start = assembled_offset
+            section_end = section_start + len(part)
+            sections.append({
+                "id": section_id,
+                "order": index,
+                "title": heading,
+                "contentChars": len(part),
+                "contentSha256": hashlib.sha256(part.encode("utf-8")).hexdigest(),
+                "sourceTypes": sorted(source_types),
+                "binding": "exact_context_part",
+                "included": True,
+                "contextRange": {
+                    "scope": "assembled_context",
+                    "start": section_start,
+                    "end": section_end,
+                    "precision": "exact",
+                },
+            })
+            assembled_offset = section_end + (2 if part_position < len(non_empty_parts) - 1 else 0)
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item.setdefault("promptLocation", "context")
+            item.setdefault("provenanceKind", "pipeline_context_source")
+            source_type = str(item.get("sourceType") or "")
+            matching = next(
+                (
+                    section for section in sections
+                    if source_type in section.get("sourceTypes", [])
+                ),
+                None,
+            )
+            if matching is not None:
+                item.setdefault("contextSectionId", matching["id"])
+                item.setdefault("contextSectionTitle", matching["title"])
+                item.setdefault("contextRange", {
+                    **matching["contextRange"],
+                    "precision": "section",
+                })
+                item.setdefault("rangeStatus", "section")
+            elif source_type in {"chapter_plan", "planner_output", "revision_instruction", "extra_guidance"}:
+                item["promptLocation"] = "writer_prompt_component"
+        manifest["contextSections"] = sections
+        manifest["rangeBindingVersion"] = 1
+
+    @staticmethod
+    def _bind_prompt_ranges(
+        manifest: dict[str, Any],
+        prompt: str,
+        component_texts: dict[str, str],
+    ) -> None:
+        """Bind known pipeline components to the final writer user message.
+
+        Prompt Registry templates are allowed to omit or repeat variables. A
+        range is therefore recorded only when the component text occurs once
+        in the final rendered prompt. This is deliberately a character-level
+        binding; provider tokenization remains owned by the model runtime.
+        """
+        writer_input = manifest.get("writerInput")
+        if not isinstance(writer_input, dict):
+            return
+        components = writer_input.get("components")
+        if not isinstance(components, list):
+            components = []
+            writer_input["components"] = components
+        component_by_id: dict[str, dict[str, Any]] = {}
+        for component in components:
+            if not isinstance(component, dict) or not component.get("id"):
+                continue
+            component_id = str(component["id"])
+            component_by_id[component_id] = component
+            raw_text = component_texts.get(component_id)
+            if raw_text is None:
+                component.setdefault("rangeStatus", "not_applicable")
+                continue
+            if not raw_text:
+                component["rangeStatus"] = "empty"
+                continue
+            occurrences = prompt.count(raw_text)
+            if occurrences != 1:
+                component["rangeStatus"] = "not_found" if occurrences == 0 else "ambiguous"
+                component["rangeReason"] = (
+                    "component text was not found in the registered prompt"
+                    if occurrences == 0
+                    else "component text occurs more than once in the registered prompt"
+                )
+                continue
+            start = prompt.find(raw_text)
+            component["promptRange"] = {
+                "scope": "writer_user_message",
+                "start": start,
+                "end": start + len(raw_text),
+                "precision": "exact",
+            }
+            component["rangeStatus"] = "exact"
+
+        context_component = component_by_id.get("context")
+        context_prompt_range = context_component.get("promptRange") if context_component else None
+        if isinstance(context_prompt_range, dict):
+            for section in manifest.get("contextSections", []):
+                if not isinstance(section, dict):
+                    continue
+                context_range = section.get("contextRange")
+                if not isinstance(context_range, dict):
+                    continue
+                section["promptRange"] = {
+                    "scope": "writer_user_message",
+                    "start": int(context_prompt_range["start"]) + int(context_range["start"]),
+                    "end": int(context_prompt_range["start"]) + int(context_range["end"]),
+                    "precision": "exact",
+                }
+                section["rangeStatus"] = "exact"
+
+        component_for_item = {
+            "chapter_plan": "chapter_plan",
+            "planner_output": "planner_output",
+            "revision_instruction": "extra",
+            "extra_guidance": "extra",
+        }
+        for item in manifest.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            direct_component = component_by_id.get(component_for_item.get(str(item.get("sourceType")), ""))
+            if direct_component and isinstance(direct_component.get("promptRange"), dict):
+                item["promptRange"] = dict(direct_component["promptRange"])
+                item["promptRange"]["precision"] = "component"
+                item["rangeStatus"] = "exact"
+                continue
+            context_range = item.get("contextRange")
+            if isinstance(context_range, dict) and isinstance(context_prompt_range, dict):
+                item["promptRange"] = {
+                    "scope": "writer_user_message",
+                    "start": int(context_prompt_range["start"]) + int(context_range["start"]),
+                    "end": int(context_prompt_range["start"]) + int(context_range["end"]),
+                    "precision": "section",
+                }
+                item["rangeStatus"] = "section"
+
+        manifest["promptBinding"] = {
+            "scope": "writer_user_message",
+            "binding": "unique_component_substrings",
+            "available": bool(
+                any(
+                    isinstance(component, dict)
+                    and isinstance(component.get("promptRange"), dict)
+                    for component in components
+                )
+            ),
+            "tokenAuthority": "generation_run.provider_usage",
+        }
+
+    def _build_story_graph_context(self, book_id: str, chapter_number: int) -> dict[str, Any]:
+        """Build a bounded, writer-eligible context slice from the prior chapter.
+
+        This uses the same projector as StoryFlow.  It never reads planning
+        overlays as canonical facts and returns an explicit warning if the
+        optional projection cannot be assembled.
+        """
+        previous = self.db.fetchone(
+            """SELECT id, number, status FROM chapters
+               WHERE book_id=? AND number < ?
+                 AND status IN ('committed', 'approved', 'drafted')
+               ORDER BY number DESC LIMIT 1""",
+            (book_id, chapter_number),
+        )
+        if not previous:
+            return {"text": "", "items": []}
+        focus_id = f"chapter:{previous['id']}"
+        try:
+            from src.story_graph.service import StoryGraphError, StoryGraphProjector
+
+            graph = StoryGraphProjector(self.db).project(
+                book_id,
+                view="story",
+                focus=focus_id,
+                depth=1,
+                limit=100,
+                edge_limit=180,
+            )
+        except (StoryGraphError, KeyError, TypeError, ValueError) as exc:
+            return {
+                "text": "",
+                "items": [],
+                "warning": f"Story Graph context unavailable: {exc}",
+            }
+
+        allowed_statuses = {"CANON", "ACCEPTED", "DRAFT"}
+        allowed_types = {
+            "Character", "Faction", "Location", "Event", "Foreshadow",
+            "PlotThread", "Conflict", "Relationship", "Fact", "StoryState",
+        }
+        nodes = [
+            node for node in graph.get("nodes", [])
+            if isinstance(node, dict)
+            and node.get("id") != focus_id
+            and node.get("type") in allowed_types
+            and str(node.get("status") or "CANON").upper() in allowed_statuses
+        ]
+        nodes.sort(key=lambda node: (str(node.get("type")), str(node.get("title"))))
+        if not nodes:
+            return {"text": "", "items": []}
+
+        type_labels = {
+            "Character": "人物",
+            "Faction": "势力",
+            "Location": "地点",
+            "Event": "事件",
+            "Foreshadow": "伏笔",
+            "PlotThread": "剧情线",
+            "Conflict": "冲突",
+            "Relationship": "关系",
+            "Fact": "事实",
+            "StoryState": "故事状态",
+        }
+        previous_status = str(previous.get("status") or "unknown")
+        lines = [f"## Story Graph 当前状态（第{previous['number']}章一阶投影；章节状态 {previous_status}）"]
+        items: list[dict[str, Any]] = []
+        edges = [edge for edge in graph.get("edges", []) if isinstance(edge, dict)]
+        for node in nodes:
+            node_id = str(node.get("id"))
+            edge_types = sorted({
+                str(edge.get("type"))
+                for edge in edges
+                if edge.get("source") == node_id or edge.get("target") == node_id
+            })
+            summary = str(node.get("summary") or "").strip().replace("\n", " ")
+            line = f"- {type_labels.get(str(node.get('type')), node.get('type'))}：{node.get('title') or node_id}"
+            if summary:
+                line += f"；{summary[:500]}"
+            lines.append(line)
+            items.append({
+                "sourceType": "story_graph_node",
+                "sourceId": node_id,
+                "label": node.get("title") or node_id,
+                "nodeType": node.get("type"),
+                "included": True,
+                "contentChars": len(line),
+                "reason": (
+                    "previous writer-eligible chapter "
+                    f"status={previous_status} depth-1 Story Graph projection"
+                ),
+                "focusNodeId": focus_id,
+                "focusChapterNumber": previous["number"],
+                "focusChapterStatus": previous_status,
+                "depth": 1,
+                "edgeTypes": edge_types,
+                "provenanceKind": "story_graph_projection",
+            })
+        return {"text": "\n".join(lines), "items": items}
+
+    @staticmethod
+    def _build_context_graph_snapshot(
+        manifest: dict[str, Any],
+        *,
+        focus_node_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Build a compact, immutable graph of the final context manifest.
+
+        ``GenerationRun.input_reference.context_manifest`` is already the
+        durable provenance seam.  This snapshot is a deterministic read model
+        inside that record: it stores source labels and evidence edges, never
+        source prose or a second canonical fact store.  A later Context View
+        can therefore answer *why included/excluded* even after the mutable
+        Story Graph projection has changed.
+        """
+        source_type_to_node_type = {
+            "story_graph_node": "StoryGraphNode",
+            "planning_node": "PlanningNode",
+            "chapter_summary": "Chapter",
+            "story_fact": "Fact",
+            "story_bible": "StoryBibleEntry",
+            "planning_source": "Knowledge",
+            "rag_chunk": "Knowledge",
+            "character": "Character",
+            "location": "Location",
+            "faction": "Faction",
+            "event": "Event",
+            "timeline_event": "Event",
+            "foreshadow": "Foreshadow",
+            "story_state": "StoryState",
+            "relationship": "Relationship",
+            "storyflow_analysis": "Knowledge",
+            "candidate_branch": "PlanningNode",
+        }
+        source_type_to_prefix = {
+            "chapter_summary": "chapter",
+            "story_fact": "fact",
+            "character": "character",
+            "location": "location",
+            "faction": "faction",
+            "event": "event",
+            "timeline_event": "timeline-event",
+            "foreshadow": "foreshadow",
+            "story_state": "story-state",
+            "relationship": "relationship",
+        }
+
+        def canonical_candidate(source_type: str, source_id: Any) -> Optional[str]:
+            value = str(source_id or "").strip()
+            if not value:
+                return None
+            if source_type in {"story_graph_node", "planning_node"} and ":" in value:
+                return value
+            prefix = source_type_to_prefix.get(source_type)
+            return f"{prefix}:{value}" if prefix else None
+
+        def stable_context_id(source_type: str, source_id: Any, label: Any) -> str:
+            canonical = canonical_candidate(source_type, source_id)
+            if canonical:
+                return canonical
+            seed = f"{source_type}\x1f{source_id or ''}\x1f{label or ''}"
+            digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+            return f"context-source:{digest}"
+
+        raw_items = manifest.get("items")
+        items = raw_items if isinstance(raw_items, list) else []
+        nodes_by_id: dict[str, dict[str, Any]] = {}
+        edges_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        focus_ids: list[str] = []
+
+        def add_focus(node_id: str, item: Optional[dict[str, Any]] = None) -> None:
+            if not node_id:
+                return
+            if node_id not in focus_ids:
+                focus_ids.append(node_id)
+            if node_id not in nodes_by_id:
+                nodes_by_id[node_id] = {
+                    "id": node_id,
+                    "type": "Chapter" if node_id.startswith("chapter:") else "StoryGraphNode",
+                    "title": "Context focus",
+                    "role": "focus",
+                    "included": True,
+                    "sourceType": "focus",
+                    "sourceId": node_id,
+                }
+            if item:
+                nodes_by_id[node_id].setdefault("focusChapterNumber", item.get("focusChapterNumber"))
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            source_type = str(item.get("sourceType") or "context")
+            source_id = item.get("sourceId")
+            label = str(item.get("label") or source_id or source_type)
+            node_id = stable_context_id(source_type, source_id, label)
+            included = bool(item.get("included", True))
+            node = nodes_by_id.setdefault(node_id, {
+                "id": node_id,
+                "type": str(item.get("nodeType") or source_type_to_node_type.get(source_type, "ContextSource")),
+                "title": label,
+                "role": "source",
+            })
+            node.update({
+                "sourceType": source_type,
+                "sourceId": source_id,
+                "title": label,
+                "included": included,
+                "contentChars": item.get("contentChars"),
+                "reason": item.get("reason"),
+                "inclusionReason": item.get("inclusionReason") or (item.get("reason") if included else None),
+                "excludedReason": item.get("excludedReason") if not included else None,
+                "contextSectionId": item.get("contextSectionId"),
+                "contextSectionTitle": item.get("contextSectionTitle"),
+                "contextRange": item.get("contextRange"),
+                "promptRange": item.get("promptRange"),
+                "persistedPromptRange": item.get("persistedPromptRange"),
+                "promptLocation": item.get("promptLocation"),
+                "selectionRole": item.get("selectionRole"),
+                "provenanceKind": item.get("provenanceKind"),
+            })
+
+            # Keep the author's recorded inclusion rationale inside the
+            # metadata-only snapshot.  This is deliberately a compact audit
+            # record, not a causal inference: Context View may explain the
+            # selection role/focus/semantic evidence after the mutable graph
+            # changes, but it must never invent why a source was used.
+            edge_types = sorted({
+                str(value).strip()
+                for value in (item.get("edgeTypes") or [])
+                if str(value).strip()
+            })
+            node["explainability"] = {
+                "recorded": True,
+                "boundary": "generation_run.input_reference.context_manifest",
+                "status": "included" if included else "excluded",
+                "reason": item.get("reason"),
+                "excludedReason": item.get("excludedReason") if not included else None,
+                "selectionRole": item.get("selectionRole"),
+                "focusNodeId": item.get("focusNodeId"),
+                "focusChapterNumber": item.get("focusChapterNumber"),
+                "depth": item.get("depth"),
+                "semanticEdgeTypes": edge_types,
+                "plannedChapterNumber": item.get("plannedChapterNumber"),
+                "provenanceKind": item.get("provenanceKind"),
+            }
+
+            item_focus = str(item.get("focusNodeId") or "").strip()
+            primary_focus = str(focus_node_id or item_focus or "").strip()
+            if primary_focus:
+                add_focus(primary_focus, item)
+                relation = "included_in_context" if included else "excluded_from_context"
+                edge_key = (node_id, relation, primary_focus)
+                if node_id != primary_focus:
+                    edges_by_key.setdefault(edge_key, {
+                        "id": f"context-edge:{hashlib.sha256(('|'.join(edge_key)).encode('utf-8')).hexdigest()[:24]}",
+                        "type": relation,
+                        "source": node_id,
+                        "target": primary_focus,
+                        "label": "Included in generation context" if included else "Recorded but excluded",
+                        "status": "INCLUDED" if included else "EXCLUDED",
+                        "included": included,
+                        "reason": item.get("reason"),
+                        "excludedReason": item.get("excludedReason") if not included else None,
+                        "contextSectionId": item.get("contextSectionId"),
+                        "promptRange": item.get("promptRange"),
+                        "persistedPromptRange": item.get("persistedPromptRange"),
+                    })
+                selection_target = item_focus if item_focus and item_focus != node_id else ""
+                if selection_target:
+                    add_focus(selection_target, item)
+                for edge_type in sorted({str(value).strip() for value in item.get("edgeTypes", []) if str(value).strip()}):
+                    if not selection_target:
+                        continue
+                    semantic_key = (node_id, edge_type, selection_target)
+                    edges_by_key.setdefault(semantic_key, {
+                        "id": f"context-selection:{hashlib.sha256(('|'.join(semantic_key)).encode('utf-8')).hexdigest()[:24]}",
+                        "type": edge_type,
+                        "source": node_id,
+                        "target": selection_target,
+                        "label": "Selection evidence",
+                        "status": "EVIDENCE",
+                        "included": included,
+                        "evidence": True,
+                        "selectionRole": item.get("selectionRole"),
+                        "reason": item.get("reason"),
+                    })
+
+        if focus_node_id:
+            add_focus(str(focus_node_id))
+        nodes = sorted(nodes_by_id.values(), key=lambda value: (str(value.get("role")), str(value.get("id"))))
+        edges = sorted(edges_by_key.values(), key=lambda value: str(value.get("id")))
+        payload = {
+            "schemaVersion": 1,
+            "scope": "generation_run_context",
+            "source": "generation_run.input_reference.context_manifest",
+            "bookId": manifest.get("bookId"),
+            "projectId": manifest.get("projectId"),
+            "chapterNumber": manifest.get("chapterNumber"),
+            "focusNodeIds": focus_ids,
+            "nodes": nodes,
+            "edges": edges,
+        }
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return {
+            **payload,
+            "nodeCount": len(nodes),
+            "edgeCount": len(edges),
+            "graphSha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "promptSha256": ((manifest.get("writerInput") or {}).get("promptSha256") if isinstance(manifest.get("writerInput"), dict) else None),
+            "contextSha256": manifest.get("contextSha256"),
+            "truncated": False,
+        }
+
+    def _build_storyflow_plan_context(
+        self,
+        book_id: str,
+        plan_node_id: Optional[str],
+        chapter_number: int,
+    ) -> dict[str, Any]:
+        """Expose the selected StoryFlow Chapter Intent as writer provenance.
+
+        The planning overlay remains the only source for this data.  Reading
+        the existing ``plot_workspaces`` row is intentionally side-effect
+        free: a context build must not lazily create or mutate a planning
+        workspace.  The resulting items are evidence for Context View, not
+        canonical facts and not a second graph store.
+        """
+        selected_plan_id = str(plan_node_id or "").strip()
+        if not selected_plan_id:
+            return {"text": "", "items": []}
+        row = self.db.fetchone(
+            "SELECT graph FROM plot_workspaces WHERE book_id=?",
+            (book_id,),
+        )
+        if row is None:
+            return {
+                "text": "",
+                "items": [],
+                "warning": f"StoryFlow Chapter Intent unavailable: workspace not found for {selected_plan_id}",
+            }
+        try:
+            graph = json.loads(row.get("graph") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return {
+                "text": "",
+                "items": [],
+                "warning": f"StoryFlow Chapter Intent unavailable: invalid workspace graph for {selected_plan_id}",
+            }
+        if not isinstance(graph, dict):
+            return {
+                "text": "",
+                "items": [],
+                "warning": f"StoryFlow Chapter Intent unavailable: invalid workspace graph for {selected_plan_id}",
+            }
+        nodes = graph.get("nodes")
+        if not isinstance(nodes, list):
+            nodes = []
+        raw_edges = graph.get("edges")
+        planning_edges = raw_edges if isinstance(raw_edges, list) else []
+
+        def planning_edge_types(node_id: str) -> list[str]:
+            """Return only the persisted semantic links to this Chapter Intent."""
+            return sorted({
+                str(edge.get("type") or edge.get("kind"))
+                for edge in planning_edges
+                if isinstance(edge, dict)
+                and (
+                    (
+                        node_id == selected_plan_id
+                        and selected_plan_id in {
+                            str(edge.get("source") or ""),
+                            str(edge.get("target") or ""),
+                        }
+                    )
+                    or (
+                        node_id != selected_plan_id
+                        and {
+                            str(edge.get("source") or ""),
+                            str(edge.get("target") or ""),
+                        } == {selected_plan_id, node_id}
+                    )
+                )
+                and str(edge.get("type") or edge.get("kind") or "").strip()
+            })
+
+        plan_node = next(
+            (
+                item for item in nodes
+                if isinstance(item, dict) and str(item.get("id") or "") == selected_plan_id
+            ),
+            None,
+        )
+        if plan_node is None:
+            return {
+                "text": "",
+                "items": [],
+                "warning": f"StoryFlow Chapter Intent unavailable: node not found {selected_plan_id}",
+            }
+        metadata = plan_node.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        intent = metadata.get("intent")
+        intent = intent if isinstance(intent, dict) else {}
+
+        def values(*keys: str) -> list[str]:
+            for key in keys:
+                raw = intent.get(key)
+                if isinstance(raw, list):
+                    return [str(item).strip() for item in raw if str(item).strip()]
+                if raw not in (None, ""):
+                    return [str(raw).strip()]
+            return []
+
+        goal_values = values("goal") or values("goals")
+        field_values = (
+            ("目标", goal_values),
+            ("必需人物", values("requiredCharacters", "required_characters")),
+            ("地点", values("locations", "requiredLocations", "required_locations")),
+            ("前置条件", values("preconditions")),
+            ("必需结果", values("requiredOutcomes", "required_outcomes")),
+            ("剧情线", values("plotThreads", "plot_threads")),
+            ("推进伏笔", values("foreshadowingToAdvance", "foreshadowing_to_advance")),
+            ("埋下伏笔", values("foreshadowingToPlant", "foreshadowing_to_plant")),
+        )
+        lines = [f"## StoryFlow Chapter Intent (第{chapter_number}章)"]
+        for label, entries in field_values:
+            if entries:
+                lines.append(f"- {label}：{'；'.join(entries[:24])}")
+
+        source_ids = []
+        for raw_id in intent.get("sourceNodeIds") or intent.get("source_node_ids") or []:
+            source_id = str(raw_id or "").strip()
+            if source_id and source_id not in source_ids:
+                source_ids.append(source_id)
+
+        role_by_type = {
+            "Character": "requiredCharacters",
+            "Location": "requiredLocations",
+            "Foreshadow": "foreshadowingToAdvance",
+            "PlotThread": "plotThreads",
+            "StoryBibleEntry": "preconditions",
+            "Fact": "preconditions",
+            "Knowledge": "preconditions",
+            "Relationship": "preconditions",
+        }
+        source_items: list[dict[str, Any]] = []
+        projector = None
+        for source_id in source_ids[:48]:
+            source_node: Optional[dict[str, Any]] = None
+            try:
+                if projector is None:
+                    from src.story_graph.service import StoryGraphProjector
+
+                    projector = StoryGraphProjector(self.db)
+                source_node = projector.node_detail(book_id, source_id).get("node")
+            except Exception:
+                # Keep the manifest honest when an old planning overlay points
+                # at a node that no longer resolves in the authoritative graph.
+                source_node = None
+            source_type = str((source_node or {}).get("type") or "StoryGraphNode")
+            selection_role = role_by_type.get(source_type, "sourceFlow")
+            title = str((source_node or {}).get("title") or source_id)
+            summary = str((source_node or {}).get("summary") or "").strip().replace("\n", " ")
+            source_line = f"- {title}（{selection_role}）"
+            if summary:
+                source_line += f"；{summary[:300]}"
+            lines.append(source_line)
+            source_items.append({
+                "sourceType": "story_graph_node",
+                "sourceId": source_id,
+                "nodeType": source_type,
+                "label": title,
+                "included": True,
+                "contentChars": len(source_line),
+                "reason": f"StoryFlow Chapter Intent selected this node as {selection_role}",
+                "selectionRole": selection_role,
+                "plannedChapterNumber": chapter_number,
+                "focusNodeId": selected_plan_id,
+                "depth": 1,
+                "edgeTypes": planning_edge_types(source_id),
+                "provenanceKind": "storyflow_chapter_intent",
+            })
+
+        plan_text = "\n".join(lines)
+        plan_edge_types = planning_edge_types(selected_plan_id)
+        plan_item = {
+            "sourceType": "planning_node",
+            "sourceId": selected_plan_id,
+            "nodeType": "PlanningNode",
+            "label": str(plan_node.get("title") or selected_plan_id),
+            "included": True,
+            "contentChars": len(plan_text),
+            "reason": "author-selected StoryFlow Chapter Intent for this writer task",
+            "selectionRole": "chapter_intent",
+            "plannedChapterNumber": chapter_number,
+            "focusNodeId": selected_plan_id,
+            "depth": 0,
+            "edgeTypes": plan_edge_types,
+            "provenanceKind": "storyflow_chapter_intent",
+        }
+        return {"text": plan_text, "items": [plan_item, *source_items]}
+
     def _build_context(self, task: dict, ctx: dict) -> dict:
         """Assemble the writing context from multiple sources."""
         project_id = ctx["project_id"]
@@ -538,6 +1234,17 @@ class WritingPipeline:
         chapter_number = ctx["chapter_number"]
         context_parts: list[str] = []
         manifest_items: list[dict[str, Any]] = []
+
+        storyflow_plan_context = self._build_storyflow_plan_context(
+            book_id,
+            ctx.get("storyflow_plan_node_id"),
+            chapter_number,
+        )
+        if storyflow_plan_context.get("text"):
+            context_parts.append(str(storyflow_plan_context["text"]))
+            manifest_items.extend(storyflow_plan_context.get("items") or [])
+        if storyflow_plan_context.get("warning"):
+            ctx.setdefault("context_warnings", []).append(storyflow_plan_context["warning"])
 
         # 1. Story Bible summary from the same immutable snapshot used by the
         # chapter plan.  Later author edits are intentionally invisible to an
@@ -646,19 +1353,28 @@ class WritingPipeline:
                 "reason": "verified, non-invalidated StoryFact",
             } for fact in facts)
 
+        graph_context = self._build_story_graph_context(book_id, chapter_number)
+        if graph_context.get("text"):
+            context_parts.append(str(graph_context["text"]))
+            manifest_items.extend(graph_context.get("items") or [])
+        if graph_context.get("warning"):
+            ctx.setdefault("context_warnings", []).append(graph_context["warning"])
+
         ctx["context_parts"] = context_parts
         assembled_context = "\n\n".join(context_parts)
         ctx["context_manifest"] = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "source": "writing_pipeline.BUILD_CONTEXT",
             "projectId": project_id,
             "bookId": book_id,
             "chapterNumber": chapter_number,
+            "chapterId": ctx.get("chapter_id") or self._get_chapter_id(book_id, chapter_number),
             "items": manifest_items,
             "contextChars": len(assembled_context),
             "contextSha256": hashlib.sha256(assembled_context.encode("utf-8")).hexdigest(),
             "note": "Source identifiers describe context assembled by the pipeline; GenerationRun stores the exact final prompt.",
         }
+        self._decorate_context_manifest(ctx["context_manifest"], context_parts)
         return {"next_stage": "RETRIEVE_MEMORY", "context": ctx}
 
     def _retrieve_memory(self, task: dict, ctx: dict) -> dict:
@@ -700,6 +1416,7 @@ class WritingPipeline:
                 assembled_context = "\n\n".join(ctx.get("context_parts", []))
                 ctx["context_manifest"]["contextChars"] = len(assembled_context)
                 ctx["context_manifest"]["contextSha256"] = hashlib.sha256(assembled_context.encode("utf-8")).hexdigest()
+                self._decorate_context_manifest(ctx["context_manifest"], ctx.get("context_parts", []))
         except Exception as exc:
             raise WritingPipelineError(
                 "RAG_RETRIEVAL_FAILED", f"RAG retrieval failed: {exc}", retryable=True
@@ -866,7 +1583,7 @@ class WritingPipeline:
             prompt = f"{prompt}\n\n## 提示词 A（规划师合成）\n{prompt_a}"
 
         context_manifest = deepcopy(ctx.get("context_manifest") or {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "source": "writing_pipeline.GENERATE_DRAFT",
             "projectId": project_id,
             "bookId": book_id,
@@ -890,13 +1607,98 @@ class WritingPipeline:
                 "contentChars": len(prompt_a),
                 "reason": "planner output appended to the writer prompt",
             })
+        if revision_notes:
+            context_manifest["items"].append({
+                "sourceType": "revision_instruction",
+                "sourceId": task.get("id"),
+                "label": "revision notes",
+                "included": True,
+                "contentChars": len(revision_notes),
+                "reason": "author or review revision instruction appended to the writer prompt",
+            })
+        if task["data"].get("context"):
+            extra_guidance = str(task["data"].get("context") or "")
+            context_manifest["items"].append({
+                "sourceType": "extra_guidance",
+                "sourceId": task.get("id"),
+                "label": "task context",
+                "included": True,
+                "contentChars": len(extra_guidance),
+                "reason": "explicit task guidance appended to the writer prompt",
+            })
+        extra_text = "\n\n".join(extra_parts)
+        prompt_components = [
+            {
+                "id": "system",
+                "label": "System prompt",
+                "location": "system",
+                "contentChars": len(system),
+                "sha256": hashlib.sha256(system.encode("utf-8")).hexdigest(),
+                "binding": "exact_generation_run_input",
+            },
+            {
+                "id": "chapter_plan",
+                "label": "Chapter plan",
+                "location": "writer_prompt_component",
+                "contentChars": len(plan_text),
+                "sha256": hashlib.sha256(plan_text.encode("utf-8")).hexdigest(),
+                "binding": "semantic_prompt_component",
+            },
+            {
+                "id": "context",
+                "label": "Story context",
+                "location": "context",
+                "contentChars": len(context_text),
+                "sha256": hashlib.sha256(context_text.encode("utf-8")).hexdigest(),
+                "binding": "exact_context_text_before_prompt_registry",
+            },
+        ]
+        if extra_text:
+            prompt_components.append({
+                "id": "extra",
+                "label": "Revision and task guidance",
+                "location": "writer_prompt_component",
+                "contentChars": len(extra_text),
+                "sha256": hashlib.sha256(extra_text.encode("utf-8")).hexdigest(),
+                "binding": "semantic_prompt_component",
+            })
+        if prompt_a:
+            prompt_components.append({
+                "id": "planner_output",
+                "label": "Planner-composed prompt A",
+                "location": "writer_prompt_component",
+                "contentChars": len(prompt_a),
+                "sha256": hashlib.sha256(prompt_a.encode("utf-8")).hexdigest(),
+                "binding": "exact_appended_prompt_text",
+            })
         context_manifest["writerInput"] = {
             "promptChars": len(prompt),
             "systemChars": len(system),
             "contextChars": len(context_text),
             "extraChars": len("\n\n".join(extra_parts)),
             "promptSha256": hashlib.sha256((system + "\n" + prompt).encode("utf-8")).hexdigest(),
+            "components": prompt_components,
         }
+        context_manifest["promptComponents"] = prompt_components
+        self._decorate_context_manifest(context_manifest, context_parts)
+        self._bind_prompt_ranges(
+            context_manifest,
+            prompt,
+            {
+                "chapter_plan": plan_text,
+                "context": context_text,
+                "extra": extra_text,
+                "planner_output": prompt_a,
+            },
+        )
+        context_manifest["contextGraphSnapshot"] = self._build_context_graph_snapshot(
+            context_manifest,
+            focus_node_id=(
+                f"chapter:{ctx.get('chapter_id') or context_manifest.get('chapterId')}"
+                if (ctx.get("chapter_id") or context_manifest.get("chapterId"))
+                else None
+            ),
+        )
         ctx["context_manifest"] = context_manifest
 
         self._checkpoint(task, "GENERATE_DRAFT", {
@@ -1373,6 +2175,27 @@ class WritingPipeline:
             raise WritingPipelineError(
                 "STORY_COMMIT_FAILED", f"story commit failed: {exc}", retryable=True
             ) from exc
+
+        plan_node_id = ctx.get("storyflow_plan_node_id")
+        if plan_node_id:
+            try:
+                # Keep the canonical StoryCommit boundary in StoryRepository;
+                # this optional follow-up only fulfills the revisioned
+                # StoryFlow overlay and never writes StoryFact/StoryState.
+                from src.story_graph.planning import StoryFlowPlanningService
+
+                _, planning_revision = StoryFlowPlanningService(self.db).mark_intent_accepted(
+                    book_id,
+                    str(plan_node_id),
+                    chapter_id=str(chapter_id),
+                    story_commit_id=commit_id,
+                )
+                ctx["storyflow_plan_status"] = "ACCEPTED"
+                ctx["storyflow_planning_revision"] = planning_revision
+            except Exception as exc:  # pragma: no cover - defensive optional overlay boundary
+                logger.warning("StoryFlow plan fulfillment failed after commit %s: %s", commit_id, exc)
+                ctx["storyflow_plan_status"] = "ACCEPTED_PENDING_OVERLAY"
+                ctx["storyflow_plan_error"] = str(exc)
 
         return {"next_stage": "COMPLETE", "context": ctx}
 

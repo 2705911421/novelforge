@@ -62,6 +62,8 @@ def run_case(target_nodes: int) -> dict[str, object]:
             "returnedDepth3": deeper["meta"]["returnedNodes"],
             "depth1Ms": round(cold_ms, 2),
             "depth3Ms": round(depth3_ms, 2),
+            "depth1CacheHit": shallow["meta"].get("projectionCacheHit"),
+            "depth3CacheHit": deeper["meta"].get("projectionCacheHit"),
         }
 
 

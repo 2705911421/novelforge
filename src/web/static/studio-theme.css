@@ -90,6 +90,8 @@ body::before {
   position: relative;
   z-index: auto;
   height: 100dvh;
+  display: flex;
+  overflow: hidden;
 }
 
 .sidebar {
@@ -502,7 +504,11 @@ body::before {
 
 .main {
   position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
   min-width: 0;
+  overflow: hidden;
   background: transparent;
 }
 
@@ -510,7 +516,7 @@ body::before {
   content: "";
   position: absolute;
   top: -120px;
-  right: -120px;
+  right: 0;
   width: 320px;
   height: 320px;
   pointer-events: none;

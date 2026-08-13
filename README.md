@@ -1,103 +1,116 @@
-# NovelForge
+# NovelForge — AI 长篇小说创作工作台
 
 [![Verification](https://github.com/2705911421/novelforge/actions/workflows/verification.yml/badge.svg?branch=main)](https://github.com/2705911421/novelforge/actions/workflows/verification.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 
-NovelForge 是一个本地优先的长篇小说创作工作台。它把世界观设定、Story Bible、长篇规划、章节写作、记忆检索、质量审查、修订、连续创作、备份恢复和文档导出连接成一条可暂停、可恢复、可追溯的工作流。
+**NovelForge** 是一个**本地优先**的 AI 长篇小说创作工作台。它将世界观设定、25 步 Story Bible、长篇规划、章节写作、记忆检索、质量审查、精准修订、连续创作、备份恢复和文档导出连接成一条**可暂停、可恢复、可追溯**的完整工作流。
 
-项目提供两种入口：
+融合了 inkOS 与 webnovel-writer 的设计思想，但以 **Python + FastAPI + SQLite** 独立运行：作品数据、执行状态、审查证据和任务记录全部持久化在本地，不依赖浏览器页面作为任务状态的唯一载体。
 
-- CLI：适合脚本化操作、批量任务和服务器环境。
-- FastAPI + Studio Web：适合可视化管理作品、章节、任务、审查结果、模型配置和扩展。
-
-NovelForge 默认把作品数据和运行状态保存在本地 SQLite 与项目目录中。模型调用通过 OpenAI 兼容接口完成；没有模型凭据时，仍可运行本地测试、查看结构和使用不依赖真实模型的功能。
-
-> 项目仍在持续开发。功能合同、验收入口和当前验证结论以 [`spec/features/`](spec/features/)、[`tests/`](tests/)、[`scripts/verify_features.py`](scripts/verify_features.py) 和 [`docs/IMPLEMENTATION_PROGRESS.md`](docs/IMPLEMENTATION_PROGRESS.md) 为准。本 README 用于说明使用方式和设计，不等同于生产就绪承诺。
-
-## 目录
-
-- [适合谁使用](#适合谁使用)
-- [核心能力](#核心能力)
-- [StoryFlow 故事画布](#storyflow-故事画布)
-- [快速开始](#快速开始)
-- [完整使用教程](#完整使用教程)
-- [工作原理](#工作原理)
-- [流程设计](#流程设计)
-- [数据与安全边界](#数据与安全边界)
-- [项目结构](#项目结构)
-- [开发与验证](#开发与验证)
-- [常见问题](#常见问题)
-- [设计文档与许可证](#设计文档与许可证)
+> 🚀 **项目仍在持续开发**。功能合同、验收入口和当前验证结论以 [`spec/features/`](spec/features/)、[`tests/`](tests/)、[`scripts/verify_features.py`](scripts/verify_features.py) 和 [`docs/IMPLEMENTATION_PROGRESS.md`](docs/IMPLEMENTATION_PROGRESS.md) 为准。本 README 说明使用方式和设计，不等同于生产就绪承诺。
 
 ## 适合谁使用
 
-NovelForge 适合希望把“写小说”变成长期、可恢复工程的人，尤其适合以下场景：
+NovelForge 适合希望把“写小说”变成长期、可恢复工程的人：
 
-- 需要维护复杂世界观、人物关系、时间线和伏笔的长篇创作。
-- 希望 AI 只在明确的规划、上下文和质量门禁下生成内容。
-- 需要批量写作，但不希望浏览器页面成为任务状态的唯一载体。
-- 需要保留章节版本、审查证据、修订原因和可恢复任务记录。
-- 需要把参考资料、草稿、章节和审查报告统一管理并导出。
+- 需要维护复杂世界观、人物关系、时间线和伏笔的**长篇创作**；
+- 希望 AI 只在明确的规划、上下文和质量门禁下生成内容的作者；
+- 需要批量写作，但要求任务状态、审查证据和修订原因**持久可查**的团队或个人；
+- 需要把参考资料、草稿、章节、审查报告统一管理并导出的创作者。
 
-## 核心能力
+## ✨ 核心特性
 
-### 创作与规划
+### 🎨 创作与规划
 
-- 作品、Book、Chapter 和章节版本的持久化管理。
-- 25 步 Story Bible 工作流：草稿、顺序确认、发布和版本快照。
-- 长篇规划、章节计划、剧情画布、思维导图、时间线、世界地图和关系图。
-- “念头创作”和“规划创作”等不同入口，并保留作者确认边界。
+- **25 步 Story Bible 工作流**：草稿、顺序确认、发布和带 SHA-256 校验和的版本快照；每步支持手填、AI 建议、优化和重生成。
+- **长篇规划系统**：卷、故事弧、章节目标、剧情画布（Plot Canvas）、思维导图、时间线、世界地图和人物关系图。
+- **多入口创作**：“念头创作”、“规划创作”、初稿导入和同人/衍生/风格模仿等模式，保留作者确认边界。
 
-### AI 写作与质量控制
+### 🤖 AI 写作与质量控制
 
-- `PRECHECK → 规划 → 上下文编排 → 记忆检索 → 草稿生成 → 审查 → 质量门禁 → 修订 → Story Commit` 写作流水线。
-- 审查结果结构化保存，包含维度、问题、证据位置和可执行修订指令。
-- 修订只针对已记录的问题或作者指令，不把无关文本悄悄重写成“顺便润色”。
-- 质量门禁失败、冲突或达到自动修订上限时进入 `needs_author_decision`，不会伪造通过。
+- **智能写作流水线**：`PRECHECK → 规划 → 上下文编排 → 记忆检索 → 草稿生成 → 审查 → 质量门禁 → 修订 → Story Commit`。
+- **双重质量门禁**：9 维度加权评分（剧情、人物、世界观、节奏、风格、伏笔、AI 痕迹等），通过阈值 93 分。
+- **精准修订**：只针对已记录的问题或作者指令修订，不把无关文本“顺手润色”；冲突或达到修订上限时进入 `needs_author_decision`，**绝不伪造通过**。
 
-### 持久化任务与连续创作
+### 📊 持久化任务与连续创作
 
-- SQLite 任务队列、worker lease、状态机、事件流和 checkpoint。
-- 任务支持暂停、恢复、协作式取消、失败分类和受控重试。
-- 连续创作由父任务和有依赖的章节子任务组成，每章完成后才推进下一章。
-- 可按配置间隔插入跨章节联合审查。
+- **SQLite 权威任务队列**：lease 租约、严格状态机、事件流（SSE 可回放）、checkpoint 和失败分类。
+- **连续创作模式**：父任务 + 章节子任务结构，每章通过质量门禁后才推进下一章；支持 5–200 章，可暂停、恢复、取消。
+- **跨章节联合审查**：默认每 5 章插入一次独立的跨章一致性审查任务。
 
-### 记忆、RAG 与资料导入
+### 🧠 记忆、RAG 与资料导入
 
-- TXT、Markdown、DOCX 等资料的保存、解析、分块、索引和来源追踪。
-- SQLite BM25 检索始终可用；可选接入 embedding 和 rerank provider。
-- 检索结果携带文档、chunk、checksum、字符范围和检索策略，便于审查和复现。
-- 章节摘要、事实、规则、时间线和参考资料按来源、版本和有效范围进入记忆读模型。
+- **多层记忆系统**：Working / Episodic / Semantic / Operational，覆盖角色状态、世界规则、时间线、伏笔、追读力等类别。
+- **多格式资料导入**：TXT、Markdown、DOCX 的上传、解析、分块、指纹去重和来源追踪；解析与索引由持久化 worker 执行。
+- **可复现检索**：SQLite BM25 始终可用，可选接入 embedding 与 rerank provider；结果携带文档、chunk、checksum、字符范围和检索策略。
 
-### Studio 与交付
+### 🗺️ StoryFlow 故事画布
 
-- 作品和章节工作台、任务看板、章节版本、审查结果和系统诊断。
-- Provider、Model、Agent role、Prompt、Skill 和 MCP 扩展管理。
-- Markdown、TXT、DOCX、Story Bible、审查报告和伏笔数据导出。
-- 备份清单、恢复任务、健康检查和运行日志查询。
+StoryFlow 是思维导图、剧情工作流、人物关系、时间线和世界地图收敛到**同一个 Story Graph** 的统一入口。当前已落地一个真实可用的 P0 vertical slice：
 
-## StoryFlow 故事画布
+- 数据链路为 `SQLite 权威领域 → StoryGraphProjector → Graph API → StoryFlow Canvas`，画布不维护第二套故事事实；
+- 默认打开 focused subgraph，支持 depth 1/2/3、类型/状态/章节范围过滤与搜索聚焦；
+- Story / Character / Timeline / World / Foreshadow / Context 六种视图共享同一 Graph API；
+- Inspector 展示来源、状态、章节和可追溯元数据；节点拖拽、框选、自动布局与布局保存只属于 UI workspace，不写入 StoryFact；
+- 工作区布局历史独立保存为可重建的 revision snapshots；支持保存后的撤销/重做、撤销后新分支清理 redo tail，以及 Ctrl/Cmd+Z、Ctrl/Cmd+Shift+Z 快捷键，不改变 StoryState；
+- 画布默认以“只读 · Canon”打开；Story Ports、章节计划、候选分支和候选决策等规划写入必须切换到“规划编辑”，而 AI 分析作为独立的只读报告任务可在 Canon 模式运行并持久化到 `tasks.result`。两种模式都不会从前端直接修改 StoryFact/StoryState；
+- 在“规划编辑”模式下可从 StoryFlow 直接创建带标题、摘要和状态的 `PlanningNode`；若当前焦点有合法锚点，默认同时创建 revisioned `originates_from`/`planned_for`/`depends_on`/`affects` 语义边，使节点刷新后仍留在焦点子图中；所有写入仍属于 `plot_workspaces` overlay，绝不伪装成 Canon；
+- 原思维导图、剧情工作流、时间线、世界地图、伏笔和人物关系入口现在优先路由到对应 StoryFlow view，旧渲染器仅作为兼容 fallback；
+- 节点包含语义 Story Ports；例如 `Chapter.events → Location.presence` 只能选择并持久化为合法的 `happens_at` planning edge，非法节点/端口组合由后端 schema 拒绝；
+- 候选分支以 revisioned `candidateBranchId` 分组保存，Inspector 可查看来源、分支序号和决策；采用/丢弃会整组转为 `PLANNED`/`SUPERSEDED`，不会直接污染 Canon；
+- 同一次 forecast 的多个候选通过后端 task-scoped `candidateSetId=forecast:{taskId}` 在侧栏聚合比较；该 id 同时记录在任务结果与 `storyflow.forecast` manifest，Canvas 通过 `apply-candidate-set` 一次 revision 原子写入整组分支并支持重试幂等，旧 overlay 按 task/run/origin lineage 回退分组，候选集合支持聚焦、分支级采用/丢弃和“全部丢弃”，决策仍复用 revisioned planning API 并保留边 provenance；
+- forecast 成功后候选覆盖层现在由持久化 worker 直接写入 `plot_workspaces`/`forecast_imports`，浏览器关闭也不会丢失；模型成功与规划投影成功分开报告，投影失败保留可重试的 task result，且不写入 StoryFact/StoryState/StoryCommit；
+- 对于 worker 已完成但规划投影尚未落盘的历史 forecast，StoryFlow 侧栏会从持久化 `tasks.result` 显示安全的 `Recoverable forecasts` 摘要；规划编辑模式可用同一 revision-checked 原子事务恢复候选，重复点击幂等，且不会把 prompt/narrative 或候选规划伪装成 Canon；
+- 候选集合现在可从侧栏进入只读“比较方案”Inspector：结果由 `GET .../story-graph/candidates/compare` 从同一 SQLite `plot_workspaces` 投影计算共同步骤、方案差异和语义边差异，不写入 Canon，也不把模型 narrative 当作事实；
+- 选中任意真实 Flow 后可“保存章节计划”或“生成章节”：后者把结构化 `ChapterIntent` 写入现有规划控制面，并排队标准 `write-next` 任务，由既有 Prompt Registry、模型路由、GenerationRun 和 StoryCommit 完成后续写作；不会覆盖旧章节或绕过 Canon 边界；StoryCommit 接受后计划节点会变为 `ACCEPTED`，并以 `leads_to` 语义边指向实际生成章节；
+- Context View 在存在真实 Writer `GenerationRun` manifest 时展示 included/excluded 语义边、来源字符数、GenerationRun provenance 和未解析的只读 `ContextSource`；现在还记录实际 context sections、Writer prompt components、包含原因和 section/prompt 绑定，点击来源可回到真实图节点；manifest 缺失或不匹配时明确显示 trace unavailable，不伪造 AI 上下文；Writer 输入还保留 `promptLayout`、`promptRange` 与 runtime 生成的 `persistedPromptRange` 字符区间，无法唯一定位时明确标记，不把字符范围冒充 Provider token 偏移；
+- StoryFlow 保存的 `ChapterIntent` 现在可作为真实 Writer Context 来源：`storyflow_plan_node_id` 会把计划目标、前置条件、必需人物/地点、剧情线和伏笔动作写入现有 `GenerationRun` manifest；Context View 以 `PlanningNode`、`selectionRole=chapter_intent`、各选中图节点的角色及已持久化的语义边类型（如 `affects`、`advances`）展示“为什么加入”，缺失计划时记录明确 warning 而不伪造 provenance；
+- Character Inspector 现在把同一投影中的人物当前状态、位置、情绪、状态来源章节、最近出现、直接人物/势力关系、PlotThread 与 Foreshadow 关联分组呈现；缺失的 `character_states` 字段明确显示为“未记录”，不从 prose 推断，且可直接切入共享 Timeline 或持久化 StoryFlow AI 分析任务；
+- 选中真实 Chapter 后，Inspector 会从同一 SQLite node-detail 邻接证据按人物/势力、地点、事件/场景、剧情线/冲突、伏笔/秘密、时间/设定分组，并分别列出“本章依赖 / 输入”和“本章改变 / 输出”；同时自动读取不可变 StoryCommit/History，展示已记录的事实与状态变化摘要，不把布局或前端推断当成 Canon；
+- Story Bible 现在也进入同一 Story Graph：已发布 25 步快照、最近草稿快照和未发布步骤分别以 `StoryBibleEntry` 的 `CANON`/`DRAFT`/`PLANNED` 投影；Chapter 通过 `depends_on` 显示对当前已发布设定的规划依赖，GenerationRun 的 `story_bible` manifest 会解析到相同快照节点，而不是降级成无来源的图数据；点击设定节点可回到现有 25 步向导，Inspector 明确 Canon 与规划边界；
+- 同一章节存在多个 Writer runs 时，Context View 可从 SQLite availableRuns 选择并通过 generation_run_id 精确读取；未知或越界 run 返回 404。component attribution 显示字符数、绑定/范围状态与 contentChars/4 estimate，整次 provider usage 仍是唯一实际 token 权威。
+- Writer `GenerationRun` 的 `context_manifest` 现在还持久化可校验的 `contextGraphSnapshot`：Context API 会重算节点/语义边 payload 的 SHA-256，Inspector 显示 included/excluded 来源、快照计数与 integrity 状态；旧 run 没有快照时明确显示 unavailable，不从当前图或 prompt 反推 AI 上下文。
+- Forecast 与 StoryFlow Analysis 复用同一 GenerationRun Context Graph seam；Inspector 可按需读取真实 SQLite 快照，查看来源节点、included/excluded 语义边、focus、hash 完整性和 provenance 边界，且不暴露 prompt 正文或凭据。该能力已在 1920×1080 与 1366×768 headed browser fixture 中验收。
+- World View 现在是有真实层级语义的 World Graph：Book 投影出 `World` 根，地点用 `locations.parent_id + type` 表达 `World → Region → City → Location`，控制/驻留/事件叠加分别追溯到 SQLite state/timeline 表；无坐标时明确标记 `spatialMap=false`，不把线性节点排列冒充地图。
+- Foreshadow View 现在从 SQLite 权威字段和显式 typed StoryFact 投影 `planted → advanced → resolved` 生命周期；`advances`/`resolves` 边保留 fact/commit provenance，结构化人物/势力/地点/事件/剧情线关联使用 `involves` 语义边，Inspector 显示当前阶段与推进章节，不从自由文本推断伏笔进度。
+- Scene、Item、Secret、StoryGoal、Conflict、TimelinePoint 和 Knowledge 等尚无独立权威表的扩展概念，只接受真实 StoryFact/结构化伏笔笔记中的 typed reference；每个节点保留 `referenceType`、`referenceId`、`story_facts` provenance，并从所属 Chapter 建立 `contains` 证据边。显式 `relation` 会继续通过 Story Ports/semantic edge validator 生成 `owns`、`reveals`、`advances`、`causes`、`knows` 等语义边，Inspector 明确标注 read-model evidence 而非新 Canon 表；
+- 对尚无独立权威实体表的扩展类型，显式 typed `PlotThread` 引用会投影为可重建的 read-model 节点，并合并 `StoryFact` / `Foreshadow.notes` 的 SQLite provenance；未标注类型的字符串不会被提升为剧情事实。PlotThread Story Ports 的合法连接由统一 schema 校验。
+- 已用 120 章真实 SQLite fixture 验收 progressive disclosure：默认焦点子图 9 节点，Depth 2 116 节点/307 语义边，浏览器 DOM viewport culling、搜索聚焦和刷新后的布局恢复均有证据；
+- Graph History 支持 exact observed-snapshot pair diff；投影健康会把旧 ChapterVersion pending commit 标成 `STALE`、阻塞 Review 标成 `CONFLICT`，并在侧栏/Inspector 显示只读 diagnostics。History 明确标注 `observed_projection`，不冒充完整 canonical replay；对已接受的 `StoryCommit / StoryFact / StoryState` immutable ledger，另提供 commit-scoped Canon replay/diff，并明确 mutable entity tables 没有被伪造成历史；
+- StoryFlow AI 分析任务写入现有 SQLite `tasks.result`，刷新后可从“最近 AI 分析”恢复选择与报告；分析结果仍是模型/任务产物，不自动变成 StoryFact 或 Canon；
+- StoryFlow Chapter Inspector 可直接打开章节、审查、重写、查看版本；章节工作台补充“查看本章关系”并把真实 chapter id 带入 Character View。存在于 authoritative SQLite 但尚无 `chapter_versions` 的章节仍会返回 truthful empty history，而不会被误报成 404；
+- 规划节点、候选分支和 AI 分析以 `PARTIAL` 状态持续迭代，当前不把未完成能力写成完整产品——详细边界见 [`docs/storyflow-canvas/`](docs/storyflow-canvas/) 与 [`docs/architecture/16-storyflow-canvas.md`](docs/architecture/16-storyflow-canvas.md)。
 
-StoryFlow 是 NovelForge 将“思维导图、剧情工作流、人物关系、时间线和世界地图”逐步收敛到同一 Story Graph 的统一入口。当前已完成一个真实可用的 P0 vertical slice：
+### 🖥️ Studio Web 工作台
 
-- 数据链路是 `SQLite authoritative domain → StoryGraphProjector → Graph API → StoryFlow Canvas`，画布不维护第二套故事事实。
-- 默认打开 focused subgraph；支持 depth 1/2/3、节点类型/状态/章节范围过滤和搜索聚焦，不默认加载 Full Graph。
-- Story、Character、Timeline、World、Foreshadow、Context 六种 view 共享同一 Graph API，并按视图采用分层、径向、时间序、层级和生命周期布局。
-- 选择 Chapter、Character、Location 或 Foreshadow 后，右侧 Inspector 展示来源、状态、章节、邻居和可追溯元数据；章节可跳转到写作工作台，Context view 会明确区分“候选来源”与尚未记录的真实 GenerationRun 上下文。
-- 画布支持平移、缩放、框选、多选、节点拖动、隐藏、聚焦、展开邻域、自动布局、Minimap 和布局保存；布局只属于 UI workspace，不写入 StoryFact。
+StoryFlow 当前还包括真实的卷、故事时间、剧情线过滤；剧情线筛选由投影语义边反向建立稳定 ID/标题索引；Inspector 可读取只读 impact/history/diff 边界，并可对高连接度节点分页加载邻居；Canvas 对当前 bounded graph 做 DOM viewport culling，并保留完整 Minimap。Projector 通过 authoritative 字段内容指纹复用可重建 `storyflow_graph_catalog_cache`，指纹变化时自动重建；章节级事实、Commit、版本和审查阻塞项走批量读取，`chapter_versions` 新增也会失效缓存；Graph history 读取现有 ChapterVersion、StoryCommit、StoryFact、状态和 planning revision，并对已观察的 StoryGraph 投影提供 scoped snapshot diff，同时公开 `projectionHealth`。accepted StoryCommit 还可按章节顺序重放 immutable ledger 并比较 commit boundary；这不是对未版本化 mutable entity tables 的完整历史图重建。当前产品结论仍为 `PARTIAL`。
 
-本轮仍是 `PARTIAL`，不是完整 StoryFlow 产品：已接入 PlanningNode/Candidate overlay、语义规划边、Story Port 拖拽连接、Flow → Chapter Intent、持久化 StoryFlow AI 分析任务、forecast→Candidate 分支接入、GenerationRun context manifest 和 accepted StoryCommit 的重建投影；增量缓存以及高级 diff/history/impact analysis 尚未完成，AI 任务仍依赖已配置 Provider。详细边界、迁移策略和证据见 [`docs/storyflow-canvas/`](docs/storyflow-canvas/)。
+StoryFlow Canvas 现在还支持 Canvas 焦点快捷键（缩放、适配、重置、Depth、搜索、全选、清空、布局撤销/重做和保存）以及可点击 Minimap 导航；这些动作只改变导航或独立 UI workspace，不写入 Canon。真实浏览器证据见 `docs/storyflow-canvas/evidence/storyflow-20260813-hotkeys-minimap-*`。
 
-## 快速开始
+- **约 45 个页面**：我的创作、章节工作台、世界观向导、连续创作、StoryFlow、思维导图、时间轴、剧情工作流、世界地图、伏笔、人物关系、数据分析、联合审查、剧情推演、导入中心、任务管理、系统诊断等；
+- **配置管理**：Provider / Model / Agent 九角色路由、Prompt 注册表、Skill 与 MCP 扩展管理；
+- **实时流**：SSE 任务事件流，支持 `Last-Event-ID` 续传；
+- **导出与交付**：Markdown、TXT、DOCX、Story Bible、审查报告、伏笔表和 JSON/ink 导出。
+
+### 🔌 扩展与交付
+
+- **提示词注册表**：按任务类型定制提示词，支持版本历史、回滚、导入导出；
+- **Skill / MCP**：内置 28 个 Skill 指令契约，支持 GitHub 安全导入 Skill 包（不执行用户代码）；
+- **翻译、互动影像、封面生成**、人物主题、题材库和文风设计等补充能力。
+
+## 🚀 快速开始
+
+### 系统要求
+
+- Python 3.11 或更高版本
+- SQLite（Python 标准库已提供）
+- OpenAI 兼容的模型服务（执行真实 AI 生成时必须配置）
 
 ### 1. 安装环境
 
-要求：
-
-- Python 3.11 或更高版本。
-- SQLite（Python 标准库已提供）。
-- 一个 OpenAI 兼容的模型服务；只有执行真实 AI 生成时才必须配置。
-
-Windows PowerShell：
+**Windows PowerShell：**
 
 ```powershell
 python -m venv .venv
@@ -105,7 +118,7 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-macOS/Linux：
+**macOS / Linux：**
 
 ```bash
 python3.11 -m venv .venv
@@ -113,7 +126,7 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-先做一次基础导入检查：
+基础导入检查：
 
 ```bash
 python verify.py
@@ -121,13 +134,13 @@ python verify.py
 
 ### 2. 配置模型服务
 
-复制模板：
+复制环境配置模板：
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-NovelForge 的运行进程需要实际拿到环境变量。PowerShell 示例：
+设置环境变量（PowerShell）：
 
 ```powershell
 $env:OPENAI_API_KEY = "your-api-key"
@@ -137,7 +150,7 @@ $env:NOVELFORGE_REVIEW_MODEL = "gpt-4o"
 $env:NOVELFORGE_ROOT = (Get-Location).Path
 ```
 
-macOS/Linux 示例：
+设置环境变量（macOS / Linux）：
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
@@ -147,32 +160,28 @@ export NOVELFORGE_REVIEW_MODEL="gpt-4o"
 export NOVELFORGE_ROOT="$PWD"
 ```
 
-也可以参考 [`config/default.yaml`](config/default.yaml)。不要把真实 API Key 写入源代码、YAML、日志或 Git 提交；安全边界见 [`SECURITY.md`](SECURITY.md)。
-
 ### 3. 创建作品
 
 ```bash
 python run.py init "我的第一部长篇" --genre "玄幻修仙"
 ```
 
-命令会输出 `project_id`。后续命令都使用这个 ID：
+命令会输出 `project_id`，后续命令都使用这个 ID：
 
 ```bash
 python run.py list
 python run.py status <project_id>
 ```
 
-### 4. 启动 worker
+### 4. 启动持久化 worker
 
-在一个终端运行持久化 worker：
+在一个终端运行 worker——它会从 SQLite 领取排队任务、写入阶段事件和 checkpoint，并执行世界观构建、文档索引、章节写作、审查和修订等工作：
 
 ```bash
 python run.py worker
 ```
 
-worker 会从 SQLite 领取排队任务、写入阶段事件和 checkpoint，并执行世界观构建、文档索引、章节写作、审查和修订等工作。不要只启动 Web 页面而不启动 worker，否则任务会停留在 `queued`。
-
-单次执行一个任务可使用：
+单次执行一个任务后退出：
 
 ```bash
 python run.py worker --once
@@ -186,31 +195,29 @@ python run.py worker --once
 python run.py serve --host 127.0.0.1 --port 8000
 ```
 
-打开 <http://127.0.0.1:8000>。也可以直接使用 Uvicorn：
+打开 http://127.0.0.1:8000。也可以直接使用 Uvicorn：
 
 ```bash
 python -m uvicorn src.web.studio:app --reload --port 8000
 ```
 
-## 完整使用教程
-
-下面是一条从“想法”到“可交付章节”的推荐路径。CLI 和 Studio 共用同一套 SQLite 权威状态与任务系统，因此可以交替使用。
+## 📚 完整使用教程
 
 ### 第一步：建立 Story Bible
 
-可以先用向导把设定请求入队：
+使用向导把设定请求入队（由 worker 执行）：
 
 ```bash
 python run.py wizard <project_id> --input "近未来城市中，记忆可以被交易；主角是一名记忆修复师。"
 ```
 
-也可以在 Studio 中打开 Story Bible 页面，逐步编辑 25 个步骤。CLI 查看状态：
+在 Studio 中打开 Story Bible 页面，逐步编辑 25 个步骤。CLI 查看状态：
 
 ```bash
 python run.py bible <project_id> show
 ```
 
-需要脚本化编辑时：
+脚本化编辑：
 
 ```bash
 python run.py bible <project_id> set <step_key> "这里写该步骤的草稿内容"
@@ -218,7 +225,7 @@ python run.py bible <project_id> confirm <step_key>
 python run.py bible <project_id> publish
 ```
 
-确认是有顺序约束的；只有完整确认并发布后，Story Bible 才成为后续写作的正式依据。AI 建议可以保存为草稿，但不会自动改变已确认内容。
+> 发布要求全部 25 步已确认，并生成带校验和的快照。严格模式下，写作流水线在发布 Story Bible 之前会被 PRECHECK 阻断。
 
 ### 第二步：导入参考资料
 
@@ -236,17 +243,9 @@ python run.py ingest <project_id> ./references/style.txt --type style
 python run.py rag-search <project_id> "主角与记忆交易的规则" --top-k 5
 ```
 
-检索输出会显示分数、文档、类型、字符范围和 chunk。参考资料不会因为被检索到就自动变成 StoryFact，必须经过明确的故事状态流程。
-
 ### 第三步：规划章节
 
-在 Studio 中完成卷、故事弧、章节目标和剧情画布；也可以使用 CLI 的底层任务入口：
-
-```bash
-python run.py bible <project_id> show
-```
-
-开始写作前，系统会执行 preflight，检查 Story Bible、章节规划、模型配置、前序提交和投影状态。缺少必要条件时，任务会被阻断并返回可处理的原因，而不是生成一章“看起来完成”的内容。
+在 Studio 中完成卷、故事弧、章节目标和剧情画布；也可以使用 CLI 的底层任务入口。开始写作前，系统会执行 preflight，检查 Story Bible、章节规划、模型配置、前序提交和投影状态。
 
 ### 第四步：写作单章
 
@@ -268,11 +267,9 @@ python run.py write <project_id>
 python run.py status <project_id>
 ```
 
-Studio 的任务详情页可以查看阶段、进度、事件、checkpoint、错误分类和模型调用记录。章节草稿先保存为新的 `ChapterVersion`，不会覆盖作者已经编辑的版本。
-
 ### 第五步：审查、修订和复审
 
-写作流水线会自动执行审查和质量门禁。需要显式调用时，Studio API 提供以下任务入口：
+写作流水线会自动执行审查和质量门禁。需要显式调用时，Studio API 提供任务入口：
 
 ```text
 POST /api/v1/books/{book_id}/audit/{chapter}
@@ -281,27 +278,17 @@ POST /api/v1/books/{book_id}/rewrite/{chapter}
 GET  /api/v1/books/{book_id}/chapters/{chapter}/reviews/latest
 ```
 
-审查关注剧情、人物一致性、世界规则、时间线、伏笔、节奏、风格、技术质量和 AI 痕迹等维度。修订任务必须绑定审查问题或作者指令；复审只验证受影响的问题和一致性维度。
-
 ### 第六步：连续创作
 
-连续创作适合已经完成规划、希望批量推进的作品：
+连续创作适合已完成规划、希望批量推进的作品：
 
 ```bash
 python run.py continuous <project_id> --start 1 --count 5 --context "保持冷峻、克制的叙述风格。"
 ```
 
-`count` 范围是 5–200。CLI 会在启动前显示 token 和质量策略提示，并要求确认。连续任务具备以下行为：
-
-1. 创建一个父任务和多个有依赖关系的章节子任务。
-2. 每章通过质量门禁并提交后，才计算下一章。
-3. 到达联合审查间隔时，插入独立的跨章节审查任务。
-4. 暂停从安全边界生效，恢复从最近 checkpoint 继续。
-5. 发生作者手改、章节删除或不可安全重试的冲突时，暂停并等待作者决策。
+`count` 范围是 5–200。CLI 会在启动前显示 token 和质量策略提示，并要求确认。
 
 ### 第七步：导出交付
-
-支持 Markdown、TXT 和 DOCX：
 
 ```bash
 python run.py export <project_id> --format md
@@ -309,54 +296,51 @@ python run.py export <project_id> --format txt --output ./exports/novel.txt
 python run.py export <project_id> --format docx --approved-only
 ```
 
-CLI 导出正文时也会生成审查报告。Studio 还提供 Story Bible、审查报告、伏笔和导出历史接口。
+## 🧰 CLI 命令参考
 
-## 工作原理
+| 命令 | 说明 |
+|------|------|
+| `python run.py init <name> [--genre] [--import-file]` | 初始化新作品，可选导入设定文件并排队世界观构建 |
+| `python run.py wizard <project_id> [--input]` | 将世界观构建请求入队 |
+| `python run.py ingest <project_id> <file> [--type]` | 保存资料附件并排队解析/分块/索引 |
+| `python run.py rag-search <project_id> <query> [--top-k]` | 检索已索引文档分块 |
+| `python run.py bible <project_id> show\|set\|confirm\|publish` | Story Bible 工作区操作 |
+| `python run.py write <project_id> [chapter] [--context]` | 排队单章写作 |
+| `python run.py continuous <project_id> [--start] [--count] [--context]` | 排队连续创作（5–200 章） |
+| `python run.py export <project_id> [--format md\|txt\|docx] [--approved-only]` | 导出正文与审查报告 |
+| `python run.py status <project_id>` | 查看作品状态（章节/角色/势力/伏笔等） |
+| `python run.py list` | 列出所有作品 |
+| `python run.py mindmap <project_id>` | 生成思维导图 HTML |
+| `python run.py timeline <project_id>` | 生成时间轴 HTML |
+| `python run.py serve [--host] [--port]` | 启动 Studio Web |
+| `python run.py worker [--once] [--worker-id]` | 运行持久化任务 worker |
+
+## 🏗️ 工作原理
 
 ### 总体架构
+
+SQLite 是**单写入者**的权威事实库：API 只创建/读取任务并串流已持久化事件，不直接充当执行队列；一个持久化 worker 对每个 Task 持有 lease 并执行；文件系统只保存二进制附件、导出和备份。
 
 ```mermaid
 flowchart TD
     AUTHOR["作者"] --> ENTRY["CLI / Studio Web"]
-    ENTRY --> API["FastAPI API"]
+    ENTRY --> API["FastAPI API（/api/v1 + SSE）"]
     API --> RUNTIME["TaskRuntime：入队、状态机、事件、checkpoint"]
     RUNTIME --> DB[("SQLite 权威状态库")]
     WORKER["PersistentTaskWorker"] --> RUNTIME
     WORKER --> PIPELINE["领域任务与写作流水线"]
-    PIPELINE --> GATEWAY["Model Gateway / Agent Router"]
+    PIPELINE --> GATEWAY["Model Gateway / Agent Router / GenerationRun"]
     GATEWAY --> PROVIDER["OpenAI 兼容模型服务"]
     PIPELINE --> MEMORY["Memory / RAG / StoryState 投影"]
     MEMORY --> DB
     PIPELINE --> FILES["项目附件、导出和备份文件"]
-    DB --> READMODEL["Studio 读模型、任务面板和审查结果"]
+    DB --> READMODEL["Studio 读模型、任务面板、StoryFlow Graph"]
     READMODEL --> AUTHOR
 ```
 
-设计的核心不是“让页面直接调用模型”，而是把每一次耗时操作变成可持久化任务：
-
-1. CLI 或 Studio 接收作者意图，进行参数校验和 preflight。
-2. API 只向 SQLite 写入任务、输入引用和幂等键，然后立即返回任务 ID。
-3. worker 使用 lease 领取任务，避免多个 worker 重复执行同一任务。
-4. 每个阶段完成后写入状态、事件和 checkpoint；重启后可以从持久化状态恢复。
-5. 领域服务调用模型网关、资料检索和故事状态，而不是直接操作浏览器内存。
-6. 结果写入章节版本、审查记录、Story Commit、Memory/RAG 投影和备份清单。
-
-### 权威数据边界
-
-SQLite 是运行状态的主要权威边界，负责保存：
-
-- Project、Book、Chapter、ChapterVersion、Story Commit 和 StoryState。
-- Task、TaskEvent、checkpoint、lease、错误分类和恢复状态。
-- Review、ReviewIssue、RevisionResult 和联合审查结果。
-- 参考文档、chunk、checksum、来源类型和字符范围。
-- Provider、Model、Agent route、GenerationRun 和 Prompt 版本。
-- 备份清单、schema 版本和恢复记录。
-
-文件系统只保存二进制附件、导出文件和备份快照。浏览器负责展示状态，不是任务或故事事实的唯一存储。
-
-## 流程设计
-
 ### 单章写作流水线
+
+每个方框都是一个 Task checkpoint 边界。Draft 只保存为不可变 `ChapterVersion`，绝不覆盖作者已编辑版本；质量门同时检查 blocking issue、最低分和所需 artifacts，超过修订上限时进入 `needs_author_decision`，不虚假通过。
 
 ```mermaid
 flowchart LR
@@ -377,14 +361,6 @@ flowchart LR
     N --> O["BACKUP + COMPLETE"]
 ```
 
-每个主要节点都是 checkpoint 边界。`PRECHECK` 会阻断缺少规划、模型配置、前序提交或有效投影的任务。草稿先成为新的章节版本；只有通过审查和质量门禁后，Story Commit 才能更新故事状态。
-
-### 审查与修订设计
-
-审查接收不可变章节版本、ContextBundle 和明确的审查维度，返回结构化审查记录。审查本身不修改正文或事实；它只记录证据、问题和修订建议。
-
-修订必须指向一个或多个开放问题，并携带基础章节版本、作者约束和允许的作用域。若作者在任务期间修改了基础版本，系统不会静默覆盖，而是进入 `needs_author_decision`，由作者选择保留作者版本、基于新版本重做或放弃草稿。
-
 ### 任务状态与恢复
 
 ```mermaid
@@ -401,80 +377,127 @@ stateDiagram-v2
     failed --> needs_author_decision: "conflict / unsafe retry"
 ```
 
-错误按恢复策略分类：
-
-- `VALIDATION`、`CONFLICT`、`MODEL_CONFIGURATION`：通常需要修正输入或作者决策。
-- `NETWORK`、`RATE_LIMIT`、`PROVIDER_TRANSIENT`：可以在保存 attempt 和 checkpoint 后受控重试。
-- `PROJECTION`：保留已接受的 Story Commit，只重试投影，不重写章节。
-- `DATA_INTEGRITY`：停止继续提交，先运行 Doctor、备份和一致性检查。
-
-### Memory 与 RAG
-
-资料索引生命周期为：
-
-```text
-uploaded → parsed → chunked → indexed → available
-```
-
-检索时先限定 Book 和文档类型，再使用 BM25；如果配置了向量 provider，可并行融合 embedding 检索和 rerank。结果返回来源、chunk、score、字符范围和降级状态。
-
-Memory 分为 Working、Episodic、Semantic 和 Operational 四类。章节提交后，投影任务以幂等键更新记忆；回滚或作者手改会将后续记忆标记为 `stale`，再排队重投影。上下文预算优先保护作者约束、世界规则、当前状态和检索证据，不会为了塞入更多背景而删除硬约束。
-
-## 数据与安全边界
+### 数据与安全边界
 
 以下内容属于本地运行数据或生成物，默认不应提交到 Git：
 
 | 路径 | 内容 | 处理方式 |
-|---|---|---|
+|------|------|----------|
 | `projects/` | 作品、SQLite 数据库、附件和项目状态 | 本地保存，按需备份 |
-| `.novelforge-secrets/`、`.env` | 凭据引用和环境配置 | 禁止提交 |
+| `.novelforge-secrets/`、`.env` | 凭据引用和环境配置 | 禁止提交；Windows 下密钥经 DPAPI 保护 |
 | `.novelforge-backups/` | 数据库和附件备份 | 通过备份功能管理 |
 | `exports/` | 正文、DOCX 和报告导出物 | 交付后单独保存 |
 | `studio/` | Studio 会话和运行记录 | 本地缓存 |
 | `test-output/` | 手工测试和诊断输出 | 不进入版本库 |
-| `.agents/`、`skills-lock.json` | 本地 Agent/Skill 环境文件 | 按机器管理 |
 
-备份与恢复遵循以下顺序：先创建当前状态备份，再验证 manifest、hash、schema 和磁盘空间；恢复作为任务执行，完成后进行数据库完整性与投影一致性检查。不要手动覆盖 SQLite 或删除项目目录来“修复”状态。
-
-安全问题请参阅 [`SECURITY.md`](SECURITY.md)。
-
-## 项目结构
+## 📁 项目结构
 
 ```text
 src/
-├── core/             数据库、领域模型、StoryRepository、TaskRuntime、worker
-├── creation/         规划、写作、连续创作和任务处理器
-├── planning/         Story Bible、规划综合、剧情画布和创作工作流
-├── llm/              Model Gateway、Agent Router、Prompt 和 GenerationRun
-├── ingestion/        文档上传、解析、分块和导入
-├── rag/              持久化检索和来源追踪
-├── review/           审查、问题、修订和联合审查
-├── export/           Markdown、TXT、DOCX 和报告导出
-├── web/              FastAPI Studio API、静态页面和事件流
-└── integrations/     Skill、MCP 和扩展配置
-config/               默认运行配置
-docs/                 架构、阶段、审计和恢复设计
-spec/features/        功能合同与验收测试入口
-scripts/              受保护文件、功能验证和进度工具
-tests/                单元、集成、API、恢复和敌对路径测试
-projects/             本地运行时作品数据，不提交到 Git
+├── core/             # 数据库/迁移、DAL、StoryRepository、TaskRuntime、worker、备份恢复
+├── pipeline/         # WritingPipeline、Composer、Observer/Reflector、RAG、Rules、节奏
+├── creation/         # 连续创作服务、章节写手、规划器、任务处理器
+├── planning/         # Story Bible、规划综合、剧情画布、创作工作流与就绪门禁
+├── llm/              # Model Gateway、Agent Router、PersistentModelRuntime、GenerationRun
+├── memory/           # 多层记忆引擎
+├── rag/              # BM25 持久化检索、重排与来源追踪
+├── ingestion/        # 文档上传、解析、分块、初稿导入
+├── review/           # 章节审查、双重门禁、联合审查
+├── export/           # Markdown / TXT / DOCX / 报告导出
+├── prompts/          # 提示词注册表（版本化）
+├── story_graph/      # StoryFlow：StoryGraphProjector 与规划服务
+├── visualization/    # 思维导图、时间轴、世界地图
+├── themes/           # 人物主题
+├── translation/      # 翻译项目
+├── interactive_film/ # 互动影像图运行时
+├── wizard/           # 世界观构建向导
+├── integrations/     # Skill / MCP 注册与安全导入
+├── web/              # FastAPI Studio（studio.py）与静态页面
+└── cli/              # Click 命令行入口
+config/default.yaml   # 默认运行配置（LLM、审查、连续创作、导出、记忆）
+docs/                 # 架构（architecture/）、阶段（phases/）、审计（audit/）、StoryFlow
+spec/features/        # 功能合同与验收入口（受保护）
+scripts/              # verify_features / generate_progress / check_protected_files
+tests/                # 单元、集成、API、持久化、敌对路径测试
+projects/             # 本地运行时作品数据（不提交 Git）
 ```
 
-重要设计文档：
+## ⚙️ 配置说明
 
-- [`DESIGN.md`](DESIGN.md)：整体设计摘要。
-- [`docs/architecture/01-system-architecture.md`](docs/architecture/01-system-architecture.md)：系统边界和进程关系。
-- [`docs/architecture/04-writing-pipeline.md`](docs/architecture/04-writing-pipeline.md)：单章写作流水线。
-- [`docs/architecture/05-review-pipeline.md`](docs/architecture/05-review-pipeline.md)：审查模型和问题证据。
-- [`docs/architecture/06-revision-pipeline.md`](docs/architecture/06-revision-pipeline.md)：修订边界和作者决策。
-- [`docs/architecture/09-task-system.md`](docs/architecture/09-task-system.md)：任务状态、lease 和错误分类。
-- [`docs/architecture/10-continuous-writing.md`](docs/architecture/10-continuous-writing.md)：连续创作的父子任务设计。
-- [`docs/architecture/15-backup-recovery.md`](docs/architecture/15-backup-recovery.md)：备份与恢复规则。
-- [`CLAUDE.md`](CLAUDE.md)：工程约束、受保护验证文件和交付要求。
+### 环境变量
 
-## 开发与验证
+| 变量名 | 描述 | 示例 |
+|--------|------|------|
+| `OPENAI_API_KEY` | 主模型 API 密钥 | `sk-...` |
+| `OPENAI_BASE_URL` | 主模型基础 URL | `https://api.openai.com/v1` |
+| `NOVELFORGE_LLM_MODEL` | 主写作模型 | `gpt-4o` |
+| `NOVELFORGE_REVIEW_API_KEY` | 审查模型密钥（可选，独立路由） | `sk-...` |
+| `NOVELFORGE_REVIEW_BASE_URL` | 审查模型基础 URL（可选） | `https://api.openai.com/v1` |
+| `NOVELFORGE_REVIEW_MODEL` | 审查模型 | `gpt-4o` |
+| `NOVELFORGE_ROOT` | 项目根目录 | `/path/to/novelforge` |
 
-安装依赖后，建议在提交或 Pull Request 前运行：
+### 配置文件
+
+主要配置位于 [`config/default.yaml`](config/default.yaml)，包含 LLM 主/审查/生图模型、审查参数（`pass_score: 93`、`max_revision_rounds: 3`、`joint_review_interval: 5`）、连续创作设置、导出选项、记忆与可视化配置。
+
+Provider / Model / Agent 路由在 Studio 的 **AI 配置**页持久化到 SQLite；原始 API Key 不写回数据库，Windows 下通过用户级 DPAPI 保存，或使用 `env:` 引用。
+
+## 🧪 测试与验证
+
+### 运行测试套件
+
+```bash
+# 运行所有测试
+python -m pytest -q --tb=short
+
+# 运行特定测试
+python -m pytest tests/test_phase8_writing_pipeline.py -v
+
+# 代码风格检查
+ruff check src tests
+
+# 类型检查
+pyright src tests
+```
+
+### 验证工具
+
+```bash
+# 核心模块导入与对象烟测
+python verify.py
+
+# 功能合同验收（spec/features/*.yaml 指向的验收测试）
+python scripts/verify_features.py
+
+# 进度报告（合同结果）
+python scripts/generate_progress.py --verify
+
+# 受保护验证资产检查
+python scripts/check_protected_files.py
+```
+
+### CI / CD
+
+GitHub Actions 的 `Verification` workflow 包含三个 job：
+
+1. `protected-artifacts`：保护文件检查；
+2. `acceptance`：合同验收（`verify_features.py` + `generate_progress.py`）；
+3. `quality`：`ruff` + `pyright` + `verify.py`。
+
+> 已知基线（见 [`docs/IMPLEMENTATION_PROGRESS.md`](docs/IMPLEMENTATION_PROGRESS.md)）：测试套件数百项通过、ruff 通过、pyright 0 errors、5 个 P0 功能合同 VERIFIED；真实第三方 Provider E2E 未配置用户凭据时不会执行。
+
+## 🛠️ 开发指南
+
+### 本地开发
+
+```bash
+git clone https://github.com/2705911421/novelforge.git
+cd novelforge
+python -m pip install -r requirements.txt
+python run.py --help
+```
+
+### 提交前检查
 
 ```bash
 python -m pytest -q --tb=short
@@ -485,54 +508,177 @@ python scripts/verify_features.py
 python scripts/generate_progress.py --verify
 ```
 
-验证含义：
+如果某个命令因本地环境、模型凭据或外部服务不可用而未运行，请在 Pull Request 中明确写出原因，不要用跳过或弱化测试代替验证。
 
-- `pytest`：运行单元、集成、API、恢复和敌对路径测试。
-- `ruff`：检查运行时和测试源码风格与静态问题。
-- `pyright`：执行 Python 类型检查。
-- `verify.py`：做核心模块导入和基础对象烟测。
-- `verify_features.py`：按 `spec/features/*.yaml` 执行合同验收；只有该脚本产生的 `VERIFIED` 才有合同验证意义。
-- `generate_progress.py --verify`：根据实际合同验收生成进度结果，不接受 README 中的主观完成度。
+### 变更边界
 
-GitHub Actions 的 `Verification` workflow 会分别执行保护文件检查、合同验收和质量检查。真实第三方 Provider 的端到端调用需要有效凭据；未配置凭据时，应在交付报告中明确说明未运行该部分。
+- 不要提交 `projects/`、本地数据库、备份、日志、缓存、浏览器产物或真实凭据；
+- `spec/features/**`、`tests/acceptance/**`、`scripts/verify_features.py`、`scripts/generate_progress.py`、`scripts/check_protected_files.py` 属于**受保护验证资产**，除非验证需求本身发生变化，否则不要修改；对测试有异议时在 `docs/test-change-requests/` 提交说明；
+- 涉及 Story System、写作流水线、Review Gate、Revision、Continuous Writing、Memory/RAG 或 Backup/Restore 的改动，需要覆盖成功、失败、持久化和恢复路径；
+- 质量门禁失败或自动修订轮次耗尽时，章节必须进入 `needs_author_decision`（等待作者），不得伪装通过。
 
-## 常见问题
+详细约束见 [`CLAUDE.md`](CLAUDE.md) 与 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 
-### 任务一直是 `queued`，没有开始执行
-
-确认 worker 正在运行，并且 CLI、Studio 和 worker 使用同一个 `NOVELFORGE_ROOT`：
-
-```bash
-python run.py worker --once
-```
-
-如果单次执行能处理任务，再启动常驻 worker。不要在不同目录分别启动 API 和 worker。
-
-### 模型返回 401、403、429 或 5xx
-
-检查 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、模型名和 review route 配置。系统会把认证/配置错误、限流、provider 暂时性错误和网络错误分类保存；可重试错误应通过任务 retry 处理，不要手动重复写章节。
-
-### 想修改已经确认的 Story Bible
-
-先查看当前工作区和快照，再通过 Story Bible 的草稿流程修改。已确认内容不能被普通 AI 建议静默覆盖；需要重新发布后，后续任务才会读取新的正式版本。
-
-### 想迁移旧项目或已有数据库
-
-先执行迁移 preflight 并创建可验证备份，再确认 fingerprint 后迁移。不要直接把旧项目目录复制覆盖到新的 `projects/`。迁移和恢复规则见 [`docs/architecture/15-backup-recovery.md`](docs/architecture/15-backup-recovery.md)。
-
-### 没有模型凭据能否开发？
-
-可以运行安装检查、绝大多数本地测试、SQLite 状态流程和不依赖真实 provider 的 API 测试；真实世界观生成、章节生成、审查和 provider 探测需要有效的 OpenAI 兼容服务。
-
-## 当前边界
-
-- README 描述的是当前代码入口和设计目标，不替代功能合同或验收报告。
-- 合同验收通过不等同于所有长篇耐久性、并发规模和真实 provider 组合都经过生产验证。
-- 真实模型调用会产生费用、延迟和供应商差异；请先使用小范围任务验证配置。
-- 项目数据默认保存在本地，跨机器部署、多人协作和远程对象存储需要额外的部署与权限设计。
-
-## 设计文档与许可证
+## 📖 设计文档与许可证
 
 完整架构、阶段说明、审计和验证证据位于 [`docs/`](docs/)。功能合同位于 [`spec/features/`](spec/features/)。
 
-本项目采用 [MIT License](LICENSE)。
+重要设计文档：
+
+- [`DESIGN.md`](DESIGN.md)：整体设计摘要与对标
+- [`docs/architecture/01-system-architecture.md`](docs/architecture/01-system-architecture.md)：系统边界和进程关系
+- [`docs/architecture/04-writing-pipeline.md`](docs/architecture/04-writing-pipeline.md)：单章写作流水线
+- [`docs/architecture/05-review-pipeline.md`](docs/architecture/05-review-pipeline.md)：审查模型和问题证据
+- [`docs/architecture/06-revision-pipeline.md`](docs/architecture/06-revision-pipeline.md)：修订边界和作者决策
+- [`docs/architecture/09-task-system.md`](docs/architecture/09-task-system.md)：任务状态、lease 和错误分类
+- [`docs/architecture/10-continuous-writing.md`](docs/architecture/10-continuous-writing.md)：连续创作的父子任务设计
+- [`docs/architecture/15-backup-recovery.md`](docs/architecture/15-backup-recovery.md)：备份与恢复规则
+- [`docs/architecture/16-storyflow-canvas.md`](docs/architecture/16-storyflow-canvas.md)：StoryFlow Canvas 当前边界
+- [`CLAUDE.md`](CLAUDE.md)：工程约束、受保护验证文件和交付要求
+
+安全问题请参阅 [`SECURITY.md`](SECURITY.md)。本项目采用 [MIT License](LICENSE)。
+
+## 🤝 社区与支持
+
+- **GitHub Issues**：报告 bug 和功能请求
+- **GitHub Discussions**：社区讨论和问题解答
+- **文档**：完整项目文档位于 [`docs/`](docs/) 目录
+
+## StoryFlow AI action provenance
+
+StoryFlow analysis is now a durable, inspectable task boundary. When a
+completed `storyflow-analyze` task has a persisted `GenerationRun` and context
+manifest, the Canvas can restore the report after refresh and show a safe
+provenance summary: run/agent/provider/model metadata, whole-run usage,
+selection, context counts and source types, and persisted character-range
+coverage. Prompt bodies and credentials are intentionally not exposed, and a
+missing or mismatched manifest remains explicitly unavailable. This is a
+read-only explainability surface; analysis findings do not become Canon.
+
+The same Inspector now exposes `生成三个候选分支` only in Planning Edit mode.
+The action reuses the forecast task boundary. When launched from a restored
+analysis report, the worker validates the same-book completed analysis task and
+successful source `GenerationRun`, then carries both ids into the forecast
+manifest, Context Graph, and revisioned Candidate overlay. The bounded analysis
+result is planning input only; it does not become Canon. Candidate branches
+remain planning data until an explicit product decision and later canonical
+acceptance; provider-backed branch generation is still provider-dependent.
+
+Candidate branches can also be reforecast from Planning Edit. The action keeps
+the parent candidate set/branch/root ids in the existing SQLite planning
+overlay and GenerationRun manifest, validates the parent before the model
+gateway, and never writes StoryFact or StoryState directly. This lineage slice
+is implemented and tested; live provider execution remains configuration-
+dependent and the broader StoryFlow roadmap remains `PARTIAL`.
+
+The Candidate Branch Inspector also exposes `查看谱系`. It queries the same
+SQLite `plot_workspaces` overlay through the bounded
+`story-graph/candidates/lineage` API, follows exact parent/child identifiers,
+and renders semantic `originates_from` edges without guessing missing parents.
+The read-only result is explicitly planning-only; adopted or discarded parent
+roots remain traceable for lineage history while the active candidate decision
+list is unchanged. A full refresh reconstructs the view from SQLite rather than
+front-end state.
+
+Forecast runs now persist a safe `storyflow.forecast` context manifest for the
+selected StoryFlow nodes/edges and planning inputs. Candidate Inspector can
+read the associated GenerationRun summary by book-scoped API; prompt bodies
+and credentials remain outside the canvas surface.
+
+Context View now exposes the persisted GenerationRun inclusion record for each
+source: reason, selection role, focus/depth, planned chapter, semantic evidence,
+and the metadata-only provenance boundary. The Inspector explicitly says when
+causality was not recorded instead of inferring it from layout or prompt prose;
+the overall StoryFlow roadmap remains `PARTIAL`.
+
+StoryFlow analysis findings now preserve the selected-node provenance boundary
+(`selectionRole`, focus, depth, observed semantic edge types, and provenance
+kind) in the existing GenerationRun manifest. Evidence ids in a restored
+analysis report are clickable: they navigate through the shared Story Graph
+API to the corresponding focused projection and Inspector. This remains a
+read-only analysis artifact and does not mutate Canon; high-degree Character
+radial layout readability is still an open follow-up, so the roadmap remains
+`PARTIAL`.
+
+## StoryFlow impact explanation
+
+The History Inspector also supports `Version compare`: it reads two real
+immutable `ChapterVersion` ids, returns a deterministic text diff, includes
+attached commit summaries when available, and shows the bounded dependency
+surface that the current Story Graph records. The surface is explicitly
+`current_projection`, not a fabricated historical graph for mutable entity
+tables; when both versions have real commits, `canonicalSurface` also reads
+the acceptance-time `story_projections.payload` state and commit-linked facts,
+including superseded → accepted boundaries. When both accepted commits have a
+valid full-catalog projection snapshot, the same surface exposes a bounded
+`historicalGraph` diff and `graphReplayComplete=true`; missing capture remains
+an explicit ledger-only result. This does not version mutable source tables
+independently, and the endpoint is read-only.
+The endpoint is read-only and the product status remains `PARTIAL`.
+
+The Chapter Inspector's read-only impact action now distinguishes recorded
+Canon/Accepted facts from Planning/Candidate overlays. Each affected node is
+labelled with an `impactBoundary`, `evidenceStatus`, and deduplicated SQLite
+source evidence (`StoryFact`, `StoryCommit`, `StoryState`, or Planning). When
+the graph has no recorded source, the UI says `node_projection_only` instead of
+inferring causality from layout or prose. This is a source-backed impact
+explanation slice; the overall StoryFlow roadmap remains `PARTIAL`.
+
+Chapter Inspector 还提供只读的 `编辑影响` 报告：它从真实
+`ChapterVersion`、`StoryCommit`、`StoryState` 和语义边读取当前版本、被
+supersede 的 Canon 边界、stale 状态、后续章节与受影响事实，并明确要求
+重新提取/接受。`GET .../story-graph/chapter-impact/{id}` 不会从正文相似度、
+布局或普通连线推断未来 Canon，也不会直接写入权威表。
+
+章节的 `StoryCommit / History` 现在会为每个真实 `ChapterVersion` 提供
+`查看编辑影响`；点击旧版本会把该行的 SQLite `sourceId` 作为 `versionId`
+钉选到只读 Inspector，历史列表仍保留在报告下方，便于比较版本而不改变
+StoryFact、StoryState 或 StoryCommit。
+
+---
+
+**⭐ 如果这个项目对你有帮助，请给我们一个 Star！**
+### StoryFlow dense Character View
+
+Character View now defaults to a real SQLite-backed `presentation=clustered`
+projection for high-degree focused subgraphs. Activity Cluster cards are
+explicitly view-only aggregates: they list exact source nodes and semantic edge
+types, can be expanded into real Chapter/Event nodes, and never become Canon.
+Use `All evidence nodes` when the full bounded projection is needed. Layout
+coordinates remain UI workspace state, and saved node positions are preserved
+when the presentation projection is recalculated. Browser evidence is recorded
+under `docs/storyflow-canvas/evidence/storyflow-20260813-character-cluster-*`.
+
+### StoryFlow explicit Full Graph
+
+Full Graph is an explicit, bounded view rather than the default entry. It uses
+the same SQLite-backed Story Graph API with `limit`/`edge_limit` bounds and a
+grid layout. Dense Story and Full Graph projections can use view-only Activity
+clusters; `All evidence nodes` restores the real projected nodes. This is a
+progressive-disclosure and density boundary, not full graph virtualization.
+Evidence for the real 120-chapter fixture is recorded under
+`docs/storyflow-canvas/evidence/storyflow-20260813-full-graph-*`.
+
+## StoryFlow server-side viewport increment (2026-08-13)
+
+Full Graph remains an explicit bounded view. In All evidence mode, the existing
+Story Graph API can now accept `x_from`, `x_to`, `y_from`, `y_to`, and
+`viewport_padding` to return a stable world-coordinate viewport slice after
+layout, while preserving authoritative SQLite totals in `meta.viewport`. The
+browser uses this boundary after Canvas pan/zoom and continues native DOM
+culling. This is an incremental read seam, not a claim of GPU rendering or
+complete virtualization; the current product status remains `PARTIAL`.
+
+StoryFlow writing actions now open a structured Chapter Intent preview before
+writing a planning overlay or queueing a chapter. The preview is returned by
+the real Graph API with `save=false`; author confirmation creates a revisioned
+PLANNED node, while “生成章节” then hands the confirmed plan and optional
+guidance to the existing `write-next` runtime. This preserves the Canon
+boundary and makes the selected Flow inspectable before AI work begins.
+
+StoryFlow also includes a read-only Story Health projection. It reports long-
+unadvanced PlotThreads, unresolved Foreshadows, and inactive or never-recorded
+Characters from explicit SQLite lifecycle/appearance evidence. Clicking a
+signal focuses the real node in its type-specific view; the panel does not
+infer from prose or write Canon. Product status remains `PARTIAL` while the
+broader Context/Planning/AI roadmap continues.

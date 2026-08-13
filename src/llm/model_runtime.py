@@ -695,6 +695,131 @@ class PersistentModelRuntime:
         finally:
             self._task_id.reset(token)
 
+    @staticmethod
+    def _build_prompt_layout(
+        effective_system: str,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]]:
+        """Build the exact persisted prompt and its character-level segments."""
+        parts: list[str] = [f"[system]\n{effective_system}" if effective_system else ""]
+        specs: list[tuple[str, Optional[int], str, str]] = []
+        if effective_system:
+            specs.append(("system", None, "system", effective_system))
+        for index, message in enumerate(messages):
+            role = str(message.get("role", "message"))
+            content = str(message.get("content", ""))
+            parts.append(f"[{role}]\n{content}")
+            specs.append((f"message:{index}", index, role, content))
+
+        raw_prompt = "\n\n".join(parts)
+        prompt = raw_prompt.strip()
+        left_trim = len(raw_prompt) - len(raw_prompt.lstrip())
+        segments: list[dict[str, Any]] = []
+        cursor = 0
+        spec_index = 0
+        for part_index, part in enumerate(parts):
+            if part_index:
+                cursor += 2
+            if spec_index < len(specs):
+                segment_id, message_index, role, content = specs[spec_index]
+                marker = f"[{role}]\n"
+                if part.startswith(marker):
+                    content_start = max(0, cursor + len(marker) - left_trim)
+                    content_end = min(len(prompt), content_start + len(content))
+                    segments.append({
+                        "id": segment_id,
+                        "role": role,
+                        "messageIndex": message_index,
+                        "markerStart": max(0, cursor - left_trim),
+                        "markerEnd": max(0, cursor + len(marker) - left_trim),
+                        "contentStart": content_start,
+                        "contentEnd": content_end,
+                        "binding": "exact_persisted_prompt",
+                    })
+                    spec_index += 1
+            cursor += len(part)
+
+        return prompt, {
+            "scope": "persisted_generation_input",
+            "binding": "exact_persisted_prompt",
+            "charCount": len(prompt),
+            "segments": segments,
+        }
+
+    @staticmethod
+    def _bind_context_manifest_to_prompt_layout(
+        manifest: dict[str, Any],
+        prompt_layout: dict[str, Any],
+    ) -> None:
+        """Rebase pipeline ranges from the user message into persisted input."""
+        segments = prompt_layout.get("segments")
+        if not isinstance(segments, list):
+            return
+        message_segments = {
+            int(segment["messageIndex"]): segment
+            for segment in segments
+            if isinstance(segment, dict) and segment.get("messageIndex") is not None
+        }
+
+        def rebase(value: dict[str, Any]) -> None:
+            source_range = value.get("promptRange")
+            if not isinstance(source_range, dict) or source_range.get("scope") != "writer_user_message":
+                return
+            try:
+                start = int(source_range["start"])
+                end = int(source_range["end"])
+            except (KeyError, TypeError, ValueError):
+                value["persistedPromptRangeStatus"] = "invalid"
+                return
+            message_index = int(source_range.get("messageIndex", 0))
+            segment = message_segments.get(message_index)
+            if segment is None:
+                value["persistedPromptRangeStatus"] = "message_not_found"
+                return
+            message_start = int(segment["contentStart"])
+            message_end = int(segment["contentEnd"])
+            if start < 0 or end < start or end > message_end - message_start:
+                value["persistedPromptRangeStatus"] = "outside_message"
+                return
+            value["persistedPromptRange"] = {
+                "scope": "persisted_generation_input",
+                "messageIndex": message_index,
+                "start": message_start + start,
+                "end": message_start + end,
+                "precision": source_range.get("precision", "exact"),
+            }
+            value["persistedPromptRangeStatus"] = "exact"
+
+        for collection_name in ("items", "contextSections"):
+            collection = manifest.get(collection_name)
+            if isinstance(collection, list):
+                for item in collection:
+                    if isinstance(item, dict):
+                        rebase(item)
+        writer_input = manifest.get("writerInput")
+        if isinstance(writer_input, dict):
+            components = writer_input.get("components")
+            if isinstance(components, list):
+                for component in components:
+                    if isinstance(component, dict):
+                        rebase(component)
+        prompt_components = manifest.get("promptComponents")
+        if isinstance(prompt_components, list):
+            for component in prompt_components:
+                if isinstance(component, dict):
+                    rebase(component)
+
+        binding = manifest.get("promptBinding")
+        if isinstance(binding, dict):
+            binding["persistedScope"] = "input_reference.prompt"
+            binding["persistedLayout"] = "input_reference.promptLayout"
+            binding["messageIndex"] = 0
+            binding["persistedAvailable"] = any(
+                isinstance(item, dict) and item.get("persistedPromptRangeStatus") == "exact"
+                for collection_name in ("items", "contextSections")
+                for item in (manifest.get(collection_name) or [])
+            )
+
     def invoke(self, role: str, messages: list[dict[str, Any]], system: str = "", *, json_mode: bool = False,
                provider_id: Optional[str] = None, **kwargs: Any) -> LLMResponse:
         task_id = self._task_id.get()
@@ -714,6 +839,10 @@ class PersistentModelRuntime:
             configured_version = int(resolved.get("route_system_prompt_version") or 0)
             prompt_version = str(configured_version) if configured_version else "builtin-1"
         prompt_sha256 = hashlib.sha256(effective_system.encode("utf-8")).hexdigest()
+        persisted_prompt, prompt_layout = self._build_prompt_layout(effective_system, messages)
+        runtime_context_manifest = deepcopy(context_manifest) if isinstance(context_manifest, dict) else None
+        if runtime_context_manifest is not None:
+            self._bind_context_manifest_to_prompt_layout(runtime_context_manifest, prompt_layout)
         run_id = self.repository.create_run(
             task_id=task_id, role=role, resolved=resolved,
             prompt_key=prompt_key, prompt_version=prompt_version,
@@ -722,25 +851,19 @@ class PersistentModelRuntime:
                 # Studio task detail view must show the exact model input.
                 "system_prompt": effective_system,
                 "messages": messages,
-                "prompt": "\n\n".join(
-                    [
-                        f"[system]\n{effective_system}" if effective_system else "",
-                        *[
-                            f"[{message.get('role', 'message')}]\n{message.get('content', '')}"
-                            for message in messages
-                        ],
-                    ]
-                ).strip(),
+                "prompt": persisted_prompt,
+                "promptLayout": prompt_layout,
                 "message_count": len(messages),
                 "system_chars": len(effective_system),
                 "message_chars": sum(len(str(message.get("content", ""))) for message in messages),
                 "prompt_sha256": prompt_sha256,
+                "persisted_prompt_sha256": hashlib.sha256(persisted_prompt.encode("utf-8")).hexdigest(),
                 "prompt_source": "agent-contract+route-override",
-                "context_manifest": deepcopy(context_manifest) if isinstance(context_manifest, dict) else None,
+                "context_manifest": runtime_context_manifest,
             },
         )
-        if isinstance(context_manifest, dict):
-            self.repository.attach_context_manifest(run_id, context_manifest)
+        if runtime_context_manifest is not None:
+            self.repository.attach_context_manifest(run_id, runtime_context_manifest)
         try:
             secret = self.repository.credentials.resolve(resolved.get("credential_ref"))
         except CredentialError as exc:

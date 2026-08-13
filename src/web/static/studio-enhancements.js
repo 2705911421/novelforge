@@ -1303,20 +1303,39 @@
     refreshTimer = window.setTimeout(() => render(), 300);
   });
 
-  // Make the existing visualization entry point advertise the interactive
-  // projection without removing the generated HTML export.
-  const originalMindmap = PAGES.mindmap;
-  PAGES.mindmap = async (p) => {
-    await originalMindmap(p);
-    const actions = p.querySelector('.header .row');
-    if (actions && !actions.querySelector('[data-flow-link]')) {
-      const button = document.createElement('button');
-      button.className = 'btn btn-secondary';
-      button.dataset.flowLink = '1';
-      button.textContent = '打开交互式关系图';
-      button.onclick = () => go('flow');
-      actions.appendChild(button);
-    }
+  // Visualization entries are compatibility aliases for the unified
+  // StoryFlow projection. Keep the old renderers addressable for deep links
+  // and local recovery, but make normal navigation answer the same graph
+  // questions through one Canvas controller.
+  const legacyStoryFlowPages = {};
+  const storyFlowAliases = {
+    mindmap: 'story',
+    flow: 'story',
+    timeline: 'timeline',
+    plot: 'story',
+    'world-map': 'world',
+    foreshadowing: 'foreshadow',
+    characters: 'character',
+  };
+  Object.entries(storyFlowAliases).forEach(([pageName, view]) => {
+    const legacyPage = PAGES[pageName];
+    if (typeof legacyPage !== 'function') return;
+    legacyStoryFlowPages[pageName] = legacyPage;
+    PAGES[`legacy-${pageName}`] = legacyPage;
+    PAGES[pageName] = async (page) => {
+      if (typeof window.openStoryFlowView === 'function') {
+        window.openStoryFlowView(view);
+        return;
+      }
+      // The base page can render once before the lazy StoryFlow asset arrives.
+      // Preserve a truthful fallback instead of leaving a blank page.
+      await legacyPage(page);
+    };
+  });
+  window.renderLegacyStoryFlowPage = async function (pageName, page = document.getElementById('page')) {
+    const legacyPage = legacyStoryFlowPages[pageName];
+    if (!legacyPage || !page) throw new Error(`legacy visualization page not found: ${pageName}`);
+    await legacyPage(page);
   };
 
   // ========== User-managed Agent extensions ==========

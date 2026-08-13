@@ -565,6 +565,28 @@ class StoryRepository:
         # locked database and fail without leaving durable metadata.
         assert backup_target is not None
         try:
+            # Story Graph is a rebuildable read model.  Capture it after the
+            # authoritative transaction commits so History has a durable
+            # observed projection boundary even when nobody had StoryFlow
+            # open during the write.  A projection-cache failure must never
+            # roll back an already accepted Canon commit; the failure is
+            # returned explicitly for callers and logged for recovery.
+            from src.story_graph.service import StoryGraphProjector
+
+            result["graph_snapshot"] = StoryGraphProjector(self.db).capture_accepted_commit_snapshot(
+                result["book_id"], commit_id
+            )
+        except Exception as exc:
+            logger.exception("Story Graph snapshot capture failed after StoryCommit %s", commit_id)
+            result["graph_snapshot"] = {
+                "captured": False,
+                "bookId": result["book_id"],
+                "commitId": commit_id,
+                "historicalScope": "observed_projection",
+                "canonicalSource": "sqlite",
+                "error": str(exc),
+            }
+        try:
             from .backup import BackupManager
             backup = BackupManager(self.db, self.workspace_root).auto_backup_after_commit(*backup_target)
             result["backup"] = {

@@ -66,13 +66,26 @@ def test_studio_parity_surfaces_are_real_and_persisted(tmp_path, monkeypatch):
 
         forecast = client.post(
             f"/api/v1/books/{project.id}/forecast",
-            json={"branchCount": 2, "currentChapter": 0, "depth": 3, "context": "keep the secret"},
+            json={
+                "branchCount": 2,
+                "currentChapter": 0,
+                "depth": 3,
+                "context": "keep the secret",
+                "sourceAnalysisTaskId": "analysis-task-provenance",
+                "sourceCandidateSetId": "forecast:parent-task",
+                "sourceCandidateBranchId": "candidate-branch:parent",
+                "sourceCandidateRootNodeId": "forecast:parent-root",
+            },
         )
         assert forecast.status_code == 200
         forecast_task = runtime.get(forecast.json()["taskId"])
         assert forecast_task is not None
         assert forecast_task["type"] == "forecast"
         assert forecast_task["data"]["branch_count"] == 2
+        assert forecast_task["data"]["source_analysis_task_id"] == "analysis-task-provenance"
+        assert forecast_task["data"]["source_candidate_set_id"] == "forecast:parent-task"
+        assert forecast_task["data"]["source_candidate_branch_id"] == "candidate-branch:parent"
+        assert forecast_task["data"]["source_candidate_root_node_id"] == "forecast:parent-root"
 
         assert client.get("/api/v1/logs").status_code == 200
         assert client.get("/api/v1/daemon").json()["running"] is False

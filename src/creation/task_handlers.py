@@ -1081,6 +1081,10 @@ class LegacyTaskHandlers:
         depth = min(max(self._positive_int(data.get("depth"), 3), 1), 12)
         context = self._text(data.get("context"))
         node_id = self._text(data.get("node_id")).strip()
+        source_analysis_task_id = self._text(data.get("source_analysis_task_id")).strip()
+        source_candidate_set_id = self._text(data.get("source_candidate_set_id")).strip()
+        source_candidate_branch_id = self._text(data.get("source_candidate_branch_id")).strip()
+        source_candidate_root_node_id = self._text(data.get("source_candidate_root_node_id")).strip()
         selected_node_ids = [
             str(item).strip()
             for item in (data.get("node_ids") or [])
@@ -1110,6 +1114,87 @@ class LegacyTaskHandlers:
                 }
             except PlotWorkspaceError:
                 canvas_graph = {}
+        source_candidate_context: Optional[dict[str, Any]] = None
+        if any((source_candidate_set_id, source_candidate_branch_id, source_candidate_root_node_id)):
+            if not all((source_candidate_set_id, source_candidate_branch_id, source_candidate_root_node_id)):
+                raise ValueError(
+                    "candidate reforecast requires sourceCandidateSetId, "
+                    "sourceCandidateBranchId, and sourceCandidateRootNodeId"
+                )
+            if not isinstance(task.get("book_id"), str) or not task.get("book_id"):
+                raise ValueError("candidate reforecast has no authoritative book id")
+            try:
+                planning_graph, _ = PlotWorkspaceRepository(
+                    self.project_manager.story_repository.db
+                ).load(task["book_id"])
+            except PlotWorkspaceError as exc:
+                raise ValueError("candidate reforecast source planning graph is unavailable") from exc
+            source_candidate_root = next(
+                (
+                    item for item in planning_graph.get("nodes", [])
+                    if isinstance(item, dict) and str(item.get("id") or "") == source_candidate_root_node_id
+                ),
+                None,
+            )
+            root_metadata = source_candidate_root.get("metadata") if isinstance(source_candidate_root, dict) else None
+            root_metadata = root_metadata if isinstance(root_metadata, dict) else {}
+            if not source_candidate_root or root_metadata.get("candidateBranchId") != source_candidate_branch_id:
+                raise ValueError(
+                    f"candidate reforecast source branch root not found: {source_candidate_root_node_id}"
+                )
+            if root_metadata.get("candidateSetId") != source_candidate_set_id:
+                raise ValueError(
+                    "candidate reforecast source root does not belong to the requested candidate set"
+                )
+            parent_status = (
+                self._text(
+                    source_candidate_root.get("status")
+                    or root_metadata.get("candidateBranchStatus")
+                )
+                or "CANDIDATE"
+            ).upper()
+            if parent_status in {"SUPERSEDED", "STALE", "CONFLICT"}:
+                raise ValueError(
+                    f"candidate reforecast source branch is not active: {parent_status}"
+                )
+            source_analysis_task_id = source_analysis_task_id or self._text(
+                root_metadata.get("sourceAnalysisTaskId")
+            ).strip()
+            parent_nodes = [
+                item for item in planning_graph.get("nodes", [])
+                if isinstance(item, dict)
+                and (item.get("metadata") or {}).get("candidateBranchId") == source_candidate_branch_id
+            ]
+            parent_steps = sorted(
+                (
+                    item for item in parent_nodes
+                    if (item.get("metadata") or {}).get("branchRootId") == source_candidate_root_node_id
+                ),
+                key=lambda item: (
+                    self._positive_int((item.get("metadata") or {}).get("step"), 10**6),
+                    self._text(item.get("id")),
+                ),
+            )
+            source_candidate_context = {
+                "candidateSetId": source_candidate_set_id,
+                "candidateBranchId": source_candidate_branch_id,
+                "candidateRootNodeId": source_candidate_root_node_id,
+                "title": self._text(source_candidate_root.get("title") or source_candidate_root.get("label")),
+                "summary": self._text(source_candidate_root.get("summary") or source_candidate_root.get("description"))[:4000],
+                "status": parent_status,
+                "plotPoints": [
+                    self._text(item.get("title") or item.get("label"))[:800]
+                    for item in parent_steps[:24]
+                    if self._text(item.get("title") or item.get("label"))
+                ],
+                "score": root_metadata.get("score"),
+                "risks": self._string_list(root_metadata.get("risks"))[:24],
+                "sourceTaskId": self._text(root_metadata.get("sourceTaskId")) or None,
+                "generationRunId": self._text(root_metadata.get("generationRunId")) or None,
+            }
+            if source_candidate_root_node_id not in selected_node_ids:
+                selected_node_ids.insert(0, source_candidate_root_node_id)
+            node_id = source_candidate_root_node_id
         if node_id and isinstance(task.get("book_id"), str):
             try:
                 canvas_context = PlotWorkspaceRepository(
@@ -1147,6 +1232,55 @@ class LegacyTaskHandlers:
                 "edges": list(selected_edges.values()),
                 "source": "sqlite.story_graph_projection",
             }
+        source_analysis_run_id: Optional[str] = None
+        source_analysis_context: Optional[dict[str, Any]] = None
+        if source_analysis_task_id:
+            analysis_row = self.project_manager.story_repository.db.fetchone(
+                "SELECT id, type, status, book_id FROM tasks WHERE id=?",
+                (source_analysis_task_id,),
+            )
+            if not analysis_row or str(analysis_row.get("book_id") or "") != str(task.get("book_id") or ""):
+                raise ValueError(
+                    f"forecast source analysis task not found for this book: {source_analysis_task_id}"
+                )
+            if analysis_row.get("type") != "storyflow-analyze":
+                raise ValueError(
+                    f"forecast source task is not a StoryFlow analysis: {source_analysis_task_id}"
+                )
+            if analysis_row.get("status") != "completed":
+                raise ValueError(
+                    f"forecast source analysis task is not completed: {source_analysis_task_id}"
+                )
+            source_analysis_run_id = self._latest_generation_run_id(source_analysis_task_id)
+            if not source_analysis_run_id:
+                raise ValueError(
+                    f"forecast source analysis has no successful GenerationRun: {source_analysis_task_id}"
+                )
+            analysis_task = self.runtime.get(source_analysis_task_id) or {}
+            raw_analysis_result = analysis_task.get("result")
+            if isinstance(raw_analysis_result, dict):
+                source_analysis_context = {
+                    "summary": self._text(raw_analysis_result.get("summary"))[:4000],
+                    "findings": [
+                        {
+                            "kind": self._text(item.get("kind"))[:120],
+                            "severity": self._text(item.get("severity"))[:40],
+                            "message": self._text(item.get("message"))[:1000],
+                            "evidenceNodeIds": [
+                                str(node_id)
+                                for node_id in (item.get("evidenceNodeIds") or [])
+                                if str(node_id).strip()
+                            ][:24],
+                        }
+                        for item in (raw_analysis_result.get("findings") or [])
+                        if isinstance(item, dict) and self._text(item.get("message"))
+                    ][:24],
+                    "nextSteps": [
+                        self._text(item)[:500]
+                        for item in (raw_analysis_result.get("nextSteps") or [])
+                        if self._text(item)
+                    ][:24],
+                }
         recent = []
         for number, chapter in sorted(project.chapters.items(), reverse=True)[:5]:
             recent.append({
@@ -1156,6 +1290,188 @@ class LegacyTaskHandlers:
                 "key_events": chapter.key_events,
             })
         world = getattr(project, "world", None)
+        forecast_manifest_items: list[dict[str, Any]] = []
+        forecast_manifest_keys: set[tuple[str, str]] = set()
+
+        def add_forecast_manifest_item(
+            source_type: str,
+            source_id: Any,
+            label: Any,
+            content: Any,
+            reason: str,
+            *,
+            metadata: Optional[dict[str, Any]] = None,
+        ) -> None:
+            normalized_id = self._text(source_id).strip()
+            if not normalized_id:
+                return
+            key = (source_type, normalized_id)
+            if key in forecast_manifest_keys:
+                return
+            forecast_manifest_keys.add(key)
+            item: dict[str, Any] = {
+                "sourceType": source_type,
+                "sourceId": normalized_id,
+                "label": self._text(label) or normalized_id,
+                "included": True,
+                "contentChars": len(str(content or "")),
+                "reason": reason,
+            }
+            if isinstance(metadata, dict) and metadata:
+                item["metadata"] = metadata
+            forecast_manifest_items.append(item)
+
+        for node in selected_story_graph.get("nodes", []):
+            if isinstance(node, dict):
+                add_forecast_manifest_item(
+                    "story_graph_node",
+                    node.get("id"),
+                    node.get("title"),
+                    node.get("summary") or node.get("title"),
+                    "author-selected StoryFlow forecast input",
+                    metadata={"nodeType": node.get("type")},
+                )
+        for edge in selected_story_graph.get("edges", []):
+            if isinstance(edge, dict):
+                add_forecast_manifest_item(
+                    "story_graph_edge",
+                    edge.get("id"),
+                    edge.get("label") or edge.get("type"),
+                    edge.get("label") or edge.get("type"),
+                    "semantic edge adjacent to the selected StoryFlow input",
+                    metadata={"edgeType": edge.get("type") or edge.get("kind")},
+                )
+        canvas_node = canvas_context.get("node")
+        if isinstance(canvas_node, dict):
+            add_forecast_manifest_item(
+                "plot_workspace_node",
+                canvas_node.get("id"),
+                canvas_node.get("title") or canvas_node.get("label"),
+                canvas_node.get("summary") or canvas_node.get("description"),
+                "selected planning canvas node included in forecast input",
+                metadata={"table": "plot_workspaces", "bookId": task.get("book_id")},
+            )
+        for neighbor in canvas_context.get("neighbors", []):
+            if isinstance(neighbor, dict):
+                raw_neighbor_node = neighbor.get("node")
+                neighbor_node = raw_neighbor_node if isinstance(raw_neighbor_node, dict) else neighbor
+                add_forecast_manifest_item(
+                    "plot_workspace_node",
+                    neighbor_node.get("id"),
+                    neighbor_node.get("title") or neighbor_node.get("label"),
+                    neighbor_node.get("summary") or neighbor_node.get("description"),
+                    "adjacent planning canvas node included in forecast input",
+                    metadata={"table": "plot_workspaces", "bookId": task.get("book_id")},
+                )
+        if canvas_graph.get("nodes") or canvas_graph.get("edges"):
+            add_forecast_manifest_item(
+                "plot_workspace_graph",
+                f"book:{task.get('book_id')}",
+                "Visible StoryFlow planning canvas",
+                json.dumps(canvas_graph, ensure_ascii=False),
+                "visible planning canvas serialized into forecast input",
+                metadata={"table": "plot_workspaces", "bookId": task.get("book_id")},
+            )
+        database = self.project_manager.story_repository.db
+        for recent_item in recent:
+            if not isinstance(recent_item, dict):
+                continue
+            row = database.fetchone(
+                "SELECT id FROM chapters WHERE book_id=? AND number=?",
+                (task.get("book_id"), recent_item.get("chapter")),
+            )
+            if row:
+                add_forecast_manifest_item(
+                    "chapter",
+                    row.get("id"),
+                    f"第{recent_item.get('chapter')}章 {recent_item.get('title') or ''}",
+                    recent_item,
+                    "recent chapter included in forecast input",
+                    metadata={"chapterNumber": recent_item.get("chapter"), "table": "chapters"},
+                )
+        for foreshadow in project.get_open_foreshadowing():
+            raw_foreshadow = getattr(foreshadow, "__dict__", {})
+            if not isinstance(raw_foreshadow, dict):
+                continue
+            add_forecast_manifest_item(
+                "foreshadow",
+                raw_foreshadow.get("id"),
+                raw_foreshadow.get("title") or raw_foreshadow.get("name"),
+                raw_foreshadow,
+                "open foreshadowing included in forecast input",
+                metadata={"table": "foreshadows"},
+            )
+        if world is not None:
+            add_forecast_manifest_item(
+                "world_state",
+                f"project:{project.id}",
+                project.name,
+                getattr(world, "__dict__", world),
+                "authoritative project world state included in forecast input",
+                metadata={"table": "projects", "projectId": project.id},
+            )
+        if context:
+            add_forecast_manifest_item(
+                "author_guidance",
+                f"task:{task['id']}",
+                "Author forecast guidance",
+                context,
+                "author-provided forecast guidance",
+                metadata={"table": "tasks", "taskId": task["id"]},
+            )
+        if source_analysis_task_id:
+            add_forecast_manifest_item(
+                "storyflow_analysis",
+                source_analysis_task_id,
+                "Prior StoryFlow analysis",
+                "",
+                "forecast generated from a completed StoryFlow analysis task",
+                metadata={
+                    "table": "tasks",
+                    "taskId": source_analysis_task_id,
+                    "generationRunId": source_analysis_run_id,
+                    "relation": "derived_from",
+                },
+            )
+        if source_candidate_context:
+            add_forecast_manifest_item(
+                "candidate_branch",
+                source_candidate_root_node_id,
+                source_candidate_context.get("title") or "Parent candidate branch",
+                source_candidate_context,
+                "forecast derived from an existing planning candidate branch",
+                metadata={
+                    "candidateSetId": source_candidate_set_id,
+                    "candidateBranchId": source_candidate_branch_id,
+                    "candidateRootNodeId": source_candidate_root_node_id,
+                    "relation": "derived_from",
+                    "planningOnly": True,
+                },
+            )
+        forecast_context_manifest = {
+            "schemaVersion": 1,
+            "source": "storyflow.forecast",
+            "projectId": task.get("project_id") or project.id,
+            "bookId": task.get("book_id"),
+            "taskId": task.get("id"),
+            "chapterNumber": current_chapter,
+            "sourceAnalysisTaskId": source_analysis_task_id or None,
+            "sourceAnalysisGenerationRunId": source_analysis_run_id,
+            "sourceCandidateSetId": source_candidate_set_id or None,
+            "sourceCandidateBranchId": source_candidate_branch_id or None,
+            "sourceCandidateRootNodeId": source_candidate_root_node_id or None,
+            # The task is the authoritative identity boundary for one set of
+            # alternatives.  The Canvas consumes this id; it must not invent
+            # a different grouping key after the model result returns.
+            "candidateSetId": f"forecast:{task['id']}",
+            "selectionNodeIds": selected_node_ids,
+            "canvasRevision": canvas_context.get("revision", actual_canvas_revision),
+            "items": forecast_manifest_items,
+        }
+        self._attach_context_graph_snapshot(
+            forecast_context_manifest,
+            focus_node_id=node_id or (selected_node_ids[0] if selected_node_ids else None),
+        )
         prompt = {
             "book": project.name,
             "genre": project.genre,
@@ -1171,6 +1487,8 @@ class LegacyTaskHandlers:
             ],
             "recent_chapters": recent,
             "guidance": context,
+            "prior_storyflow_analysis": source_analysis_context,
+            "prior_candidate_branch": source_candidate_context,
             "plot_canvas": {
                 "selected_node": canvas_context.get("node"),
                 "neighbors": canvas_context.get("neighbors", []),
@@ -1189,6 +1507,10 @@ class LegacyTaskHandlers:
             "如果提供了 plot_canvas.selected_node，必须把它视为作者当前选中的剧情节点，"
             "说明后续变化如何从该节点及其邻接事实自然推出；plot_canvas.graph 是作者调整后的预测画布，"
             "只用于本次推演，绝不能写入 Story Bible、章节参考或既有章节正文。"
+            "如果提供了 prior_storyflow_analysis，只能把它当作已持久化的分析建议和证据索引，"
+            "不得把分析报告本身伪装成 Canon 事实。"
+            "如果提供了 prior_candidate_branch，只能把它当作作者已经选中的规划候选及其步骤，"
+            "新分支必须视为该规划候选的后续推演，不得把候选内容伪装成已发生的 Canon。"
         )
         self.runtime.checkpoint(
             task["id"], "forecast", {"current_chapter": current_chapter, "depth": depth}
@@ -1197,6 +1519,7 @@ class LegacyTaskHandlers:
             [{"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}],
             system=system,
             task_type="forecast",
+            context_manifest=forecast_context_manifest,
             max_tokens=5000,
         )
         payload = self._parse_json_response(response.content)
@@ -1221,14 +1544,101 @@ class LegacyTaskHandlers:
                 f"forecast model returned {len(normalized)} branches; {branch_count} required"
             )
         self.runtime.checkpoint(task["id"], "forecast-complete", {"branches": len(normalized)})
+        generation_run_id = self._latest_generation_run_id(task["id"])
+        candidate_set_id = f"forecast:{task['id']}"
+        source_node_id = node_id or (selected_node_ids[0] if selected_node_ids else "")
+        enriched_branches = [
+            {
+                **branch,
+                "candidateSetId": candidate_set_id,
+                "sourceTaskId": task["id"],
+                "generationRunId": generation_run_id,
+                "sourceAnalysisTaskId": source_analysis_task_id or None,
+                "sourceAnalysisGenerationRunId": source_analysis_run_id,
+                "sourceCandidateSetId": source_candidate_set_id or None,
+                "sourceCandidateBranchId": source_candidate_branch_id or None,
+                "sourceCandidateRootNodeId": source_candidate_root_node_id or None,
+                "branchIndex": index,
+                "branchCount": len(normalized),
+            }
+            for index, branch in enumerate(normalized, start=1)
+        ]
+
+        # Forecast is a StoryFlow action, not merely a task report.  Persist
+        # the planning-only candidate overlay from the worker so the result is
+        # still visible when the browser closes before polling completes.  It
+        # uses the current workspace revision rather than the revision sent by
+        # the browser: the forecast may run for minutes, and a concurrent
+        # author layout/planning edit must not turn a successful model result
+        # into a stale-write failure.  Canonical StoryFact/StoryState/Commit
+        # tables are never touched by this import.
+        candidate_import: dict[str, Any] = {
+            "status": "skipped",
+            "candidateSetId": candidate_set_id,
+            "sourceTaskId": task["id"],
+            "generationRunId": generation_run_id,
+            "sourceNodeId": source_node_id or None,
+            "reason": "forecast task has no authoritative book id",
+        }
+        authoritative_book_id = task.get("book_id")
+        project_id = task.get("project_id") or project.id
+        if isinstance(authoritative_book_id, str) and authoritative_book_id:
+            try:
+                workspace = PlotWorkspaceRepository(self.project_manager.story_repository.db)
+                graph, applied_revision, candidate_set, imported = workspace.apply_candidate_set_with_audit(
+                    authoritative_book_id,
+                    project_id,
+                    enriched_branches,
+                    source_node_id,
+                    expected_revision=None,
+                )
+                candidate_import = {
+                    "status": "completed",
+                    "atomic": True,
+                    "candidateSetId": candidate_set_id,
+                    "sourceTaskId": task["id"],
+                    "generationRunId": generation_run_id,
+                    "sourceNodeId": source_node_id or None,
+                    "revision": applied_revision,
+                    "createdBranchCount": candidate_set.get("createdBranchCount", 0),
+                    "branchCount": candidate_set.get("branchCount", len(enriched_branches)),
+                    "forecastImportCount": len(imported),
+                    "canonicalMutation": False,
+                    "planningNodeCount": len(graph.get("nodes", [])),
+                }
+            except PlotWorkspaceError as exc:
+                # Keep the successful model result durable and expose the
+                # planning import failure explicitly.  The Canvas can retry
+                # the same task-scoped candidateSetId through its idempotent
+                # import endpoint after the author resolves the workspace
+                # problem.
+                candidate_import = {
+                    "status": "failed",
+                    "atomic": True,
+                    "candidateSetId": candidate_set_id,
+                    "sourceTaskId": task["id"],
+                    "generationRunId": generation_run_id,
+                    "sourceNodeId": source_node_id or None,
+                    "error": str(exc),
+                    "retryable": True,
+                    "canonicalMutation": False,
+                }
         return {
-            "branches": normalized,
+            "branches": enriched_branches,
             "currentChapter": current_chapter,
             "depth": depth,
             "guidance": context,
             "sourceNodeId": node_id,
             "sourceNodeIds": selected_node_ids,
             "canvasRevision": canvas_context.get("revision", actual_canvas_revision),
+            "generationRunId": generation_run_id,
+            "candidateSetId": candidate_set_id,
+            "sourceAnalysisTaskId": source_analysis_task_id or None,
+            "sourceAnalysisGenerationRunId": source_analysis_run_id,
+            "sourceCandidateSetId": source_candidate_set_id or None,
+            "sourceCandidateBranchId": source_candidate_branch_id or None,
+            "sourceCandidateRootNodeId": source_candidate_root_node_id or None,
+            "candidateImport": candidate_import,
         }
 
     def storyflow_analyze(self, task: dict[str, Any]) -> dict[str, Any]:
@@ -1269,6 +1679,7 @@ class LegacyTaskHandlers:
         projector = StoryGraphProjector(self.project_manager.story_repository.db)
         nodes: list[dict[str, Any]] = []
         edges: dict[str, dict[str, Any]] = {}
+        selection_edge_types: dict[str, set[str]] = {node_id: set() for node_id in selected_node_ids}
         for node_id in selected_node_ids:
             try:
                 detail = projector.node_detail(book_id, node_id)
@@ -1279,7 +1690,14 @@ class LegacyTaskHandlers:
                 edge = neighbor.get("edge")
                 if isinstance(edge, dict) and edge.get("id"):
                     edges[str(edge["id"])] = edge
+                    edge_type = str(edge.get("type") or "").strip()
+                    if edge_type:
+                        for endpoint in (edge.get("source"), edge.get("target")):
+                            endpoint_id = str(endpoint or "").strip()
+                            if endpoint_id in selection_edge_types:
+                                selection_edge_types[endpoint_id].add(edge_type)
         selection = {"nodes": nodes, "edges": list(edges.values()), "source": "sqlite.story_graph_projection"}
+        focus_node_id = selected_node_ids[0]
         self.runtime.checkpoint(
             task["id"],
             "storyflow-selection",
@@ -1317,11 +1735,21 @@ class LegacyTaskHandlers:
                     "included": True,
                     "contentChars": len(str(node.get("summary") or "")),
                     "reason": "author-selected StoryFlow analysis input",
+                    "selectionRole": "analysisSelection",
+                    "focusNodeId": focus_node_id,
+                    "depth": 0,
+                    "edgeTypes": sorted(selection_edge_types.get(str(node.get("id") or ""), set())),
+                    "provenanceKind": "author_selected_storyflow_analysis",
                 }
                 for node in nodes
             ],
             "selectionNodeIds": selected_node_ids,
+            "focusNodeId": focus_node_id,
         }
+        self._attach_context_graph_snapshot(
+            context_manifest,
+            focus_node_id=focus_node_id,
+        )
         self.runtime.checkpoint(task["id"], "storyflow-model-call", {"node_count": len(nodes)})
         response = self.model_manager.chat(
             [{"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)}],
@@ -1363,6 +1791,7 @@ class LegacyTaskHandlers:
             "summary": str(payload.get("summary") or ""),
             "findings": normalized_findings,
             "nextSteps": [str(item) for item in (payload.get("nextSteps") or []) if item is not None],
+            "generationRunId": self._latest_generation_run_id(task["id"]),
         }
         self.runtime.checkpoint(task["id"], "storyflow-model-call", {"finding_count": len(normalized_findings)})
         return result
@@ -1654,6 +2083,38 @@ class LegacyTaskHandlers:
     @staticmethod
     def _text(value: Any) -> str:
         return value if isinstance(value, str) else ""
+
+    def _latest_generation_run_id(self, task_id: str) -> Optional[str]:
+        """Link a successful model result to its durable GenerationRun."""
+        row = self.project_manager.story_repository.db.fetchone(
+            """SELECT id FROM generation_runs
+                WHERE task_id=? AND status='succeeded'
+                ORDER BY completed_at DESC, started_at DESC, id DESC
+                LIMIT 1""",
+            (task_id,),
+        )
+        return str(row["id"]) if row and row.get("id") else None
+
+    @staticmethod
+    def _attach_context_graph_snapshot(
+        manifest: dict[str, Any],
+        *,
+        focus_node_id: Optional[str] = None,
+    ) -> None:
+        """Attach the shared metadata-only Context Graph read model.
+
+        Forecast and StoryFlow analysis use the same GenerationRun manifest
+        seam as Writer.  Importing the builder lazily keeps this compatibility
+        adapter independent from the writing pipeline at module import time;
+        the snapshot itself contains labels, ids, and provenance only, never
+        prompt prose or canonical facts.
+        """
+        from src.pipeline.writing_pipeline import WritingPipeline
+
+        manifest["contextGraphSnapshot"] = WritingPipeline._build_context_graph_snapshot(
+            manifest,
+            focus_node_id=focus_node_id,
+        )
 
     @staticmethod
     def _parse_json_response(content: str) -> Any:
