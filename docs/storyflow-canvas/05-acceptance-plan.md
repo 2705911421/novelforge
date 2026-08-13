@@ -425,20 +425,6 @@ runs without a snapshot say unavailable, long hashes wrap inside the Inspector,
 and headed browser evidence passes at 1920x1080 and 1366x768 with zero console
 errors/warnings.
 
-84. Open a real SQLite StoryFlow fixture with explicit lifecycle and character
-appearance evidence. Verify `GET .../story-graph/health` returns only the
-requested supported types, clamps `chapterTo` to the latest real chapter,
-reports stalled PlotThreads, unresolved Foreshadows, and inactive/never-
-recorded Characters with source evidence, and excludes resolved/closed nodes.
-Verify the API is marked read-only and StoryFact/StoryState/StoryCommit counts
-remain unchanged. In the browser, verify the Story Health sidebar summary and
-bounded rows are visible; clicking a row switches to its type-specific view
-and focuses the real projected node. Capture
-`storyflow-20260813-health-1920.png` and
-`storyflow-20260813-health-1366.png`; require HTTP 200 and zero console
-errors/warnings at 1920x1080 and 1366x768. This is deterministic evidence
-reporting, not an AI diagnosis or an automatic Canon mutation.
-
 68. From a restored completed `storyflow-analyze` Inspector, trigger
 `生成三个候选分支` in Planning Edit. Verify the forecast task validates the
 same-book analysis task, its completed status, and successful source
@@ -645,3 +631,18 @@ explicit “保存并生成下一章” action reaches the existing `write-next`
 Cancel the preview and verify no generation task is created. Capture
 1920x1080 and 1366x768 headed-browser evidence with zero console
 errors/warnings.
+
+84. Open a real SQLite StoryFlow fixture with explicit lifecycle and character
+appearance evidence. Verify `GET .../story-graph/health` returns only the
+requested supported types, clamps `chapter_to` (and its compatibility
+`chapterTo` alias) to the latest real chapter,
+reports stalled PlotThreads, unresolved Foreshadows, and inactive/never-
+recorded Characters with source evidence, and excludes resolved/closed nodes.
+Verify the API is marked read-only and StoryFact/StoryState/StoryCommit counts
+remain unchanged. In the browser, verify the Story Health sidebar summary and
+bounded rows are visible; clicking a row switches to its type-specific view
+and focuses the real projected node. Capture
+`storyflow-20260813-health-1920.png` and
+`storyflow-20260813-health-1366.png`; require HTTP 200 and zero console
+errors/warnings at 1920x1080 and 1366x768. This is deterministic evidence
+reporting, not an AI diagnosis or an automatic Canon mutation.

@@ -803,8 +803,9 @@ semantic-edge chapter evidence; Character activity comes from the projected
 `appearanceChapters` field. Resolved/closed lifecycle nodes and non-Canon
 statuses are excluded.
 
-The endpoint supports `lookback`, `chapterTo`, `types`, and `limit`; it clamps
-the cutoff to the latest real chapter and returns the evidence boundary,
+The endpoint supports `lookback`, `chapter_to` (with `chapterTo` accepted as a
+compatibility alias), `types`, and `limit`; it clamps the cutoff to the latest
+real chapter and returns the evidence boundary,
 current chapter, gap, source ids, and a bounded recommendation per item. The
 response is marked `readOnly=true` and does not write StoryFact, StoryState,
 StoryCommit, or planning overlay. The Canvas renders the result in a compact

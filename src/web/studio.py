@@ -3287,7 +3287,8 @@ async def search_story_graph(
 async def get_story_graph_health(
     book_id: str,
     lookback: int = Query(8, ge=1, le=200),
-    chapter_to: Optional[int] = Query(None, alias="chapterTo", ge=1),
+    chapter_to: Optional[int] = Query(None, alias="chapter_to", ge=1),
+    chapter_to_camel: Optional[int] = Query(None, alias="chapterTo", ge=1),
     types: str = Query(""),
     limit: int = Query(50, ge=1, le=200),
 ):
@@ -3297,7 +3298,7 @@ async def get_story_graph_health(
         result = get_story_graph_projector().story_health(
             str(book["id"]),
             lookback=lookback,
-            chapter_to=chapter_to,
+            chapter_to=chapter_to if chapter_to is not None else chapter_to_camel,
             types=_split_graph_query(types),
             limit=limit,
         )
