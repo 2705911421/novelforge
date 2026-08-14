@@ -10,7 +10,13 @@ exports/
 studio/
 test-output/
 .agents/
+.skills/
 skills-lock.json
+.venv/
+.mimocode/
+.storyflow-*/
+.storyflow-analysis-*/
+.node_modules/
 *.db
 *.db-*
 *.sqlite

@@ -401,7 +401,8 @@ class TaskManager:
         return stats
 
 
-# 全局任务管理器实例
+# 全局任务管理器实例（线程安全）
+_task_manager_lock = Lock()
 _task_manager: Optional[TaskManager] = None
 
 
@@ -409,5 +410,7 @@ def get_task_manager() -> TaskManager:
     """获取全局任务管理器"""
     global _task_manager
     if _task_manager is None:
-        _task_manager = TaskManager()
+        with _task_manager_lock:
+            if _task_manager is None:
+                _task_manager = TaskManager()
     return _task_manager

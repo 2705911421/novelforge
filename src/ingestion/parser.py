@@ -142,7 +142,7 @@ class DocumentParser:
             except UnicodeDecodeError:
                 continue
         
-        raise UnicodeDecodeError("novelforge", b"", 0, 0, f"无法解码文件: {path}")
+        raise ValueError(f"无法解码文件: {path}")
     
     def _read_docx_file(self, path: Path) -> str:
         """读取DOCX文件"""
@@ -246,9 +246,8 @@ class DocumentParser:
     
     def _generate_id(self, path: Path) -> str:
         """生成文档ID"""
-        import hashlib
-        content = f"{path.name}_{path.stat().st_size}_{path.stat().st_mtime}"
-        return hashlib.md5(content.encode()).hexdigest()[:12]
+        import uuid
+        return uuid.uuid4().hex[:12]
 
 
 class DocumentClassifier:

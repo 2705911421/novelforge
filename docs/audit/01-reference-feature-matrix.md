@@ -1,12 +1,12 @@
 # NovelForge 参考功能矩阵
 
-> 重审日期: 2026-08-07
+> 重审日期: 2026-08-12
 > 参考项目: InkOS `a6e05d4d4567df0efd5825e9b0037146a16e4f3e`、Webnovel Writer `2041abad78211e29a67a2f0c64b2a97a747dce57`。
 > 方法：直接阅读参考项目和 NovelForge 源码；执行 `pytest -q`（151 passed）。本矩阵有 183 条可解析原子功能项，先前“196”是错误汇总，不予沿用。
 
 ## 证据与读法
 
-- `TESTED` 仅表示对应模块存在自动化测试，不代表 UI/API/真实 Provider E2E 已完成。
+- `TESTED` 仅表示对应模块存在自动化测试，不代表 UI/API/真实 Provider E2E 已完成；本轮 StoryFlow 的浏览器证据另见 `docs/storyflow-canvas/evidence/`。
 - `FUNCTIONAL` 表示观察到非 mock 的核心实现与持久化或文件工作流；没有端到端证据时不应解读为产品完成。
 - Studio 中的内存 `tasks`、静态 HTML、固定预测分支和简单文风统计不能升格为真实任务、图谱或 AI 功能。
 - 每行的 `NovelForge Current` 列是来源/实现提示；具体 API、数据与 AI 链路见 `04`—`07`，参考研究见 `08`。
@@ -240,14 +240,15 @@
 
 | ID | Domain | Feature | InkOS | Webnovel Writer | NovelForge Current | NovelForge Target | Status |
 |----|--------|---------|-------|-----------------|-------------------|-------------------|--------|
-| VIS-001 | Visual | 思维导图 | ❌ | ❌ | ⚠️ 静态Mermaid | 交互式Graph | PARTIAL |
-| VIS-002 | Visual | 时间轴 | ✅ | ✅ | ⚠️ 静态HTML | 交互式时间轴 | PARTIAL |
-| VIS-003 | Visual | 人物关系图 | ❌ | ❌ | ✅ MemoryEngine.add_character_relationship_graph | 交互式Graph | TESTED |
-| VIS-004 | Visual | 势力关系图 | ❌ | ❌ | ✅ MemoryEngine.add_faction_relationship_graph | 交互式Graph | TESTED |
-| VIS-005 | Visual | 剧情结构图 | ❌ | ❌ | ✅ MemoryEngine.add_plot_structure_graph | 交互式Graph | TESTED |
-| VIS-006 | Visual | 伏笔图 | ❌ | ❌ | ✅ MemoryEngine.add_foreshadowing_graph | 交互式Graph | TESTED |
-| VIS-007 | Visual | 地图系统 | ❌ | ❌ | ✅ MemoryEngine.add_map_system_graph | 结构化+AI生图 | TESTED |
+| VIS-001 | Visual | StoryFlow 故事画布 | ❌ | ❌ | ✅ StoryGraphProjector + Graph API + 原生 Canvas；默认 focused subgraph；选中 Flow 可编译 ChapterIntent、排队标准 write-next，并在 StoryCommit 接受后回写 ACCEPTED/实际章节边；Context View 读取 GenerationRun sections/components 与 source explainability；Chapter Inspector 另有基于 ChapterVersion/StoryCommit/StoryState 的只读编辑影响报告；Story Health 读取明确 lifecycle/appearance evidence 并可聚焦信号 | 统一 Story Graph 工作流 | PARTIAL |
+| VIS-002 | Visual | 时间轴 | ✅ | ✅ | ✅ StoryFlow Timeline view；同时保留 narrative order / story time | 可交互双时间轴 | PARTIAL |
+| VIS-003 | Visual | 人物关系图 | ❌ | ❌ | ✅ StoryFlow Character view；由统一 Graph API 投影，Character Inspector 展示 authoritative state、recent appearances、direct relationships、PlotThread/Foreshadow links | 交互式人物上下文图 | PARTIAL |
+| VIS-004 | Visual | 势力关系图 | ❌ | ❌ | ✅ StoryGraphProjector 语义边 + Character view | 交互式势力图 | PARTIAL |
+| VIS-005 | Visual | 剧情结构图 | ❌ | ❌ | ✅ StoryFlow Story view；分层布局、章节/事件/伏笔节点 | 可驱动创作的剧情工作流 | PARTIAL |
+| VIS-006 | Visual | 伏笔图 | ❌ | ❌ | ✅ StoryFlow Foreshadow view；Plant/Advance/Resolve projection | 生命周期与回收规划 | PARTIAL |
+| VIS-007 | Visual | 地图系统 | ❌ | ❌ | ✅ StoryFlow World view；无坐标时明确为层级 World Graph | 坐标地图与空间查询 | PARTIAL |
 | VIS-008 | Visual | 数据分析面板 | ✅ analytics | ✅ | ⚠️ 简单统计 | 增强Dashboard | PARTIAL |
+| VIS-009 | Visual | Graph API / semantic validation | ❌ | ❌ | ✅ book-scoped query、focus/depth/filter、typed edge validation | 可扩展 Graph schema 与合法连接 | PARTIAL |
 
 ## 十八、导出系统
 
@@ -305,8 +306,8 @@
 | UI-006 | UI | 世界观向导 | ✅ | ✅ | ✅ | 增强交互 | FUNCTIONAL |
 | UI-007 | UI | 模型配置 | ✅ | ❌ | ✅ 多 Provider/Model、九角色路由、凭据不回显、队列测试；隔离浏览器验证 | 增强多Provider | TESTED |
 | UI-008 | UI | 数据分析 | ✅ | ✅ | ⚠️ 简单统计 | 增强图表 | PARTIAL |
-| UI-009 | UI | 思维导图 | ❌ | ❌ | ⚠️ 静态 | 交互式 | PARTIAL |
-| UI-010 | UI | 时间轴 | ✅ | ✅ | ⚠️ 静态 | 交互式 | PARTIAL |
+| UI-009 | UI | StoryFlow Canvas | ❌ | ❌ | ✅ 原生无限画布、Inspector、搜索、focus/depth、布局持久化、PlanningNode/生成章节队列；Character state/relationship summary、Chapter workflow evidence（人物/地点/事件/伏笔、依赖/改变）、StoryCommit/History 自动读取、Context source click-through、sections、prompt components、只读 Story Health 信号面板 已接入；`storyflow-analyze` 可在只读 Canon 模式排队为非 Canon durable task，但 Provider 完成态、完整 AI 动作和高级编排未完成 | 统一交互式 StoryFlow | PARTIAL |
+| UI-010 | UI | 时间轴 | ✅ | ✅ | ✅ StoryFlow Timeline view；数据稀疏时不伪造事件 | 交互式双时间轴 | PARTIAL |
 | UI-011 | UI | 系统诊断 | ✅ | ✅ | ⚠️ 简单 | 增强Doctor | PARTIAL |
 | UI-012 | UI | 导出界面 | ✅ | ❌ | ✅ | 保持 | FUNCTIONAL |
 

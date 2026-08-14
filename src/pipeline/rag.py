@@ -84,15 +84,17 @@ class BM25Index:
         return results
 
     def _tokenize(self, text: str) -> list:
-        """简单分词（中文按字，英文按词）"""
-        # 移除标点
+        """分词（中文按字+bigram，英文按词）"""
         text = re.sub(r'[^\w\s\u4e00-\u9fff]', ' ', text)
         tokens = []
-        for char in text:
-            if '\u4e00' <= char <= '\u9fff':
-                tokens.append(char)
-            elif char.isalnum():
-                tokens.append(char.lower())
+        for segment in re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9]+', text):
+            if '\u4e00' <= segment[0] <= '\u9fff':
+                for i, char in enumerate(segment):
+                    tokens.append(char)
+                    if i > 0:
+                        tokens.append(segment[i - 1] + char)
+            else:
+                tokens.append(segment.lower())
         return tokens
 
     def _compute_score(self, query_terms: list, doc_idx: int) -> float:

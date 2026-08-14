@@ -9,13 +9,17 @@ Features:
 
 from __future__ import annotations
 
+import logging
 import shutil
 import sqlite3
+import threading as _threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 from .database import Database, generate_id, get_db
+
+logger = logging.getLogger(__name__)
 
 
 class BackupManager:
@@ -409,7 +413,13 @@ class BackupManager:
             # 删除超过保留天数的备份
             if days_old >= keep_days:
                 # 删除备份
-                backup_path = Path(backup["file_path"])
+                backup_path = Path(backup["file_path"]).resolve()
+                try:
+                    backup_path.relative_to(self.backup_dir.resolve())
+                except ValueError:
+                    logger.warning("Refusing to delete backup outside backup_dir: %s", backup_path)
+                    kept_count += 1
+                    continue
                 try:
                     if backup_path.exists():
                         backup_path.unlink()
@@ -487,7 +497,8 @@ class BackupManager:
         }
 
 
-# 全局备份管理器实例
+# 全局备份管理器实例（线程安全）
+_backup_lock = _threading.Lock()
 _backup_manager: Optional[BackupManager] = None
 
 
@@ -495,7 +506,9 @@ def get_backup_manager() -> BackupManager:
     """获取全局备份管理器实例"""
     global _backup_manager
     if _backup_manager is None:
-        _backup_manager = BackupManager()
+        with _backup_lock:
+            if _backup_manager is None:
+                _backup_manager = BackupManager()
     return _backup_manager
 
 

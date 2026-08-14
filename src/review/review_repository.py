@@ -57,7 +57,8 @@ class ReviewRepository:
             chapter_version_id = version["id"] if version else None
 
         review_id = generate_id()
-        now = datetime.now().isoformat()
+        from datetime import timezone
+        now = datetime.now(timezone.utc).isoformat()
 
         with self.db.transaction() as conn:
             # Insert the main review record with chapter_version_id for provenance.

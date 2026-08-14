@@ -126,6 +126,36 @@ def test_native_book_api_uses_sqlite_for_create_update_reload_and_delete(native_
 
 
 @pytest.mark.integration
+def test_versions_endpoint_returns_empty_history_for_existing_chapter(native_workspace, monkeypatch):
+    """A real chapter without versions is not a missing chapter."""
+    _, database, _, manager = native_workspace
+    from src.web import studio
+
+    project = manager.create_project("Versionless Chapter", "fantasy")
+    book_id = database.fetchone("SELECT id FROM books WHERE project_id=?", (project.id,))["id"]
+    database.insert("chapters", {
+        "id": "chapter-versionless",
+        "book_id": book_id,
+        "number": 2,
+        "title": "Imported without a version row",
+        "content": "",
+        "summary": "",
+        "word_count": 0,
+        "status": "draft",
+        "key_events": "[]",
+        "characters_appeared": "[]",
+        "locations_used": "[]",
+    })
+    monkeypatch.setattr(studio, "story_repository", StoryRepository(database))
+    monkeypatch.setattr(studio, "project_mgr", manager)
+    response = TestClient(studio.app).get(f"/api/v1/books/{project.id}/chapters/2/versions")
+    assert response.status_code == 200
+    assert response.json()["versions"] == []
+    assert response.json()["historyAvailable"] is False
+    assert TestClient(studio.app).get(f"/api/v1/books/{project.id}/chapters/3/versions").status_code == 404
+
+
+@pytest.mark.integration
 def test_version_diff_and_restore_append_history_and_stale_committed_state(native_workspace, monkeypatch):
     from src.web import studio
 

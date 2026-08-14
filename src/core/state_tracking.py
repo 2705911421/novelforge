@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import threading as _threading
 from typing import Any, Optional
 
 from .database import Database, generate_id, get_db
@@ -61,7 +61,6 @@ class StateTrackingRepository:
             状态快照ID
         """
         state_id = generate_id()
-        now = datetime.now().isoformat()
 
         self.db.execute(
             """INSERT INTO character_states(id, character_id, chapter_id, location, status,
@@ -204,7 +203,6 @@ class StateTrackingRepository:
             状态快照ID
         """
         state_id = generate_id()
-        now = datetime.now().isoformat()
 
         self.db.execute(
             """INSERT INTO faction_states(id, faction_id, chapter_id, territory, power_level,
@@ -345,7 +343,6 @@ class StateTrackingRepository:
             状态快照ID
         """
         state_id = generate_id()
-        now = datetime.now().isoformat()
 
         self.db.execute(
             """INSERT INTO location_states(id, location_id, chapter_id, controlling_faction,
@@ -466,9 +463,13 @@ class StateTrackingRepository:
 _state_tracking_repo: Optional[StateTrackingRepository] = None
 
 
+_state_tracking_lock = _threading.Lock()
+
 def get_state_tracking_repository() -> StateTrackingRepository:
     """获取全局状态追踪仓库实例"""
     global _state_tracking_repo
     if _state_tracking_repo is None:
-        _state_tracking_repo = StateTrackingRepository()
+        with _state_tracking_lock:
+            if _state_tracking_repo is None:
+                _state_tracking_repo = StateTrackingRepository()
     return _state_tracking_repo

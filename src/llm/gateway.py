@@ -3,6 +3,8 @@ NovelForge Model Gateway
 统一的多Provider LLM网关，支持OpenAI、Anthropic、Gemini等
 """
 
+import base64
+import binascii
 import json
 import time
 import logging
@@ -38,6 +40,17 @@ class LLMResponse:
 
 
 @dataclass
+class ImageResponse:
+    """Binary image returned by an image-capable provider."""
+
+    data: bytes
+    mime_type: str = "image/png"
+    model: str = ""
+    latency_ms: int = 0
+    provider: str = ""
+
+
+@dataclass
 class LLMConfig:
     """LLM配置"""
     provider: ProviderType = ProviderType.OPENAI
@@ -53,10 +66,23 @@ class LLMConfig:
 
 class BaseProvider(ABC):
     """Provider基类"""
-    
+
     def __init__(self, config: LLMConfig):
         self.config = config
         self.provider_type = config.provider
+        self._client: httpx.Client | None = None
+
+    def _get_client(self) -> httpx.Client:
+        """获取或创建复用的 HTTP 客户端"""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.Client(timeout=self.config.timeout)
+        return self._client
+
+    def close(self):
+        """关闭 HTTP 客户端"""
+        if self._client and not self._client.is_closed:
+            self._client.close()
+            self._client = None
     
     @abstractmethod
     def chat(self, messages: List[Dict], system: str = "", **kwargs) -> LLMResponse:
@@ -68,6 +94,10 @@ class BaseProvider(ABC):
         """流式聊天"""
         pass
     
+    def generate_image(self, prompt: str, **kwargs) -> ImageResponse:
+        """Generate one image when the provider supports it."""
+        raise NotImplementedError("provider does not support image generation")
+
     def _build_headers(self) -> Dict[str, str]:
         """构建请求头"""
         headers = {"Content-Type": "application/json"}
@@ -75,8 +105,14 @@ class BaseProvider(ABC):
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         return headers
     
+    _NON_RETRYABLE_STATUS = {400, 401, 403, 404, 422}
+
     def _handle_error(self, e: Exception, attempt: int) -> bool:
-        """处理错误，返回是否重试"""
+        """处理错误，返回是否重试。不可重试的 HTTP 错误直接抛出。"""
+        # Check for non-retryable HTTP status codes
+        status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+        if status_code in self._NON_RETRYABLE_STATUS:
+            return False
         if attempt < self.config.max_retries - 1:
             wait_time = self.config.retry_delay * (2 ** attempt)
             logger.warning(f"请求失败，{wait_time}秒后重试: {e}")
@@ -110,15 +146,15 @@ class OpenAIProvider(BaseProvider):
         
         for attempt in range(self.config.max_retries):
             try:
-                with httpx.Client(timeout=self.config.timeout) as client:
-                    response = client.post(
-                        f"{self.config.base_url}/chat/completions",
-                        headers=headers,
-                        json=body
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                
+                client = self._get_client()
+                response = client.post(
+                    f"{self.config.base_url}/chat/completions",
+                    headers=headers,
+                    json=body
+                )
+                response.raise_for_status()
+                data = response.json()
+
                 latency = int((time.time() - start_time) * 1000)
                 usage = data.get("usage", {})
                 
@@ -153,26 +189,73 @@ class OpenAIProvider(BaseProvider):
             "stream": True
         }
         
-        with httpx.Client(timeout=self.config.timeout) as client:
-            with client.stream(
-                "POST",
-                f"{self.config.base_url}/chat/completions",
-                headers=headers,
-                json=body
-            ) as response:
+        client = self._get_client()
+        with client.stream(
+            "POST",
+            f"{self.config.base_url}/chat/completions",
+            headers=headers,
+            json=body
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0].get("delta", {})
+                        if "content" in delta:
+                            yield delta["content"]
+                    except json.JSONDecodeError:
+                        continue
+
+
+    def generate_image(self, prompt: str, **kwargs) -> ImageResponse:
+        if not prompt.strip():
+            raise ValueError("image prompt must not be empty")
+        body = {
+            "model": kwargs.get("model", self.config.model),
+            "prompt": prompt,
+            "n": 1,
+            "size": kwargs.get("size", "1024x1024"),
+            "response_format": "b64_json",
+        }
+        for key in ("quality", "style", "background"):
+            if kwargs.get(key):
+                body[key] = kwargs[key]
+        start_time = time.time()
+        for attempt in range(self.config.max_retries):
+            try:
+                client = self._get_client()
+                response = client.post(
+                    f"{self.config.base_url}/images/generations",
+                    headers=self._build_headers(),
+                    json=body,
+                )
                 response.raise_for_status()
-                for line in response.iter_lines():
-                    if line.startswith("data: "):
-                        data = line[6:]
-                        if data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                            delta = chunk["choices"][0].get("delta", {})
-                            if "content" in delta:
-                                yield delta["content"]
-                        except json.JSONDecodeError:
-                            continue
+                payload = response.json()
+                item = (payload.get("data") or [{}])[0]
+                encoded = item.get("b64_json")
+                if not isinstance(encoded, str) or not encoded:
+                    raise RuntimeError("image provider did not return b64_json")
+                try:
+                    image = base64.b64decode(encoded, validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise RuntimeError("image provider returned invalid base64") from exc
+                if not image:
+                    raise RuntimeError("image provider returned an empty image")
+                return ImageResponse(
+                    data=image,
+                    mime_type=str(item.get("mime_type") or "image/png"),
+                    model=str(payload.get("model") or self.config.model),
+                    latency_ms=int((time.time() - start_time) * 1000),
+                    provider="openai",
+                )
+            except Exception as exc:
+                if not self._handle_error(exc, attempt):
+                    raise RuntimeError(f"OpenAI image generation failed: {exc}") from exc
+        raise RuntimeError("OpenAI image generation failed: retry loop ended without a response")
 
 
 class AnthropicProvider(BaseProvider):
@@ -207,18 +290,18 @@ class AnthropicProvider(BaseProvider):
         
         for attempt in range(self.config.max_retries):
             try:
-                with httpx.Client(timeout=self.config.timeout) as client:
-                    response = client.post(
-                        f"{self.config.base_url}/messages",
-                        headers=headers,
-                        json=body
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                
+                client = self._get_client()
+                response = client.post(
+                    f"{self.config.base_url}/messages",
+                    headers=headers,
+                    json=body
+                )
+                response.raise_for_status()
+                data = response.json()
+
                 latency = int((time.time() - start_time) * 1000)
                 usage = data.get("usage", {})
-                
+
                 return LLMResponse(
                     content=data["content"][0]["text"],
                     model=data.get("model", self.config.model),
@@ -259,13 +342,13 @@ class AnthropicProvider(BaseProvider):
         if system:
             body["system"] = system
         
-        with httpx.Client(timeout=self.config.timeout) as client:
-            with client.stream(
-                "POST",
-                f"{self.config.base_url}/messages",
-                headers=headers,
-                json=body
-            ) as response:
+        client = self._get_client()
+        with client.stream(
+            "POST",
+            f"{self.config.base_url}/messages",
+            headers=headers,
+            json=body
+        ) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
                     if line.startswith("data: "):
@@ -281,7 +364,7 @@ class GeminiProvider(BaseProvider):
     """Google Gemini Provider"""
     
     def chat(self, messages: List[Dict], system: str = "", **kwargs) -> LLMResponse:
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "x-goog-api-key": self.config.api_key}
         
         # Gemini 格式转换
         contents = []
@@ -308,18 +391,18 @@ class GeminiProvider(BaseProvider):
         
         for attempt in range(self.config.max_retries):
             try:
-                with httpx.Client(timeout=self.config.timeout) as client:
-                    response = client.post(
-                        f"{self.config.base_url}/models/{model}:generateContent?key={self.config.api_key}",
-                        headers=headers,
-                        json=body
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                
+                client = self._get_client()
+                response = client.post(
+                    f"{self.config.base_url.rstrip('/')}/models/{model}:generateContent",
+                    headers=headers,
+                    json=body
+                )
+                response.raise_for_status()
+                data = response.json()
+
                 latency = int((time.time() - start_time) * 1000)
                 usage = data.get("usageMetadata", {})
-                
+
                 return LLMResponse(
                     content=data["candidates"][0]["content"]["parts"][0]["text"],
                     model=model,
@@ -336,7 +419,7 @@ class GeminiProvider(BaseProvider):
         raise RuntimeError("Gemini调用失败: retry loop ended without a response")
     
     def chat_stream(self, messages: List[Dict], system: str = "", **kwargs) -> Generator[str, None, None]:
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "x-goog-api-key": self.config.api_key}
         
         contents = []
         for msg in messages:
@@ -359,21 +442,21 @@ class GeminiProvider(BaseProvider):
         
         model = kwargs.get("model", self.config.model)
         
-        with httpx.Client(timeout=self.config.timeout) as client:
-            with client.stream(
-                "POST",
-                f"{self.config.base_url}/models/{model}:streamGenerateContent?key={self.config.api_key}",
-                headers=headers,
-                json=body
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if line.startswith("data: "):
-                        try:
-                            data = json.loads(line[6:])
-                            text = data["candidates"][0]["content"]["parts"][0]["text"]
-                            yield text
-                        except (json.JSONDecodeError, KeyError, IndexError):
+        client = self._get_client()
+        with client.stream(
+            "POST",
+            f"{self.config.base_url.rstrip('/')}/models/{model}:streamGenerateContent?alt=sse",
+            headers=headers,
+            json=body
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    try:
+                        data = json.loads(line[6:])
+                        text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        yield text
+                    except (json.JSONDecodeError, KeyError, IndexError):
                             continue
 
 
@@ -456,12 +539,14 @@ class ModelGateway:
         """聊天并返回JSON"""
         kwargs["json_mode"] = True
         response = self.chat(provider_name, messages, system, **kwargs)
-        
+
         try:
             content = response.content.strip()
-            if content.startswith("```"):
-                lines = content.split("\n")
-                content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            # Extract JSON from markdown code blocks
+            import re
+            m = re.search(r'```(?:json)?\s*(.*?)```', content, re.DOTALL)
+            if m:
+                content = m.group(1).strip()
             return json.loads(content)
         except json.JSONDecodeError:
             try:
@@ -471,6 +556,19 @@ class ModelGateway:
             except (ValueError, json.JSONDecodeError):
                 return {"raw": content, "error": "JSON解析失败"}
     
+    def generate_image(self, provider_name: str, prompt: str, **kwargs) -> ImageResponse:
+        """Generate an image through an image-capable provider."""
+        provider = self.get_provider(provider_name)
+        try:
+            response = provider.generate_image(prompt, **kwargs)
+            stats = self._usage_stats[provider_name]
+            stats["total_calls"] += 1
+            stats["total_latency_ms"] += response.latency_ms
+            return response
+        except Exception:
+            self._usage_stats[provider_name]["errors"] += 1
+            raise
+
     def get_usage_stats(self, provider_name: Optional[str] = None) -> Dict:
         """获取使用统计"""
         if provider_name:

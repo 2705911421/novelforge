@@ -14,7 +14,9 @@ from ..core.config import Config
 from ..core.database import Database
 from ..core.project import ProjectManager
 from ..core.story_repository import StoryRepository
-from ..core.task_runtime import TaskRuntime
+from ..core.task_runtime import TaskRuntime, TaskStateError
+from ..creation.continuous_service import ContinuousWritingService
+from ..llm.model_runtime import build_model_runtime
 
 app = FastAPI(title="NovelForge", description="AI小说创作平台")
 
@@ -24,6 +26,15 @@ config = Config(project_path=str(workspace_root))
 story_repository = StoryRepository(Database(str(workspace_root / "projects" / "novelforge.db")))
 project_mgr = ProjectManager(str(workspace_root), repository=story_repository)
 task_runtime = TaskRuntime(story_repository.db)
+try:
+    model_runtime = build_model_runtime(story_repository.db, workspace_root)
+except Exception:
+    model_runtime = None
+
+
+def _config_int(section: str, key: str, default: int) -> int:
+    value = config.get(section, key, default=default)
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
 
 
 class CreateProjectRequest(BaseModel):
@@ -127,12 +138,31 @@ async def continuous_mode(project_id: str, req: ContinuousRequest):
     if not book:
         raise HTTPException(409, "项目没有 authoritative book")
     start = req.start_chapter or (project.get_latest_chapter_number() + 1)
+    if start < 1:
+        raise HTTPException(422, "start_chapter must be positive")
     if req.count < 5 or req.count > 200:
         raise HTTPException(422, "count must be between 5 and 200")
-    task = task_runtime.enqueue(
-        "continuous", project_id=project_id, book_id=book["id"],
-        data={"start": start, "count": req.count, "context": req.context},
-    )
+    try:
+        task = ContinuousWritingService(
+            story_repository.db,
+            model_runtime,
+            story_repository,
+            task_runtime,
+            score_threshold=_config_int("review", "pass_score", 93),
+            max_revisions=_config_int("review", "max_revision_rounds", 3),
+        ).start_continuous(
+            project_id,
+            book["id"],
+            start,
+            req.count,
+            req.context,
+            # This route is the documented legacy/unmanaged adapter.  The
+            # managed Studio route below requires a published planning
+            # snapshot; keeping this explicit preserves old API clients.
+            strict_planning=False,
+        )
+    except TaskStateError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {"taskId": task["id"], "status": task["status"], "message": "连续创作任务已排队"}
 
 

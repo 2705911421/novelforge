@@ -8,11 +8,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.core.database import Database
+from src.core.database import Database, generate_id
 from src.core.project import ProjectManager
 from src.core.story_repository import StoryRepository
 from src.core.task_runtime import TaskRuntime
 from src.pipeline.writing_pipeline import WritingPipeline, WritingPipelineError
+from src.story_graph import StoryFlowPlanningService, StoryGraphProjector
 
 
 @pytest.fixture
@@ -165,6 +166,232 @@ def test_pipeline_full_happy_path(pipeline_deps):
     events = runtime.events(task["id"])
     stage_names = [e["event_type"] for e in events]
     assert "claimed" in stage_names
+
+
+def test_context_manifest_binds_story_graph_and_writer_prompt_components(pipeline_deps):
+    """Writer context records the real StoryFlow slice and prompt components."""
+    db = pipeline_deps["db"]
+    runtime = pipeline_deps["runtime"]
+    repo = pipeline_deps["repo"]
+    project_id = pipeline_deps["project_id"]
+    book_id = pipeline_deps["book_id"]
+    chapter_one = db.fetchone(
+        "SELECT id FROM chapters WHERE book_id=? AND number=1", (book_id,)
+    )
+    assert chapter_one is not None
+
+    character_id = generate_id()
+    db.insert(
+        "characters",
+        {
+            "id": character_id,
+            "book_id": book_id,
+            "name": "Context Witness",
+            "description": "A canonical character used by the context projection.",
+        },
+    )
+    db.execute(
+        """UPDATE chapters
+           SET status='committed', summary=?, characters_appeared=?
+         WHERE id=?""",
+        (
+            "The witness reaches the old city.",
+            json.dumps(["Context Witness"]),
+            chapter_one["id"],
+        ),
+    )
+
+    _, _, plan_node, _ = StoryFlowPlanningService(db).save_intent_from_flow(
+        book_id,
+        [f"character:{character_id}"],
+        chapter_number=2,
+    )
+
+    pipeline = WritingPipeline(db, DummyModelManager(), repo, runtime)
+    context_task = {"id": "context-build-task", "data": {"context": "Keep the unresolved clue visible."}}
+    built = pipeline._build_context(
+        context_task,
+        {
+            "project_id": project_id,
+            "book_id": book_id,
+            "chapter_number": 2,
+            "strict_planning": False,
+            "storyflow_plan_node_id": plan_node["id"],
+        },
+    )["context"]
+    manifest = built["context_manifest"]
+    assert manifest["schemaVersion"] == 3
+    graph_items = [item for item in manifest["items"] if item["sourceType"] == "story_graph_node"]
+    assert graph_items
+    assert any(item["sourceId"] == f"character:{character_id}" for item in graph_items)
+    graph_sections = [section for section in manifest["contextSections"] if "Story Graph" in section["title"]]
+    assert graph_sections
+    assert graph_sections[0]["contentSha256"]
+    assert graph_sections[0]["contextRange"]["scope"] == "assembled_context"
+    assert graph_sections[0]["contextRange"]["start"] < graph_sections[0]["contextRange"]["end"]
+    assert graph_items[0]["contextRange"]["precision"] == "section"
+    assert all(item["contextSectionId"] == graph_sections[0]["id"] for item in graph_items)
+    assert all(item["promptLocation"] == "context" for item in graph_items)
+    intent_items = [item for item in manifest["items"] if item["sourceType"] == "planning_node"]
+    assert len(intent_items) == 1
+    assert intent_items[0]["sourceId"] == plan_node["id"]
+    assert intent_items[0]["selectionRole"] == "chapter_intent"
+    assert intent_items[0]["edgeTypes"] == ["affects"]
+    assert intent_items[0]["contextSectionTitle"].startswith("## StoryFlow Chapter Intent")
+    assert any(
+        item["sourceType"] == "story_graph_node"
+        and item["sourceId"] == f"character:{character_id}"
+        and item["selectionRole"] == "requiredCharacters"
+        and item["edgeTypes"] == ["affects"]
+        for item in manifest["items"]
+    )
+
+
+    task = runtime.enqueue(
+        "write-next",
+        project_id=project_id,
+        book_id=book_id,
+        data={"chapter_number": 2, "context": "Keep the unresolved clue visible."},
+    )
+    claimed = runtime.claim("context-writer", lease_seconds=60)
+    assert claimed is not None
+    built.update({
+        "chapter_plan": {"goal": "test context binding"},
+        "prompt_a": "Planner output that is actually appended to the writer prompt.",
+        "revision_notes": "Keep the witness cautious.",
+    })
+    generated = pipeline._generate_draft(claimed, built)["context"]
+    final_manifest = generated["context_manifest"]
+    component_ids = {item["id"] for item in final_manifest["writerInput"]["components"]}
+    assert {"system", "chapter_plan", "context", "extra", "planner_output"} <= component_ids
+    components = {item["id"]: item for item in final_manifest["writerInput"]["components"]}
+    assert components["context"]["rangeStatus"] == "exact"
+    assert components["context"]["promptRange"]["scope"] == "writer_user_message"
+    assert components["context"]["promptRange"]["start"] < components["context"]["promptRange"]["end"]
+    final_graph_section = next(
+        section for section in final_manifest["contextSections"] if "Story Graph" in section["title"]
+    )
+    assert final_graph_section["rangeStatus"] == "exact"
+    assert final_graph_section["promptRange"]["start"] >= components["context"]["promptRange"]["start"]
+    final_graph_item = next(item for item in final_manifest["items"] if item["sourceType"] == "story_graph_node")
+    assert final_graph_item["promptRange"]["precision"] == "section"
+    assert final_manifest["promptBinding"]["available"] is True
+    prompt_item_types = {item["sourceType"] for item in final_manifest["items"]}
+    assert {"revision_instruction", "extra_guidance", "planner_output"} <= prompt_item_types
+    assert all(
+        item["promptLocation"] == "writer_prompt_component"
+        for item in final_manifest["items"]
+        if item["sourceType"] in {"revision_instruction", "extra_guidance", "planner_output"}
+    )
+    context_graph = final_manifest["contextGraphSnapshot"]
+    assert context_graph["scope"] == "generation_run_context"
+    assert context_graph["nodeCount"] >= 2
+    assert context_graph["edgeCount"] >= 1
+    assert context_graph["graphSha256"]
+    assert context_graph["promptSha256"] == final_manifest["writerInput"]["promptSha256"]
+    assert any(edge["type"] == "included_in_context" for edge in context_graph["edges"])
+
+
+def test_context_manifest_records_style_constraints_and_memory_boundary(pipeline_deps):
+    """Context View must distinguish real project inputs from unavailable legacy memory."""
+    db = pipeline_deps["db"]
+    project_id = pipeline_deps["project_id"]
+    book_id = pipeline_deps["book_id"]
+    db.execute(
+        """UPDATE projects
+           SET author_intent=?, writing_style=?, style_profile=?
+           WHERE id=?""",
+        (
+            "Keep the unresolved identity mystery intact.",
+            "Close third person, restrained prose.",
+            json.dumps({"rhythm": "short paragraphs", "donts": ["no deus ex machina"]}),
+            project_id,
+        ),
+    )
+
+    pipeline = WritingPipeline(
+        db,
+        DummyModelManager(),
+        pipeline_deps["repo"],
+        pipeline_deps["runtime"],
+    )
+    built = pipeline._build_context(
+        {"id": "style-constraints-context", "data": {}},
+        {
+            "project_id": project_id,
+            "book_id": book_id,
+            "chapter_number": 2,
+            "strict_planning": False,
+        },
+    )["context"]
+    manifest = built["context_manifest"]
+    source_types = {item["sourceType"] for item in manifest["items"]}
+    assert {"style", "constraints"} <= source_types
+    assert "Writing Style" in "\n".join(built["context_parts"])
+    assert "Author Constraints" in "\n".join(built["context_parts"])
+    assert manifest["availability"]["style"]["status"] == "included"
+    assert manifest["availability"]["constraints"]["status"] == "included"
+    assert manifest["availability"]["memory"]["status"] == "not_included"
+    assert "legacy file-backed MemorySystem" in manifest["availability"]["memory"]["reason"]
+
+
+def test_pipeline_acceptance_fulfills_storyflow_plan(pipeline_deps):
+    """An accepted write task marks its Flow plan and links the new chapter."""
+    db = pipeline_deps["db"]
+    runtime = pipeline_deps["runtime"]
+    repo = pipeline_deps["repo"]
+    project_id = pipeline_deps["project_id"]
+    book_id = pipeline_deps["book_id"]
+    chapter_one = db.fetchone("SELECT id FROM chapters WHERE book_id=? AND number=1", (book_id,))
+    assert chapter_one is not None
+
+    _, planning_revision, plan_node, _ = StoryFlowPlanningService(db).save_intent_from_flow(
+        book_id,
+        [f"chapter:{chapter_one['id']}"],
+        chapter_number=2,
+    )
+    assert planning_revision >= 2
+
+    pipeline = WritingPipeline(
+        db,
+        DummyModelManager(
+            draft="这是从 StoryFlow 计划生成的章节正文。" * 30,
+            facts=[{"fact_type": "event", "content": "StoryFlow 计划被兑现。"}],
+        ),
+        repo,
+        runtime,
+        score_threshold=90,
+    )
+    task = runtime.enqueue(
+        "write-next",
+        project_id=project_id,
+        book_id=book_id,
+        data={"chapter_number": 2, "storyflow_plan_node_id": plan_node["id"]},
+    )
+    claimed = runtime.claim("storyflow-plan-worker", lease_seconds=60)
+    assert claimed is not None
+
+    result = pipeline.execute(claimed)
+    assert result["completed"] is True
+    assert result["storyflow_plan_status"] == "ACCEPTED"
+    commit = db.fetchone(
+        "SELECT id, status FROM story_commits WHERE chapter_id=(SELECT id FROM chapters WHERE book_id=? AND number=2)",
+        (book_id,),
+    )
+    assert commit is not None and commit["status"] == "accepted"
+    chapter_two = db.fetchone("SELECT id FROM chapters WHERE book_id=? AND number=2", (book_id,))
+    assert chapter_two is not None
+    graph = StoryGraphProjector(db).project(book_id, view="story", focus=plan_node["id"], depth=2)
+    plan = next(node for node in graph["nodes"] if node["id"] == plan_node["id"])
+    assert plan["status"] == "ACCEPTED"
+    assert plan["metadata"]["acceptedChapterId"] == chapter_two["id"]
+    assert plan["metadata"]["acceptedChapterNumber"] == 2
+    assert any(
+        edge["type"] == "leads_to"
+        and edge["source"] == plan_node["id"]
+        and edge["target"] == f"chapter:{chapter_two['id']}"
+        for edge in graph["edges"]
+    )
 
 
 def test_pipeline_revises_when_review_fails(pipeline_deps):

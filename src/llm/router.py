@@ -8,6 +8,7 @@ from typing import Optional, Dict, List
 from enum import Enum
 
 from .gateway import ModelGateway, LLMResponse, get_gateway
+from .agent_prompts import compose_agent_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +36,14 @@ class ModelRouter:
     def configure(self, role_mapping: Dict[str, str]):
         """
         配置角色映射
-        
+
         Args:
             role_mapping: 角色到Provider的映射，例如 {"planner": "primary", "reviewer": "review"}
         """
+        valid_roles = {r.value for r in AgentRole}
+        for role in role_mapping:
+            if role not in valid_roles:
+                logger.warning("Unknown role in mapping: %s (valid: %s)", role, valid_roles)
         self._role_mapping = role_mapping
         logger.info(f"配置角色映射: {role_mapping}")
     
@@ -49,27 +54,39 @@ class ModelRouter:
     def get_provider_name(self, role: AgentRole) -> str:
         """获取角色对应的Provider名称"""
         return self._role_mapping.get(role.value, self._fallback_provider)
+
+    @staticmethod
+    def _contract_role(role: AgentRole) -> str:
+        return {
+            AgentRole.EXTRACTOR: "fact_extraction",
+            AgentRole.FORECAST: "planner",
+            AgentRole.STYLE: "context",
+        }.get(role, role.value)
+
+    def _effective_system(self, role: AgentRole, system: str) -> str:
+        """Keep the legacy in-memory gateway on the same contract boundary."""
+        return compose_agent_prompt(self._contract_role(role), system)
     
     def chat(self, role: AgentRole, messages: List[Dict], 
              system: str = "", **kwargs) -> LLMResponse:
         """按角色调用聊天"""
         provider_name = self.get_provider_name(role)
         logger.debug(f"路由 {role.value} -> {provider_name}")
-        return self.gateway.chat(provider_name, messages, system, **kwargs)
+        return self.gateway.chat(provider_name, messages, self._effective_system(role, system), **kwargs)
     
     def chat_json(self, role: AgentRole, messages: List[Dict],
                   system: str = "", **kwargs) -> Dict:
         """按角色调用聊天，返回JSON"""
         provider_name = self.get_provider_name(role)
         logger.debug(f"路由 {role.value} -> {provider_name} (JSON)")
-        return self.gateway.chat_json(provider_name, messages, system, **kwargs)
+        return self.gateway.chat_json(provider_name, messages, self._effective_system(role, system), **kwargs)
     
     def chat_stream(self, role: AgentRole, messages: List[Dict],
                     system: str = "", **kwargs):
         """按角色流式聊天"""
         provider_name = self.get_provider_name(role)
         logger.debug(f"路由 {role.value} -> {provider_name} (stream)")
-        return self.gateway.chat_stream(provider_name, messages, system, **kwargs)
+        return self.gateway.chat_stream(provider_name, messages, self._effective_system(role, system), **kwargs)
     
     def get_usage_by_role(self) -> Dict[str, Dict]:
         """获取按角色分组的使用统计"""

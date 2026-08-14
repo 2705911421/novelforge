@@ -42,14 +42,18 @@ class ProjectManager:
         config: Optional[Config] = None,
         *,
         target_chapters: Optional[int] = None,
+        target_volumes: Optional[int] = None,
         chapter_word_target: Optional[int] = None,
         language: Optional[str] = None,
+        style_profile: Optional[dict] = None,
     ) -> StoryProject:
         """创建新项目"""
         chapter_words_min = self._config_int(config, "chapter_words_min", 2000)
         chapter_words_max = self._config_int(config, "chapter_words_max", 4000)
         configured_target_chapters = self._config_int(config, "target_chapters", 100)
         resolved_target_chapters = self._positive_int(target_chapters, configured_target_chapters)
+        configured_target_volumes = self._config_int(config, "target_volumes", 5)
+        resolved_target_volumes = self._positive_int(target_volumes, configured_target_volumes)
         resolved_chapter_word_target = self._positive_int(chapter_word_target, 0)
         configured_language = config.get("project", "language", default="zh-CN") if config else "zh-CN"
         resolved_language = (
@@ -61,7 +65,9 @@ class ProjectManager:
             name, genre, target_chapters=resolved_target_chapters, chapter_words_min=chapter_words_min,
             chapter_words_max=chapter_words_max,
             target_word_count=resolved_target_chapters * resolved_chapter_word_target,
+            target_volumes=resolved_target_volumes,
             language=resolved_language,
+            style_profile=style_profile if isinstance(style_profile, dict) else {},
         )
         project_dir = self.projects_dir / project_id
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -146,6 +152,10 @@ class ProjectManager:
                         "name": data.get("name"),
                         "genre": data.get("genre"),
                         "chapters": len(data.get("chapters", {})),
+                        "target_chapters": data.get("target_chapters", 100),
+                        "target_volumes": data.get("target_volumes", 5),
+                        "target_word_count": data.get("target_word_count", 0),
+                        "language": data.get("language", "zh-CN"),
                         "created_at": data.get("created_at"),
                         "updated_at": data.get("updated_at"),
                     })
@@ -289,8 +299,10 @@ class ProjectManager:
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
             writing_style=data.get("writing_style", ""),
+            style_profile=data.get("style_profile", {}) if isinstance(data.get("style_profile", {}), dict) else {},
             target_word_count=data.get("target_word_count", 0),
             target_chapters=data.get("target_chapters", 100),
+            target_volumes=data.get("target_volumes", 5),
             language=data.get("language", "zh-CN"),
             author_intent=data.get("author_intent", ""),
             timeline=data.get("timeline", []),

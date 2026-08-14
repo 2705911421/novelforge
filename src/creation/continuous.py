@@ -1,4 +1,9 @@
-"""连续创作模式 - 核心特色功能（集成结构化编排管线）
+"""连续创作模式 - 遗留版本（已废弃）
+
+.. deprecated::
+    此模块为旧版连续创作实现，无持久化检查点，进程崩溃后所有进度丢失。
+    请使用 `continuous_service.ContinuousWritingService` 替代，
+    后者基于 TaskRuntime 实现了完整的检查点、子任务恢复和作者决策机制。
 
 融合inkOS和webnovel-writer的核心架构：
 - 使用Composer进行章节意图规划和上下文编排

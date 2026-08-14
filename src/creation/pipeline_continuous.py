@@ -1,5 +1,9 @@
 """流水线并发创作模式 - 真正的多章节并行
 
+.. deprecated::
+    此模块使用 asyncio 但与项目整体同步架构不兼容，且无持久化检查点。
+    请使用 continuous_service.ContinuousWritingService 替代。
+
 核心设计理念：
 - 多个章节同时处于不同阶段（创作/观察/审查/修订/提交）
 - 走在最前方的创作永远不会停下来等待

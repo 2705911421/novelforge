@@ -5,7 +5,7 @@ NovelForge 多层记忆引擎
 
 import json
 import logging
-from typing import List, Dict, Optional
+from typing import Callable, List, Dict, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -111,27 +111,31 @@ class MemoryItem:
 
 class MemoryStore:
     """记忆存储"""
-    
+
     def __init__(self):
         self.items: Dict[str, MemoryItem] = {}
         self._category_index: Dict[MemoryCategory, List[str]] = {}
         self._layer_index: Dict[MemoryLayer, List[str]] = {}
-    
+        self._on_change: Optional[Callable[[], None]] = None
+
     def add(self, item: MemoryItem):
         """添加记忆项"""
         self.items[item.id] = item
-        
+
         # 更新类别索引
         if item.category not in self._category_index:
             self._category_index[item.category] = []
         if item.id not in self._category_index[item.category]:
             self._category_index[item.category].append(item.id)
-        
+
         # 更新层级索引
         if item.layer not in self._layer_index:
             self._layer_index[item.layer] = []
         if item.id not in self._layer_index[item.layer]:
             self._layer_index[item.layer].append(item.id)
+
+        if self._on_change:
+            self._on_change()
     
     def get(self, item_id: str) -> Optional[MemoryItem]:
         """获取记忆项"""
@@ -140,24 +144,28 @@ class MemoryStore:
     def update(self, item: MemoryItem):
         """更新记忆项"""
         self.items[item.id] = item
-    
+        if self._on_change:
+            self._on_change()
+
     def remove(self, item_id: str):
         """移除记忆项"""
         if item_id in self.items:
             item = self.items[item_id]
-            
+
             # 从索引中移除
             if item.category in self._category_index:
                 self._category_index[item.category] = [
                     i for i in self._category_index[item.category] if i != item_id
                 ]
-            
+
             if item.layer in self._layer_index:
                 self._layer_index[item.layer] = [
                     i for i in self._layer_index[item.layer] if i != item_id
                 ]
-            
+
             del self.items[item_id]
+            if self._on_change:
+                self._on_change()
     
     def get_by_category(self, category: MemoryCategory) -> List[MemoryItem]:
         """按类别获取记忆项"""
@@ -202,16 +210,40 @@ class MemoryStore:
 
 class MemoryEngine:
     """记忆引擎 - 多层记忆管理"""
-    
-    def __init__(self, max_items: int = 1000):
+
+    def __init__(self, max_items: int = 1000, persist_path: str | None = None):
         self.store = MemoryStore()
         self.max_items = max_items
         self._counter = 0
-    
+        self._persist_path = persist_path
+        self.store._on_change = self._auto_save
+        if persist_path:
+            self._load_from_persist_path(persist_path)
+
     def _generate_id(self, prefix: str = "mem") -> str:
-        """生成ID"""
-        self._counter += 1
-        return f"{prefix}_{self._counter:06d}"
+        """生成ID（使用 UUID 避免重启后冲突）"""
+        import uuid
+        return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+    def _load_from_persist_path(self, path: str):
+        """从持久化文件加载"""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.import_from_dict(data)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def _auto_save(self):
+        """自动保存到持久化文件"""
+        if self._persist_path:
+            try:
+                import os
+                os.makedirs(os.path.dirname(self._persist_path) or '.', exist_ok=True)
+                with open(self._persist_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.export_to_dict(), f, ensure_ascii=False, indent=2)
+            except OSError as e:
+                logger.warning("Memory auto-save failed: %s", e)
     
     def add_character_state(self, character_name: str, state: str,
                            chapter: int, evidence: str = "") -> MemoryItem:

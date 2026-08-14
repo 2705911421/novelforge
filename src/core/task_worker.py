@@ -21,10 +21,13 @@ class PersistentTaskWorker:
     """
 
     def __init__(self, runtime: TaskRuntime, handlers: dict[str, Callable[[dict[str, Any]], Any]],
-                 *, lease_seconds: int = 60):
+                 *, lease_seconds: int = 60, retry_delay_seconds: int = 5):
         self.runtime = runtime
         self.handlers = handlers
         self.lease_seconds = lease_seconds
+        if retry_delay_seconds < 0:
+            raise ValueError("retry_delay_seconds must not be negative")
+        self.retry_delay_seconds = retry_delay_seconds
 
     async def execute_once(self, worker_id: str = "studio") -> Optional[dict]:
         task = self.runtime.claim(worker_id, lease_seconds=self.lease_seconds)
@@ -43,6 +46,19 @@ class PersistentTaskWorker:
             result = await asyncio.to_thread(handler, task)
             if inspect.isawaitable(result):
                 result = await result
+            # A parent orchestrator may have durably scheduled a child and
+            # released its own lease.  Do not let the generic worker turn
+            # that safe hand-off into a false completed parent task.
+            if isinstance(result, dict) and result.get("_defer"):
+                child_task_id = result.get("child_task_id")
+                if not isinstance(child_task_id, str) or not child_task_id:
+                    raise RuntimeError("deferred task did not provide child_task_id")
+                return self.runtime.defer_until_child(
+                    task["id"],
+                    child_task_id,
+                    detail=result.get("detail") if isinstance(result.get("detail"), dict) else None,
+                    lease_owner=worker_id,
+                )
             current = self.runtime.get(task["id"])
             if current and current["status"] == "cancelling":
                 self.runtime.checkpoint(task["id"], current.get("stage") or "cancelled",
@@ -59,12 +75,20 @@ class PersistentTaskWorker:
         except TaskFailure as exc:
             return self.runtime.fail(
                 task["id"], exc.code, str(exc), retryable=exc.retryable,
+                retry_delay_seconds=(
+                    self.retry_delay_seconds
+                    if exc.retry_delay_seconds is None
+                    else exc.retry_delay_seconds
+                ),
                 lease_owner=worker_id
             )
         except Exception as exc:  # Handler errors must be observable and durable.
             code, retryable = self._classify_exception(exc)
-            return self.runtime.fail(task["id"], code, str(exc), retryable=retryable,
-                                     lease_owner=worker_id)
+            return self.runtime.fail(
+                task["id"], code, str(exc), retryable=retryable,
+                retry_delay_seconds=self.retry_delay_seconds,
+                lease_owner=worker_id,
+            )
         finally:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):

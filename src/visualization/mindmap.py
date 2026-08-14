@@ -89,6 +89,28 @@ class MindMapGenerator:
                 story_branch["children"].append(vol_node)
             mindmap["root"]["children"].append(story_branch)
 
+        # Timeline events live in their own table and must remain visible even
+        # when the book has no generated chapter prose yet.
+        if project.timeline:
+            timeline_branch = {"text": "⏳ 时间剧情线", "children": []}
+            for event in project.timeline:
+                if not isinstance(event, dict):
+                    continue
+                title = event.get("title") or "未命名事件"
+                node = {"text": f"◈ {title}", "children": []}
+                event_time = event.get("event_time") or event.get("eventTime")
+                detail = event.get("description") or event.get("significance") or ""
+                if event_time:
+                    node["children"].append({"text": f"时间: {event_time}"})
+                if detail:
+                    node["children"].append({"text": detail})
+                chars = event.get("characters_involved") or event.get("characters") or []
+                if chars:
+                    node["children"].append({"text": f"参与: {', '.join(str(item) for item in chars)}"})
+                timeline_branch["children"].append(node)
+            if timeline_branch["children"]:
+                mindmap["root"]["children"].append(timeline_branch)
+
         # 伏笔分支
         hooks = project.get_open_foreshadowing()
         if hooks:
@@ -224,6 +246,16 @@ class TimelineGenerator:
                 "events": ch.key_events,
                 "characters": ch.characters_appeared,
                 "location": ch.locations_used[0] if ch.locations_used else "",
+            })
+        for event in project.timeline:
+            if not isinstance(event, dict):
+                continue
+            events.append({
+                "chapter": event.get("event_time") or "时间事件",
+                "title": event.get("title") or "未命名事件",
+                "events": [event.get("description") or event.get("significance") or ""],
+                "characters": event.get("characters_involved") or event.get("characters") or [],
+                "location": event.get("location") or "",
             })
         return events
 

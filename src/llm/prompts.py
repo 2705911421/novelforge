@@ -11,22 +11,31 @@ class PromptManager:
         if template_dir is None:
             template_dir = Path(__file__).parent.parent.parent / "config" / "prompts"
         self.template_dir = template_dir
-        self._cache = {}
+        self._cache: dict[str, tuple[float, str]] = {}
+        self._cache_ttl = 300.0  # 5 minutes
 
     def load(self, name: str) -> str:
-        """加载提示词模板"""
+        """加载提示词模板（带 TTL 缓存）"""
+        import time
+        now = time.monotonic()
         if name in self._cache:
-            return self._cache[name]
+            cached_time, content = self._cache[name]
+            if now - cached_time < self._cache_ttl:
+                return content
 
         file_path = self.template_dir / f"{name}.md"
         if file_path.exists():
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
-            self._cache[name] = content
+            self._cache[name] = (now, content)
             return content
 
         # 返回内置模板
-        return self._get_builtin(name)
+        content = self._get_builtin(name)
+        if content:
+            import time
+            self._cache[name] = (time.monotonic(), content)
+        return content
 
     def _get_builtin(self, name: str) -> str:
         """获取内置提示词"""

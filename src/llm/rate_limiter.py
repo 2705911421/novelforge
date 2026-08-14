@@ -18,6 +18,8 @@ class RateLimitError(Exception):
 class SlidingWindowRateLimiter:
     """In-memory sliding window rate limiter."""
 
+    _MAX_KEYS = 10000
+
     def __init__(self, max_requests: int = 10, window_seconds: float = 60.0):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
@@ -27,6 +29,12 @@ class SlidingWindowRateLimiter:
         """Check if request is allowed. Returns retry_after if limited, None if ok."""
         now = time.monotonic()
         window_start = now - self.window_seconds
+
+        # Evict stale keys if over limit
+        if len(self._requests) > self._MAX_KEYS:
+            stale = [k for k, v in self._requests.items() if not v or v[-1] < window_start]
+            for k in stale[:len(stale) // 2]:
+                del self._requests[k]
 
         # Clean old entries.
         self._requests[key] = [t for t in self._requests[key] if t > window_start]

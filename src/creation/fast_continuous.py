@@ -1,5 +1,9 @@
 """高速连续创作模式 - 优化版管线
 
+.. deprecated::
+    此模块无持久化检查点，进程崩溃后所有进度丢失。
+    请使用 continuous_service.ContinuousWritingService 替代。
+
 核心优化策略（不简化审查流程）：
 1. 并行化LLM调用 - Observer与Reviewer并行执行
 2. 流水线重叠 - 上一章审查与下一章规划重叠

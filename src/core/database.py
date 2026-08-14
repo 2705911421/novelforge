@@ -7,6 +7,7 @@ import sqlite3
 import uuid
 import hashlib
 import json
+import threading as _threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -940,6 +941,220 @@ def _apply_v14(conn: sqlite3.Connection) -> None:
     _execute_sql_script(conn, PHASE_14_TASK_INTEGRITY_SQL)
 
 
+PHASE_15_PLOT_WORKSPACE_SQL = """
+CREATE TABLE IF NOT EXISTS plot_workspaces (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL UNIQUE REFERENCES books(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL DEFAULT 1,
+    graph JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS plot_workspace_revisions (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES plot_workspaces(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    graph JSON NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plot_workspace_revisions_workspace
+    ON plot_workspace_revisions(workspace_id, revision);
+"""
+
+
+def _apply_v15(conn: sqlite3.Connection) -> None:
+    """Add per-book planning settings and a durable editable plot canvas."""
+    _add_column_if_missing(conn, "projects", "target_volumes INTEGER NOT NULL DEFAULT 5")
+    _add_column_if_missing(conn, "projects", "style_profile JSON NOT NULL DEFAULT '{}'")
+    _execute_sql_script(conn, PHASE_15_PLOT_WORKSPACE_SQL)
+
+
+PHASE_16_CREATION_WORKFLOW_SQL = """
+CREATE TABLE IF NOT EXISTS creation_workflows (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL DEFAULT 'planned',
+    status TEXT NOT NULL DEFAULT 'planning',
+    seed TEXT NOT NULL DEFAULT '',
+    metadata JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS planning_sources (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    metadata JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, source_type, checksum)
+);
+
+CREATE INDEX IF NOT EXISTS idx_planning_sources_project
+    ON planning_sources(project_id, source_type, created_at);
+
+CREATE TABLE IF NOT EXISTS thought_sessions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'questioning',
+    seed TEXT NOT NULL DEFAULT '',
+    turns JSON NOT NULL DEFAULT '[]',
+    current_question TEXT NOT NULL DEFAULT '',
+    question_index INTEGER NOT NULL DEFAULT 0,
+    framework JSON NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS story_architecture_views (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    snapshot_id TEXT,
+    view_type TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    payload JSON NOT NULL DEFAULT '{}',
+    source_manifest JSON NOT NULL DEFAULT '[]',
+    generated_by TEXT NOT NULL DEFAULT 'planning-materials-projection',
+    readonly INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, view_type)
+);
+
+CREATE TABLE IF NOT EXISTS forecast_imports (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source_task_id TEXT,
+    target TEXT NOT NULL DEFAULT 'canvas',
+    branch JSON NOT NULL DEFAULT '{}',
+    canvas_revision INTEGER,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_forecast_imports_project
+    ON forecast_imports(project_id, created_at);
+"""
+
+
+def _apply_v16(conn: sqlite3.Connection) -> None:
+    """Add durable creation modes, planning inputs, read-only projections, and forecast audit."""
+    _execute_sql_script(conn, PHASE_16_CREATION_WORKFLOW_SQL)
+
+
+PHASE_17_AGENT_EXTENSIONS_SQL = """
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    transport TEXT NOT NULL DEFAULT 'stdio',
+    command TEXT NOT NULL DEFAULT '',
+    args JSON NOT NULL DEFAULT '[]',
+    url TEXT NOT NULL DEFAULT '',
+    environment JSON NOT NULL DEFAULT '{}',
+    headers JSON NOT NULL DEFAULT '{}',
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    config JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (transport IN ('stdio', 'sse', 'streamable_http'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_enabled
+    ON mcp_servers(enabled, name);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_key
+    ON skills(key) WHERE key IS NOT NULL AND key <> '';
+"""
+
+
+def _apply_v17(conn: sqlite3.Connection) -> None:
+    """Add editable Agent prompts and durable user extension registries."""
+    _add_column_if_missing(conn, "agent_model_routes", "system_prompt TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(conn, "agent_model_routes", "system_prompt_version INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "skills", "key TEXT")
+    _add_column_if_missing(conn, "skills", "version INTEGER NOT NULL DEFAULT 1")
+    _add_column_if_missing(conn, "skills", "source TEXT NOT NULL DEFAULT 'builtin'")
+    _add_column_if_missing(conn, "skills", "config JSON NOT NULL DEFAULT '{}'")
+    _execute_sql_script(conn, PHASE_17_AGENT_EXTENSIONS_SQL)
+
+
+PHASE_18_AGENT_EXTENSION_SCOPE_SQL = """
+CREATE TABLE IF NOT EXISTS agent_extension_overrides (
+    -- Project IDs also identify legacy file-backed novels, so this scope table
+    -- intentionally keeps the string reference without a foreign key.
+    project_id TEXT NOT NULL,
+    extension_type TEXT NOT NULL,
+    extension_id TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(project_id, extension_type, extension_id),
+    CHECK (extension_type IN ('skill', 'mcp'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_extension_overrides_project
+    ON agent_extension_overrides(project_id, extension_type, enabled);
+"""
+
+
+def _apply_v18(conn: sqlite3.Connection) -> None:
+    """Add per-project enablement overrides for global Agent extensions."""
+    _execute_sql_script(conn, PHASE_18_AGENT_EXTENSION_SCOPE_SQL)
+
+
+PHASE_19_DRAFT_IMPORT_ANALYSIS_SQL = """
+CREATE TABLE IF NOT EXISTS draft_imports (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    story_bible_document_id TEXT,
+    language_plan_document_id TEXT,
+    draft_document_ids JSON NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'uploaded',
+    task_id TEXT,
+    report JSON NOT NULL DEFAULT '{}',
+    error_code TEXT,
+    error_detail TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (status IN ('uploaded', 'running', 'completed', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_draft_imports_project
+    ON draft_imports(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_draft_imports_task
+    ON draft_imports(task_id);
+"""
+
+
+def _apply_v19(conn: sqlite3.Connection) -> None:
+    """Persist imported draft batches and their model analysis reports."""
+    _execute_sql_script(conn, PHASE_19_DRAFT_IMPORT_ANALYSIS_SQL)
+
+
+PHASE_20_CONTINUOUS_RUN_GOVERNANCE_SQL = """
+-- A continuous parent releases its lease while an independently queued child
+-- is executing.  The runtime uses this pointer to wake the parent only after
+-- the child reaches a terminal state.
+"""
+
+
+def _apply_v20(conn: sqlite3.Connection) -> None:
+    """Add durable parent-child waiting and auditable author overrides."""
+    _add_column_if_missing(conn, "tasks", "waiting_for_task_id TEXT")
+    _add_column_if_missing(conn, "story_commits", "author_override BOOLEAN NOT NULL DEFAULT FALSE")
+    _add_column_if_missing(conn, "story_commits", "override_reason TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_waiting_for_task ON tasks(waiting_for_task_id)"
+    )
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -965,6 +1180,12 @@ _MIGRATIONS = (
     _Migration(12, "phase_12_character_themes", _apply_v12, PHASE_12_CHARACTER_THEMES_SCHEMA_SQL),
     _Migration(13, "phase_13_story_commit_integrity", _apply_v13, PHASE_13_STORY_COMMIT_INTEGRITY_SQL),
     _Migration(14, "phase_14_task_idempotency_unique", _apply_v14, PHASE_14_TASK_INTEGRITY_SQL),
+    _Migration(15, "phase_15_per_book_style_and_plot_workspace", _apply_v15, PHASE_15_PLOT_WORKSPACE_SQL),
+    _Migration(16, "phase_16_creation_workflow_and_planning_views", _apply_v16, PHASE_16_CREATION_WORKFLOW_SQL),
+    _Migration(17, "phase_17_agent_extensions", _apply_v17, PHASE_17_AGENT_EXTENSIONS_SQL),
+    _Migration(18, "phase_18_agent_extension_scope", _apply_v18, PHASE_18_AGENT_EXTENSION_SCOPE_SQL),
+    _Migration(19, "phase_19_draft_import_analysis", _apply_v19, PHASE_19_DRAFT_IMPORT_ANALYSIS_SQL),
+    _Migration(20, "phase_20_continuous_run_governance", _apply_v20, PHASE_20_CONTINUOUS_RUN_GOVERNANCE_SQL),
 )
 
 
@@ -1133,6 +1354,8 @@ class Database:
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
         try:
             yield conn
         finally:
@@ -1160,7 +1383,9 @@ class Database:
     def executemany(self, sql: str, params_list: list) -> sqlite3.Cursor:
         """批量执行SQL语句"""
         with self.connect() as conn:
-            return conn.executemany(sql, params_list)
+            cursor = conn.executemany(sql, params_list)
+            conn.commit()
+            return cursor
     
     def fetchone(self, sql: str, params: tuple = ()) -> Optional[Dict]:
         """查询单条记录"""
@@ -1175,11 +1400,20 @@ class Database:
             cursor = conn.execute(sql, params)
             return [dict(row) for row in cursor.fetchall()]
     
+    _IDENTIFIER_RE = __import__('re').compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+    @classmethod
+    def _validate_identifier(cls, name: str, label: str = "identifier") -> None:
+        """校验 SQL 标识符，防止注入"""
+        if not cls._IDENTIFIER_RE.match(name):
+            raise ValueError(f"Invalid SQL {label}: {name!r}")
+
     def insert(self, table: str, data: Dict) -> str:
         """插入记录，返回ID"""
+        self._validate_identifier(table, "table name")
         if 'id' not in data:
             data['id'] = generate_id()
-        
+
         columns = ', '.join(data.keys())
         placeholders = ', '.join(['?'] * len(data))
         sql = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
@@ -1192,6 +1426,7 @@ class Database:
     
     def update(self, table: str, data: Dict, where: str, where_params: tuple) -> int:
         """更新记录"""
+        self._validate_identifier(table, "table name")
         # Some append-only audit tables intentionally have no ``updated_at``.
         # The generic legacy helper remains compatible without manufacturing a
         # column those tables do not own.
@@ -1209,6 +1444,7 @@ class Database:
     
     def delete(self, table: str, where: str, where_params: tuple) -> int:
         """删除记录"""
+        self._validate_identifier(table, "table name")
         sql = f"DELETE FROM {table} WHERE {where}"
         
         with self.connect() as conn:
@@ -1218,11 +1454,13 @@ class Database:
     
     def get_by_id(self, table: str, id: str) -> Optional[Dict]:
         """根据ID获取记录"""
+        self._validate_identifier(table, "table name")
         return self.fetchone(f"SELECT * FROM {table} WHERE id = ?", (id,))
     
-    def list_all(self, table: str, where: str = "", params: tuple = (), 
+    def list_all(self, table: str, where: str = "", params: tuple = (),
                  order_by: str = "created_at DESC", limit: int = 100) -> List[Dict]:
         """列出记录"""
+        self._validate_identifier(table, "table name")
         sql = f"SELECT * FROM {table}"
         if where:
             sql += f" WHERE {where}"
@@ -1231,6 +1469,7 @@ class Database:
     
     def count(self, table: str, where: str = "", params: tuple = ()) -> int:
         """统计记录数"""
+        self._validate_identifier(table, "table name")
         sql = f"SELECT COUNT(*) as cnt FROM {table}"
         if where:
             sql += f" WHERE {where}"
@@ -1251,10 +1490,16 @@ class Database:
         return result['version'] if result else 0
     
     def backup(self, backup_path: str):
-        """备份数据库"""
+        """备份数据库（仅允许备份到 .novelforge-backups 目录）"""
         import shutil
-        shutil.copy2(str(self.db_path), backup_path)
-        logger.info(f"数据库备份完成: {backup_path}")
+        dest = Path(backup_path).resolve()
+        backups_dir = Path(self.db_path).resolve().parent / ".novelforge-backups"
+        try:
+            dest.relative_to(backups_dir)
+        except ValueError:
+            raise ValueError(f"Backup path must be under {backups_dir}, got: {dest}")
+        shutil.copy2(str(self.db_path), str(dest))
+        logger.info(f"数据库备份完成: {dest}")
     
     def vacuum(self):
         """压缩数据库"""
@@ -1263,7 +1508,8 @@ class Database:
         logger.info("数据库压缩完成")
 
 
-# 全局数据库实例
+# 全局数据库实例（线程安全）
+_db_lock = _threading.Lock()
 _db_instance: Optional[Database] = None
 
 
@@ -1271,14 +1517,17 @@ def get_db() -> Database:
     """获取全局数据库实例"""
     global _db_instance
     if _db_instance is None:
-        _db_instance = Database()
+        with _db_lock:
+            if _db_instance is None:
+                _db_instance = Database()
     return _db_instance
 
 
 def init_db(db_path: Optional[str] = None) -> Database:
     """初始化数据库"""
     global _db_instance
-    _db_instance = Database(db_path)
+    with _db_lock:
+        _db_instance = Database(db_path)
     return _db_instance
 
 

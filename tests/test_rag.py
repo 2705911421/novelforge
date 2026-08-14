@@ -47,23 +47,27 @@ class TestBM25Index:
         assert len(results) == 0
     
     def test_tokenize_chinese(self):
-        """测试中文分词"""
+        """测试中文分词（单字+bigram）"""
         index = BM25Index()
         tokens = index._tokenize("这是测试")
-        
-        assert len(tokens) == 4
+
+        # 单字 + bigram
         assert "这" in tokens
         assert "是" in tokens
-    
+        assert "测" in tokens
+        assert "试" in tokens
+        assert "这是" in tokens  # bigram
+        assert "是测" in tokens  # bigram
+        assert "测试" in tokens  # bigram
+
     def test_tokenize_english(self):
-        """测试英文分词"""
+        """测试英文分词（按词）"""
         index = BM25Index()
         tokens = index._tokenize("Hello World")
-        
-        # 英文按字符分词
-        assert "h" in tokens
-        assert "e" in tokens
-        assert "l" in tokens
+
+        # 英文按词分词（小写）
+        assert "hello" in tokens
+        assert "world" in tokens
     
     def test_clear(self):
         """测试清空"""

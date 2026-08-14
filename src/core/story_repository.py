@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import difflib
 import logging
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -19,7 +20,12 @@ def _json(value: Any) -> str:
 
 
 def _load(value: Optional[str], default: Any) -> Any:
-    return json.loads(value) if value else default
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return default
 
 
 class ChapterVersionConflict(ValueError):
@@ -60,7 +66,9 @@ class StoryRepository:
         chapter_words_min: int = 2000,
         chapter_words_max: int = 4000,
         target_word_count: int = 0,
+        target_volumes: int = 5,
         language: str = "zh-CN",
+        style_profile: Optional[dict[str, Any]] = None,
     ) -> str:
         """Create a Project and its first Book as one SQLite transaction."""
         if not isinstance(name, str) or not name.strip():
@@ -70,12 +78,12 @@ class StoryRepository:
         now = datetime.now().isoformat()
         with self.db.transaction() as conn:
             conn.execute(
-                """INSERT INTO projects(id, name, genre, target_chapters, chapter_words_min,
-                   chapter_words_max, target_word_count, language, source_kind, migration_status,
+                """INSERT INTO projects(id, name, genre, target_chapters, target_volumes, chapter_words_min,
+                   chapter_words_max, target_word_count, style_profile, language, source_kind, migration_status,
                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'native', 'native', ?, ?)""",
-                (project_id, name.strip(), genre, target_chapters, chapter_words_min, chapter_words_max,
-                 target_word_count, language, now, now),
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'native', 'native', ?, ?)""",
+                (project_id, name.strip(), genre, target_chapters, target_volumes, chapter_words_min,
+                 chapter_words_max, target_word_count, _json(style_profile or {}), language, now, now),
             )
             conn.execute(
                 """INSERT INTO books(id, project_id, title, genre, status, created_at, updated_at)
@@ -103,7 +111,7 @@ class StoryRepository:
     def list_authoritative_projects(self) -> list[dict[str, Any]]:
         """List native and explicitly migrated projects without auto-adopting DB rows."""
         return self.db.fetchall(
-            """SELECT p.id, p.name, p.genre, p.language, p.target_chapters, p.target_word_count,
+            """SELECT p.id, p.name, p.genre, p.language, p.target_chapters, p.target_volumes, p.target_word_count,
                p.created_at, p.updated_at,
                COALESCE(b.total_chapters, 0) AS chapters
                FROM projects p JOIN books b ON b.project_id = p.id
@@ -129,6 +137,7 @@ class StoryRepository:
         status: Optional[str] = None,
         change_summary: str = "manual save",
         expected_version: Optional[int] = None,
+        _connection: Any = None,
     ) -> dict[str, Any]:
         """Append a version when body text changes and update the chapter head.
 
@@ -136,7 +145,8 @@ class StoryRepository:
         old callers for compatibility; new editors must send the version they
         loaded so a stale tab cannot overwrite a newer author edit.
         """
-        with self.db.transaction() as conn:
+        transaction = self.db.transaction() if _connection is None else nullcontext(_connection)
+        with transaction as conn:
             chapter = conn.execute(
                 "SELECT * FROM chapters WHERE book_id = ? AND number = ?", (book_id, number)
             ).fetchone()
@@ -441,6 +451,8 @@ class StoryRepository:
         review_score: Optional[float] = None,
         blocking_issues: int = 0,
         chapter_version_id: Optional[str] = None,
+        author_override: bool = False,
+        override_reason: str = "",
     ) -> str:
         commit_id = generate_id()
         with self.db.transaction() as conn:
@@ -462,89 +474,161 @@ class StoryRepository:
 
             conn.execute(
                 """INSERT INTO story_commits(id, chapter_id, status, facts_extracted, state_changes,
-                   review_score, blocking_issues, chapter_version_id)
-                   VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)""",
+                   review_score, blocking_issues, chapter_version_id, author_override, override_reason)
+                   VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
                 (commit_id, chapter_id, _json(list(facts)), _json(state_changes), review_score,
-                 blocking_issues, chapter_version_id),
+                 blocking_issues, chapter_version_id, bool(author_override), (override_reason or "")[:2000]),
             )
         return commit_id
 
-    def accept_story_commit(self, commit_id: str) -> dict[str, Any]:
+    def accept_story_commit(self, commit_id: str, *, author_override: bool = False,
+                            override_reason: str = "") -> dict[str, Any]:
         """Accept a pending commit and atomically advance the book projection."""
         result: dict[str, Any]
         backup_target: tuple[str, str] | None = None
+        idempotent_accept = False
         with self.db.transaction() as conn:
             commit = conn.execute("SELECT * FROM story_commits WHERE id = ?", (commit_id,)).fetchone()
             if commit is None:
                 raise KeyError(f"story commit not found: {commit_id}")
             if commit["status"] == "accepted":
-                return {"commit_id": commit_id, "accepted": True, "idempotent": True}
-            if commit["status"] != "pending":
-                raise ValueError(f"cannot accept {commit['status']} story commit")
-            if commit["blocking_issues"]:
-                raise ValueError("cannot accept a commit with blocking review issues")
-            chapter = conn.execute(
-                """SELECT c.book_id, b.project_id FROM chapters c
-                   JOIN books b ON b.id = c.book_id WHERE c.id = ?""",
-                (commit["chapter_id"],),
-            ).fetchone()
-            if chapter is None:
-                raise ValueError("commit chapter no longer exists")
-            # Version fence: reject if the commit targets a stale chapter version.
-            commit_version_id = commit["chapter_version_id"] if commit["chapter_version_id"] else None
-            if commit_version_id is not None:
-                current_version = conn.execute(
-                    "SELECT id FROM chapter_versions WHERE chapter_id = ? ORDER BY version DESC LIMIT 1",
+                chapter = conn.execute(
+                    """SELECT c.book_id, b.project_id FROM chapters c
+                       JOIN books b ON b.id = c.book_id WHERE c.id = ?""",
                     (commit["chapter_id"],),
                 ).fetchone()
-                if current_version is not None and current_version["id"] != commit_version_id:
-                    raise ValueError(
-                        f"story commit version {commit_version_id} is stale; "
-                        f"chapter has been edited to {current_version['id']}"
+                if chapter is None:
+                    raise ValueError("commit chapter no longer exists")
+                # An earlier post-acceptance StoryFlow projection may have
+                # failed after Canon was already committed.  Keep the public
+                # acceptance operation idempotent, but let the derived read
+                # model make a provenance-checked recovery attempt after the
+                # transaction closes.
+                result = {
+                    "commit_id": commit_id,
+                    "book_id": chapter["book_id"],
+                    "accepted": True,
+                    "idempotent": True,
+                }
+                idempotent_accept = True
+            else:
+                result = {}
+            if not idempotent_accept and commit["status"] != "pending":
+                raise ValueError(f"cannot accept {commit['status']} story commit")
+            if not idempotent_accept:
+                effective_override = bool(commit["author_override"] or author_override)
+                if commit["blocking_issues"] and not effective_override:
+                    raise ValueError("cannot accept a commit with blocking review issues")
+                if author_override and not commit["author_override"]:
+                    reason = (override_reason or "author override")[:2000]
+                    conn.execute(
+                        "UPDATE story_commits SET author_override=TRUE, override_reason=? WHERE id=? AND status='pending'",
+                        (reason, commit_id),
                     )
-            book_id = chapter["book_id"]
-            now = datetime.now().isoformat()
-            if conn.execute(
-                "UPDATE story_commits SET status = 'accepted', accepted_at = ? WHERE id = ? AND status = 'pending'",
-                (now, commit_id),
-            ).rowcount != 1:
-                raise ValueError("story commit was changed concurrently")
-            facts = _load(commit["facts_extracted"], [])
-            for fact in facts:
+                chapter = conn.execute(
+                    """SELECT c.book_id, b.project_id FROM chapters c
+                       JOIN books b ON b.id = c.book_id WHERE c.id = ?""",
+                    (commit["chapter_id"],),
+                ).fetchone()
+                if chapter is None:
+                    raise ValueError("commit chapter no longer exists")
+                # Version fence: reject if the commit targets a stale chapter version.
+                commit_version_id = commit["chapter_version_id"] if commit["chapter_version_id"] else None
+                if commit_version_id is not None:
+                    current_version = conn.execute(
+                        "SELECT id FROM chapter_versions WHERE chapter_id = ? ORDER BY version DESC LIMIT 1",
+                        (commit["chapter_id"],),
+                    ).fetchone()
+                    if current_version is not None and current_version["id"] != commit_version_id:
+                        raise ValueError(
+                            f"story commit version {commit_version_id} is stale; "
+                            f"chapter has been edited to {current_version['id']}"
+                        )
+                book_id = chapter["book_id"]
+                now = datetime.now().isoformat()
+                if conn.execute(
+                    "UPDATE story_commits SET status = 'accepted', accepted_at = ? WHERE id = ? AND status = 'pending'",
+                    (now, commit_id),
+                ).rowcount != 1:
+                    raise ValueError("story commit was changed concurrently")
+                facts = _load(commit["facts_extracted"], [])
+                for fact in facts:
+                    conn.execute(
+                        """INSERT INTO story_facts(id, book_id, chapter_id, fact_type, content, entities,
+                           confidence, commit_id, source, verification_status)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'native', 'verified')""",
+                        (generate_id(), book_id, commit["chapter_id"], fact.get("fact_type", "event"),
+                         fact["content"], _json(fact.get("entities", [])), fact.get("confidence", 1.0), commit_id),
+                    )
+                old = conn.execute("SELECT * FROM story_states WHERE book_id = ?", (book_id,)).fetchone()
+                state = _load(old["state"], {}) if old else {}
+                state.update(_load(commit["state_changes"], {}))
+                version = int(old["state_version"]) + 1 if old else 1
+                payload = {"state": state, "state_version": version}
                 conn.execute(
-                    """INSERT INTO story_facts(id, book_id, chapter_id, fact_type, content, entities,
-                       confidence, commit_id, source, verification_status)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'native', 'verified')""",
-                    (generate_id(), book_id, commit["chapter_id"], fact.get("fact_type", "event"),
-                     fact["content"], _json(fact.get("entities", [])), fact.get("confidence", 1.0), commit_id),
+                    """INSERT INTO story_projections(id, book_id, commit_id, payload, applied_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (generate_id(), book_id, commit_id, _json(payload), now),
                 )
-            old = conn.execute("SELECT * FROM story_states WHERE book_id = ?", (book_id,)).fetchone()
-            state = _load(old["state"], {}) if old else {}
-            state.update(_load(commit["state_changes"], {}))
-            version = int(old["state_version"]) + 1 if old else 1
-            payload = {"state": state, "state_version": version}
-            conn.execute(
-                """INSERT INTO story_projections(id, book_id, commit_id, payload, applied_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (generate_id(), book_id, commit_id, _json(payload), now),
-            )
-            conn.execute(
-                """INSERT INTO story_states(book_id, state, last_commit_id, state_version, stale, updated_at)
-                   VALUES (?, ?, ?, ?, FALSE, ?)
-                   ON CONFLICT(book_id) DO UPDATE SET state=excluded.state,
-                     last_commit_id=excluded.last_commit_id, state_version=excluded.state_version,
-                     stale=FALSE, updated_at=excluded.updated_at""",
-                (book_id, _json(state), commit_id, version, now),
-            )
+                conn.execute(
+                    """INSERT INTO story_states(book_id, state, last_commit_id, state_version, stale, updated_at)
+                       VALUES (?, ?, ?, ?, FALSE, ?)
+                       ON CONFLICT(book_id) DO UPDATE SET state=excluded.state,
+                         last_commit_id=excluded.last_commit_id, state_version=excluded.state_version,
+                         stale=FALSE, updated_at=excluded.updated_at""",
+                    (book_id, _json(state), commit_id, version, now),
+                )
 
-            result = {"commit_id": commit_id, "book_id": book_id, "accepted": True, "state": state}
-            backup_target = (chapter["project_id"], commit["chapter_id"])
+                result = {"commit_id": commit_id, "book_id": book_id, "accepted": True, "state": state}
+                backup_target = (chapter["project_id"], commit["chapter_id"])
 
         # Run the backup after the accepting transaction commits.  A second
         # SQLite connection opened inside the transaction can otherwise see a
         # locked database and fail without leaving durable metadata.
-        assert backup_target is not None
+        assert result.get("book_id")
+        projector = None
         try:
+            # Story Graph is a rebuildable read model.  Capture it after the
+            # authoritative transaction commits so History has a durable
+            # observed projection boundary even when nobody had StoryFlow
+            # open during the write.  A projection-cache failure must never
+            # roll back an already accepted Canon commit; the failure is
+            # returned explicitly for callers and logged for recovery.
+            from src.story_graph.service import StoryGraphProjector
+
+            projector = StoryGraphProjector(self.db)
+            if idempotent_accept:
+                result["graph_snapshot"] = projector.retry_accepted_commit_snapshot(
+                    result["book_id"], commit_id
+                )
+            else:
+                result["graph_snapshot"] = projector.capture_accepted_commit_snapshot(
+                    result["book_id"], commit_id
+                )
+        except Exception as exc:
+            logger.exception("Story Graph snapshot capture failed after StoryCommit %s", commit_id)
+            if projector is not None and not idempotent_accept:
+                try:
+                    projector.record_snapshot_capture_failure(
+                        result["book_id"], commit_id, str(exc)
+                    )
+                except Exception:
+                    logger.exception(
+                        "Story Graph snapshot failure boundary could not be recorded for StoryCommit %s",
+                        commit_id,
+                    )
+            result["graph_snapshot"] = {
+                "captured": False,
+                "bookId": result["book_id"],
+                "commitId": commit_id,
+                "historicalScope": "observed_projection",
+                "canonicalSource": "sqlite",
+                "error": str(exc),
+            }
+        if idempotent_accept:
+            return result
+        try:
+            assert backup_target is not None
             from .backup import BackupManager
             backup = BackupManager(self.db, self.workspace_root).auto_backup_after_commit(*backup_target)
             result["backup"] = {
@@ -667,6 +751,171 @@ class StoryRepository:
             )
         return row
 
+    def apply_planning_synthesis(self, project_id: str, synthesis: dict[str, Any]) -> dict[str, Any]:
+        """Persist the model's planning summary as the canonical read/write projection.
+
+        Planning documents and Story Bible snapshots remain the source record.
+        This method only updates the structured projections used by writing,
+        review and Studio read views, and it preserves existing non-empty entity
+        fields when a later synthesis is less specific.
+        """
+        book = self.book_for_project(project_id)
+        if not book:
+            raise KeyError(f"no authoritative book for project: {project_id}")
+        world = dict(synthesis.get("world") or {})
+        power = world.get("power_system") or {}
+        if isinstance(power, dict):
+            power_parts = [str(item).strip() for item in (
+                power.get("name"), power.get("description")
+            ) if isinstance(item, str) and item.strip()]
+            levels = power.get("levels") or []
+            limitations = power.get("limitations") or []
+            if levels:
+                power_parts.append("阶段：" + "、".join(str(item) for item in levels))
+            if limitations:
+                power_parts.append("限制：" + "；".join(str(item) for item in limitations))
+            world["power_system"] = "；".join(power_parts)
+        world.pop("powerSystem", None)
+        world["name"] = str(world.get("name") or "架空世界").strip() or "架空世界"
+        world.setdefault("setting_description", "")
+        world.setdefault("core_conflict", "")
+        world.setdefault("world_rules", [])
+        world.setdefault("history", "")
+        world.setdefault("themes", [])
+        style = dict(synthesis.get("writing_style") or {})
+        style_summary = style.get("summary") if isinstance(style.get("summary"), str) else ""
+        if not style_summary:
+            style_summary = "；".join(
+                f"{label}：{style[key]}" for key, label in (
+                    ("voice", "叙述声音"), ("pov", "视角"), ("rhythm", "节奏"),
+                    ("dialogue", "对白"), ("emotion", "情绪"),
+                ) if isinstance(style.get(key), str) and style[key].strip()
+            )
+        now = datetime.now().isoformat()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """UPDATE projects SET author_intent=?, writing_style=?, style_profile=?,
+                   world_setting=?, updated_at=? WHERE id=?""",
+                (
+                    synthesis.get("author_intent") or "",
+                    style_summary,
+                    _json(style),
+                    _json(world),
+                    now,
+                    project_id,
+                ),
+            )
+
+            def upsert_character(item: dict[str, Any]) -> None:
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    return
+                values = (
+                    item.get("description") or "", item.get("personality") or "",
+                    item.get("background") or "", _json(item.get("goals") or []),
+                    _json(item.get("flaws") or []), item.get("importance") or "minor",
+                )
+                existing = conn.execute(
+                    "SELECT id, description, personality, background, goals, flaws, importance FROM characters WHERE book_id=? AND name=? LIMIT 1",
+                    (book["id"], name),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        """UPDATE characters SET description=?, personality=?, background=?, goals=?, flaws=?, importance=?, updated_at=? WHERE id=?""",
+                        tuple(new if not existing[key] or (key == "importance" and existing[key] == "minor") else existing[key]
+                              for new, key in zip(values, ("description", "personality", "background", "goals", "flaws", "importance"))) + (now, existing["id"]),
+                    )
+                    return
+                conn.execute(
+                    """INSERT INTO characters(id, book_id, name, description, personality, background,
+                       goals, flaws, importance, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (generate_id(), book["id"], name, *values, now),
+                )
+
+            def upsert_faction(item: dict[str, Any]) -> None:
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    return
+                values = (
+                    item.get("description") or "", _json(item.get("goals") or []),
+                    item.get("resources") or "", item.get("leader") or item.get("leadership") or "",
+                )
+                existing = conn.execute(
+                    "SELECT id, description, goals, resources, leadership FROM factions WHERE book_id=? AND name=? LIMIT 1",
+                    (book["id"], name),
+                ).fetchone()
+                if existing:
+                    merged = tuple(new if not existing[key] else existing[key]
+                                   for new, key in zip(values, ("description", "goals", "resources", "leadership")))
+                    conn.execute("UPDATE factions SET description=?, goals=?, resources=?, leadership=?, updated_at=? WHERE id=?", merged + (now, existing["id"]))
+                    return
+                conn.execute(
+                    """INSERT INTO factions(id, book_id, name, description, goals, resources, leadership, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (generate_id(), book["id"], name, *values, now),
+                )
+
+            def upsert_location(item: dict[str, Any]) -> None:
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    return
+                values = (item.get("description") or "", item.get("type") or "", item.get("significance") or "")
+                existing = conn.execute(
+                    "SELECT id, description, type, significance FROM locations WHERE book_id=? AND name=? LIMIT 1",
+                    (book["id"], name),
+                ).fetchone()
+                if existing:
+                    merged = tuple(new if not existing[key] else existing[key]
+                                   for new, key in zip(values, ("description", "type", "significance")))
+                    conn.execute("UPDATE locations SET description=?, type=?, significance=?, updated_at=? WHERE id=?", merged + (now, existing["id"]))
+                    return
+                conn.execute(
+                    """INSERT INTO locations(id, book_id, name, description, type, significance, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (generate_id(), book["id"], name, *values, now),
+                )
+
+            for item in synthesis.get("characters") or []:
+                if isinstance(item, dict):
+                    upsert_character(item)
+            for item in synthesis.get("factions") or []:
+                if isinstance(item, dict):
+                    upsert_faction(item)
+            for item in synthesis.get("locations") or []:
+                if isinstance(item, dict):
+                    upsert_location(item)
+
+            # Do not duplicate auxiliary projections when a synthesis task is
+            # retried.  Existing hand-authored rows are left untouched.
+            if not conn.execute("SELECT 1 FROM world_rules WHERE book_id=? LIMIT 1", (book["id"],)).fetchone():
+                for rule in world.get("world_rules") or []:
+                    if isinstance(rule, str) and rule.strip():
+                        conn.execute(
+                            "INSERT INTO world_rules(id, book_id, category, rule_text) VALUES (?, ?, ?, ?)",
+                            (generate_id(), book["id"], "planning", rule.strip()),
+                        )
+            for item in synthesis.get("foreshadowing") or []:
+                if not isinstance(item, dict):
+                    continue
+                description = str(item.get("description") or item.get("name") or "").strip()
+                if not description:
+                    continue
+                if conn.execute(
+                    "SELECT 1 FROM foreshadows WHERE book_id=? AND description=? LIMIT 1",
+                    (book["id"], description),
+                ).fetchone():
+                    continue
+                conn.execute(
+                    """INSERT INTO foreshadows(id, book_id, created_chapter, title, description, status, notes)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        generate_id(), book["id"], int(item.get("plantedChapter") or item.get("planted_chapter") or 0),
+                        item.get("title") or item.get("name") or "", description,
+                        item.get("status") or "open", item.get("notes") or "",
+                    ),
+                )
+        return {"projectId": project_id, "bookId": book["id"], "updatedAt": now}
+
     def save_chapter_content(
         self,
         project_id: str,
@@ -687,7 +936,7 @@ class StoryRepository:
 
     def load_authoritative_project(self, project_id: str):
         """Return the compatible dataclass view from the authoritative store."""
-        from .models import Chapter, ChapterStatus, Character, Faction, Foreshadowing, Location, StoryProject, WorldSetting
+        from .models import Arc, Chapter, ChapterStatus, Character, Faction, Foreshadowing, Location, StoryProject, Volume, WorldSetting
 
         project = self.db.get_by_id("projects", project_id)
         book = self.book_for_project(project_id)
@@ -699,6 +948,8 @@ class StoryRepository:
                               writing_style=project.get("writing_style") or "", author_intent=project.get("author_intent") or "",
                               target_word_count=project.get("target_word_count") or 0,
                               target_chapters=project.get("target_chapters") or 100,
+                              target_volumes=project.get("target_volumes") or 5,
+                              style_profile=_load(project.get("style_profile"), {}),
                               language=project.get("language") or "zh-CN")
         result.world = WorldSetting(**{key: value for key, value in world.items() if key in WorldSetting.__dataclass_fields__})
         for row in self.db.fetchall("SELECT * FROM characters WHERE book_id=?", (book["id"],)):
@@ -707,9 +958,12 @@ class StoryRepository:
         for row in self.db.fetchall("SELECT * FROM factions WHERE book_id=?", (book["id"],)):
             result.factions[row["name"]] = Faction(name=row["name"], description=row.get("description") or "",
                 leader=row.get("leadership") or "", goals=_load(row.get("goals"), []) if row.get("goals") else [])
-        for row in self.db.fetchall("SELECT * FROM locations WHERE book_id=?", (book["id"],)):
+        location_rows = self.db.fetchall("SELECT * FROM locations WHERE book_id=?", (book["id"],))
+        location_names = {row["id"]: row["name"] for row in location_rows}
+        for row in location_rows:
             result.locations[row["name"]] = Location(name=row["name"], description=row.get("description") or "",
-                significance=row.get("significance") or "")
+                significance=row.get("significance") or "", type=row.get("type") or "",
+                parent=location_names.get(row.get("parent_id"), "") if row.get("parent_id") else "")
         for row in self.db.fetchall("SELECT * FROM foreshadows WHERE book_id=?", (book["id"],)):
             result.foreshadowing[row["id"]] = Foreshadowing(id=row["id"], description=row.get("description") or "",
                 planted_chapter=row.get("created_chapter") or 0,
@@ -728,6 +982,43 @@ class StoryRepository:
                 key_events=_load(row.get("key_events"), []), characters_appeared=_load(row.get("characters_appeared"), []),
                 locations_used=_load(row.get("locations_used"), []), created_at=row.get("created_at") or "",
                 updated_at=row.get("updated_at") or "")
+        # Restore the structured planning projections that the legacy visualizers use.
+        volume_rows = self.db.fetchall("SELECT * FROM volumes WHERE book_id=? ORDER BY number", (book["id"],))
+        for volume_row in volume_rows:
+            volume = Volume(number=volume_row["number"], title=volume_row.get("title") or "",
+                            description=volume_row.get("description") or "",
+                            target_chapters=volume_row.get("target_chapters") or 0)
+            for arc_row in self.db.fetchall("SELECT * FROM arcs WHERE volume_id=? ORDER BY number", (volume_row["id"],)):
+                volume.arcs.append(Arc(name=arc_row.get("title") or "", volume=volume.number,
+                                       description=arc_row.get("description") or "",
+                                       themes=_load(arc_row.get("theme"), []) if arc_row.get("theme") else []))
+            result.volumes.append(volume)
+        result.timeline = []
+        for event_row in self.db.fetchall("SELECT * FROM timeline_events WHERE book_id=? ORDER BY event_time, created_at", (book["id"],)):
+            event = dict(event_row)
+            event["characters_involved"] = _load(event.get("characters_involved"), [])
+            result.timeline.append(event)
+        character_rows = self.db.fetchall("SELECT id, name FROM characters WHERE book_id=?", (book["id"],))
+        faction_rows = self.db.fetchall("SELECT id, name FROM factions WHERE book_id=?", (book["id"],))
+        entity_names = {(row_type, row["id"]): row["name"] for row_type, rows in (("character", character_rows), ("faction", faction_rows)) for row in rows}
+        for relation in self.db.fetchall("SELECT * FROM relationships WHERE book_id=?", (book["id"],)):
+            source_name = entity_names.get((relation["source_type"], relation["source_id"]))
+            target_name = entity_names.get((relation["target_type"], relation["target_id"]))
+            if not source_name or not target_name:
+                continue
+            relation_type = relation.get("relationship_type") or "relates"
+            if relation["source_type"] == "character" and source_name in result.characters:
+                result.characters[source_name].relationships[target_name] = relation_type
+            if relation["source_type"] == "faction" and source_name in result.factions:
+                if relation_type in {"ally", "allies", "friend"}:
+                    result.factions[source_name].allies.append(target_name)
+                elif relation_type in {"enemy", "enemies", "rival"}:
+                    result.factions[source_name].enemies.append(target_name)
+        for relation in self.db.fetchall("SELECT * FROM relationships WHERE book_id=? AND source_type='location'", (book["id"],)):
+            source_name = location_names.get(relation["source_id"])
+            target_name = location_names.get(relation["target_id"])
+            if source_name in result.locations and target_name:
+                result.locations[source_name].connected_to.append(target_name)
         return result
 
     def load_legacy_project(self, project_id: str):
@@ -743,12 +1034,12 @@ class StoryRepository:
         now = datetime.now().isoformat()
         with self.db.transaction() as conn:
             conn.execute(
-                """UPDATE projects SET name=?, genre=?, writing_style=?, author_intent=?,
-                   world_setting=?, target_word_count=?, target_chapters=?, language=?, updated_at=?
+                """UPDATE projects SET name=?, genre=?, writing_style=?, style_profile=?, author_intent=?,
+                   world_setting=?, target_word_count=?, target_chapters=?, target_volumes=?, language=?, updated_at=?
                    WHERE id=?""",
-                (project.name, project.genre, project.writing_style, project.author_intent,
+                (project.name, project.genre, project.writing_style, _json(project.style_profile), project.author_intent,
                  _json(project.world.__dict__), project.target_word_count, project.target_chapters,
-                 project.language, now, project.id),
+                 project.target_volumes, project.language, now, project.id),
             )
             conn.execute(
                 "UPDATE books SET title=?, genre=?, updated_at=? WHERE id=?",
@@ -779,13 +1070,48 @@ class StoryRepository:
             # Persist locations.
             for name, loc in getattr(project, "locations", {}).items():
                 conn.execute(
-                    """INSERT INTO locations(id, book_id, name, description, significance)
-                       VALUES (?, ?, ?, ?, ?)
+                    """INSERT INTO locations(id, book_id, name, description, type, significance)
+                       VALUES (?, ?, ?, ?, ?, ?)
                        ON CONFLICT(book_id, name) DO UPDATE SET
-                         description=excluded.description, significance=excluded.significance""",
-                    (generate_id(), book_id, name, getattr(loc, "description", ""),
+                         description=excluded.description, type=excluded.type, significance=excluded.significance""",
+                    (generate_id(), book_id, name, getattr(loc, "description", ""), getattr(loc, "type", ""),
                      getattr(loc, "significance", "")),
                 )
+            location_ids = {row["name"]: row["id"] for row in conn.execute(
+                "SELECT id, name FROM locations WHERE book_id=?", (book_id,)
+            ).fetchall()}
+            for name, loc in getattr(project, "locations", {}).items():
+                parent_id = location_ids.get(getattr(loc, "parent", ""))
+                conn.execute(
+                    "UPDATE locations SET parent_id=? WHERE book_id=? AND name=?",
+                    (parent_id, book_id, name),
+                )
+            # Persist the per-book volume and arc outline used by the visual planners.
+            for volume_index, volume in enumerate(getattr(project, "volumes", []), start=1):
+                volume_number = getattr(volume, "number", volume_index) or volume_index
+                conn.execute(
+                    """INSERT INTO volumes(id, book_id, number, title, description, target_chapters)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(book_id, number) DO UPDATE SET
+                         title=excluded.title, description=excluded.description,
+                         target_chapters=excluded.target_chapters""",
+                    (generate_id(), book_id, volume_number, getattr(volume, "title", ""),
+                     getattr(volume, "description", ""), getattr(volume, "target_chapters", 0)),
+                )
+                volume_row = conn.execute(
+                    "SELECT id FROM volumes WHERE book_id=? AND number=?", (book_id, volume_number)
+                ).fetchone()
+                if volume_row:
+                    for arc_index, arc in enumerate(getattr(volume, "arcs", []), start=1):
+                        conn.execute(
+                            """INSERT INTO arcs(id, volume_id, number, title, description, theme)
+                               VALUES (?, ?, ?, ?, ?, ?)
+                               ON CONFLICT(volume_id, number) DO UPDATE SET
+                                 title=excluded.title, description=excluded.description,
+                                 theme=excluded.theme""",
+                            (generate_id(), volume_row["id"], arc_index, getattr(arc, "name", ""),
+                             getattr(arc, "description", ""), _json(getattr(arc, "themes", []))),
+                        )
             # Persist foreshadows.
             for fid, fs in getattr(project, "foreshadowing", {}).items():
                 conn.execute(
@@ -799,11 +1125,103 @@ class StoryRepository:
                      getattr(fs, "planted_chapter", 0), getattr(fs, "resolved_chapter", 0),
                      getattr(fs, "status", "open"), getattr(fs, "notes", "")),
                 )
+            # Persist timeline events without duplicating entries on every project save.
+            for event in getattr(project, "timeline", []):
+                if not isinstance(event, dict):
+                    continue
+                event_id = event.get("id")
+                if not event_id:
+                    existing_event = conn.execute(
+                        """SELECT id FROM timeline_events WHERE book_id=? AND title=?
+                           AND COALESCE(event_time, '')=COALESCE(?, '') LIMIT 1""",
+                        (book_id, event.get("title", ""), event.get("event_time", event.get("eventTime", ""))),
+                    ).fetchone()
+                    event_id = existing_event["id"] if existing_event else generate_id()
+                chapter_id = event.get("chapter_id", event.get("chapterId"))
+                if isinstance(chapter_id, int):
+                    chapter_row = conn.execute(
+                        "SELECT id FROM chapters WHERE book_id=? AND number=?", (book_id, chapter_id)
+                    ).fetchone()
+                    chapter_id = chapter_row["id"] if chapter_row else None
+                values = (
+                    event_id, book_id, chapter_id, event.get("event_time", event.get("eventTime", "")),
+                    event.get("event_type", event.get("eventType", "event")), event.get("title", ""),
+                    event.get("description", ""), _json(event.get("characters_involved", event.get("characters", []))),
+                    event.get("location", ""), event.get("significance", ""),
+                )
+                conn.execute(
+                    """INSERT INTO timeline_events(id, book_id, chapter_id, event_time, event_type, title,
+                       description, characters_involved, location, significance)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET chapter_id=excluded.chapter_id,
+                       event_time=excluded.event_time, event_type=excluded.event_type, title=excluded.title,
+                       description=excluded.description, characters_involved=excluded.characters_involved,
+                       location=excluded.location, significance=excluded.significance""",
+                    values,
+                )
+            # Project-level character and faction relationship maps are the legacy
+            # editing surface; mirror them into the shared relationship projection.
+            character_ids = {row["name"]: row["id"] for row in conn.execute(
+                "SELECT id, name FROM characters WHERE book_id=?", (book_id,)
+            ).fetchall()}
+            faction_ids = {row["name"]: row["id"] for row in conn.execute(
+                "SELECT id, name FROM factions WHERE book_id=?", (book_id,)
+            ).fetchall()}
+            for name, char in getattr(project, "characters", {}).items():
+                for target_name, relationship_type in getattr(char, "relationships", {}).items():
+                    source_id, target_id = character_ids.get(name), character_ids.get(target_name)
+                    if not source_id or not target_id:
+                        continue
+                    if not conn.execute(
+                        """SELECT 1 FROM relationships WHERE book_id=? AND source_type='character'
+                           AND source_id=? AND target_type='character' AND target_id=? AND relationship_type=?""",
+                        (book_id, source_id, target_id, str(relationship_type)),
+                    ).fetchone():
+                        conn.execute(
+                            """INSERT INTO relationships(id, book_id, source_type, source_id, target_type,
+                               target_id, relationship_type) VALUES (?, ?, 'character', ?, 'character', ?, ?)""",
+                            (generate_id(), book_id, source_id, target_id, str(relationship_type)),
+                        )
+            for name, faction in getattr(project, "factions", {}).items():
+                for target_name, relationship_type in [
+                    *((target, "ally") for target in getattr(faction, "allies", [])),
+                    *((target, "enemy") for target in getattr(faction, "enemies", [])),
+                ]:
+                    source_id, target_id = faction_ids.get(name), faction_ids.get(target_name)
+                    if not source_id or not target_id:
+                        continue
+                    if not conn.execute(
+                        """SELECT 1 FROM relationships WHERE book_id=? AND source_type='faction'
+                           AND source_id=? AND target_type='faction' AND target_id=? AND relationship_type=?""",
+                        (book_id, source_id, target_id, relationship_type),
+                    ).fetchone():
+                        conn.execute(
+                            """INSERT INTO relationships(id, book_id, source_type, source_id, target_type,
+                               target_id, relationship_type) VALUES (?, ?, 'faction', ?, 'faction', ?, ?)""",
+                            (generate_id(), book_id, source_id, target_id, relationship_type),
+                        )
+            for name, location in getattr(project, "locations", {}).items():
+                source_id = location_ids.get(name)
+                for target_name in getattr(location, "connected_to", []):
+                    target_id = location_ids.get(target_name)
+                    if not source_id or not target_id:
+                        continue
+                    if not conn.execute(
+                        """SELECT 1 FROM relationships WHERE book_id=? AND source_type='location'
+                           AND source_id=? AND target_type='location' AND target_id=?
+                           AND relationship_type='连接'""",
+                        (book_id, source_id, target_id),
+                    ).fetchone():
+                        conn.execute(
+                            """INSERT INTO relationships(id, book_id, source_type, source_id, target_type,
+                               target_id, relationship_type) VALUES (?, ?, 'location', ?, 'location', ?, '连接')""",
+                            (generate_id(), book_id, source_id, target_id),
+                        )
             # Persist chapters.
             for number, chapter in project.chapters.items():
                 self.append_chapter_version(book_id, int(number), chapter.content or "", title=chapter.title,
                     summary=chapter.summary, status=getattr(chapter.status, "value", str(chapter.status)),
-                    change_summary="legacy project save")
+                    change_summary="legacy project save", _connection=conn)
 
     def save_legacy_project(self, project) -> None:
         """Backward-compatible alias retained for older callers."""

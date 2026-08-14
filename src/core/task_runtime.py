@@ -16,23 +16,102 @@ class TaskStateError(ValueError):
 class TaskFailure(RuntimeError):
     """A handler failure whose retry policy is explicit at the task seam."""
 
-    def __init__(self, code: str, message: str, *, retryable: bool = False):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        retry_delay_seconds: Optional[int] = None,
+    ):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        self.retry_delay_seconds = retry_delay_seconds
 
 
 TERMINAL = {"completed", "cancelled", "needs_author_decision"}
+WAITING_ON_CHILD = "waiting_on_child"
 RECOVERY_REQUIRES_AUTHOR = {"world-bootstrap", "write", "write-next"}
 TRANSITIONS = {
     "queued": {"running", "cancelled"},
-    "running": {"paused", "cancelling", "completed", "failed", "needs_author_decision"},
+    "running": {"paused", "cancelling", "completed", "failed", "needs_author_decision", WAITING_ON_CHILD},
     "paused": {"queued", "cancelled"},
     "cancelling": {"cancelled", "needs_author_decision"},
     "failed": {"queued", "needs_author_decision"},
+    WAITING_ON_CHILD: {"queued", "cancelled", "needs_author_decision"},
     "completed": set(),
     "cancelled": set(),
     "needs_author_decision": {"queued", "cancelled"},
+}
+
+# These labels are a read-model concern: the worker keeps its stable task
+# identifiers, while Studio receives a useful name a person can understand.
+TASK_OPERATION_LABELS = {
+    "continuous": "连续创作",
+    "write": "章节写作",
+    "write-next": "章节写作",
+    "draft-chapter": "生成草稿",
+    "audit-chapter": "章节审查",
+    "review": "章节审查",
+    "revise-chapter": "章节修订",
+    "revise": "章节修订",
+    "rewrite-chapter": "章节重写",
+    "plan-chapter": "章节规划",
+    "compose-chapter": "上下文编排",
+    "joint-review": "联合审查",
+    "world-bootstrap": "世界观构建",
+    "planning-synthesis": "理解规划资料",
+    "planning-views-generate": "整理规划视图",
+    "forecast": "剧情推演",
+    "storyflow-analyze": "StoryFlow 分析",
+    "draft-import": "初稿分析",
+    "document-index": "文档索引",
+    "model-connection-test": "测试模型连接",
+    "model-discovery": "获取模型列表",
+    "thought-clarify": "追问创作想法",
+    "thought-framework": "整理小说框架",
+}
+
+_WRITING_PROGRESS = {
+    "queued": 0,
+    "PRECHECK": 5,
+    "LOAD_CHAPTER_PLAN": 12,
+    "BUILD_CONTEXT": 22,
+    "RETRIEVE_MEMORY": 32,
+    "PLAN_CHAPTER": 40,
+    "EXTRACT_REQUIREMENTS": 44,
+    "COMPOSE_WRITING_PROMPT": 48,
+    "GENERATE_DRAFT": 52,
+    "REVIEW": 68,
+    "QUALITY_GATE": 76,
+    "REVISION": 84,
+    "EXTRACT_FACTS": 92,
+    "CREATE_STORY_COMMIT": 97,
+    "COMPLETE": 99,
+    "DONE": 100,
+}
+
+_TASK_PROGRESS = {
+    "write-next": _WRITING_PROGRESS,
+    "write": _WRITING_PROGRESS,
+    "draft-chapter": {"queued": 0, "plan": 35, "draft": 82, "completed": 100},
+    "audit-chapter": {"queued": 0, "review": 82, "completed": 100},
+    "review": {"queued": 0, "review": 82, "completed": 100},
+    "revise-chapter": {"queued": 0, "revise": 48, "re-review": 82, "completed": 100},
+    "revise": {"queued": 0, "revise": 48, "re-review": 82, "completed": 100},
+    "rewrite-chapter": {"queued": 0, "plan": 35, "rewrite": 82, "completed": 100},
+    "plan-chapter": {"queued": 0, "plan": 82, "completed": 100},
+    "compose-chapter": {"queued": 0, "plan": 42, "compose": 82, "completed": 100},
+    "world-bootstrap": {"queued": 0, "world-bootstrap": 82, "completed": 100},
+    "joint-review": {"queued": 0, "joint-review": 82, "completed": 100},
+    "planning-synthesis": {"queued": 0, "planning-synthesis-model-call": 55, "completed": 100},
+    "planning-views-generate": {"queued": 0, "planning-views-model-call": 55, "planning-views-saved": 92, "completed": 100},
+    "model-connection-test": {"queued": 0, "provider-test": 82, "completed": 100},
+    "model-discovery": {"queued": 0, "model-discovery": 82, "completed": 100},
+    "document-index": {"queued": 0, "parsing": 45, "indexed": 88, "completed": 100},
+    "forecast": {"queued": 0, "forecast-complete": 92, "completed": 100},
+    "storyflow-analyze": {"queued": 0, "storyflow-selection": 24, "storyflow-model-call": 72, "completed": 100},
 }
 
 
@@ -65,6 +144,61 @@ class TaskRuntime:
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return self._task_dict(row)
 
+    def enqueue_continuous(
+        self,
+        *,
+        project_id: str,
+        book_id: str,
+        data: dict[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Atomically enqueue one exclusive continuous-writing session.
+
+        A separate preflight query is not sufficient here: two HTTP/CLI
+        callers can both observe an empty queue before either inserts.  The
+        active-session check and insert therefore share the same IMMEDIATE
+        transaction.
+        """
+        task_id = generate_id()
+        now = datetime.now().isoformat()
+        with self.db.transaction() as conn:
+            previous = conn.execute(
+                "SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+            if previous:
+                return self._task_dict(previous)
+
+            existing = conn.execute(
+                """SELECT id FROM tasks
+                   WHERE book_id=? AND type='continuous'
+                     AND status IN ('queued', 'running', 'waiting_on_child', 'paused', 'cancelling')
+                   ORDER BY created_at LIMIT 1""",
+                (book_id,),
+            ).fetchone()
+            if existing:
+                raise TaskStateError(
+                    "continuous writing already running or queued: "
+                    f"{existing['id']}"
+                )
+
+            conn.execute(
+                """INSERT INTO tasks(id, type, status, project_id, book_id, stage, data,
+                   idempotency_key, created_at, updated_at)
+                   VALUES (?, 'continuous', 'queued', ?, ?, 'queued', ?, ?, ?, ?)""",
+                (
+                    task_id,
+                    project_id,
+                    book_id,
+                    json.dumps(data, ensure_ascii=False),
+                    idempotency_key,
+                    now,
+                    now,
+                ),
+            )
+            self._append_event(conn, task_id, "queued", {"stage": "queued", "type": "continuous"})
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return self._task_dict(row)
+
     def get(self, task_id: str) -> Optional[dict[str, Any]]:
         row = self.db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
         return self._task_dict(row) if row else None
@@ -83,12 +217,23 @@ class TaskRuntime:
         return [self._task_dict(row) for row in rows]
 
     def claim(self, worker_id: str, *, lease_seconds: int = 60) -> Optional[dict[str, Any]]:
-        """Atomically claim exactly one queued task for a worker lease."""
+        """Atomically claim one runnable task for a worker lease.
+
+        A continuous parent is stored as ``waiting_on_child`` while its child
+        runs.  Once the child is terminal, the same queue claim wakes the
+        parent.  No process-local callback is required, so a restart cannot
+        strand a parent task in memory.
+        """
         now = datetime.now()
         with self.db.transaction() as conn:
             row = conn.execute(
-                """SELECT * FROM tasks WHERE status='queued' AND stage != 'blocked' AND
-                   (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                """SELECT t.* FROM tasks t WHERE
+                   ((t.status='queued' AND t.stage != 'blocked') OR
+                    (t.status='waiting_on_child' AND t.waiting_for_task_id IS NOT NULL AND
+                     EXISTS (SELECT 1 FROM tasks child
+                            WHERE child.id=t.waiting_for_task_id
+                              AND child.status IN ('completed', 'failed', 'needs_author_decision', 'cancelled'))))
+                   AND (t.next_attempt_at IS NULL OR t.next_attempt_at <= ?)
                    ORDER BY created_at LIMIT 1""", (now.isoformat(),)
             ).fetchone()
             if not row:
@@ -96,13 +241,23 @@ class TaskRuntime:
             expires = (now + timedelta(seconds=lease_seconds)).isoformat()
             updated = conn.execute(
                 """UPDATE tasks SET status='running', lease_owner=?, lease_expires_at=?,
-                   attempt=attempt+1, started_at=COALESCE(started_at, ?), updated_at=?
-                   WHERE id=? AND status='queued'""",
+                   attempt=attempt+1, started_at=COALESCE(started_at, ?),
+                   waiting_for_task_id=NULL, updated_at=?
+                   WHERE id=? AND
+                     (status='queued' OR
+                      (status='waiting_on_child' AND waiting_for_task_id IS NOT NULL AND
+                       EXISTS (SELECT 1 FROM tasks child
+                              WHERE child.id=tasks.waiting_for_task_id
+                                AND child.status IN ('completed', 'failed', 'needs_author_decision', 'cancelled'))))""",
                 (worker_id, expires, now.isoformat(), now.isoformat(), row["id"]),
             )
             if updated.rowcount != 1:
                 return None
-            self._append_event(conn, row["id"], "claimed", {"worker_id": worker_id, "lease_expires_at": expires})
+            self._append_event(conn, row["id"], "claimed", {
+                "worker_id": worker_id,
+                "lease_expires_at": expires,
+                "woken_by_child": row["status"] == WAITING_ON_CHILD,
+            })
             claimed = conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
         return self._task_dict(claimed)
 
@@ -155,7 +310,7 @@ class TaskRuntime:
             if target not in TRANSITIONS.get(current, set()):
                 raise TaskStateError(f"illegal task transition: {current} -> {target}")
             # Lease fencing: if caller supplies lease_owner, verify it matches.
-            if lease_owner is not None and row["lease_owner"] and row["lease_owner"] != lease_owner:
+            if lease_owner is not None and row["lease_owner"] != lease_owner:
                 raise TaskStateError(
                     f"lease owner mismatch: task owned by {row['lease_owner']}, "
                     f"caller claims {lease_owner}"
@@ -165,11 +320,13 @@ class TaskRuntime:
             conn.execute(
                 """UPDATE tasks SET status=?, error_code=COALESCE(?, error_code), error=COALESCE(?, error),
                    result=COALESCE(?, result),
+                   progress=CASE WHEN ?='completed' THEN 100 ELSE progress END,
+                   total_steps=CASE WHEN ?='completed' AND total_steps=0 THEN 1 ELSE total_steps END,
                    lease_owner=CASE WHEN ? IN ('running', 'cancelling') THEN lease_owner ELSE NULL END,
                    lease_expires_at=CASE WHEN ? IN ('running', 'cancelling') THEN lease_expires_at ELSE NULL END,
                    completed_at=COALESCE(?, completed_at), updated_at=? WHERE id=?""",
                 (target, error_code, error, json.dumps(result, ensure_ascii=False) if result is not None else None,
-                 target, target, completed_at, now, task_id),
+                 target, target, target, target, completed_at, now, task_id),
             )
             self._append_event(conn, task_id, target, detail or {"error_code": error_code, "error": error})
             updated_row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -178,13 +335,13 @@ class TaskRuntime:
     def checkpoint(self, task_id: str, stage: str, state: dict[str, Any],
                    *, lease_owner: Optional[str] = None) -> dict[str, Any]:
         with self.db.transaction() as conn:
-            task = conn.execute("SELECT status, lease_owner FROM tasks WHERE id=?", (task_id,)).fetchone()
+            task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if task is None:
                 raise KeyError(f"task not found: {task_id}")
             if task["status"] not in {"running", "cancelling", "paused"}:
                 raise TaskStateError("a checkpoint requires an active task")
             # Lease fencing: verify caller still owns the task.
-            if lease_owner is not None and task["lease_owner"] and task["lease_owner"] != lease_owner:
+            if lease_owner is not None and task["lease_owner"] != lease_owner:
                 raise TaskStateError(
                     f"lease owner mismatch at checkpoint: owned by {task['lease_owner']}"
                 )
@@ -195,9 +352,88 @@ class TaskRuntime:
                    VALUES (?, ?, ?, ?, ?)""",
                 (checkpoint_id, task_id, stage, json.dumps(state, ensure_ascii=False), now),
             )
-            conn.execute("UPDATE tasks SET stage=?, updated_at=? WHERE id=?", (stage, now, task_id))
+            task_data = json.loads(task["data"] or "{}")
+            progress, total_steps = self._progress_snapshot(
+                task["type"], task_data, task["status"], stage, state,
+                persisted_progress=task["progress"], persisted_total=task["total_steps"],
+            )
+            conn.execute(
+                """UPDATE tasks SET stage=?, progress=?, total_steps=?, updated_at=? WHERE id=?""",
+                (stage, progress, total_steps, now, task_id),
+            )
             self._append_event(conn, task_id, "checkpoint", {"checkpoint_id": checkpoint_id, "stage": stage})
         return {"id": checkpoint_id, "stage": stage, "state": state}
+
+    def defer_until_child(
+        self,
+        task_id: str,
+        child_task_id: str,
+        *,
+        detail: Optional[dict[str, Any]] = None,
+        lease_owner: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Release a parent lease while a durable child executes elsewhere."""
+        if not isinstance(child_task_id, str) or not child_task_id:
+            raise ValueError("child_task_id is required")
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            if row["status"] != "running":
+                raise TaskStateError("only a running task can wait for a child")
+            if lease_owner is not None and row["lease_owner"] != lease_owner:
+                raise TaskStateError(
+                    f"lease owner mismatch while deferring: task owned by {row['lease_owner']}"
+                )
+            child = conn.execute("SELECT id FROM tasks WHERE id=?", (child_task_id,)).fetchone()
+            if child is None:
+                raise KeyError(f"child task not found: {child_task_id}")
+            now = datetime.now().isoformat()
+            conn.execute(
+                """UPDATE tasks SET status=?, stage=?, waiting_for_task_id=?,
+                   lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?""",
+                (WAITING_ON_CHILD, WAITING_ON_CHILD, child_task_id, now, task_id),
+            )
+            self._append_event(conn, task_id, WAITING_ON_CHILD, {
+                "child_task_id": child_task_id,
+                **(detail or {}),
+            })
+            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task_dict(updated)
+
+    def update_data(
+        self,
+        task_id: str,
+        data: dict[str, Any],
+        *,
+        waiting_for_task_id: Optional[str] = None,
+        lease_owner: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Replace task input at an author boundary or owned checkpoint."""
+        if not isinstance(data, dict):
+            raise ValueError("task data must be an object")
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            if row["status"] not in {"queued", "paused", "needs_author_decision", WAITING_ON_CHILD, "running"}:
+                raise TaskStateError("task data can only be updated at a safe boundary")
+            if row["status"] == "running" and lease_owner is not None:
+                owner = conn.execute("SELECT lease_owner FROM tasks WHERE id=?", (task_id,)).fetchone()["lease_owner"]
+                if owner != lease_owner:
+                    raise TaskStateError(f"lease owner mismatch while updating data: task owned by {owner}")
+            elif row["status"] == "running":
+                raise TaskStateError("a running task requires its lease owner to update data")
+            now = datetime.now().isoformat()
+            conn.execute(
+                "UPDATE tasks SET data=?, waiting_for_task_id=?, updated_at=? WHERE id=?",
+                (json.dumps(data, ensure_ascii=False), waiting_for_task_id, now, task_id),
+            )
+            self._append_event(conn, task_id, "data_updated", {
+                "waiting_for_task_id": waiting_for_task_id,
+            })
+            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task_dict(updated)
 
     def latest_checkpoint(self, task_id: str) -> Optional[dict[str, Any]]:
         row = self.db.fetchone("SELECT * FROM task_checkpoints WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,))
@@ -217,18 +453,39 @@ class TaskRuntime:
             row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row is None:
                 raise KeyError(f"task not found: {task_id}")
-            if row["status"] in TERMINAL or row["status"] == "failed":
+            if row["status"] in {"completed", "cancelled", "failed"}:
                 raise TaskStateError("a terminal task cannot be cancelled")
             now = datetime.now().isoformat()
-            if row["status"] in {"queued", "paused"}:
+            if row["status"] in {"queued", "paused", "needs_author_decision", WAITING_ON_CHILD}:
                 target = "cancelled"
-                conn.execute("UPDATE tasks SET status=?, cancel_requested=TRUE, completed_at=?, updated_at=? WHERE id=?",
+                conn.execute("UPDATE tasks SET status=?, cancel_requested=TRUE, waiting_for_task_id=NULL, completed_at=?, updated_at=? WHERE id=?",
                              (target, now, now, task_id))
             else:
                 target = "cancelling"
                 conn.execute("UPDATE tasks SET status=?, cancel_requested=TRUE, updated_at=? WHERE id=?",
                              (target, now, task_id))
             self._append_event(conn, task_id, target, {"cancel_requested": True})
+            child_id = row["waiting_for_task_id"]
+            if child_id:
+                child = conn.execute("SELECT id, status FROM tasks WHERE id=?", (child_id,)).fetchone()
+                if child and child["status"] in {"queued", "paused", "needs_author_decision"}:
+                    conn.execute(
+                        "UPDATE tasks SET status='cancelled', cancel_requested=TRUE, completed_at=?, updated_at=? WHERE id=?",
+                        (now, now, child_id),
+                    )
+                    self._append_event(conn, child_id, "cancelled", {
+                        "reason": "parent_cancelled",
+                        "parent_task_id": task_id,
+                    })
+                elif child and child["status"] == "running":
+                    conn.execute(
+                        "UPDATE tasks SET status='cancelling', cancel_requested=TRUE, updated_at=? WHERE id=?",
+                        (now, child_id),
+                    )
+                    self._append_event(conn, child_id, "cancelling", {
+                        "reason": "parent_cancelled",
+                        "parent_task_id": task_id,
+                    })
             result = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task_dict(result)
 
@@ -251,7 +508,7 @@ class TaskRuntime:
             if row["status"] not in {"running", "cancelling"}:
                 raise TaskStateError("only an active task can fail")
             # Lease fencing for fail().
-            if lease_owner is not None and row["lease_owner"] and row["lease_owner"] != lease_owner:
+            if lease_owner is not None and row["lease_owner"] != lease_owner:
                 raise TaskStateError(
                     f"lease owner mismatch at fail: owned by {row['lease_owner']}"
                 )
@@ -330,8 +587,94 @@ class TaskRuntime:
         for field in ("data", "result"):
             task[field] = json.loads(task[field]) if task.get(field) else {}
         task["cancel_requested"] = bool(task.get("cancel_requested"))
+        task["waitingForTaskId"] = task.get("waiting_for_task_id")
         task["bookId"] = task.get("book_id")
         task["projectId"] = task.get("project_id")
         task["taskId"] = task["id"]
         task["checkpoint"] = self.latest_checkpoint(task["id"])
+        checkpoint_state = task["checkpoint"].get("state", {}) if task["checkpoint"] else {}
+        progress, total_steps = self._progress_snapshot(
+            task.get("type", ""), task.get("data", {}), task.get("status", ""),
+            task.get("stage", ""), checkpoint_state,
+            persisted_progress=task.get("progress", 0), persisted_total=task.get("total_steps", 0),
+        )
+        task["progress"] = progress
+        task["total_steps"] = total_steps
+        task["progressPercent"] = progress
+        task_type = task.get("type")
+        task["operationLabel"] = (
+            TASK_OPERATION_LABELS.get(task_type, "后台处理")
+            if isinstance(task_type, str)
+            else "后台处理"
+        )
+        chapter = self._chapter_number(task.get("data", {}))
+        task["chapterNumber"] = chapter
+        task["displayName"] = (
+            f"第{chapter}章-{task['operationLabel']}" if chapter else task["operationLabel"]
+        )
         return task
+
+    @staticmethod
+    def _chapter_number(data: Any) -> Optional[int]:
+        if not isinstance(data, dict):
+            return None
+        for key in ("chapter_number", "chapterNumber", "chapter", "current_chapter", "currentChapter", "start_chapter", "startChapter", "start"):
+            value: Any = data.get(key)
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                return number
+        return None
+
+    @staticmethod
+    def _progress_snapshot(
+        task_type: str,
+        data: Any,
+        status: str,
+        stage: str,
+        state: Any,
+        *,
+        persisted_progress: Any = 0,
+        persisted_total: Any = 0,
+    ) -> tuple[int, int]:
+        """Return a stable percentage read model for old and new tasks."""
+        data = data if isinstance(data, dict) else {}
+        state = state if isinstance(state, dict) else {}
+        try:
+            stored_progress = max(0, min(100, int(persisted_progress or 0)))
+        except (TypeError, ValueError):
+            stored_progress = 0
+        try:
+            stored_total = max(0, int(persisted_total or 0))
+        except (TypeError, ValueError):
+            stored_total = 0
+        if status == "completed":
+            return 100, max(stored_total, 1)
+
+        if task_type == "continuous":
+            requested = data.get("count") or data.get("total") or 0
+            completed = state.get("completed", 0)
+            if isinstance(completed, list):
+                completed = len(completed)
+            try:
+                requested = max(0, int(requested))
+                completed = max(0, int(completed or 0))
+            except (TypeError, ValueError):
+                requested, completed = 0, 0
+            if requested:
+                return min(100, round(completed / requested * 100)), requested
+
+        stages = _TASK_PROGRESS.get(task_type)
+        if stages:
+            value = stages.get(stage)
+            if value is None:
+                value = stages.get(status)
+            if value is not None:
+                return int(value), max(len(stages) - 1, 1)
+        if stored_total:
+            return stored_progress, stored_total
+        # Unknown tasks still get a usable progress bar instead of a blank
+        # value. Their stage remains readable in the detail view.
+        return 0, 1

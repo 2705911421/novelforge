@@ -1,4 +1,10 @@
-"""记忆系统 - 管理项目长期记忆、章节摘要和状态追踪"""
+"""记忆系统 - 管理项目长期记忆、章节摘要和状态追踪
+
+.. deprecated::
+    此模块为遗留记忆系统，功能已被 src/memory/engine.py 的 MemoryEngine 替代。
+    MemoryEngine 支持 40+ 种记忆类别、自动持久化和容量管理。
+    新代码应使用 MemoryEngine(persist_path=...) 替代 MemorySystem。
+"""
 
 import json
 import sqlite3
