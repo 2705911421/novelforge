@@ -12,6 +12,7 @@ from src.core.story_repository import StoryRepository
 from src.core.task_runtime import TaskRuntime
 from src.core.task_worker import PersistentTaskWorker
 from src.ingestion.service import DocumentRepository
+from src.llm.model_runtime import CredentialStore, ModelRepository
 from src.planning.story_bible import StoryBibleRepository
 
 
@@ -32,6 +33,29 @@ def test_studio_parity_surfaces_are_real_and_persisted(tmp_path, monkeypatch):
     monkeypatch.setattr(studio, "document_repository", DocumentRepository(db, tmp_path))
     monkeypatch.setattr(studio, "bible_repository", StoryBibleRepository(db))
     monkeypatch.setattr(studio, "task_worker", PersistentTaskWorker(runtime, {}))
+    monkeypatch.setenv("NOVELFORGE_PARITY_TEST_KEY", "parity-test-secret")
+    ModelRepository(db, CredentialStore(tmp_path)).save_configuration({
+        "providers": [{
+            "id": "parity-test-provider",
+            "name": "Parity test provider",
+            "providerType": "openai",
+            "baseUrl": "https://example.invalid/v1",
+            "credentialEnv": "NOVELFORGE_PARITY_TEST_KEY",
+        }],
+        "models": [{
+            "id": "parity-test-model",
+            "providerId": "parity-test-provider",
+            "name": "Parity test model",
+            "modelId": "parity-test-model",
+        }],
+        "routes": {
+            "planner": "parity-test-model",
+            "writer": "parity-test-model",
+            "reviewer": "parity-test-model",
+            "reviser": "parity-test-model",
+            "fact_extraction": "parity-test-model",
+        },
+    })
     studio.studio_daemon_state.update(task=None, stop_event=None, worker_id=None)
 
     def task_type(task_id: str) -> str:

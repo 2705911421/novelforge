@@ -5,7 +5,7 @@ NovelForge 多层记忆引擎
 
 import json
 import logging
-from typing import List, Dict, Optional
+from typing import Callable, List, Dict, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -116,7 +116,7 @@ class MemoryStore:
         self.items: Dict[str, MemoryItem] = {}
         self._category_index: Dict[MemoryCategory, List[str]] = {}
         self._layer_index: Dict[MemoryLayer, List[str]] = {}
-        self._on_change: callable = None
+        self._on_change: Optional[Callable[[], None]] = None
 
     def add(self, item: MemoryItem):
         """添加记忆项"""

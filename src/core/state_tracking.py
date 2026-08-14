@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import threading as _threading
 from typing import Any, Optional
 
 from .database import Database, generate_id, get_db
@@ -462,7 +463,6 @@ class StateTrackingRepository:
 _state_tracking_repo: Optional[StateTrackingRepository] = None
 
 
-import threading as _threading
 _state_tracking_lock = _threading.Lock()
 
 def get_state_tracking_repository() -> StateTrackingRepository:

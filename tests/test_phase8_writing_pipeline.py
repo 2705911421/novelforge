@@ -220,7 +220,7 @@ def test_context_manifest_binds_story_graph_and_writer_prompt_components(pipelin
         },
     )["context"]
     manifest = built["context_manifest"]
-    assert manifest["schemaVersion"] == 2
+    assert manifest["schemaVersion"] == 3
     graph_items = [item for item in manifest["items"] if item["sourceType"] == "story_graph_node"]
     assert graph_items
     assert any(item["sourceId"] == f"character:{character_id}" for item in graph_items)
@@ -245,6 +245,7 @@ def test_context_manifest_binds_story_graph_and_writer_prompt_components(pipelin
         and item["edgeTypes"] == ["affects"]
         for item in manifest["items"]
     )
+
 
     task = runtime.enqueue(
         "write-next",
@@ -289,6 +290,49 @@ def test_context_manifest_binds_story_graph_and_writer_prompt_components(pipelin
     assert context_graph["graphSha256"]
     assert context_graph["promptSha256"] == final_manifest["writerInput"]["promptSha256"]
     assert any(edge["type"] == "included_in_context" for edge in context_graph["edges"])
+
+
+def test_context_manifest_records_style_constraints_and_memory_boundary(pipeline_deps):
+    """Context View must distinguish real project inputs from unavailable legacy memory."""
+    db = pipeline_deps["db"]
+    project_id = pipeline_deps["project_id"]
+    book_id = pipeline_deps["book_id"]
+    db.execute(
+        """UPDATE projects
+           SET author_intent=?, writing_style=?, style_profile=?
+           WHERE id=?""",
+        (
+            "Keep the unresolved identity mystery intact.",
+            "Close third person, restrained prose.",
+            json.dumps({"rhythm": "short paragraphs", "donts": ["no deus ex machina"]}),
+            project_id,
+        ),
+    )
+
+    pipeline = WritingPipeline(
+        db,
+        DummyModelManager(),
+        pipeline_deps["repo"],
+        pipeline_deps["runtime"],
+    )
+    built = pipeline._build_context(
+        {"id": "style-constraints-context", "data": {}},
+        {
+            "project_id": project_id,
+            "book_id": book_id,
+            "chapter_number": 2,
+            "strict_planning": False,
+        },
+    )["context"]
+    manifest = built["context_manifest"]
+    source_types = {item["sourceType"] for item in manifest["items"]}
+    assert {"style", "constraints"} <= source_types
+    assert "Writing Style" in "\n".join(built["context_parts"])
+    assert "Author Constraints" in "\n".join(built["context_parts"])
+    assert manifest["availability"]["style"]["status"] == "included"
+    assert manifest["availability"]["constraints"]["status"] == "included"
+    assert manifest["availability"]["memory"]["status"] == "not_included"
+    assert "legacy file-backed MemorySystem" in manifest["availability"]["memory"]["reason"]
 
 
 def test_pipeline_acceptance_fulfills_storyflow_plan(pipeline_deps):

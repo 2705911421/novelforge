@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,7 @@ from src.core.database import Database, generate_id
 from src.core.project import ProjectManager
 from src.core.story_repository import StoryRepository
 from src.core.task_runtime import TaskRuntime
+from src.llm.model_runtime import CredentialStore, ModelRepository
 from src.planning.plot_workspace import PlotRevisionConflict, PlotWorkspaceError, PlotWorkspaceRepository
 from src.planning.story_bible import STORY_BIBLE_STEPS, StoryBibleRepository
 from src.pipeline.writing_pipeline import WritingPipeline
@@ -24,6 +26,7 @@ from src.story_graph import (
     is_valid_edge,
     semantic_edge_options,
     validate_edge,
+    validate_planning_transition,
 )
 
 
@@ -137,6 +140,100 @@ def _publish_story_bible(db: Database, project_id: str) -> tuple[StoryBibleRepos
     snapshot_id = result["workspace"]["published_snapshot_id"]
     assert snapshot_id
     return repository, str(snapshot_id)
+
+
+def _configure_storyflow_model_gate(db: Database, root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Persist a complete provider/route contract for StoryFlow API tests."""
+    monkeypatch.setenv("NOVELFORGE_STORYFLOW_TEST_KEY", "storyflow-test-secret")
+    repository = ModelRepository(db, CredentialStore(root))
+    repository.save_configuration({
+        "providers": [{
+            "id": "storyflow-test-provider",
+            "name": "StoryFlow test provider",
+            "providerType": "openai",
+            "baseUrl": "https://example.invalid/v1",
+            "credentialEnv": "NOVELFORGE_STORYFLOW_TEST_KEY",
+        }],
+        "models": [{
+            "id": "storyflow-test-model",
+            "providerId": "storyflow-test-provider",
+            "name": "StoryFlow test model",
+            "modelId": "storyflow-test-model",
+        }],
+        "routes": {
+            "planner": "storyflow-test-model",
+            "writer": "storyflow-test-model",
+            "reviewer": "storyflow-test-model",
+            "reviser": "storyflow-test-model",
+            "fact_extraction": "storyflow-test-model",
+        },
+    })
+
+
+def test_storyflow_model_actions_fail_before_enqueue_without_runtime(tmp_path, monkeypatch):
+    """The API must expose setup failure before a model task is durable."""
+    db = Database(str(tmp_path / "model-gate.db"))
+    repository = StoryRepository(db)
+    manager = ProjectManager(str(tmp_path), repository=repository)
+    project = manager.create_project("StoryFlow model gate", "fantasy")
+    book = db.fetchone("SELECT id FROM books WHERE project_id=?", (project.id,))
+    assert book is not None
+    chapter_id = generate_id()
+    db.insert(
+        "chapters",
+        {
+            "id": chapter_id,
+            "book_id": book["id"],
+            "number": 1,
+            "title": "Gate chapter",
+            "summary": "A chapter used to verify model action gating.",
+            "status": "draft",
+        },
+    )
+
+    from src.web import studio
+
+    monkeypatch.setenv("NOVELFORGE_DISABLE_STUDIO_WORKER", "1")
+    monkeypatch.setattr(studio, "workspace_root", tmp_path)
+    monkeypatch.setattr(studio, "story_repository", repository)
+    monkeypatch.setattr(studio, "project_mgr", manager)
+    monkeypatch.setattr(studio, "plot_workspace_repository", PlotWorkspaceRepository(db))
+    monkeypatch.setattr(studio, "task_runtime", TaskRuntime(db))
+    studio.studio_daemon_state.update(task=None, stop_event=None, worker_id=None)
+
+    with TestClient(studio.app) as client:
+        forecast = client.post(
+            f"/api/v1/books/{project.id}/forecast",
+            json={"branchCount": 2, "currentChapter": 1, "depth": 2},
+        )
+        assert forecast.status_code == 409
+        assert forecast.json()["detail"]["code"] == "LLM_PROVIDER_REQUIRED"
+
+        analysis = client.post(
+            f"/api/v1/books/{project.id}/story-graph/actions/analyze",
+            json={"nodeIds": [f"chapter:{chapter_id}"]},
+        )
+        assert analysis.status_code == 409
+        assert analysis.json()["detail"]["code"] == "LLM_PROVIDER_REQUIRED"
+
+        generation = client.post(
+            f"/api/v1/books/{project.id}/story-graph/planning/generate",
+            json={"nodeIds": [f"chapter:{chapter_id}"]},
+        )
+        assert generation.status_code == 409
+        assert generation.json()["detail"]["code"] == "LLM_PROVIDER_REQUIRED"
+
+        task_rows = db.fetchall(
+            "SELECT type FROM tasks WHERE project_id=? AND type IN ('forecast', 'storyflow-analyze', 'write-next')",
+            (project.id,),
+        )
+        assert task_rows == []
+
+        planning = client.post(
+            f"/api/v1/books/{project.id}/story-graph/planning/node",
+            json={"title": "可保存的规划", "summary": "模型未配置时规划仍可编辑"},
+        )
+        assert planning.status_code == 200
 
 
 def test_story_graph_semantic_edge_validation():
@@ -651,6 +748,27 @@ def test_story_graph_viewport_query_slices_stable_layout_coordinates(tmp_path):
         "returnedInViewport": 1,
         "truncated": False,
         "layoutScope": "filtered_candidates",
+        "pageSize": 20,
+        "pageOffset": 0,
+        "pageIndex": 0,
+        "hasMore": False,
+        "nextPageToken": None,
+        "cursorSourceFingerprint": viewport["meta"]["viewport"]["cursorSourceFingerprint"],
+        "querySignature": viewport["meta"]["viewport"]["querySignature"],
+        "pageBoundary": "loaded_page",
+        "internalEdgeScope": "viewport_candidate_set",
+        "internalEdgeCount": 0,
+        "returnedInternalEdges": 0,
+        "internalEdgesTruncated": False,
+        "internalEdgePageSize": 20,
+        "internalEdgePageOffset": 0,
+        "internalEdgePageIndex": 0,
+        "nextInternalEdgePageToken": None,
+        "crossBoundaryEdgeCount": 0,
+        "returnedCrossBoundaryEdges": 0,
+        "crossBoundaryEdgesTruncated": False,
+        "crossBoundaryEdgeTypeCounts": {},
+        "crossBoundaryEdges": [],
     }
     assert [node["id"] for node in viewport["nodes"]] == [target["id"]]
     assert viewport["nodes"][0]["x"] == target["x"]
@@ -660,6 +778,482 @@ def test_story_graph_viewport_query_slices_stable_layout_coordinates(tmp_path):
 
     with pytest.raises(StoryGraphError, match="require x_from"):
         projector.project(book_id, view="all", viewport_x_from=x)
+
+
+def test_story_graph_viewport_reports_cross_boundary_semantic_edges(tmp_path):
+    db, _, book_id, _, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+
+    full = projector.project(book_id, view="all", limit=2000, edge_limit=6000)
+    chapter = next(node for node in full["nodes"] if node["type"] == "Chapter")
+    anchor_id = chapter["id"]
+    anchor_x = float(chapter["x"])
+    anchor_y = float(chapter["y"])
+    viewport = projector.project(
+        book_id,
+        view="all",
+        limit=20,
+        edge_limit=20,
+        viewport_x_from=anchor_x - 0.1,
+        viewport_x_to=anchor_x + 0.1,
+        viewport_y_from=anchor_y - 0.1,
+        viewport_y_to=anchor_y + 0.1,
+    )
+
+    boundary = viewport["meta"]["viewport"]
+    assert boundary["crossBoundaryEdgeCount"] > 0
+    assert boundary["returnedCrossBoundaryEdges"] <= boundary["crossBoundaryEdgeCount"]
+    assert boundary["crossBoundaryEdges"]
+    assert all(item["boundary"] is True for item in boundary["crossBoundaryEdges"])
+    assert all(item["loadedEndpointId"] == anchor_id for item in boundary["crossBoundaryEdges"])
+    assert all(item["remoteEndpoint"]["id"] != anchor_id for item in boundary["crossBoundaryEdges"])
+    assert boundary["crossBoundaryEdgeTypeCounts"]
+
+
+def test_story_graph_viewport_boundary_edges_have_stable_paged_cursor(tmp_path):
+    db, _, book_id, _, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+    full = projector.project(book_id, view="all", limit=2000, edge_limit=6000)
+    chapter = next(node for node in full["nodes"] if node["type"] == "Chapter")
+    base_query = {
+        "view": "all",
+        "limit": 20,
+        "edge_limit": 1,
+        "viewport_x_from": float(chapter["x"]) - 0.1,
+        "viewport_x_to": float(chapter["x"]) + 0.1,
+        "viewport_y_from": float(chapter["y"]) - 0.1,
+        "viewport_y_to": float(chapter["y"]) + 0.1,
+        "boundary_node_id": chapter["id"],
+    }
+    first = projector.project(book_id, **base_query)
+    first_meta = first["meta"]["viewport"]
+    assert first_meta["crossBoundaryEdgeCount"] > 1
+    assert first_meta["boundaryPageOffset"] == 0
+    assert first_meta["boundaryHasMore"] is True
+    assert first_meta["nextBoundaryPageToken"]
+    assert [node["id"] for node in first["nodes"]] == [chapter["id"]]
+
+    second = projector.project(
+        book_id,
+        **base_query,
+        boundary_page_token=first_meta["nextBoundaryPageToken"],
+    )
+    second_meta = second["meta"]["viewport"]
+    assert second_meta["boundaryPageOffset"] == 1
+    assert second_meta["querySignature"] == first_meta["querySignature"]
+    assert second_meta["cursorSourceFingerprint"] == first_meta["cursorSourceFingerprint"]
+    assert first["meta"]["viewport"]["crossBoundaryEdges"][0]["id"] != second["meta"]["viewport"]["crossBoundaryEdges"][0]["id"]
+
+    different_boundary_node = next(node for node in full["nodes"] if node["id"] != chapter["id"])
+    with pytest.raises(StoryGraphError, match="does not match"):
+        projector.project(
+            book_id,
+            **{**base_query, "boundary_node_id": different_boundary_node["id"]},
+            boundary_page_token=first_meta["nextBoundaryPageToken"],
+        )
+
+
+def test_story_graph_viewport_internal_edges_have_independent_paged_cursor(tmp_path):
+    db, _, book_id, _, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+    full = projector.project(book_id, view="all", limit=2000, edge_limit=6000)
+    xs = [float(node["x"]) for node in full["nodes"]]
+    ys = [float(node["y"]) for node in full["nodes"]]
+    base_query = {
+        "view": "all",
+        "limit": 1,
+        "edge_limit": 1,
+        "viewport_x_from": min(xs) - 1,
+        "viewport_x_to": max(xs) + 1,
+        "viewport_y_from": min(ys) - 1,
+        "viewport_y_to": max(ys) + 1,
+    }
+
+    first = projector.project(book_id, **base_query)
+    first_meta = first["meta"]["viewport"]
+    assert first_meta["internalEdgeScope"] == "viewport_candidate_set"
+    assert first_meta["internalEdgeCount"] == full["meta"]["totalAvailableEdges"]
+    assert first_meta["returnedInternalEdges"] == len(first["edges"]) == 1
+    assert first_meta["internalEdgesTruncated"] is True
+    assert first_meta["internalEdgePageOffset"] == 0
+    assert first_meta["nextInternalEdgePageToken"]
+
+    second = projector.project(
+        book_id,
+        **base_query,
+        viewport_edge_page_token=first_meta["nextInternalEdgePageToken"],
+    )
+    second_meta = second["meta"]["viewport"]
+    assert second_meta["internalEdgePageOffset"] == 1
+    assert second_meta["returnedInternalEdges"] == len(second["edges"]) == 1
+    assert first["edges"][0]["id"] != second["edges"][0]["id"]
+
+    with pytest.raises(StoryGraphError, match="does not match"):
+        projector.project(
+            book_id,
+            **{**base_query, "edge_limit": 2},
+            viewport_edge_page_token=first_meta["nextInternalEdgePageToken"],
+        )
+
+
+def test_story_graph_spatial_read_model_rebuild_is_cache_only(tmp_path):
+    db, _, book_id, _, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+    canonical_before = {
+        table: db.fetchall(f"SELECT * FROM {table} WHERE book_id=? ORDER BY 1", (book_id,))
+        for table in ("story_facts", "story_states")
+    }
+    full = projector.project(book_id, view="all", limit=2000, edge_limit=6000)
+    target = full["nodes"][0]
+    query = {
+        "view": "all",
+        "limit": 20,
+        "edge_limit": 20,
+        "viewport_x_from": float(target["x"]) - 0.1,
+        "viewport_x_to": float(target["x"]) + 0.1,
+        "viewport_y_from": float(target["y"]) - 0.1,
+        "viewport_y_to": float(target["y"]) + 0.1,
+    }
+
+    first = projector.project(book_id, **query)
+    meta_row = db.fetchone(
+        "SELECT node_count, edge_count FROM storyflow_spatial_index_meta WHERE book_id=? AND view=?",
+        (book_id, "all"),
+    )
+    assert meta_row == {
+        "node_count": full["meta"]["totalAvailableNodes"],
+        "edge_count": full["meta"]["totalAvailableEdges"],
+    }
+    layout_count = db.fetchone(
+        "SELECT COUNT(*) AS count FROM storyflow_spatial_layouts WHERE book_id=? AND view=?",
+        (book_id, "all"),
+    )
+    edge_count = db.fetchone(
+        "SELECT COUNT(*) AS count FROM storyflow_graph_edge_index WHERE book_id=?",
+        (book_id,),
+    )
+    assert layout_count is not None
+    assert layout_count["count"] == full["meta"]["totalAvailableNodes"]
+    assert edge_count is not None
+    assert edge_count["count"] == full["meta"]["totalAvailableEdges"]
+
+    db.execute("DELETE FROM storyflow_spatial_layouts WHERE book_id=?", (book_id,))
+    db.execute("DELETE FROM storyflow_graph_edge_index WHERE book_id=?", (book_id,))
+    db.execute("DELETE FROM storyflow_spatial_index_meta WHERE book_id=?", (book_id,))
+    rebuilt = projector.project(book_id, **query)
+    assert rebuilt["meta"]["viewport"]["cursorSourceFingerprint"] == first["meta"]["viewport"]["cursorSourceFingerprint"]
+    rebuilt_layout_count = db.fetchone(
+        "SELECT COUNT(*) AS count FROM storyflow_spatial_layouts WHERE book_id=? AND view=?",
+        (book_id, "all"),
+    )
+    rebuilt_edge_count = db.fetchone(
+        "SELECT COUNT(*) AS count FROM storyflow_graph_edge_index WHERE book_id=?",
+        (book_id,),
+    )
+    assert rebuilt_layout_count is not None
+    assert rebuilt_layout_count["count"] == full["meta"]["totalAvailableNodes"]
+    assert rebuilt_edge_count is not None
+    assert rebuilt_edge_count["count"] == full["meta"]["totalAvailableEdges"]
+    assert canonical_before == {
+        table: db.fetchall(f"SELECT * FROM {table} WHERE book_id=? ORDER BY 1", (book_id,))
+        for table in ("story_facts", "story_states")
+    }
+
+
+def test_story_graph_warm_viewport_uses_indexed_nodes_without_catalog_deserialization(tmp_path, monkeypatch):
+    db, _, book_id, _, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+
+    full = projector.project(book_id, view="all", limit=2000, edge_limit=6000)
+    target = full["nodes"][0]
+    query = {
+        "view": "all",
+        "limit": 20,
+        "edge_limit": 20,
+        "viewport_x_from": float(target["x"]) - 0.1,
+        "viewport_x_to": float(target["x"]) + 0.1,
+        "viewport_y_from": float(target["y"]) - 0.1,
+        "viewport_y_to": float(target["y"]) + 0.1,
+    }
+
+    cold = projector.project(book_id, **query)
+    warm = projector.project(book_id, **query)
+    assert cold["nodes"]
+    assert [node["id"] for node in warm["nodes"]] == [node["id"] for node in cold["nodes"]]
+    index_meta = db.fetchone(
+        """SELECT node_count, index_schema FROM storyflow_graph_node_index_meta
+             WHERE book_id=? AND source_fingerprint=?""",
+        (book_id, warm["meta"]["projectionSourceFingerprint"]),
+    )
+    assert index_meta == {"node_count": full["meta"]["totalAvailableNodes"], "index_schema": 3}
+
+    def fail_catalog(_book_id):
+        raise AssertionError("warm viewport should not deserialize the full catalog")
+
+    monkeypatch.setattr(projector, "_read_catalog", fail_catalog)
+    indexed = projector.project(book_id, **query)
+    assert indexed["nodes"]
+    assert [node["id"] for node in indexed["nodes"]] == [node["id"] for node in warm["nodes"]]
+    assert indexed["meta"]["viewport"]["totalInViewport"] == warm["meta"]["viewport"]["totalInViewport"]
+    assert indexed["meta"]["projectionReadModel"] == "sqlite_node_index"
+
+
+def test_story_graph_source_epoch_invalidates_indexed_viewport_after_authoritative_mutation(tmp_path):
+    db, _, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+    full = projector.project(book_id, view="all", limit=2000, edge_limit=6000)
+    chapter = next(node for node in full["nodes"] if node["id"] == f"chapter:{chapter_one}")
+    query = {
+        "view": "all",
+        "limit": 20,
+        "edge_limit": 20,
+        "viewport_x_from": float(chapter["x"]) - 0.1,
+        "viewport_x_to": float(chapter["x"]) + 0.1,
+        "viewport_y_from": float(chapter["y"]) - 0.1,
+        "viewport_y_to": float(chapter["y"]) + 0.1,
+    }
+    projector.project(book_id, **query)
+    before_epoch = db.fetchone(
+        "SELECT source_revision, source_fingerprint FROM storyflow_projection_epochs WHERE book_id=?",
+        (book_id,),
+    )
+    assert before_epoch is not None
+    assert before_epoch["source_fingerprint"]
+
+    db.update("chapters", {"title": "Indexed source changed"}, "id=?", (chapter_one,))
+    invalidated = db.fetchone(
+        "SELECT source_revision, source_fingerprint FROM storyflow_projection_epochs WHERE book_id=?",
+        (book_id,),
+    )
+    assert invalidated is not None
+    assert invalidated["source_revision"] > before_epoch["source_revision"]
+    assert invalidated["source_fingerprint"] == ""
+
+    rebuilt = projector.project(book_id, **query)
+    changed = next(node for node in rebuilt["nodes"] if node["id"] == f"chapter:{chapter_one}")
+    assert changed["title"].endswith("Indexed source changed")
+    after_epoch = db.fetchone(
+        "SELECT source_revision, source_fingerprint FROM storyflow_projection_epochs WHERE book_id=?",
+        (book_id,),
+    )
+    assert after_epoch is not None
+    assert after_epoch["source_revision"] == invalidated["source_revision"]
+    assert after_epoch["source_fingerprint"] == rebuilt["meta"]["projectionSourceFingerprint"]
+
+
+def test_story_graph_search_uses_indexed_rows_without_catalog_deserialization(tmp_path, monkeypatch):
+    db, _, book_id, _, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+
+    projector.project(book_id, view="all", limit=2000, edge_limit=6000)
+    first = projector.search(book_id, "Aster", view="character")
+    assert any(item["title"] == "Aster" for item in first["matches"])
+
+    def fail_catalog(_book_id):
+        raise AssertionError("warm search should not deserialize the full catalog")
+
+    monkeypatch.setattr(projector, "_read_catalog", fail_catalog)
+    warm = projector.search(book_id, "Aster", view="character")
+    assert warm == first
+
+
+def test_story_graph_warm_neighbors_use_paired_semantic_edge_index(tmp_path, monkeypatch):
+    db, _, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+
+    cold = projector.neighbors(book_id, f"chapter:{chapter_one}", limit=20)
+    assert cold["neighbors"]
+    assert cold.get("projectionReadModel") == "json_catalog"
+    edge_meta = db.fetchone(
+        """SELECT node_count, edge_count, index_schema
+             FROM storyflow_graph_node_index_meta
+            WHERE book_id=?""",
+        (book_id,),
+    )
+    semantic_edge_count = db.fetchone(
+        """SELECT COUNT(*) AS count
+             FROM storyflow_graph_semantic_edge_index
+            WHERE book_id=?""",
+        (book_id,),
+    )
+    assert edge_meta is not None
+    assert edge_meta["index_schema"] == 3
+    assert semantic_edge_count is not None
+    assert edge_meta["edge_count"] == semantic_edge_count["count"]
+
+    def fail_catalog(_book_id):
+        raise AssertionError("warm Inspector neighbors should not deserialize the full catalog")
+
+    monkeypatch.setattr(projector, "_read_catalog", fail_catalog)
+    warm = projector.neighbors(book_id, f"chapter:{chapter_one}", limit=20)
+    assert warm["projectionReadModel"] == "sqlite_node_index+semantic_edge_index"
+    assert warm["node"] == cold["node"]
+    assert warm["neighbors"] == cold["neighbors"]
+    assert warm["pagination"] == cold["pagination"]
+
+
+def test_story_graph_warm_neighbors_page_in_sqlite_before_hydration(tmp_path, monkeypatch):
+    db, _, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    extra_names = [f"Fixture Character {index:02d}" for index in range(1, 13)]
+    for index, name in enumerate(extra_names, start=1):
+        db.insert(
+            "characters",
+            {
+                "id": f"fixture-character-{index}",
+                "book_id": book_id,
+                "name": name,
+                "description": "High-degree paging fixture",
+            },
+        )
+    db.update(
+        "chapters",
+        {
+            "characters_appeared": json.dumps(
+                ["Aster", *extra_names], ensure_ascii=False
+            )
+        },
+        "id=?",
+        (chapter_one,),
+    )
+    projector = StoryGraphProjector(db)
+    cold = projector.neighbors(book_id, f"chapter:{chapter_one}", limit=2)
+    assert cold["pagination"]["total"] >= len(extra_names)
+
+    original_fetchall = db.fetchall
+    page_queries: list[tuple[str, tuple]] = []
+
+    def capture_fetchall(sql, params=()):
+        if "SELECT e.payload AS edge_payload" in sql:
+            page_queries.append((sql, tuple(params)))
+        return original_fetchall(sql, params)
+
+    monkeypatch.setattr(db, "fetchall", capture_fetchall)
+    first = projector.neighbors(book_id, f"chapter:{chapter_one}", limit=2, offset=0)
+    second = projector.neighbors(book_id, f"chapter:{chapter_one}", limit=2, offset=2)
+
+    assert first["projectionReadModel"] == "sqlite_node_index+semantic_edge_index"
+    assert second["projectionReadModel"] == "sqlite_node_index+semantic_edge_index"
+    assert len(page_queries) == 2
+    assert all("LIMIT ? OFFSET ?" in sql for sql, _ in page_queries)
+    assert page_queries[0][1][-2:] == (2, 0)
+    assert page_queries[1][1][-2:] == (2, 2)
+    assert len(first["neighbors"]) <= 2
+    assert len(second["neighbors"]) <= 2
+    assert {item["node"]["id"] for item in first["neighbors"]}.isdisjoint(
+        {item["node"]["id"] for item in second["neighbors"]}
+    )
+
+
+def test_story_graph_semantic_edge_index_is_rebuilt_after_source_change(tmp_path):
+    db, _, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+
+    first = projector.neighbors(book_id, f"chapter:{chapter_one}", limit=20)
+    first_fingerprint = projector._source_identity(book_id)
+    assert first["neighbors"]
+    db.update("chapters", {"title": "Semantic edge source changed"}, "id=?", (chapter_one,))
+
+    refreshed = projector.neighbors(book_id, f"chapter:{chapter_one}", limit=20)
+    second_fingerprint = projector._source_identity(book_id)
+    assert second_fingerprint != first_fingerprint
+    assert refreshed["node"]["title"].endswith("Semantic edge source changed")
+    assert refreshed["projectionReadModel"] == "json_catalog"
+    warm = projector.neighbors(book_id, f"chapter:{chapter_one}", limit=20)
+    assert warm["projectionReadModel"] == "sqlite_node_index+semantic_edge_index"
+    assert warm["node"] == refreshed["node"]
+
+
+def test_story_graph_warm_focused_projection_uses_edge_frontier_without_catalog(tmp_path, monkeypatch):
+    db, _, book_id, _, _, aster, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+    query = {
+        "view": "character",
+        "focus": f"character:{aster}",
+        "depth": 2,
+        "limit": 80,
+        "edge_limit": 160,
+    }
+
+    cold = projector.project(book_id, **query)
+    assert cold["nodes"]
+    assert cold["meta"]["projectionReadModel"] == "json_catalog"
+
+    def fail_catalog(_book_id):
+        raise AssertionError("warm focused projection should not deserialize the full catalog")
+
+    monkeypatch.setattr(projector, "_read_catalog", fail_catalog)
+    warm = projector.project(book_id, **query)
+    assert warm["meta"]["projectionReadModel"] == "sqlite_node_index+semantic_edge_index"
+    assert [node["id"] for node in warm["nodes"]] == [node["id"] for node in cold["nodes"]]
+    assert sorted(edge["id"] for edge in warm["edges"]) == sorted(edge["id"] for edge in cold["edges"])
+    focused = next(node for node in warm["nodes"] if node["id"] == f"character:{aster}")
+    assert focused["metadata"] == next(
+        node["metadata"] for node in cold["nodes"] if node["id"] == f"character:{aster}"
+    )
+
+
+def test_story_graph_viewport_pages_are_stable_and_cursor_bound(tmp_path):
+    db, _, book_id, _, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+    query = {
+        "view": "all",
+        "limit": 2,
+        "edge_limit": 20,
+        "viewport_x_from": -100.0,
+        "viewport_x_to": 5000.0,
+        "viewport_y_from": -100.0,
+        "viewport_y_to": 5000.0,
+    }
+
+    first = projector.project(book_id, **query)
+    first_viewport = first["meta"]["viewport"]
+    assert first_viewport["pageSize"] == 2
+    assert first_viewport["pageOffset"] == 0
+    assert first_viewport["pageIndex"] == 0
+    assert first_viewport["hasMore"] is True
+    assert first_viewport["nextPageToken"]
+
+    second = projector.project(
+        book_id,
+        **query,
+        viewport_page_token=first_viewport["nextPageToken"],
+    )
+    second_viewport = second["meta"]["viewport"]
+    assert second_viewport["pageOffset"] == 2
+    assert second_viewport["pageIndex"] == 1
+    assert second_viewport["querySignature"] == first_viewport["querySignature"]
+    assert second_viewport["cursorSourceFingerprint"] == first_viewport["cursorSourceFingerprint"]
+    assert set(node["id"] for node in first["nodes"]).isdisjoint(
+        node["id"] for node in second["nodes"]
+    )
+    assert second["nodes"]
+
+    with pytest.raises(StoryGraphError, match="does not match"):
+        projector.project(
+            book_id,
+            **{**query, "limit": 3},
+            viewport_page_token=first_viewport["nextPageToken"],
+        )
+    with pytest.raises(StoryGraphError, match="invalid viewport page token"):
+        projector.project(book_id, **query, viewport_page_token="not-a-token")
+
+    db.insert(
+        "chapters",
+        {
+            "id": "viewport-cursor-new-chapter",
+            "book_id": book_id,
+            "number": 99,
+            "title": "Cursor invalidation",
+            "summary": "A source mutation invalidates a continuation cursor.",
+            "status": "draft",
+        },
+    )
+    with pytest.raises(StoryGraphError, match="expired"):
+        projector.project(
+            book_id,
+            **query,
+            viewport_page_token=first_viewport["nextPageToken"],
+        )
 
 
 def test_story_bible_projection_keeps_canon_and_planning_overlay(tmp_path):
@@ -1160,6 +1754,51 @@ def test_accepted_story_commit_is_visible_on_next_story_graph_projection(tmp_pat
     assert any(edge["type"] == "changes" and edge["source"] == f"chapter:{chapter_one}" for edge in graph["edges"])
 
 
+def test_story_graph_freshness_feed_detects_accepted_commit_and_resyncs(tmp_path):
+    db, _, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+    before = projector.project(book_id, view="story", focus=f"chapter:{chapter_one}", depth=1)
+    before_snapshot_id = before["meta"]["graphSnapshotId"]
+
+    commit_id = StoryRepository(db).create_story_commit(
+        chapter_one,
+        facts=[{
+            "fact_type": "reveal",
+            "content": "Freshness feed exposes the accepted reveal",
+            "entities": ["Aster"],
+        }],
+        state_changes={"freshness": "updated"},
+    )
+    accepted = StoryRepository(db).accept_story_commit(commit_id)
+    assert accepted["graph_snapshot"]["captured"] is True
+
+    changed = StoryGraphProjector(db).changes_since_snapshot(
+        book_id,
+        before_snapshot_id,
+        node_id=f"chapter:{chapter_one}",
+    )
+    assert changed["changed"] is True
+    assert changed["resyncRequired"] is False
+    assert changed["from"]["id"] == before_snapshot_id
+    assert changed["to"]["id"] != before_snapshot_id
+    assert changed["to"]["sourceCommitId"] == commit_id
+    assert changed["diff"]["hasRelevantChange"] is True
+    assert any(
+        item["id"] == f"chapter:{chapter_one}"
+        for item in changed["diff"]["changedNodes"]
+    ) or changed["diff"]["addedNodes"]
+
+    current = StoryGraphProjector(db).changes_since_snapshot(book_id, changed["to"]["id"])
+    assert current["changed"] is False
+    assert current["resyncRequired"] is False
+    assert current["diff"]["hasRelevantChange"] is False
+
+    missing = StoryGraphProjector(db).changes_since_snapshot(book_id, "missing-observed-snapshot")
+    assert missing["changed"] is True
+    assert missing["resyncRequired"] is True
+    assert "reload" in missing["reason"]
+
+
 def test_story_graph_focus_depth_and_filters_are_bounded(tmp_path):
     db, _, book_id, chapter_one, chapter_two, _, _ = _seed_book(tmp_path)
     projector = StoryGraphProjector(db)
@@ -1604,6 +2243,17 @@ def test_chapter_version_compare_exposes_canonical_commit_projection_boundaries(
     assert canonical["replayComplete"] is True
     assert canonical["historicalGraph"]["scope"] == "accepted_commit_snapshot_diff"
     assert canonical["historicalGraph"]["complete"] is True
+    historical_dependency = canonical["historicalDependencySurface"]
+    assert historical_dependency["scope"] == "accepted_commit_snapshot_dependency_surface"
+    assert historical_dependency["complete"] is True
+    assert f"chapter:{chapter_one}" in historical_dependency["seedNodeIds"]
+    assert historical_dependency["meta"]["dependencyEvidence"].startswith(
+        "accepted StoryCommit graph snapshots"
+    )
+    assert any(
+        item["type"] == "Chapter"
+        for item in historical_dependency["affectedNodes"]
+    )
     assert canonical["from"]["commit"]["graphSnapshot"]["id"]
     assert canonical["to"]["commit"]["graphSnapshot"]["id"]
     assert canonical["graphRefs"]["scope"] == "current_catalog_references"
@@ -1614,6 +2264,75 @@ def test_chapter_version_compare_exposes_canonical_commit_projection_boundaries(
         assert row is not None
         after[table] = row["count"]
     assert after == before
+
+
+def test_story_graph_history_exposes_accepted_graph_boundaries(tmp_path):
+    db, _, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    repository = StoryRepository(db)
+    first = repository.append_chapter_version(
+        book_id, 1, "Graph history baseline.", expected_version=0
+    )
+    first_commit = repository.create_story_commit(
+        chapter_one,
+        facts=[{"fact_type": "reveal", "content": "The first boundary", "entities": ["Aster"]}],
+        state_changes={"boundary": "first"},
+        chapter_version_id=first["version_id"],
+    )
+    first_accept = repository.accept_story_commit(first_commit)
+
+    second = repository.append_chapter_version(
+        book_id, 1, "Graph history revised.", expected_version=1
+    )
+    second_commit = repository.create_story_commit(
+        chapter_one,
+        facts=[{"fact_type": "reveal", "content": "The second boundary", "entities": ["Aster"]}],
+        state_changes={"boundary": "second"},
+        chapter_version_id=second["version_id"],
+    )
+    second_accept = repository.accept_story_commit(second_commit)
+
+    def count_rows(query: str) -> int:
+        row = db.fetchone(query, (book_id,))
+        assert row is not None
+        return int(row["count"])
+
+    before_counts = {
+        "story_facts": count_rows("SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?"),
+        "story_states": count_rows("SELECT COUNT(*) AS count FROM story_states WHERE book_id=?"),
+        "story_commits": count_rows(
+            "SELECT COUNT(*) AS count FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id WHERE c.book_id=?"
+        ),
+    }
+    history = StoryGraphProjector(db).history(
+        book_id,
+        f"chapter:{chapter_one}",
+        limit=20,
+    )
+    graph_history = history["canonicalGraphHistory"]
+    entries = {entry["commitId"]: entry for entry in graph_history["entries"]}
+
+    assert graph_history["scope"] == "accepted_commit_snapshot_history"
+    assert graph_history["available"] is True
+    assert graph_history["complete"] is True
+    assert graph_history["meta"]["acceptedCommitCount"] == 2
+    assert graph_history["meta"]["snapshotCount"] == 2
+    assert graph_history["meta"]["comparableCount"] == 1
+    assert graph_history["meta"]["mutableDomainTablesHistorical"] is False
+    assert entries[first_commit]["snapshotId"] == first_accept["graph_snapshot"]["snapshotId"]
+    assert entries[second_commit]["snapshotId"] == second_accept["graph_snapshot"]["snapshotId"]
+    assert entries[second_commit]["comparisonAvailable"] is True
+    assert entries[second_commit]["previousSnapshotId"] == entries[first_commit]["snapshotId"]
+    assert entries[second_commit]["diffSummary"]["hasRelevantChange"] is True
+    assert entries[second_commit]["changedNodeIds"]
+
+    after_counts = {
+        "story_facts": count_rows("SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?"),
+        "story_states": count_rows("SELECT COUNT(*) AS count FROM story_states WHERE book_id=?"),
+        "story_commits": count_rows(
+            "SELECT COUNT(*) AS count FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id WHERE c.book_id=?"
+        ),
+    }
+    assert after_counts == before_counts
 
 
 def test_story_graph_history_reads_immutable_versions_and_commits(tmp_path):
@@ -1851,6 +2570,97 @@ def test_story_commit_accept_keeps_canon_when_graph_snapshot_capture_fails(tmp_p
     assert replay["historicalGraph"]["available"] is False
 
 
+def test_idempotent_accept_recovers_failed_graph_snapshot_at_same_source_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    db, _, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    repository = StoryRepository(db)
+    commit_id = repository.create_story_commit(
+        chapter_one,
+        facts=[{"fact_type": "reveal", "content": "Retryable graph boundary", "entities": ["Aster"]}],
+        state_changes={"retryable_boundary": True},
+    )
+
+    def fail_capture(*args, **kwargs):
+        raise RuntimeError("synthetic first capture outage")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(StoryGraphProjector, "capture_accepted_commit_snapshot", fail_capture)
+        first = repository.accept_story_commit(commit_id)
+
+    assert first["accepted"] is True
+    assert first["graph_snapshot"]["captured"] is False
+    failure = db.fetchone(
+        "SELECT source_fingerprint, source_revision FROM storyflow_graph_snapshot_capture_failures WHERE book_id=? AND commit_id=?",
+        (book_id, commit_id),
+    )
+    assert failure is not None
+    failed_history = StoryGraphProjector(db).history(book_id, f"chapter:{chapter_one}")
+    assert failed_history["meta"]["graphSnapshotCaptureFailures"] == 1
+    assert failed_history["canonicalGraphHistory"]["complete"] is False
+    assert commit_id in failed_history["canonicalGraphHistory"]["meta"]["missingSnapshotCommitIds"]
+    assert any(
+        entry["kind"] == "graph_snapshot_capture_failure"
+        and entry["commitId"] == commit_id
+        for entry in failed_history["entries"]
+    )
+    observed_read_replay = StoryGraphProjector(db).canonical_replay(book_id, commit_id)
+    assert observed_read_replay["graphReplayComplete"] is False
+    assert observed_read_replay["historicalGraph"]["available"] is False
+
+    retry = repository.accept_story_commit(commit_id)
+    assert retry["accepted"] is True
+    assert retry["idempotent"] is True
+    assert retry["graph_snapshot"]["captured"] is True
+    assert retry["graph_snapshot"]["recovered"] is True
+    assert db.fetchone(
+        "SELECT 1 FROM storyflow_graph_snapshot_capture_failures WHERE book_id=? AND commit_id=?",
+        (book_id, commit_id),
+    ) is None
+    replay = StoryGraphProjector(db).canonical_replay(book_id, commit_id)
+    assert replay["graphReplayComplete"] is True
+    assert replay["historicalGraph"]["sourceCommitId"] == commit_id
+    recovered_history = StoryGraphProjector(db).history(book_id, f"chapter:{chapter_one}")
+    assert recovered_history["canonicalGraphHistory"]["complete"] is True
+    assert recovered_history["canonicalGraphHistory"]["meta"]["snapshotCount"] == 1
+
+
+def test_failed_graph_snapshot_is_not_backfilled_after_mutable_source_change(
+    tmp_path,
+    monkeypatch,
+):
+    db, _, book_id, chapter_one, _, _, mira = _seed_book(tmp_path)
+    repository = StoryRepository(db)
+    commit_id = repository.create_story_commit(
+        chapter_one,
+        facts=[{"fact_type": "reveal", "content": "Do not relabel current data", "entities": ["Mira"]}],
+        state_changes={"unsafe_backfill": True},
+    )
+
+    def fail_capture(*args, **kwargs):
+        raise RuntimeError("synthetic source-boundary outage")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(StoryGraphProjector, "capture_accepted_commit_snapshot", fail_capture)
+        repository.accept_story_commit(commit_id)
+
+    db.execute("UPDATE characters SET name=? WHERE id=?", ("Current Mira", mira))
+    retry = repository.accept_story_commit(commit_id)
+
+    assert retry["idempotent"] is True
+    assert retry["graph_snapshot"]["captured"] is False
+    assert retry["graph_snapshot"]["recoveryAllowed"] is False
+    assert retry["graph_snapshot"]["sourceChanged"] is True
+    assert db.fetchone(
+        "SELECT id FROM storyflow_graph_snapshots WHERE book_id=? AND source_commit_id=?",
+        (book_id, commit_id),
+    ) is None
+    replay = StoryGraphProjector(db).canonical_replay(book_id, commit_id)
+    assert replay["graphReplayComplete"] is False
+    assert replay["historicalGraph"]["available"] is False
+
+
 def test_story_graph_projection_health_surfaces_stale_and_conflict_boundaries(tmp_path):
     db, _, book_id, chapter_one, chapter_two, _, _ = _seed_book(tmp_path)
     repository = StoryRepository(db)
@@ -1900,8 +2710,233 @@ def test_story_graph_neighbors_are_paged_and_directional(tmp_path):
         )
         assert second["neighbors"]
         assert second["neighbors"][0]["node"]["id"] != first["neighbors"][0]["node"]["id"]
+        cursor_second = projector.neighbors(
+            book_id,
+            f"chapter:{chapter_one}",
+            limit=1,
+            page_token=first["pagination"]["nextPageToken"],
+            direction="out",
+        )
+        assert cursor_second["pagination"]["offset"] == 1
+        assert cursor_second["neighbors"] == second["neighbors"]
+        with pytest.raises(StoryGraphError, match="does not match"):
+            projector.neighbors(
+                book_id,
+                f"chapter:{chapter_one}",
+                limit=1,
+                page_token=first["pagination"]["nextPageToken"],
+                direction="in",
+            )
+        db.update(
+            "chapters",
+            {"title": "Neighbor cursor source mutation"},
+            "id=?",
+            (chapter_one,),
+        )
+        with pytest.raises(StoryGraphError, match="expired"):
+            projector.neighbors(
+                book_id,
+                f"chapter:{chapter_one}",
+                limit=1,
+                page_token=first["pagination"]["nextPageToken"],
+                direction="out",
+            )
     with pytest.raises(StoryGraphError):
         projector.neighbors(book_id, f"chapter:{chapter_one}", direction="sideways")
+
+
+def test_story_graph_selection_projection_returns_semantic_flow_and_external_edges(tmp_path):
+    db, _, book_id, chapter_one, chapter_two, aster, mira = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+
+    selection = projector.selection_projection(
+        book_id,
+        [f"chapter:{chapter_one}", f"character:{aster}"],
+    )
+
+    assert selection["meta"]["canonicalSource"] == "sqlite.story_graph_projection"
+    assert selection["meta"]["readOnly"] is True
+    assert selection["meta"]["canonicalMutation"] is False
+    assert selection["missingNodeIds"] == []
+    assert set(selection["nodeIds"]) == {f"chapter:{chapter_one}", f"character:{aster}"}
+    assert selection["summary"]["nodeTypeCounts"] == {"Chapter": 1, "Character": 1}
+    assert selection["summary"]["internalEdgeCount"] >= 1
+    assert selection["summary"]["edgeTypeCounts"].get("appears_in") == 1
+    assert selection["summary"]["externalEdgeCount"] >= 1
+    assert any(
+        item["remoteEndpointId"] == f"character:{mira}"
+        for item in selection["externalEdges"]
+    )
+    assert selection["summary"]["chapterFrom"] == 1
+    assert selection["summary"]["chapterTo"] == 1
+
+    missing = projector.selection_projection(book_id, [f"chapter:{chapter_two}", "missing:node"])
+    assert missing["missingNodeIds"] == ["missing:node"]
+    assert missing["meta"]["missingNodeCount"] == 1
+
+
+def test_story_graph_warm_selection_uses_indexed_nodes_and_edges_without_catalog_deserialization(
+    tmp_path,
+    monkeypatch,
+):
+    db, _, book_id, chapter_one, _, aster, mira = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+    node_ids = [f"chapter:{chapter_one}", f"character:{aster}"]
+
+    cold = projector.selection_projection(book_id, node_ids)
+    assert cold["meta"]["projectionReadModel"] == "json_catalog"
+
+    def fail_catalog(_book_id):
+        raise AssertionError("warm selection should not deserialize the full catalog")
+
+    monkeypatch.setattr(projector, "_read_catalog", fail_catalog)
+    warm = projector.selection_projection(book_id, node_ids)
+
+    assert warm["meta"]["projectionReadModel"] == "sqlite_node_index+semantic_edge_index"
+    assert warm["meta"]["canonicalMutation"] is False
+    assert set(warm["nodeIds"]) == set(node_ids)
+    assert warm["summary"]["internalEdgeCount"] == cold["summary"]["internalEdgeCount"]
+    assert warm["summary"]["externalEdgeCount"] == cold["summary"]["externalEdgeCount"]
+    assert any(
+        item["remoteEndpointId"] == f"character:{mira}"
+        for item in warm["externalEdges"]
+    )
+
+
+def test_story_graph_selection_external_edges_page_in_sqlite_and_cursor_boundary(tmp_path):
+    db, _, book_id, _, _, aster, _ = _seed_book(tmp_path)
+    remote_ids = []
+    for number in range(6):
+        remote_id = f"selection-remote-{number}"
+        remote_ids.append(remote_id)
+        db.insert(
+            "characters",
+            {
+                "id": remote_id,
+                "book_id": book_id,
+                "name": f"Selection Remote {number}",
+                "description": "A high-degree selection pagination fixture.",
+            },
+        )
+        db.insert(
+            "relationships",
+            {
+                "id": f"selection-relationship-{number}",
+                "book_id": book_id,
+                "source_type": "character",
+                "source_id": aster,
+                "target_type": "character",
+                "target_id": remote_id,
+                "relationship_type": "allied",
+                "strength": number + 1,
+            },
+        )
+
+    projector = StoryGraphProjector(db)
+    selected_id = f"character:{aster}"
+    first = projector.selection_projection(book_id, [selected_id], edge_limit=2)
+    page = first["meta"]["externalEdgesPage"]
+    assert first["summary"]["externalEdgeCount"] >= len(remote_ids)
+    assert page["limit"] == 2
+    assert page["total"] == first["summary"]["externalEdgeCount"]
+    assert page["hasMore"] is True
+    first_token = page["nextPageToken"]
+
+    seen_edge_ids = {edge["id"] for edge in first["externalEdges"]}
+    second = projector.selection_projection(
+        book_id,
+        [selected_id],
+        edge_limit=2,
+        external_page_token=first_token,
+    )
+    assert second["meta"]["projectionReadModel"] == "sqlite_node_index+semantic_edge_index"
+    assert second["meta"]["externalEdgesPage"]["offset"] == 2
+    assert not seen_edge_ids.intersection(edge["id"] for edge in second["externalEdges"])
+    seen_edge_ids.update(edge["id"] for edge in second["externalEdges"])
+
+    page = second["meta"]["externalEdgesPage"]
+    while page["nextPageToken"]:
+        current = projector.selection_projection(
+            book_id,
+            [selected_id],
+            edge_limit=2,
+            external_page_token=page["nextPageToken"],
+        )
+        assert not seen_edge_ids.intersection(edge["id"] for edge in current["externalEdges"])
+        seen_edge_ids.update(edge["id"] for edge in current["externalEdges"])
+        page = current["meta"]["externalEdgesPage"]
+    assert len(seen_edge_ids) == first["summary"]["externalEdgeCount"]
+
+    with pytest.raises(StoryGraphError, match="does not match"):
+        projector.selection_projection(
+            book_id,
+            [f"character:{remote_ids[0]}"],
+            edge_limit=2,
+            external_page_token=first_token,
+        )
+
+    db.update("characters", {"name": "Selection Remote changed"}, "id=?", (remote_ids[0],))
+    with pytest.raises(StoryGraphError, match="expired"):
+        projector.selection_projection(
+            book_id,
+            [selected_id],
+            edge_limit=2,
+            external_page_token=first_token,
+        )
+
+
+def test_story_graph_selection_index_rebuilds_after_authoritative_mutation_without_canon_write(tmp_path):
+    db, _, book_id, chapter_one, _, aster, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+    node_id = f"character:{aster}"
+    projector.selection_projection(book_id, [f"chapter:{chapter_one}", node_id])
+    before = {
+        "story_facts": db.fetchall(
+            "SELECT * FROM story_facts WHERE book_id=? ORDER BY 1", (book_id,)
+        ),
+        "story_states": db.fetchall(
+            "SELECT * FROM story_states WHERE book_id=? ORDER BY 1", (book_id,)
+        ),
+        "story_commits": db.fetchall(
+            """SELECT sc.* FROM story_commits sc
+               JOIN chapters c ON c.id=sc.chapter_id
+              WHERE c.book_id=? ORDER BY sc.id""",
+            (book_id,),
+        ),
+    }
+    previous_epoch = db.fetchone(
+        "SELECT source_revision, source_fingerprint FROM storyflow_projection_epochs WHERE book_id=?",
+        (book_id,),
+    )
+    assert previous_epoch is not None
+
+    db.update("characters", {"name": "Aster after selection rebuild"}, "id=?", (aster,))
+    invalidated_epoch = db.fetchone(
+        "SELECT source_revision, source_fingerprint FROM storyflow_projection_epochs WHERE book_id=?",
+        (book_id,),
+    )
+    assert invalidated_epoch is not None
+    assert invalidated_epoch["source_revision"] > previous_epoch["source_revision"]
+    assert invalidated_epoch["source_fingerprint"] == ""
+
+    rebuilt = projector.selection_projection(book_id, [node_id])
+    changed = next(node for node in rebuilt["nodes"] if node["id"] == node_id)
+    assert changed["title"] == "Aster after selection rebuild"
+    assert rebuilt["meta"]["projectionReadModel"] == "json_catalog"
+    assert before == {
+        "story_facts": db.fetchall(
+            "SELECT * FROM story_facts WHERE book_id=? ORDER BY 1", (book_id,)
+        ),
+        "story_states": db.fetchall(
+            "SELECT * FROM story_states WHERE book_id=? ORDER BY 1", (book_id,)
+        ),
+        "story_commits": db.fetchall(
+            """SELECT sc.* FROM story_commits sc
+               JOIN chapters c ON c.id=sc.chapter_id
+              WHERE c.book_id=? ORDER BY sc.id""",
+            (book_id,),
+        ),
+    }
 
 
 def test_storyflow_layout_is_separate_and_survives_refresh(tmp_path):
@@ -1923,6 +2958,27 @@ def test_storyflow_layout_is_separate_and_survives_refresh(tmp_path):
     auto_item = next(item for item in auto["items"] if item["nodeId"] == f"chapter:{chapter_one}")
     assert (auto_item["x"], auto_item["y"], auto_item["pinned"]) == (811.0, 377.0, True)
     assert before["meta"]["canonicalSource"] == "sqlite"
+    assert story_state_before == projector.db.fetchone("SELECT * FROM story_states WHERE book_id=?", (book_id,))
+
+
+def test_storyflow_layout_workspace_flags_survive_refresh_without_canon_mutation(tmp_path):
+    db, _, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    projector = StoryGraphProjector(db)
+    node_id = f"chapter:{chapter_one}"
+    story_state_before = projector.db.fetchone("SELECT * FROM story_states WHERE book_id=?", (book_id,))
+
+    projector.save_layout(
+        book_id,
+        "story",
+        [{"nodeId": node_id, "x": 144, "y": 233, "collapsed": True, "pinned": True, "hidden": True}],
+    )
+    refreshed = projector.project(book_id, view="story", focus=node_id, depth=1)
+    chapter = next(node for node in refreshed["nodes"] if node["id"] == node_id)
+    assert (chapter["x"], chapter["y"]) == (144.0, 233.0)
+    assert chapter["collapsed"] is True
+    assert chapter["pinned"] is True
+    assert chapter["hidden"] is True
+    assert projector.read_layout(book_id, "story")[0]["hidden"] is True
     assert story_state_before == projector.db.fetchone("SELECT * FROM story_states WHERE book_id=?", (book_id,))
 
 
@@ -1982,6 +3038,98 @@ def test_context_view_depth_is_explicit_and_progressive(tmp_path):
     assert len(expanded["graph"]["nodes"]) >= len(shallow["graph"]["nodes"])
     assert expanded["trace"]["available"] is False
     assert expanded["graph"]["meta"]["contextGraph"] is False
+
+
+def test_context_input_accounting_reconciles_ranges_and_untracked_prompt_space():
+    prompt = "[system]\nSYS\n\n[user]\nAAAA\nBB"
+    system_start = prompt.index("SYS")
+    user_start = prompt.index("AAAA")
+    manifest = {
+        "items": [
+            {
+                "sourceType": "story_fact",
+                "included": True,
+                "persistedPromptRange": {
+                    "scope": "persisted_generation_input",
+                    "start": user_start,
+                    "end": user_start + 4,
+                    "precision": "section",
+                },
+                "persistedPromptRangeStatus": "exact",
+            }
+        ],
+        "contextSections": [
+            {
+                "id": "context-section:fact",
+                "included": True,
+                "persistedPromptRange": {
+                    "scope": "persisted_generation_input",
+                    "start": user_start,
+                    "end": user_start + 4,
+                    "precision": "exact",
+                },
+                "persistedPromptRangeStatus": "exact",
+            }
+        ],
+        "writerInput": {
+            "components": [
+                {
+                    "id": "context",
+                    "included": True,
+                    "persistedPromptRange": {
+                        "scope": "persisted_generation_input",
+                        "start": user_start,
+                        "end": user_start + 4,
+                        "precision": "exact",
+                    },
+                    "persistedPromptRangeStatus": "exact",
+                }
+            ]
+        },
+    }
+
+    accounting = StoryGraphProjector._context_input_accounting(
+        manifest,
+        {
+            "prompt": prompt,
+            "promptLayout": {
+                "scope": "persisted_generation_input",
+                "charCount": len(prompt),
+                "segments": [
+                    {
+                        "id": "system",
+                        "role": "system",
+                        "messageIndex": None,
+                        "contentStart": system_start,
+                        "contentEnd": system_start + 3,
+                    },
+                    {
+                        "id": "message:0",
+                        "role": "user",
+                        "messageIndex": 0,
+                        "contentStart": user_start,
+                        "contentEnd": len(prompt),
+                    },
+                ],
+            },
+        },
+    )
+
+    assert accounting["status"] == "exact_character_accounting"
+    assert accounting["promptLayoutAvailable"] is True
+    assert accounting["promptChars"] == len(prompt)
+    assert accounting["systemChars"] == 3
+    assert accounting["messageChars"] == 7
+    assert accounting["recordedRangeCount"] == 3
+    assert accounting["uniqueCoveredChars"] == 4
+    assert accounting["rawAttributedChars"] == 12
+    assert accounting["overlapChars"] == 8
+    assert accounting["coveredMessageChars"] == 4
+    assert accounting["untrackedMessageChars"] == 3
+    assert accounting["rangeStatusCounts"] == {"exact": 3}
+    assert accounting["rangePrecisionCounts"] == {"exact": 2, "section": 1}
+    assert accounting["includedSourceWithoutPersistedRange"] == 0
+    assert accounting["providerTokenOffsets"] is False
 
 
 def test_context_view_reads_actual_generation_manifest_without_inference(tmp_path):
@@ -2108,6 +3256,12 @@ def test_context_view_reads_actual_generation_manifest_without_inference(tmp_pat
     assert context["tokenSummary"]["totalTokens"] == 30
     assert context["tokenSummary"]["promptSha256"] == "abc"
     assert context["tokenSummary"]["promptHashScope"] == "system_prompt"
+    input_accounting = context["tokenSummary"]["inputAccounting"]
+    assert input_accounting["status"] == "ranges_without_prompt_length"
+    assert input_accounting["recordedRangeCount"] == 2
+    assert input_accounting["uniqueCoveredChars"] == 42
+    assert input_accounting["overlapChars"] == 42
+    assert input_accounting["includedSourceWithoutPersistedRange"] == 0
     assert context["sources"][0]["provenance"][0]["generationRunId"] == run_id
     assert context["sources"][0]["inclusionReason"] == "verified StoryFact selected for the writer"
     assert context["sources"][0]["contextSectionId"] == "context-section:facts"
@@ -2159,6 +3313,7 @@ def test_context_view_reads_actual_generation_manifest_without_inference(tmp_pat
     assert context["tokenSummary"]["promptComponents"][0]["id"] == "context"
     assert context["tokenSummary"]["componentAttribution"][0]["estimatedTokens"] == 10
     assert context["tokenSummary"]["providerUsage"]["authority"] == "generation_runs.provider_usage"
+    assert context["tokenSummary"]["sourceAvailability"] == {}
     assert context["tokenSummary"]["tokenAttribution"] == {
         "status": "whole_run_provider_usage_plus_source_estimates",
         "exactPerSourceProviderTokens": False,
@@ -2633,6 +3788,44 @@ def test_storyflow_planning_overlay_is_revisioned_and_semantic(tmp_path):
     assert projected["status"] == "CANDIDATE"
     assert any(item["kind"] == "plot_workspace" for item in projected["provenance"])
 
+    anchored_graph, anchored_revision, anchored = service.add_node(
+        book_id,
+        title="锚定旧城章节的后续计划",
+        summary="节点和语义锚点必须作为一个 revision 写入",
+        status="PLANNED",
+        anchor_node_id=f"chapter:{chapter_one}",
+        anchor_edge_type="originates_from",
+        anchor_label="起源于旧城章节",
+        expected_revision=revision,
+    )
+    assert anchored_revision == revision + 1
+    assert any(node["id"] == anchored["id"] for node in anchored_graph["nodes"])
+    anchored_edge = next(
+        edge
+        for edge in anchored_graph["edges"]
+        if edge["source"] == anchored["id"] and edge["target"] == f"chapter:{chapter_one}"
+    )
+    assert anchored_edge["type"] == "originates_from"
+    assert anchored_edge["status"] == "planned"
+    revision = anchored_revision
+
+    before_invalid_anchor_revision = service.load(book_id)[1]
+    with pytest.raises(StoryFlowPlanningError, match="not a valid"):
+        service.add_node(
+            book_id,
+            title="不应留下的非法锚点",
+            status="PLANNED",
+            anchor_node_id=f"chapter:{chapter_one}",
+            anchor_edge_type="happens_at",
+            expected_revision=before_invalid_anchor_revision,
+        )
+    after_invalid_anchor_graph, after_invalid_anchor_revision = service.load(book_id)
+    assert after_invalid_anchor_revision == before_invalid_anchor_revision
+    assert not any(
+        node.get("title") == "不应留下的非法锚点"
+        for node in after_invalid_anchor_graph["nodes"]
+    )
+
     workspace, revision, edge = service.add_edge(
         book_id,
         source_node_id=candidate["id"],
@@ -2644,6 +3837,15 @@ def test_storyflow_planning_overlay_is_revisioned_and_semantic(tmp_path):
     assert edge["type"] == "planned_for"
     projected = service.projector.project(book_id, view="story", focus=candidate["id"], depth=1)
     assert any(item["type"] == "planned_for" for item in projected["edges"])
+
+    before_invalid_edge_update_revision = service.load(book_id)[1]
+    with pytest.raises(StoryFlowPlanningError, match="StoryCommit provenance"):
+        service._apply(
+            book_id,
+            [{"op": "update_edge", "id": edge["id"], "patch": {"status": "ACCEPTED"}}],
+            before_invalid_edge_update_revision,
+        )
+    assert service.load(book_id)[1] == before_invalid_edge_update_revision
 
     location_row = db.fetchone("SELECT id FROM locations WHERE book_id=? LIMIT 1", (book_id,))
     assert location_row is not None
@@ -2723,6 +3925,188 @@ def test_storyflow_plan_is_fulfilled_by_accepted_story_commit(tmp_path):
         story_commit_id=commit_id,
     )
     assert repeated_revision == fulfilled_revision
+
+
+def test_storyflow_fulfillment_rejects_untrusted_commit_and_illegal_lifecycle(tmp_path):
+    db, _, book_id, chapter_one, chapter_two, _, _ = _seed_book(tmp_path)
+    service = StoryFlowPlanningService(db)
+    _, revision, plan_node, _ = service.save_intent_from_flow(
+        book_id,
+        [f"chapter:{chapter_one}"],
+        chapter_number=2,
+    )
+
+    with pytest.raises(StoryFlowPlanningError, match="not found"):
+        service.mark_intent_accepted(
+            book_id,
+            plan_node["id"],
+            chapter_id=chapter_two,
+            story_commit_id="missing-commit",
+            expected_revision=revision,
+        )
+
+    pending_id = StoryRepository(db).create_story_commit(
+        chapter_two,
+        facts=[{"fact_type": "event", "content": "Pending is not canon."}],
+    )
+    with pytest.raises(StoryFlowPlanningError, match="not accepted"):
+        service.mark_intent_accepted(
+            book_id,
+            plan_node["id"],
+            chapter_id=chapter_two,
+            story_commit_id=pending_id,
+            expected_revision=revision,
+        )
+
+    wrong_chapter_commit = StoryRepository(db).create_story_commit(
+        chapter_one,
+        facts=[{"fact_type": "event", "content": "This belongs to chapter one."}],
+    )
+    StoryRepository(db).accept_story_commit(wrong_chapter_commit)
+    with pytest.raises(StoryFlowPlanningError, match="chapter number"):
+        service.mark_intent_accepted(
+            book_id,
+            plan_node["id"],
+            chapter_id=chapter_one,
+            story_commit_id=wrong_chapter_commit,
+            expected_revision=revision,
+        )
+
+    with pytest.raises(StoryFlowPlanningError, match="ACCEPTED"):
+        service.add_node(book_id, title="Forged canonical plan", status="ACCEPTED")
+
+    with pytest.raises(StoryFlowPlanningError, match="illegal planning transition"):
+        validate_planning_transition("ACCEPTED", "PLANNED")
+
+
+def test_storyflow_reconcile_reads_completed_task_result_and_is_idempotent(tmp_path):
+    db, _, book_id, chapter_one, chapter_two, _, _ = _seed_book(tmp_path)
+    service = StoryFlowPlanningService(db)
+    _, revision, plan_node, _ = service.save_intent_from_flow(
+        book_id,
+        [f"chapter:{chapter_one}"],
+        chapter_number=2,
+    )
+    repository = StoryRepository(db)
+    commit_id = repository.create_story_commit(
+        chapter_two,
+        facts=[{"fact_type": "event", "content": "The durable task fulfilled the plan."}],
+        state_changes={"plan_fulfilled": True},
+    )
+    repository.accept_story_commit(commit_id)
+
+    runtime = TaskRuntime(db)
+    task = runtime.enqueue(
+        "write-next",
+        project_id="project-storyflow",
+        book_id=book_id,
+        data={
+            "chapter_number": 2,
+            "storyflow_plan_node_id": plan_node["id"],
+        },
+    )
+    runtime.transition(task["id"], "running")
+    completed = runtime.transition(
+        task["id"],
+        "completed",
+        result={
+            "chapter_id": chapter_two,
+            "chapter_number": 2,
+            "story_commit_id": commit_id,
+            "storyflow_plan_node_id": plan_node["id"],
+            "storyflow_plan_status": "ACCEPTED_PENDING_OVERLAY",
+        },
+    )
+    assert completed["status"] == "completed"
+
+    graph, reconciled_revision = service.reconcile_intent_from_task(
+        book_id,
+        task["id"],
+        expected_revision=revision,
+    )
+    assert reconciled_revision == revision + 1
+    fulfilled = next(node for node in graph["nodes"] if node["id"] == plan_node["id"])
+    assert fulfilled["status"] == "accepted"
+    assert fulfilled["metadata"]["storyCommitId"] == commit_id
+    assert any(
+        (edge.get("type") or edge.get("edgeType") or edge.get("kind")) == "leads_to"
+        and edge.get("source") == plan_node["id"]
+        and edge.get("target") == f"chapter:{chapter_two}"
+        for edge in graph["edges"]
+    )
+
+    _, repeated_revision = service.reconcile_intent_from_task(book_id, task["id"])
+    assert repeated_revision == reconciled_revision
+
+
+def test_storyflow_reconcile_api_uses_durable_task_output(tmp_path, monkeypatch):
+    db, _, book_id, chapter_one, chapter_two, _, _ = _seed_book(tmp_path)
+    repository = StoryRepository(db)
+    service = StoryFlowPlanningService(db)
+    _, revision, plan_node, _ = service.save_intent_from_flow(
+        book_id,
+        [f"chapter:{chapter_one}"],
+        chapter_number=2,
+    )
+    commit_id = repository.create_story_commit(
+        chapter_two,
+        facts=[{"fact_type": "event", "content": "API recovery accepts the canonical chapter."}],
+    )
+    repository.accept_story_commit(commit_id)
+    runtime = TaskRuntime(db)
+    task = runtime.enqueue(
+        "write-next",
+        project_id="project-storyflow",
+        book_id=book_id,
+        data={"chapter_number": 2, "storyflow_plan_node_id": plan_node["id"]},
+    )
+    runtime.transition(task["id"], "running")
+    runtime.transition(
+        task["id"],
+        "completed",
+        result={
+            "chapter_id": chapter_two,
+            "chapter_number": 2,
+            "story_commit_id": commit_id,
+            "storyflow_plan_node_id": plan_node["id"],
+            "storyflow_plan_status": "ACCEPTED_PENDING_OVERLAY",
+            "storyflow_plan_error": "revision race in the optional overlay",
+        },
+    )
+
+    from src.web import studio
+
+    monkeypatch.setenv("NOVELFORGE_DISABLE_STUDIO_WORKER", "1")
+    monkeypatch.setattr(studio, "story_repository", repository)
+    monkeypatch.setattr(studio, "task_runtime", runtime)
+    studio.studio_daemon_state.update(task=None, stop_event=None, worker_id=None)
+
+    with TestClient(studio.app) as client:
+        candidates = client.get(
+            f"/api/v1/books/{book_id}/story-graph/planning/reconciliation-candidates"
+            f"?planNodeId={plan_node['id']}"
+        )
+        assert candidates.status_code == 200
+        candidate_payload = candidates.json()
+        assert candidate_payload["canonicalMutation"] is False
+        assert candidate_payload["candidates"][0]["taskId"] == task["id"]
+        assert candidate_payload["candidates"][0]["storyCommitId"] == commit_id
+        response = client.post(
+            f"/api/v1/books/{book_id}/story-graph/planning/reconcile",
+            json={"taskId": task["id"], "expectedRevision": revision},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["reconciled"] is True
+        assert payload["canonicalSource"] == "sqlite.story_commits + tasks.result"
+        fulfilled = next(node for node in payload["graph"]["nodes"] if node["id"] == plan_node["id"])
+        assert fulfilled["status"] == "accepted"
+        remaining = client.get(
+            f"/api/v1/books/{book_id}/story-graph/planning/reconciliation-candidates"
+            f"?planNodeId={plan_node['id']}"
+        )
+        assert remaining.status_code == 200
+        assert remaining.json()["candidates"] == []
 
 
 def test_legacy_forecast_branch_is_projected_as_candidate_overlay(tmp_path):
@@ -3431,6 +4815,7 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
     monkeypatch.setattr(studio, "project_mgr", manager)
     monkeypatch.setattr(studio, "plot_workspace_repository", PlotWorkspaceRepository(db))
     monkeypatch.setattr(studio, "task_runtime", TaskRuntime(db))
+    _configure_storyflow_model_gate(db, tmp_path, monkeypatch)
     studio.studio_daemon_state.update(task=None, stop_event=None, worker_id=None)
 
     with TestClient(studio.app) as client:
@@ -3441,6 +4826,13 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         first_snapshot_id = payload["meta"]["graphSnapshotId"]
         assert any(node["title"].endswith("First move") for node in payload["nodes"])
 
+        unchanged_changes = client.get(
+            f"/api/v1/books/{project.id}/story-graph/changes?fromSnapshot={first_snapshot_id}"
+        )
+        assert unchanged_changes.status_code == 200
+        assert unchanged_changes.json()["changed"] is False
+        assert unchanged_changes.json()["resyncRequired"] is False
+
         health_response = client.get(
             f"/api/v1/books/{project.id}/story-graph/health?lookback=1&types=Foreshadow"
         )
@@ -3450,6 +4842,16 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         assert health_payload["readOnly"] is True
         assert health_payload["authoritativeBookId"] == book["id"]
         assert all(item["type"] == "Foreshadow" for item in health_payload["items"])
+        health_cutoff = client.get(
+            f"/api/v1/books/{project.id}/story-graph/health?chapter_to=1"
+        )
+        assert health_cutoff.status_code == 200
+        assert health_cutoff.json()["currentChapter"] == 1
+        health_camel_cutoff = client.get(
+            f"/api/v1/books/{project.id}/story-graph/health?chapterTo=1"
+        )
+        assert health_camel_cutoff.status_code == 200
+        assert health_camel_cutoff.json()["currentChapter"] == 1
         invalid_health = client.get(
             f"/api/v1/books/{project.id}/story-graph/health?types=Chapter"
         )
@@ -3493,6 +4895,64 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         assert viewport_payload["meta"]["viewport"]["layoutScope"] == "filtered_candidates"
         assert viewport_payload["meta"]["viewport"]["returnedInViewport"] >= 1
         assert any(node["id"] == viewport_anchor["id"] for node in viewport_payload["nodes"])
+        assert "crossBoundaryEdgeCount" in viewport_payload["meta"]["viewport"]
+        assert "crossBoundaryEdges" in viewport_payload["meta"]["viewport"]
+
+        boundary_response = client.get(
+            f"/api/v1/books/{project.id}/story-graph?view=all&limit=20&edge_limit=1"
+            f"&x_from={float(viewport_anchor['x']) - 0.1}"
+            f"&x_to={float(viewport_anchor['x']) + 0.1}"
+            f"&y_from={float(viewport_anchor['y']) - 0.1}"
+            f"&y_to={float(viewport_anchor['y']) + 0.1}"
+            f"&boundary_node_id={viewport_anchor['id']}"
+        )
+        assert boundary_response.status_code == 200
+        boundary_payload = boundary_response.json()
+        boundary_meta = boundary_payload["meta"]["viewport"]
+        assert boundary_meta["boundaryPageSize"] == 1
+        assert boundary_meta["boundaryPageOffset"] == 0
+        if boundary_meta["boundaryHasMore"]:
+            boundary_next = client.get(
+                f"/api/v1/books/{project.id}/story-graph?view=all&limit=20&edge_limit=1"
+                f"&x_from={float(viewport_anchor['x']) - 0.1}"
+                f"&x_to={float(viewport_anchor['x']) + 0.1}"
+                f"&y_from={float(viewport_anchor['y']) - 0.1}"
+                f"&y_to={float(viewport_anchor['y']) + 0.1}"
+                f"&boundary_node_id={viewport_anchor['id']}"
+                f"&boundary_page_token={boundary_meta['nextBoundaryPageToken']}"
+            )
+            assert boundary_next.status_code == 200
+            assert boundary_next.json()["meta"]["viewport"]["boundaryPageOffset"] == 1
+
+        paged_viewport = client.get(
+            f"/api/v1/books/{project.id}/story-graph?view=all&limit=2&edge_limit=20"
+            "&x_from=-100&x_to=5000&y_from=-100&y_to=5000"
+        )
+        assert paged_viewport.status_code == 200
+        paged_payload = paged_viewport.json()
+        paged_meta = paged_payload["meta"]["viewport"]
+        assert paged_meta["pageSize"] == 2
+        assert paged_meta["pageOffset"] == 0
+        assert paged_meta["hasMore"] is True
+        assert paged_meta["nextPageToken"]
+        next_page = client.get(
+            f"/api/v1/books/{project.id}/story-graph?view=all&limit=2&edge_limit=20"
+            "&x_from=-100&x_to=5000&y_from=-100&y_to=5000"
+            f"&page_token={paged_meta['nextPageToken']}"
+        )
+        assert next_page.status_code == 200
+        next_payload = next_page.json()
+        assert next_payload["meta"]["viewport"]["pageOffset"] == 2
+        assert {
+            node["id"] for node in paged_payload["nodes"]
+        }.isdisjoint(node["id"] for node in next_payload["nodes"])
+        invalid_page = client.get(
+            f"/api/v1/books/{project.id}/story-graph?view=all&limit=3&edge_limit=20"
+            "&x_from=-100&x_to=5000&y_from=-100&y_to=5000"
+            f"&page_token={paged_meta['nextPageToken']}"
+        )
+        assert invalid_page.status_code == 422
+        assert invalid_page.json()["detail"]["code"] == "STORY_GRAPH_QUERY"
 
         foreshadow_response = client.get(
             f"/api/v1/books/{project.id}/story-graph?view=foreshadow"
@@ -3603,6 +5063,7 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         node_payload = node.json()
         assert node_payload["node"]["source_type"] == "chapters"
         assert node_payload["canonicalSource"] == "sqlite"
+        assert node_payload["projectionReadModel"] == "sqlite_node_index+semantic_edge_index"
         chapter_neighbor_types = {
             item["node"]["type"] for item in node_payload["neighbors"]
         }
@@ -3620,6 +5081,52 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         assert neighbors.status_code == 200
         assert neighbors.json()["pagination"]["limit"] == 1
         assert neighbors.json()["canonicalSource"] == "sqlite"
+        assert neighbors.json()["projectionReadModel"] == "sqlite_node_index+semantic_edge_index"
+        neighbor_payload = neighbors.json()
+        if neighbor_payload["pagination"]["hasMore"]:
+            neighbor_cursor = client.get(
+                f"/api/v1/books/{project.id}/story-graph/neighbors/chapter:{chapter_id}"
+                f"?limit=1&pageToken={neighbor_payload['pagination']['nextPageToken']}&direction=both"
+            )
+            assert neighbor_cursor.status_code == 200
+            assert neighbor_cursor.json()["pagination"]["offset"] == 1
+        selection = client.get(
+            f"/api/v1/books/{project.id}/story-graph/selection"
+            f"?nodeIds=chapter:{chapter_id},character:{character_id}"
+        )
+        assert selection.status_code == 200
+        selection_payload = selection.json()
+        assert selection_payload["meta"]["canonicalSource"] == "sqlite.story_graph_projection"
+        assert selection_payload["meta"]["projectionReadModel"] == "sqlite_node_index+semantic_edge_index"
+        assert selection_payload["meta"]["canonicalMutation"] is False
+        assert selection_payload["summary"]["internalEdgeCount"] >= 1
+        assert selection_payload["summary"]["nodeTypeCounts"]["Chapter"] == 1
+        assert selection_payload["summary"]["nodeTypeCounts"]["Character"] == 1
+        assert selection_payload["externalEdges"]
+        assert selection_payload["meta"]["externalEdgesPage"]["total"] == selection_payload["summary"]["externalEdgeCount"]
+        assert selection_payload["authoritativeBookId"] == book["id"]
+        selection_page = client.get(
+            f"/api/v1/books/{project.id}/story-graph/selection"
+            f"?nodeIds=chapter:{chapter_id},character:{character_id}&edgeLimit=1"
+        )
+        assert selection_page.status_code == 200
+        selection_page_payload = selection_page.json()
+        selection_page_meta = selection_page_payload["meta"]["externalEdgesPage"]
+        assert selection_page_meta["limit"] == 1
+        if selection_page_meta["hasMore"]:
+            selection_cursor = client.get(
+                f"/api/v1/books/{project.id}/story-graph/selection"
+                f"?nodeIds=chapter:{chapter_id},character:{character_id}&edgeLimit=1"
+                f"&externalPageToken={selection_page_meta['nextPageToken']}"
+            )
+            assert selection_cursor.status_code == 200
+            assert selection_cursor.json()["meta"]["externalEdgesPage"]["offset"] == 1
+            mismatch_cursor = client.get(
+                f"/api/v1/books/{project.id}/story-graph/selection"
+                f"?nodeIds=chapter:{chapter_id}&edgeLimit=1"
+                f"&externalPageToken={selection_page_meta['nextPageToken']}"
+            )
+            assert mismatch_cursor.status_code == 422
         def count_story_rows(sql: str) -> int:
             row = db.fetchone(sql, (book["id"],))
             assert row is not None
@@ -3743,6 +5250,14 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         )
         assert changed_graph.status_code == 200
         second_snapshot_id = changed_graph.json()["meta"]["graphSnapshotId"]
+        graph_history = client.get(
+            f"/api/v1/books/{project.id}/story-graph/history?nodeId=chapter:{chapter_id}"
+        )
+        assert graph_history.status_code == 200
+        graph_history_payload = graph_history.json()["canonicalGraphHistory"]
+        assert graph_history_payload["scope"] == "accepted_commit_snapshot_history"
+        assert graph_history_payload["available"] is True
+        assert graph_history_payload["meta"]["snapshotCount"] >= 1
         snapshot_diff = client.get(
             f"/api/v1/books/{project.id}/story-graph/diff"
             f"?fromSnapshot={first_snapshot_id}&toSnapshot={second_snapshot_id}"
@@ -3766,6 +5281,80 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         assert canonical_diff.status_code == 200
         assert canonical_diff.json()["replayComplete"] is True
         assert canonical_diff.json()["addedCommits"][0]["commitId"] == observed_commit
+
+        failed_capture_version = generate_id()
+        db.insert(
+            "chapter_versions",
+            {
+                "id": failed_capture_version,
+                "chapter_id": chapter_id,
+                "version": 3,
+                "content": "Third immutable API version for snapshot recovery.",
+                "word_count": 30,
+                "change_summary": "Snapshot recovery boundary",
+            },
+        )
+        failed_capture_commit = repository.create_story_commit(
+            chapter_id,
+            facts=[{"fact_type": "reveal", "content": "API snapshot recovery boundary", "entities": []}],
+            chapter_version_id=failed_capture_version,
+        )
+
+        def fail_capture(*args, **kwargs):
+            raise RuntimeError("synthetic API capture outage")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(StoryGraphProjector, "capture_accepted_commit_snapshot", fail_capture)
+            failed_capture = repository.accept_story_commit(failed_capture_commit)
+        assert failed_capture["graph_snapshot"]["captured"] is False
+
+        retry_snapshot = client.post(
+            f"/api/v1/books/{project.id}/story-graph/snapshots/retry",
+            json={"commitId": failed_capture_commit},
+        )
+        assert retry_snapshot.status_code == 200
+        retry_payload = retry_snapshot.json()
+        assert retry_payload["captured"] is True
+        assert retry_payload["recovered"] is True
+        assert retry_payload["canonicalMutation"] is False
+        retry_history = client.get(
+            f"/api/v1/books/{project.id}/story-graph/history?nodeId=chapter:{chapter_id}"
+        )
+        assert retry_history.status_code == 200
+        assert retry_history.json()["meta"]["graphSnapshotCaptureFailures"] == 0
+
+        accepted_version = generate_id()
+        db.insert(
+            "chapter_versions",
+            {
+                "id": accepted_version,
+                "chapter_id": chapter_id,
+                "version": 4,
+                "content": "Fourth immutable API version for freshness.",
+                "word_count": 31,
+                "change_summary": "Freshness boundary",
+            },
+        )
+        accepted_commit = repository.create_story_commit(
+            chapter_id,
+            facts=[{
+                "fact_type": "reveal",
+                "content": "The API freshness boundary records a real Canon update",
+                "entities": [character_id],
+            }],
+            state_changes={"api_freshness": "accepted"},
+            chapter_version_id=accepted_version,
+        )
+        repository.accept_story_commit(accepted_commit)
+        changed_response = client.get(
+            f"/api/v1/books/{project.id}/story-graph/changes?fromSnapshot={first_snapshot_id}"
+        )
+        assert changed_response.status_code == 200
+        changed_payload = changed_response.json()
+        assert changed_payload["changed"] is True
+        assert changed_payload["resyncRequired"] is False
+        assert changed_payload["to"]["sourceCommitId"] == accepted_commit
+        assert changed_payload["diff"]["hasRelevantChange"] is True
 
         workspace = client.get(f"/api/v1/books/{project.id}/chapters/1/workspace")
         assert workspace.status_code == 200
@@ -3927,11 +5516,21 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         assert planning.json()["revision"] == 1
         created_plan = client.post(
             f"/api/v1/books/{project.id}/story-graph/planning/node",
-            json={"title": "让门后的事实进入计划", "summary": "真实规划节点", "status": "PLANNED", "expectedRevision": 1},
+            json={
+                "title": "让门后的事实进入计划",
+                "summary": "真实规划节点",
+                "status": "PLANNED",
+                "anchorNodeId": f"chapter:{chapter_id}",
+                "anchorEdgeType": "originates_from",
+                "anchorLabel": "起源于本章",
+                "expectedRevision": 1,
+            },
         )
         assert created_plan.status_code == 200
         plan_node = created_plan.json()["node"]
         assert plan_node["type"] == "PlanningNode"
+        assert created_plan.json()["anchorEdge"]["type"] == "originates_from"
+        assert created_plan.json()["revision"] == 2
         linked = client.post(
             f"/api/v1/books/{project.id}/story-graph/planning/edge",
             json={
@@ -3942,6 +5541,25 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
             },
         )
         assert linked.status_code == 200
+        invalid_anchor = client.post(
+            f"/api/v1/books/{project.id}/story-graph/planning/node",
+            json={
+                "title": "不应写入的非法锚点",
+                "status": "PLANNED",
+                "anchorNodeId": f"chapter:{chapter_id}",
+                "anchorEdgeType": "happens_at",
+                "expectedRevision": 3,
+            },
+        )
+        assert invalid_anchor.status_code == 422
+        planning_after_invalid = client.get(
+            f"/api/v1/books/{project.id}/story-graph/planning"
+        ).json()
+        assert planning_after_invalid["revision"] == 3
+        assert all(
+            node.get("title") != "不应写入的非法锚点"
+            for node in planning_after_invalid["nodes"]
+        )
         def canon_counts():
             facts_row = db.fetchone("SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?", (book["id"],)) or {}
             states_row = db.fetchone("SELECT COUNT(*) AS count FROM story_states WHERE book_id=?", (book["id"],)) or {}

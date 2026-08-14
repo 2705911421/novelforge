@@ -7,6 +7,7 @@ import sqlite3
 import uuid
 import hashlib
 import json
+import threading as _threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -1508,7 +1509,6 @@ class Database:
 
 
 # 全局数据库实例（线程安全）
-import threading as _threading
 _db_lock = _threading.Lock()
 _db_instance: Optional[Database] = None
 

@@ -9,13 +9,17 @@ Features:
 
 from __future__ import annotations
 
+import logging
 import shutil
 import sqlite3
+import threading as _threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 from .database import Database, generate_id, get_db
+
+logger = logging.getLogger(__name__)
 
 
 class BackupManager:
@@ -494,7 +498,6 @@ class BackupManager:
 
 
 # 全局备份管理器实例（线程安全）
-import threading as _threading
 _backup_lock = _threading.Lock()
 _backup_manager: Optional[BackupManager] = None
 

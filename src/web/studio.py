@@ -26,6 +26,8 @@ try:
     from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, Response
     from fastapi.staticfiles import StaticFiles
     from fastapi.middleware.cors import CORSMiddleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
     from pydantic import BaseModel, Field
 except ImportError:
     raise ImportError("需要安装 fastapi uvicorn python-multipart: pip install fastapi uvicorn python-multipart")
@@ -158,10 +160,6 @@ app.add_middleware(
 
 # API Key 认证中间件（可通过环境变量启用）
 _NOVELFORGE_API_KEY = os.environ.get("NOVELFORGE_API_KEY")
-
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):

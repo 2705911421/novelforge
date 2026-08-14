@@ -27,7 +27,7 @@ story_repository = StoryRepository(Database(str(workspace_root / "projects" / "n
 project_mgr = ProjectManager(str(workspace_root), repository=story_repository)
 task_runtime = TaskRuntime(story_repository.db)
 try:
-    model_runtime = build_model_runtime(story_repository.db, str(workspace_root))
+    model_runtime = build_model_runtime(story_repository.db, workspace_root)
 except Exception:
     model_runtime = None
 

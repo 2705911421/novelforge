@@ -5,6 +5,7 @@ NovelForge 数据访问层
 
 import json
 import logging
+import threading as _threading
 from typing import Optional, Dict, Any, List
 
 from .database import get_db, generate_id
@@ -658,7 +659,6 @@ class OperationLogDAL:
 
 
 # 全局 DAL 实例（线程安全）
-import threading as _threading
 _dal_lock = _threading.Lock()
 _dal_instances = {}
 

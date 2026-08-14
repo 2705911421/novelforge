@@ -146,6 +146,25 @@ def test_studio_create_and_visualization_endpoints_use_new_book_settings(tmp_pat
         )
         assert stale.status_code == 409
         assert stale.json()["detail"]["code"] == "PLOT_REVISION_CONFLICT"
+        forged_acceptance = client.post(
+            f"/api/v1/books/{book_id}/plot-canvas/delta",
+            json={
+                "delta": {
+                    "operations": [{
+                        "op": "update_node",
+                        "id": f"book:{canvas_book['id']}",
+                        "patch": {
+                            "status": "ACCEPTED",
+                            "metadata": {"storyCommitId": "forged"},
+                        },
+                    }]
+                },
+                "expectedRevision": 2,
+            },
+        )
+        assert forged_acceptance.status_code == 422
+        assert forged_acceptance.json()["detail"]["code"] == "PLOT_CANON_BOUNDARY"
+        assert client.get(f"/api/v1/books/{book_id}/plot-canvas").json()["revision"] == 2
         assert client.get(f"/api/v1/books/{book_id}/world-map").status_code == 200
         assert client.get(f"/api/v1/books/{book_id}/mindmap").status_code == 200
         assert client.get(f"/api/v1/books/{book_id}/timeline").status_code == 200

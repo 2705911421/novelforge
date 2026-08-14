@@ -5,6 +5,7 @@ NovelForge 数据库适配器
 
 import json
 import logging
+import threading as _threading
 from typing import Optional, Dict, Any, List
 
 from .dal import (
@@ -554,7 +555,6 @@ class DatabaseAdapter:
 
 
 # 全局适配器实例（线程安全）
-import threading as _threading
 _adapter_lock = _threading.Lock()
 _adapter: Optional[DatabaseAdapter] = None
 

@@ -402,8 +402,7 @@ class TaskManager:
 
 
 # 全局任务管理器实例（线程安全）
-import threading as _threading
-_task_manager_lock = _threading.Lock()
+_task_manager_lock = Lock()
 _task_manager: Optional[TaskManager] = None
 
 
