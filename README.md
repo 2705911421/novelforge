@@ -5,6 +5,8 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
 
+**文档语言：** 简体中文 · [English](README.en.md) · [日本語](README.ja.md)
+
 **NovelForge** 是一个**本地优先**的 AI 长篇小说创作工作台。它将世界观设定、25 步 Story Bible、长篇规划、章节写作、记忆检索、质量审查、精准修订、连续创作、备份恢复和文档导出连接成一条**可暂停、可恢复、可追溯**的完整工作流。
 
 融合了 inkOS 与 webnovel-writer 的设计思想，但以 **Python + FastAPI + SQLite** 独立运行：作品数据、执行状态、审查证据和任务记录全部持久化在本地，不依赖浏览器页面作为任务状态的唯一载体。
