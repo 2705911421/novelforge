@@ -430,13 +430,6 @@ class Composer:
         return contract_items + [
             item.get("rule") for item in profile.get("rules", []) if item.get("rule")
         ]
-        """获取题材规则"""
-        from src.pipeline.rules import GENRE_RULES
-
-        profile = GENRE_RULES.get(genre) or {}
-        rules = [item.get("rule") for item in profile.get("rules", []) if item.get("rule")]
-        hard_limits = ((profile.get("limits") or {}).get("hard") or [])
-        return rules + [f"题材硬限制：{item}" for item in hard_limits]
 
     def _get_book_rules(self, project) -> list:
         """获取书级规则"""

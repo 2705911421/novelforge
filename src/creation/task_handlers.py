@@ -189,6 +189,12 @@ class LegacyTaskHandlers:
             "accepted_candidate": result.get("accepted_candidate", ""),
             "author_decision": result.get("author_decision", ""),
             "author_approved": result.get("author_approved", False),
+            "chapter_id": result.get("chapter_id"),
+            "story_commit_id": result.get("story_commit_id"),
+            "storyflow_plan_node_id": result.get("storyflow_plan_node_id") or data.get("storyflow_plan_node_id"),
+            "storyflow_plan_status": result.get("storyflow_plan_status"),
+            "storyflow_planning_revision": result.get("storyflow_planning_revision"),
+            "storyflow_plan_error": result.get("storyflow_plan_error"),
         }
 
     def continuous(self, task: dict[str, Any]) -> dict[str, Any]:

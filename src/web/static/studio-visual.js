@@ -37,7 +37,7 @@
     document.body.classList.toggle('nav-open', isOpen);
   }
 
-  setTheme(root.dataset.theme || 'dark');
+  setTheme(root.dataset.theme || 'light');
 
   themeToggle.addEventListener('click', function () {
     setTheme(root.dataset.theme === 'light' ? 'dark' : 'light');

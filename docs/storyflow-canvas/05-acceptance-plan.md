@@ -109,6 +109,15 @@ Use a real browser at 1920x1080 and 1366x768. Final screenshots and interaction 
 
 39. Verify the Canvas opens in `只读 · Canon` mode. Story Port output handles and planning write actions are visibly gated; the non-Canon `AI 分析选择` action is enabled only for real selected nodes and does not require Planning Edit. Attempting a direct port write does not call `edge-options`. Toggle `规划编辑`, verify legal port drag can call `edge-options` and persist only a revisioned `PLANNED` edge, then toggle back and confirm Canon data remains unchanged. Layout movement/save remains available in read-only mode because it is UI workspace state.
 
+The model-backed actions in this item must also be truthful at the HTTP
+boundary: when the existing Provider/model role contract is not ready,
+`POST /forecast`, `POST .../story-graph/actions/analyze`, and `POST
+.../story-graph/planning/generate` return `LLM_PROVIDER_REQUIRED` before a
+durable task is created. Planning-node and Chapter Intent saves remain
+available without a Provider. The browser recheck is recorded in
+`storyflow-20260814-api-gate-1280.png`; API regression coverage is in
+`test_storyflow_model_actions_fail_before_enqueue_without_runtime`.
+
 40. In `规划编辑` mode, click `新建规划节点`, submit a title, summary, and `PLANNED`/`CANDIDATE` status, and verify the real `POST .../story-graph/planning/node` returns 200. The returned node must be projected from the revisioned `plot_workspaces` overlay, remain selected/focused in the Canvas, and be discoverable through StoryFlow search after a page refresh. Verify the browser never writes StoryFact, StoryState, or StoryCommit for this action; in `只读 · Canon` mode the button remains disabled.
 
 41. With an eligible Chapter/Event/Character/Foreshadow/PlotThread/StoryGoal/setting anchor selected, leave the modal's semantic-anchor checkbox enabled. Verify the browser performs a revision-checked `POST .../story-graph/planning/edge` after the node POST, the edge uses a schema-legal relation (`originates_from`, `planned_for`, `depends_on`, or `affects`), the new node is still present in the default focused subgraph after refresh, and the Inspector shows the semantic edge and `plot_workspaces` provenance. Uncheck the option once and verify a standalone planning node remains supported and discoverable through Search.
@@ -583,8 +592,9 @@ cluster policy must not change the authoritative graph response or overwrite
 saved UI workspace positions.
 
 80. Seed a disposable real SQLite fixture with at least 500 chapters and
-verify the explicit Full Graph / All evidence path remains bounded at
-`limit=1200` and `edge_limit=3000`, then zoom and pan the native Canvas. The
+verify the explicit Full Graph / All evidence path starts with a bounded
+`limit=240` and `edge_limit=600` working set, then zoom and pan the native
+Canvas. The
 browser must issue real Graph API requests carrying `x_from`, `x_to`, `y_from`,
 `y_to`, and `viewport_padding`, receive HTTP 200, and expose
 `meta.viewport.requested`, `totalInViewport`, `returnedInViewport`, and
@@ -646,3 +656,344 @@ and focuses the real projected node. Capture
 `storyflow-20260813-health-1366.png`; require HTTP 200 and zero console
 errors/warnings at 1920x1080 and 1366x768. This is deterministic evidence
 reporting, not an AI diagnosis or an automatic Canon mutation.
+
+85. Open a real SQLite StoryFlow fixture and record the initial
+`meta.graphSnapshotId`. While the headed Canvas remains open, accept a real
+StoryCommit through the existing StoryRepository boundary in a separate
+process. Verify `GET .../story-graph/changes?fromSnapshot=...` returns HTTP
+200, reports `changed=true`, preserves `canonicalSource=sqlite`, exposes the
+new source commit and a scoped observed-projection diff, and never writes from
+the browser. In read-only mode verify the Canvas polls, refreshes the focused
+projection, and displays the newly projected fact. Then switch to Planning Edit,
+drag a node without saving, accept another real StoryCommit, and verify the
+Canvas keeps the unsaved layout and displays `CANON UPDATE · REFRESH REQUIRED`
+instead of replacing the graph. Use the explicit Refresh action and verify the
+new fact then appears. Capture
+`storyflow-20260813-freshness-initial-1920.png`,
+`storyflow-20260813-freshness-auto-refresh-1920.png`,
+`storyflow-20260813-freshness-pending-1920.png`,
+`storyflow-20260813-freshness-pending-1366.png`, and
+`storyflow-20260813-freshness-refresh-1366.png`; require zero console
+errors/warnings and HTTP 200 for the graph, changes, node, history, health,
+and layout requests. This is a read-only observed-projection synchronization
+boundary, not a second Canon event log or a claim of realtime push delivery.
+
+86. From a real SQLite-backed Studio book, activate each historical navigation
+entry (`mindmap`, `timeline`, `plot`, `world-map`, `foreshadowing`, and
+`characters`). Verify the browser enters the single StoryFlow page with the
+expected `story`, `timeline`, `story`, `world`, `foreshadow`, and `character`
+view selected, respectively. Verify the network log contains the matching
+`GET .../story-graph?view=...` request and does not use the old visualization
+data endpoints on the normal click path. Keep the old API/renderers available
+for compatibility fallback. Capture
+`storyflow-20260813-legacy-character-1920.png` and
+`storyflow-20260813-legacy-world-1366.png`; require HTTP 200 and zero console
+errors/warnings at both viewport sizes.
+
+87. Start StoryFlow against a real disposable SQLite fixture with the Canvas
+open. Run one deterministic acceptance task through the production
+`PersistentTaskWorker` and `LegacyTaskHandlers` seam (the harness must not
+write directly to `StoryFact` or `StoryState`). Verify the worker reaches
+`completed`, the pipeline accepts a `StoryCommit`, the next Chapter and
+extracted StoryFact become `CANON` Graph nodes with semantic edges, and the
+accepted commit captures an observed projection snapshot. Verify the open
+read-only Canvas discovers the new chapter through the existing freshness
+poll, reloads the SQLite projection, and lets the author select the chapter to
+inspect its Fact, StoryCommit history, and Canon provenance. Capture
+`storyflow-20260813-writing-before-1920.png`,
+`storyflow-20260813-writing-after-1920.png`, and
+`storyflow-20260813-writing-after-1366.png`; require HTTP 200 for Graph,
+changes, node, history, health, and layout requests, plus zero console errors
+and warnings. The deterministic model is test infrastructure only; this does
+not claim a live external provider completion.
+
+88. Hide a selected real node from the Canvas and verify the shared sidebar
+immediately exposes a recoverable `Hidden workspace nodes` list. Restore it,
+verify the node returns to the Canvas and Inspector without a Canon write, then
+open a Character/Foreshadow/World node action and verify the shared StoryFlow
+view changes while preserving the selected node focus. Capture the 1920x1080
+and 1366x768 recovery evidence and require zero browser console errors.
+
+89. Force the optional planning-overlay fulfillment to lose its revision race
+after a real Writer task has accepted a StoryCommit. Verify the durable
+`tasks.result` carries `storyflow_plan_status=ACCEPTED_PENDING_OVERLAY`, the
+Graph API exposes only safe reconciliation identifiers, and no duplicate
+StoryFact/StoryState/StoryCommit is created. Select the affected PlanningNode
+in StoryFlow and verify the Inspector shows the recovery boundary; the retry
+button is disabled in Canon read-only mode and enabled only in Planning Edit.
+Invoke `POST .../planning/reconcile`, verify the PlanningNode becomes
+`ACCEPTED`, the `leads_to` edge carries StoryCommit provenance, the candidate
+list becomes empty, and a second retry is idempotent. Require HTTP 200/4xx
+semantics to be explicit, zero console errors, and 1920x1080 / 1366x768
+browser evidence. This proves recovery of an optional overlay write, not a
+second canonical acceptance.
+
+90. Assemble a new Writer context from a real project row containing writing
+style and author intent. Verify the persisted context manifest is schema v3,
+records `style` and `constraints` as included with section/provenance, and
+records legacy file-backed MemorySystem as `not_included` rather than claiming
+it was supplied. Open Context View and verify the Source availability section
+reads the persisted manifest after refresh. Older manifests without
+`availability` must remain truthful and must not gain inferred rows.
+
+91. Exercise the retained legacy `POST .../plot-canvas/delta` compatibility
+surface against a real SQLite workspace. Verify a layout edit still advances
+the existing revision, while an explicit `ACCEPTED` node/edge mutation is
+rejected with `422 PLOT_CANON_BOUNDARY`; verify the revision and graph remain
+unchanged after rejection. Canon fulfillment must still require the accepted
+`StoryCommit` StoryFlow path. This is a compatibility-boundary check, not a
+second Canon write path.
+
+92. Open Full Graph against a real 500-chapter SQLite fixture with the
+   `presentation=expanded` evidence mode. Verify the initial response is bounded,
+   the toolbar reports authoritative `loaded / total`, and a completed pan into a
+   previously unloaded world-coordinate region issues a viewport Graph request.
+   Verify the returned nodes and semantic edges are merged into the existing
+   Canvas rather than replacing it, and that the browser diagnostics expose the
+   larger loaded count. Verify pointer movement during a single drag does not fan
+   out one request per move, the final request returns HTTP 200, and the headed
+   session reports zero console errors/warnings at 1920x1080 and 1366x768. This
+   is progressive loaded-projection merging with DOM culling, not a claim of true
+   virtualization or complete cross-page edge paging.
+
+93. Request a narrow Full Graph viewport around a real Chapter or Character and
+    verify `meta.viewport.crossBoundaryEdgeCount` and the bounded
+    `crossBoundaryEdges` sample are derived from the same SQLite semantic edge
+    catalog. Verify the sample includes `loadedEndpointId` and a remote endpoint
+    summary, while the remote node is not silently added to the rendered page.
+    In the headed Canvas, verify the toolbar exposes the boundary count and the
+    selected node Inspector labels the relationship as recorded SQLite evidence;
+    selecting a remote endpoint must issue a new authoritative focus query. The
+    complete high-degree neighbor page remains the exact inspection path.
+    Boundary is defined by the current world-coordinate page, not by whether a
+    remote endpoint happens to remain cached from an earlier viewport page.
+
+94. Select two real SQLite-backed nodes in the StoryFlow Canvas and verify the
+    browser calls `GET .../story-graph/selection` with both ids, receives HTTP
+    200, and shows node/status counts, internal semantic edges, bounded external
+    edges, chapter range, and the `sqlite.story_graph_projection` boundary in
+    the Inspector. Verify the selected ids remain a valid input to the existing
+    Intent/AI/candidate actions; no StoryFact, StoryState, StoryCommit, or layout
+    row is written. Expand the external-edge section and click a remote endpoint
+    that is not in the current page; verify a new authoritative focus query
+    selects that node and returns HTTP 200. Verify missing ids are reported by
+    the API rather than invented by the browser, and require zero console
+    errors/warnings at 1920x1080 and 1366x768.
+
+95. Request a real Full Graph world-coordinate page with a small `limit` and
+    verify `meta.viewport.pageSize`, `pageOffset`, `pageIndex`, `hasMore`, and
+    `nextPageToken`. Re-request with the cursor and verify the next page does
+    not duplicate nodes. Change the query limit or mutate the authoritative
+    SQLite source and verify the cursor is rejected with an observable `422
+    STORY_GRAPH_QUERY`; the Canvas must keep the existing page visible and
+    require a fresh viewport query. This is an implemented continuation seam,
+    not a claim that server-side candidate layout is already fully virtualized.
+
+96. Warm a real Full Graph viewport twice and verify the second request reuses
+    the SQLite-derived spatial index for the same source/filter/workspace
+    fingerprint. Delete the derived spatial rows, repeat the request, and
+    verify the index is rebuilt with the same node/edge counts. Request a
+    `boundary_node_id` page with a small edge limit, follow
+    `boundary_page_token`, verify no duplicate boundary edge is returned, and
+    change the target/query to require an observable `422 STORY_GRAPH_QUERY`.
+    Compare `story_facts` and `story_states` before/after; they must be byte-
+    for-byte unchanged. This proves a rebuildable read model and semantic
+    boundary paging, not Canon mutation or complete GPU virtualization.
+
+97. In an expanded Full Graph, search for a real Character, verify the result
+    stays in `view=all` and the Inspector retains its boundary action. Continue
+    the boundary page after the selected node is loaded; the request must reuse
+    the response's exact viewport coordinates and return HTTP 200. Pan to a
+    different world-coordinate page and require a fresh cursor rather than
+    mixing the old boundary token with the new page. Page/API diagnostics must
+    remain free of application errors at 1920x1080 and 1366x768; any Browser
+    Use harness-only environment diagnostic must be recorded separately.
+
+98. Warm a real Full Graph viewport after the node-index seam has been built.
+    Verify the response reports `meta.projectionReadModel=sqlite_node_index`
+    and returns the same selected nodes/coordinates as the cold projection.
+    In a unit/integration seam test, make `_read_catalog` fail after warm-up;
+    the bounded viewport must still succeed from the SQLite-derived node and
+    spatial indexes. Mutate an authoritative Chapter and verify the trigger
+    advances `storyflow_projection_epochs`, clears its cached fingerprint,
+    rebuilds the node index, and exposes the new title without changing
+    StoryFact, StoryState, or StoryCommit. This proves indexed candidate
+    filtering and source-epoch invalidation; it does not claim zero-cost cold
+    rebuilds or full predicate pushdown for every Graph view.
+
+99. Warm the same real SQLite-backed StoryFlow search after the node index has
+    been built. Verify the result preserves the existing `id`, type, title,
+    summary, status, and provenance fields and remains restricted to the
+    selected view. In a seam test, make `_read_catalog` fail after warm-up;
+    the search must still return the same rows from the SQLite-derived search
+    index. Mutate an authoritative source row, then verify the next search
+    rebuilds the index before matching and does not write StoryFact,
+    StoryState, or StoryCommit. This proves search shares the read model; it
+    does not claim fuzzy ranking, full-text tokenization, or provider-backed
+    semantic search.
+
+100. Warm a real node Inspector and focused Character/Story projection after
+     the paired node/semantic-edge read model has been built. Verify the node
+     endpoint reports `projectionReadModel=sqlite_node_index+semantic_edge_index`,
+     neighbor pagination preserves the semantic edge/node payloads, and a
+     Depth 1/2/3 focused projection returns the same selected ids as the cold
+     JSON projector. In a seam test, make `_read_catalog` fail after warm-up;
+     the Inspector and focused projection must still succeed from SQLite.
+     Mutate an authoritative source and verify the trigger forces the cold
+     rebuild before the warm path resumes. This proves high-frequency focus
+     reads use the same rebuildable Story Graph projection; it does not claim
+     complete GPU virtualization or full historical replay.
+
+101. Inspector neighbor pagination must expose an opaque `nextPageToken` when
+     more edges exist. The token must preserve the resolved node, direction,
+     type filter, page size, and source fingerprint: using it for a changed
+     query returns 422, and using it after an authoritative source mutation
+     returns an expired-cursor error. Warm pages must return no more than the
+     requested limit and must not deserialize the complete high-degree incident
+     edge set.
+
+102. Full Graph cross-viewport boundary pagination must execute a bounded
+     SQLite page query for ordinary Canvas working sets, preserve the exact
+     edge count/type counts, and keep the continuation cursor query-bound. The
+     response must distinguish the capped boundary sample from the complete
+     count and must not write StoryFact, StoryState, or StoryCommit.
+
+103. Warm the SQLite-backed multi-selection projection after a real StoryFlow
+     graph has built the paired node/semantic-edge index. Verify that
+     `GET .../story-graph/selection` returns the same selected ids, internal
+     semantic edges, and external remote endpoint summaries as the cold JSON
+     projection while reporting
+     `projectionReadModel=sqlite_node_index+semantic_edge_index`. In a seam
+     test, make `_read_catalog` fail after warm-up; selection must still serve
+     the read-only working set. Mutate an authoritative Character and verify
+     the next selection rebuilds the index and exposes the new title without
+     changing StoryFact, StoryState, or StoryCommit.
+### 104. Multi-selection external-edge pagination
+
+- A real selection response reports a complete external-edge count and a
+  bounded page from SQLite.
+- A continuation token returns the next page without duplicate edge ids.
+- A token bound to another selection or a changed source fingerprint is
+  rejected with a client-visible 422/error boundary.
+- The Inspector exposes an explicit progressive-load action and retains the
+  read-only Canon boundary after the final page.
+
+### 105. Accepted commit snapshot recovery
+
+- Inject a post-acceptance StoryFlow snapshot failure and verify Canon remains
+  accepted while a durable source fingerprint/revision failure boundary is
+  recorded.
+- Retry through idempotent accept and the StoryFlow snapshot retry API at the
+  unchanged source boundary; verify one historical graph snapshot is restored,
+  the failure diagnostic clears, and `canonicalMutation=false`.
+- Mutate a Character/Location/source row before retry; verify the API refuses
+  historical backfill with a visible source-changed reason and no snapshot is
+created for the old commit.
+
+### 106. Historical dependency surface in Version Compare
+
+- Accept two real ChapterVersions for the same chapter through the existing
+  StoryCommit path and ensure both accepted graph snapshots are captured.
+- Call `chapter-version-compare` and verify the current projection surface and
+  `canonicalSurface.historicalDependencySurface` remain separate.
+- Verify the historical surface exposes changed node/edge seeds, bounded
+  direct/downstream semantic traversal, snapshot provenance, and an explicit
+  `mutableDomainTablesHistorical=false` boundary without changing Canon rows.
+- In the headed browser, open Chapter History, compare Version 1 → Version 2,
+  and verify the Inspector renders the historical dependency panel with zero
+  page/console errors or warnings.
+
+### 107. Accepted Story Graph history timeline
+
+- Accept two real StoryCommits and verify `/story-graph/history` returns
+  `canonicalGraphHistory` with two accepted graph boundaries, immutable snapshot
+  provenance, node/edge counts, and one comparable transition.
+- Verify an older accepted boundary remains present after its commit becomes
+  `superseded`; verify the timeline does not mutate StoryFact, StoryState,
+  StoryCommit, or layout rows.
+- Inject a failed post-acceptance capture and verify the timeline reports the
+  missing commit id, `complete=false`, and a visible `STALE` boundary. After a
+  provenance-safe retry, verify the snapshot is restored and the comparison
+  chain becomes complete without inferring across the missing boundary.
+- In the headed browser, open a real Chapter Inspector History and verify the
+  `Canon Graph history` panel, accepted-snapshot status, and exact diff action
+  remain readable at both desktop sizes with zero page/console diagnostics.
+
+### 108. Context input accounting boundary
+
+- Build a real Writer `GenerationRun` whose `input_reference` contains a
+  persisted prompt layout plus source, section, and prompt-component ranges.
+  Verify `tokenSummary.inputAccounting.status=exact_character_accounting`,
+  prompt/message character totals, union coverage, overlap, untracked message
+  characters, and range-status counts are derived from those persisted ranges.
+- Verify overlapping source → section → component rows are not summed as
+  additional prompt characters, while missing included-source ranges remain
+  visible as a coverage gap. Confirm the provider's whole-run
+  `prompt_tokens/total_tokens` remain the only authoritative token values and
+  `providerTokenOffsets=false`.
+- Repeat with an older manifest missing `promptLayout` or total prompt length.
+  Verify the API reports `ranges_without_prompt_layout` or
+  `ranges_without_prompt_length` instead of inventing coverage or token
+  offsets. The Context Inspector must render the same status and explanation
+  without mutating any Canon or layout row.
+
+### 109. Dense semantic-edge Canvas renderer
+
+- Open the real 500-chapter SQLite fixture at 1920x1080 and 1366x768, switch
+  explicitly to Full Graph, and verify the bounded viewport reports
+  `edgeRenderer=canvas-2d`, `viewportCulling=enabled`, 38 DOM nodes, zero SVG
+  edge groups, and a positive `edgePaintedEdges` count. Confirm the loaded
+  catalog totals remain 1,200 nodes and 3,000 indexed edges rather than being
+  replaced with browser demo data.
+- Move across a painted semantic curve and click it. Verify the Canvas hit
+  test selects the underlying real edge and the Inspector shows its semantic
+  type, source, target, provenance boundary, and any view-only aggregation
+  evidence. Verify no StoryFact, StoryState, StoryCommit, or layout row is
+  written.
+- Switch back to Story Flow and verify sparse SVG rendering returns with its
+  semantic edge DOM and the Canvas paint counter is cleared. Start a port
+  connection in edit mode and verify the SVG preview remains visible over the
+  dense layer.
+- Collect browser console/page diagnostics at both sizes and run the 100/500/
+  1000-node benchmark. This acceptance item proves a real hybrid renderer and
+  bounded edge hit testing; it does not claim GPU virtualization or a fixed
+  FPS SLA.
+
+### 110. Independent viewport semantic-edge pagination
+
+- Request a real Full Graph viewport with `edge_limit=1` over a rectangle that
+  contains multiple projected nodes. Verify the response returns
+  `internalEdgeScope=viewport_candidate_set`, an exact `internalEdgeCount`,
+  `internalEdgePageOffset=0`, and an opaque `nextInternalEdgePageToken`.
+- Request the next page with the same viewport and `edge_page_token`; verify
+  the offset advances, the semantic edge id is not duplicated, and changing
+  the edge limit or viewport rejects the cursor with a visible 422.
+- In the Canvas, verify “Load more semantic edges” advances the edge page
+  without resetting the node page, merges records by semantic edge id, and
+  keeps edges whose endpoint cards arrive on a later node page.
+
+### 111. Cross-view focus continuity
+
+- On the real SQLite fixture, select or search a Chapter, then switch through
+  Timeline and World View. Verify each request remains Chapter-focused and the
+  Inspector keeps the same authoritative Chapter node instead of falling back
+  to an unrelated root or first-page node.
+- Switch to Context View from that Chapter and verify the same Chapter remains
+  the focus. The Context projection may report that no persisted
+  `GenerationRun.context_manifest` is available, but it must not reinterpret a
+  Character, Location, or other non-Chapter focus as actual Writer context.
+- Collect browser page/console diagnostics. This is navigation workspace state
+  only; no StoryFact, StoryState, StoryCommit, or Graph edge is written.
+
+### 112. Minimap viewport navigation
+
+- Open a real SQLite-backed StoryFlow graph and verify the Minimap renders a
+  viewport rectangle over the same world-coordinate projection as the Canvas.
+- Click an empty Minimap point and verify the Canvas recenters without changing
+  the selected node or any Canon row. Then drag the viewport rectangle and
+  verify its position and the Canvas transform move together while zoom stays
+  unchanged.
+- Verify the drag releases cleanly, the Minimap no longer reports a dragging
+  state, and a long gesture does not issue one viewport Graph request per
+  pointer move; the final page remains a real SQLite query. Capture page and
+  console diagnostics with no application errors.

@@ -12,7 +12,12 @@ from .service import (
     semantic_edge_options,
     validate_edge,
 )
-from .planning import PLANNING_STATUSES, StoryFlowPlanningError, StoryFlowPlanningService
+from .planning import (
+    PLANNING_STATUSES,
+    StoryFlowPlanningError,
+    StoryFlowPlanningService,
+    validate_planning_transition,
+)
 
 __all__ = [
     "EDGE_TYPES",
@@ -28,4 +33,5 @@ __all__ = [
     "PLANNING_STATUSES",
     "StoryFlowPlanningError",
     "StoryFlowPlanningService",
+    "validate_planning_transition",
 ]

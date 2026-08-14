@@ -486,84 +486,107 @@ class StoryRepository:
         """Accept a pending commit and atomically advance the book projection."""
         result: dict[str, Any]
         backup_target: tuple[str, str] | None = None
+        idempotent_accept = False
         with self.db.transaction() as conn:
             commit = conn.execute("SELECT * FROM story_commits WHERE id = ?", (commit_id,)).fetchone()
             if commit is None:
                 raise KeyError(f"story commit not found: {commit_id}")
             if commit["status"] == "accepted":
-                return {"commit_id": commit_id, "accepted": True, "idempotent": True}
-            if commit["status"] != "pending":
-                raise ValueError(f"cannot accept {commit['status']} story commit")
-            effective_override = bool(commit["author_override"] or author_override)
-            if commit["blocking_issues"] and not effective_override:
-                raise ValueError("cannot accept a commit with blocking review issues")
-            if author_override and not commit["author_override"]:
-                reason = (override_reason or "author override")[:2000]
-                conn.execute(
-                    "UPDATE story_commits SET author_override=TRUE, override_reason=? WHERE id=? AND status='pending'",
-                    (reason, commit_id),
-                )
-            chapter = conn.execute(
-                """SELECT c.book_id, b.project_id FROM chapters c
-                   JOIN books b ON b.id = c.book_id WHERE c.id = ?""",
-                (commit["chapter_id"],),
-            ).fetchone()
-            if chapter is None:
-                raise ValueError("commit chapter no longer exists")
-            # Version fence: reject if the commit targets a stale chapter version.
-            commit_version_id = commit["chapter_version_id"] if commit["chapter_version_id"] else None
-            if commit_version_id is not None:
-                current_version = conn.execute(
-                    "SELECT id FROM chapter_versions WHERE chapter_id = ? ORDER BY version DESC LIMIT 1",
+                chapter = conn.execute(
+                    """SELECT c.book_id, b.project_id FROM chapters c
+                       JOIN books b ON b.id = c.book_id WHERE c.id = ?""",
                     (commit["chapter_id"],),
                 ).fetchone()
-                if current_version is not None and current_version["id"] != commit_version_id:
-                    raise ValueError(
-                        f"story commit version {commit_version_id} is stale; "
-                        f"chapter has been edited to {current_version['id']}"
+                if chapter is None:
+                    raise ValueError("commit chapter no longer exists")
+                # An earlier post-acceptance StoryFlow projection may have
+                # failed after Canon was already committed.  Keep the public
+                # acceptance operation idempotent, but let the derived read
+                # model make a provenance-checked recovery attempt after the
+                # transaction closes.
+                result = {
+                    "commit_id": commit_id,
+                    "book_id": chapter["book_id"],
+                    "accepted": True,
+                    "idempotent": True,
+                }
+                idempotent_accept = True
+            else:
+                result = {}
+            if not idempotent_accept and commit["status"] != "pending":
+                raise ValueError(f"cannot accept {commit['status']} story commit")
+            if not idempotent_accept:
+                effective_override = bool(commit["author_override"] or author_override)
+                if commit["blocking_issues"] and not effective_override:
+                    raise ValueError("cannot accept a commit with blocking review issues")
+                if author_override and not commit["author_override"]:
+                    reason = (override_reason or "author override")[:2000]
+                    conn.execute(
+                        "UPDATE story_commits SET author_override=TRUE, override_reason=? WHERE id=? AND status='pending'",
+                        (reason, commit_id),
                     )
-            book_id = chapter["book_id"]
-            now = datetime.now().isoformat()
-            if conn.execute(
-                "UPDATE story_commits SET status = 'accepted', accepted_at = ? WHERE id = ? AND status = 'pending'",
-                (now, commit_id),
-            ).rowcount != 1:
-                raise ValueError("story commit was changed concurrently")
-            facts = _load(commit["facts_extracted"], [])
-            for fact in facts:
+                chapter = conn.execute(
+                    """SELECT c.book_id, b.project_id FROM chapters c
+                       JOIN books b ON b.id = c.book_id WHERE c.id = ?""",
+                    (commit["chapter_id"],),
+                ).fetchone()
+                if chapter is None:
+                    raise ValueError("commit chapter no longer exists")
+                # Version fence: reject if the commit targets a stale chapter version.
+                commit_version_id = commit["chapter_version_id"] if commit["chapter_version_id"] else None
+                if commit_version_id is not None:
+                    current_version = conn.execute(
+                        "SELECT id FROM chapter_versions WHERE chapter_id = ? ORDER BY version DESC LIMIT 1",
+                        (commit["chapter_id"],),
+                    ).fetchone()
+                    if current_version is not None and current_version["id"] != commit_version_id:
+                        raise ValueError(
+                            f"story commit version {commit_version_id} is stale; "
+                            f"chapter has been edited to {current_version['id']}"
+                        )
+                book_id = chapter["book_id"]
+                now = datetime.now().isoformat()
+                if conn.execute(
+                    "UPDATE story_commits SET status = 'accepted', accepted_at = ? WHERE id = ? AND status = 'pending'",
+                    (now, commit_id),
+                ).rowcount != 1:
+                    raise ValueError("story commit was changed concurrently")
+                facts = _load(commit["facts_extracted"], [])
+                for fact in facts:
+                    conn.execute(
+                        """INSERT INTO story_facts(id, book_id, chapter_id, fact_type, content, entities,
+                           confidence, commit_id, source, verification_status)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'native', 'verified')""",
+                        (generate_id(), book_id, commit["chapter_id"], fact.get("fact_type", "event"),
+                         fact["content"], _json(fact.get("entities", [])), fact.get("confidence", 1.0), commit_id),
+                    )
+                old = conn.execute("SELECT * FROM story_states WHERE book_id = ?", (book_id,)).fetchone()
+                state = _load(old["state"], {}) if old else {}
+                state.update(_load(commit["state_changes"], {}))
+                version = int(old["state_version"]) + 1 if old else 1
+                payload = {"state": state, "state_version": version}
                 conn.execute(
-                    """INSERT INTO story_facts(id, book_id, chapter_id, fact_type, content, entities,
-                       confidence, commit_id, source, verification_status)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'native', 'verified')""",
-                    (generate_id(), book_id, commit["chapter_id"], fact.get("fact_type", "event"),
-                     fact["content"], _json(fact.get("entities", [])), fact.get("confidence", 1.0), commit_id),
+                    """INSERT INTO story_projections(id, book_id, commit_id, payload, applied_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (generate_id(), book_id, commit_id, _json(payload), now),
                 )
-            old = conn.execute("SELECT * FROM story_states WHERE book_id = ?", (book_id,)).fetchone()
-            state = _load(old["state"], {}) if old else {}
-            state.update(_load(commit["state_changes"], {}))
-            version = int(old["state_version"]) + 1 if old else 1
-            payload = {"state": state, "state_version": version}
-            conn.execute(
-                """INSERT INTO story_projections(id, book_id, commit_id, payload, applied_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (generate_id(), book_id, commit_id, _json(payload), now),
-            )
-            conn.execute(
-                """INSERT INTO story_states(book_id, state, last_commit_id, state_version, stale, updated_at)
-                   VALUES (?, ?, ?, ?, FALSE, ?)
-                   ON CONFLICT(book_id) DO UPDATE SET state=excluded.state,
-                     last_commit_id=excluded.last_commit_id, state_version=excluded.state_version,
-                     stale=FALSE, updated_at=excluded.updated_at""",
-                (book_id, _json(state), commit_id, version, now),
-            )
+                conn.execute(
+                    """INSERT INTO story_states(book_id, state, last_commit_id, state_version, stale, updated_at)
+                       VALUES (?, ?, ?, ?, FALSE, ?)
+                       ON CONFLICT(book_id) DO UPDATE SET state=excluded.state,
+                         last_commit_id=excluded.last_commit_id, state_version=excluded.state_version,
+                         stale=FALSE, updated_at=excluded.updated_at""",
+                    (book_id, _json(state), commit_id, version, now),
+                )
 
-            result = {"commit_id": commit_id, "book_id": book_id, "accepted": True, "state": state}
-            backup_target = (chapter["project_id"], commit["chapter_id"])
+                result = {"commit_id": commit_id, "book_id": book_id, "accepted": True, "state": state}
+                backup_target = (chapter["project_id"], commit["chapter_id"])
 
         # Run the backup after the accepting transaction commits.  A second
         # SQLite connection opened inside the transaction can otherwise see a
         # locked database and fail without leaving durable metadata.
-        assert backup_target is not None
+        assert result.get("book_id")
+        projector = None
         try:
             # Story Graph is a rebuildable read model.  Capture it after the
             # authoritative transaction commits so History has a durable
@@ -573,11 +596,27 @@ class StoryRepository:
             # returned explicitly for callers and logged for recovery.
             from src.story_graph.service import StoryGraphProjector
 
-            result["graph_snapshot"] = StoryGraphProjector(self.db).capture_accepted_commit_snapshot(
-                result["book_id"], commit_id
-            )
+            projector = StoryGraphProjector(self.db)
+            if idempotent_accept:
+                result["graph_snapshot"] = projector.retry_accepted_commit_snapshot(
+                    result["book_id"], commit_id
+                )
+            else:
+                result["graph_snapshot"] = projector.capture_accepted_commit_snapshot(
+                    result["book_id"], commit_id
+                )
         except Exception as exc:
             logger.exception("Story Graph snapshot capture failed after StoryCommit %s", commit_id)
+            if projector is not None and not idempotent_accept:
+                try:
+                    projector.record_snapshot_capture_failure(
+                        result["book_id"], commit_id, str(exc)
+                    )
+                except Exception:
+                    logger.exception(
+                        "Story Graph snapshot failure boundary could not be recorded for StoryCommit %s",
+                        commit_id,
+                    )
             result["graph_snapshot"] = {
                 "captured": False,
                 "bookId": result["book_id"],
@@ -586,7 +625,10 @@ class StoryRepository:
                 "canonicalSource": "sqlite",
                 "error": str(exc),
             }
+        if idempotent_accept:
+            return result
         try:
+            assert backup_target is not None
             from .backup import BackupManager
             backup = BackupManager(self.db, self.workspace_root).auto_backup_after_commit(*backup_target)
             result["backup"] = {

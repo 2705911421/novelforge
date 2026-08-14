@@ -66,10 +66,23 @@ class LLMConfig:
 
 class BaseProvider(ABC):
     """Provider基类"""
-    
+
     def __init__(self, config: LLMConfig):
         self.config = config
         self.provider_type = config.provider
+        self._client: httpx.Client | None = None
+
+    def _get_client(self) -> httpx.Client:
+        """获取或创建复用的 HTTP 客户端"""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.Client(timeout=self.config.timeout)
+        return self._client
+
+    def close(self):
+        """关闭 HTTP 客户端"""
+        if self._client and not self._client.is_closed:
+            self._client.close()
+            self._client = None
     
     @abstractmethod
     def chat(self, messages: List[Dict], system: str = "", **kwargs) -> LLMResponse:
@@ -92,8 +105,14 @@ class BaseProvider(ABC):
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         return headers
     
+    _NON_RETRYABLE_STATUS = {400, 401, 403, 404, 422}
+
     def _handle_error(self, e: Exception, attempt: int) -> bool:
-        """处理错误，返回是否重试"""
+        """处理错误，返回是否重试。不可重试的 HTTP 错误直接抛出。"""
+        # Check for non-retryable HTTP status codes
+        status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+        if status_code in self._NON_RETRYABLE_STATUS:
+            return False
         if attempt < self.config.max_retries - 1:
             wait_time = self.config.retry_delay * (2 ** attempt)
             logger.warning(f"请求失败，{wait_time}秒后重试: {e}")
@@ -127,15 +146,15 @@ class OpenAIProvider(BaseProvider):
         
         for attempt in range(self.config.max_retries):
             try:
-                with httpx.Client(timeout=self.config.timeout) as client:
-                    response = client.post(
-                        f"{self.config.base_url}/chat/completions",
-                        headers=headers,
-                        json=body
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                
+                client = self._get_client()
+                response = client.post(
+                    f"{self.config.base_url}/chat/completions",
+                    headers=headers,
+                    json=body
+                )
+                response.raise_for_status()
+                data = response.json()
+
                 latency = int((time.time() - start_time) * 1000)
                 usage = data.get("usage", {})
                 
@@ -170,26 +189,26 @@ class OpenAIProvider(BaseProvider):
             "stream": True
         }
         
-        with httpx.Client(timeout=self.config.timeout) as client:
-            with client.stream(
-                "POST",
-                f"{self.config.base_url}/chat/completions",
-                headers=headers,
-                json=body
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if line.startswith("data: "):
-                        data = line[6:]
-                        if data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                            delta = chunk["choices"][0].get("delta", {})
-                            if "content" in delta:
-                                yield delta["content"]
-                        except json.JSONDecodeError:
-                            continue
+        client = self._get_client()
+        with client.stream(
+            "POST",
+            f"{self.config.base_url}/chat/completions",
+            headers=headers,
+            json=body
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0].get("delta", {})
+                        if "content" in delta:
+                            yield delta["content"]
+                    except json.JSONDecodeError:
+                        continue
 
 
     def generate_image(self, prompt: str, **kwargs) -> ImageResponse:
@@ -208,14 +227,14 @@ class OpenAIProvider(BaseProvider):
         start_time = time.time()
         for attempt in range(self.config.max_retries):
             try:
-                with httpx.Client(timeout=self.config.timeout) as client:
-                    response = client.post(
-                        f"{self.config.base_url}/images/generations",
-                        headers=self._build_headers(),
-                        json=body,
-                    )
-                    response.raise_for_status()
-                    payload = response.json()
+                client = self._get_client()
+                response = client.post(
+                    f"{self.config.base_url}/images/generations",
+                    headers=self._build_headers(),
+                    json=body,
+                )
+                response.raise_for_status()
+                payload = response.json()
                 item = (payload.get("data") or [{}])[0]
                 encoded = item.get("b64_json")
                 if not isinstance(encoded, str) or not encoded:
@@ -271,18 +290,18 @@ class AnthropicProvider(BaseProvider):
         
         for attempt in range(self.config.max_retries):
             try:
-                with httpx.Client(timeout=self.config.timeout) as client:
-                    response = client.post(
-                        f"{self.config.base_url}/messages",
-                        headers=headers,
-                        json=body
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                
+                client = self._get_client()
+                response = client.post(
+                    f"{self.config.base_url}/messages",
+                    headers=headers,
+                    json=body
+                )
+                response.raise_for_status()
+                data = response.json()
+
                 latency = int((time.time() - start_time) * 1000)
                 usage = data.get("usage", {})
-                
+
                 return LLMResponse(
                     content=data["content"][0]["text"],
                     model=data.get("model", self.config.model),
@@ -323,13 +342,13 @@ class AnthropicProvider(BaseProvider):
         if system:
             body["system"] = system
         
-        with httpx.Client(timeout=self.config.timeout) as client:
-            with client.stream(
-                "POST",
-                f"{self.config.base_url}/messages",
-                headers=headers,
-                json=body
-            ) as response:
+        client = self._get_client()
+        with client.stream(
+            "POST",
+            f"{self.config.base_url}/messages",
+            headers=headers,
+            json=body
+        ) as response:
                 response.raise_for_status()
                 for line in response.iter_lines():
                     if line.startswith("data: "):
@@ -372,18 +391,18 @@ class GeminiProvider(BaseProvider):
         
         for attempt in range(self.config.max_retries):
             try:
-                with httpx.Client(timeout=self.config.timeout) as client:
-                    response = client.post(
-                        f"{self.config.base_url.rstrip('/')}/models/{model}:generateContent",
-                        headers=headers,
-                        json=body
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                
+                client = self._get_client()
+                response = client.post(
+                    f"{self.config.base_url.rstrip('/')}/models/{model}:generateContent",
+                    headers=headers,
+                    json=body
+                )
+                response.raise_for_status()
+                data = response.json()
+
                 latency = int((time.time() - start_time) * 1000)
                 usage = data.get("usageMetadata", {})
-                
+
                 return LLMResponse(
                     content=data["candidates"][0]["content"]["parts"][0]["text"],
                     model=model,
@@ -423,21 +442,21 @@ class GeminiProvider(BaseProvider):
         
         model = kwargs.get("model", self.config.model)
         
-        with httpx.Client(timeout=self.config.timeout) as client:
-            with client.stream(
-                "POST",
-                f"{self.config.base_url.rstrip('/')}/models/{model}:streamGenerateContent?alt=sse",
-                headers=headers,
-                json=body
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if line.startswith("data: "):
-                        try:
-                            data = json.loads(line[6:])
-                            text = data["candidates"][0]["content"]["parts"][0]["text"]
-                            yield text
-                        except (json.JSONDecodeError, KeyError, IndexError):
+        client = self._get_client()
+        with client.stream(
+            "POST",
+            f"{self.config.base_url.rstrip('/')}/models/{model}:streamGenerateContent?alt=sse",
+            headers=headers,
+            json=body
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    try:
+                        data = json.loads(line[6:])
+                        text = data["candidates"][0]["content"]["parts"][0]["text"]
+                        yield text
+                    except (json.JSONDecodeError, KeyError, IndexError):
                             continue
 
 
@@ -520,12 +539,14 @@ class ModelGateway:
         """聊天并返回JSON"""
         kwargs["json_mode"] = True
         response = self.chat(provider_name, messages, system, **kwargs)
-        
+
         try:
             content = response.content.strip()
-            if content.startswith("```"):
-                lines = content.split("\n")
-                content = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            # Extract JSON from markdown code blocks
+            import re
+            m = re.search(r'```(?:json)?\s*(.*?)```', content, re.DOTALL)
+            if m:
+                content = m.group(1).strip()
             return json.loads(content)
         except json.JSONDecodeError:
             try:

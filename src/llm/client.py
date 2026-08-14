@@ -44,7 +44,7 @@ class LLMClient:
             "model": self.model,
             "messages": formatted_messages,
             "temperature": temperature if temperature is not None else self.temperature,
-            "max_tokens": max_tokens or self.max_tokens,
+            "max_tokens": max_tokens if max_tokens is not None else self.max_tokens,
         }
 
         if json_mode:
@@ -92,12 +92,10 @@ class LLMClient:
             except (ValueError, json.JSONDecodeError):
                 return {"raw": content, "error": "JSON解析失败"}
 
-    async def chat_stream(self, messages: list, system: str = "",
+    def chat_stream(self, messages: list, system: str = "",
                     temperature: Optional[float] = None):
-        """流式聊天接口（同步包装）"""
-        # 简化实现：使用非流式调用，分段返回
+        """流式聊天接口（同步分段返回）"""
         response = self.chat(messages, system, temperature)
-        # 模拟流式输出
         content = response.content
         chunk_size = 50
         for i in range(0, len(content), chunk_size):

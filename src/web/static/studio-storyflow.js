@@ -39,6 +39,12 @@
   };
   TYPE_VIEW.ContextSource = 'context';
   const STATUS_LABEL = { CANON: 'CANON', ACCEPTED: 'ACCEPTED', PLANNED: 'PLANNED', CANDIDATE: 'CANDIDATE', DRAFT: 'DRAFT', SUPERSEDED: 'SUPERSEDED', STALE: 'STALE', CONFLICT: 'CONFLICT' };
+  // Dense graphs keep their semantic node DOM (ports, keyboard focus and
+  // Inspector navigation) but move the edge paint layer to one 2D surface.
+  // This is deliberately a rendering threshold, not a data threshold: the
+  // server still owns the complete bounded projection and the same edge
+  // records are used for SVG, Canvas paint and hit testing.
+  const DENSE_EDGE_THRESHOLD = 40;
 
   let state = null;
 
@@ -92,6 +98,19 @@
 
   function currentBook() {
     return encodeURIComponent(S.book || '');
+  }
+
+  function modelRuntimeStatus() {
+    if (!state || state.modelReadinessLoading) return 'checking';
+    const readiness = state.modelReadiness;
+    if (!readiness) return 'checking';
+    if (readiness.ready === true) return 'ready';
+    if (readiness.ready === false) return 'setup';
+    return 'unavailable';
+  }
+
+  function modelRuntimeReady() {
+    return modelRuntimeStatus() === 'ready';
   }
 
   function realNodes() {
@@ -322,6 +341,24 @@
     return rendered;
   }
 
+  function renderedEdgeRecords() {
+    const nodes = new Map(canvasNodes().map((node) => [node.id, node]));
+    const rendered = new Set(renderedNodes().map((node) => node.id));
+    return canvasEdges()
+      .filter((edge) => rendered.has(edge.source) && rendered.has(edge.target))
+      .map((edge) => ({ edge, source: nodes.get(edge.source), target: nodes.get(edge.target) }))
+      .filter((item) => item.source && item.target);
+  }
+
+  function edgeRendererMode(records = renderedEdgeRecords()) {
+    return records.length >= DENSE_EDGE_THRESHOLD ? 'canvas-2d' : 'svg-dom';
+  }
+
+  function denseEdgeRendererActive() {
+    const canvas = document.getElementById('sf-canvas');
+    return canvas?.dataset.edgeRenderer === 'canvas-2d';
+  }
+
   function selectedNodes() {
     const ids = state ? state.selected : new Set();
     return canvasNodes().filter((node) => ids.has(node.id));
@@ -343,6 +380,7 @@
     });
     state.selected = next;
     state.edgeSelectedId = null;
+    state.edgeHoveredId = null;
     state.detail = null;
     state.impact = null;
     state.chapterImpact = null;
@@ -359,6 +397,7 @@
     state.contextEvidence = null;
     state.candidateComparison = null;
     state.candidateLineage = null;
+    state.selectionProjection = null;
     refreshNodeSelection();
     renderToolbar();
     renderSidebar();
@@ -379,11 +418,19 @@
   }
 
   function changeStoryFlowView(view) {
-    const selectedChapter = selectedNodes().find((node) => node.type === 'Chapter');
-    state.view = VIEW_META[view] ? view : state.view;
+    const nextView = VIEW_META[view] ? view : state.view;
+    const targetTypes = new Set(VIEW_TYPES[nextView] || []);
+    const selectedInCurrentView = selectedNodes().find((node) => targetTypes.has(node.type));
+    const currentFocus = state.focus ? nodeById(state.focus) : null;
+    const preservedFocus = currentFocus && targetTypes.has(currentFocus.type)
+      ? currentFocus
+      : selectedInCurrentView;
+    const selectedChapter = selectedNodes().find((node) => node.type === 'Chapter')
+      || (currentFocus?.type === 'Chapter' ? currentFocus : null);
+    state.view = nextView;
     state.focus = state.view === 'context'
       ? (selectedChapter?.id || state.contextChapterId || '')
-      : '';
+      : (preservedFocus?.id || '');
     state.selected = state.focus ? new Set([state.focus]) : new Set();
     state.detail = null;
     state.edgeSelectedId = null;
@@ -393,6 +440,7 @@
     state.canonicalReplay = null;
     state.canonicalDiff = null;
     state.analysisResult = null;
+    state.selectionProjection = null;
     state.analysisTrace = null;
     state.analysisTaskId = null;
     state.generationRunTrace = null;
@@ -439,6 +487,7 @@
     if (!toolbar) return;
     const editMode = !!state.editMode;
     const planningWriteAttrs = editMode ? '' : 'disabled aria-disabled="true"';
+    const modelActionAttrs = modelRuntimeReady() ? '' : 'disabled aria-disabled="true"';
     toolbar.innerHTML = `
       <div class="sf-toolbar-group">
         <label class="sr-only" for="sf-view-select">StoryFlow 视图</label>
@@ -461,13 +510,65 @@
       <button class="btn btn-sm btn-ghost" data-sf-action="redo-layout" title="恢复下一次布局保存（Ctrl/Cmd+Shift+Z）" ${state.layoutHistory?.canRedo ? '' : 'disabled'}>重做</button>
     `;
     if (state.view === 'all' && state.graph?.meta?.viewport?.requested) {
-      toolbar.insertAdjacentHTML('afterbegin', `<span class="sf-bounded-badge sf-viewport-badge" title="Server-side world-coordinate viewport projection">VIEWPORT · ${text(state.graph.meta.viewport.returnedInViewport || 0)} loaded</span>`);
+      const viewport = state.graph.meta.viewport;
+      if (viewport.hasMore && viewport.nextPageToken) {
+        toolbar.insertAdjacentHTML('afterbegin', '<button type="button" class="sf-viewport-next" data-sf-action="load-next-viewport-page">Load next viewport page</button>');
+      }
+      if (viewport.internalEdgesTruncated && viewport.nextInternalEdgePageToken) {
+        toolbar.insertAdjacentHTML('afterbegin', '<button type="button" class="sf-viewport-next sf-edge-next" data-sf-action="load-next-viewport-edge-page">Load more semantic edges</button>');
+      }
+      const loaded = Number(viewport.loadedNodeCount || state.graph.nodes?.length || 0);
+      const total = Number(state.graph.meta.totalAvailableNodes || 0);
+      const loadedLabel = total ? `${loaded} loaded / ${total} total` : `${loaded} loaded`;
+      const mergeLabel = viewport.incrementalMerge ? ' · incremental' : '';
+      const boundaryCount = Number(viewport.crossBoundaryEdgeCount || 0);
+      const boundaryLabel = boundaryCount
+        ? ` · ${boundaryCount} boundary edge${boundaryCount === 1 ? '' : 's'}`
+        : '';
+      const internalEdgeCount = Number(viewport.internalEdgeCount || 0);
+      const loadedInternalEdges = Number(viewport.loadedInternalEdgeCount || viewport.returnedInternalEdges || 0);
+      const internalEdgeLabel = internalEdgeCount
+        ? ` · ${loadedInternalEdges}/${internalEdgeCount} semantic edges`
+        : '';
+      toolbar.insertAdjacentHTML('afterbegin', `<span class="sf-bounded-badge sf-viewport-badge" title="Server-side world-coordinate viewport projection; node and semantic-edge pages are merged into the current read model. Boundary edges remain queryable from the selected node Inspector">VIEWPORT · ${text(loadedLabel)}${text(internalEdgeLabel)}${text(mergeLabel)}${text(boundaryLabel)}</span>`);
     }
     if (state.view === 'all' && state.viewportFetchError) {
       toolbar.insertAdjacentHTML('afterbegin', `<span class="sf-bounded-badge sf-viewport-badge is-error" title="${attr(state.viewportFetchError)}">VIEWPORT query error</span>`);
     }
-    const analysisAttrs = analysisNodes().length ? '' : 'disabled aria-disabled="true"';
+    if (state.graphFreshness?.changed) {
+      const pending = state.graphFreshness.resyncRequired || state.editMode || state.connection || state.layoutDirty;
+      toolbar.insertAdjacentHTML('afterbegin', `<span class="sf-bounded-badge sf-freshness-badge ${pending ? 'is-pending' : ''}" title="${attr(state.graphFreshness.reason || 'A newer observed Story Graph projection is available')}" data-sf-freshness-banner>CANON UPDATE${pending ? ' · REFRESH REQUIRED' : ''}<button type="button" data-sf-action="refresh-graph">Refresh</button></span>`);
+    } else if (state.graphFreshnessError) {
+      toolbar.insertAdjacentHTML('afterbegin', `<span class="sf-bounded-badge sf-freshness-badge is-error" title="${attr(state.graphFreshnessError)}">FRESHNESS CHECK FAILED</span>`);
+    }
+    if (state.modelReadinessLoading || state.modelReadiness) {
+      const runtimeStatus = modelRuntimeStatus();
+      const readiness = state.modelReadiness || {};
+      const runtimeLabel = runtimeStatus === 'ready'
+        ? 'AI RUNTIME · READY'
+        : runtimeStatus === 'setup'
+          ? 'AI RUNTIME · SETUP REQUIRED'
+          : runtimeStatus === 'unavailable'
+            ? 'AI RUNTIME · UNAVAILABLE'
+            : 'AI RUNTIME · CHECKING';
+      const runtimeAction = runtimeStatus === 'setup'
+        ? '<button type="button" data-sf-action="open-model-config">Open AI config</button>'
+        : runtimeStatus === 'unavailable'
+          ? '<button type="button" data-sf-action="refresh-model-readiness">Retry</button>'
+          : '';
+      toolbar.insertAdjacentHTML('afterbegin', `<span class="sf-bounded-badge sf-runtime-badge ${runtimeStatus === 'ready' ? 'is-ready' : runtimeStatus === 'setup' ? 'is-setup' : 'is-pending'}" title="${attr(readiness.message || 'StoryFlow model runtime readiness')}">${runtimeLabel}${runtimeAction}</span>`);
+    }
+    const analysisAttrs = analysisNodes().length && modelRuntimeReady() ? '' : 'disabled aria-disabled="true"';
     toolbar.insertAdjacentHTML('beforeend', `<button class="btn btn-sm btn-secondary" data-sf-action="create-planning-node" title="在 revisioned planning overlay 中创建一个作者规划节点" ${planningWriteAttrs}>新建规划节点</button><button class="btn btn-sm btn-secondary" data-sf-action="generate-intent" title="将选中 Story Flow 保存为章节计划" ${planningWriteAttrs}>保存章节计划</button><button class="btn btn-sm btn-primary" data-sf-action="generate-chapter" title="将选中 Flow 保存为计划并排队生成下一章" ${planningWriteAttrs}>生成章节</button><button class="btn btn-sm btn-secondary" data-sf-action="generate-candidates" title="通过持久模型任务生成候选分支" ${planningWriteAttrs}>生成候选分支</button><button class="btn btn-sm btn-secondary" data-sf-action="analyze-selection" title="读取选中的真实 Story Graph 节点并持久化只读分析报告；不修改 Canon" ${analysisAttrs}>AI 分析选择</button><button class="btn btn-sm btn-ghost" data-sf-action="adopt-candidate" title="将选中候选纳入计划" ${planningWriteAttrs}>采用候选</button><button class="btn btn-sm btn-ghost" data-sf-action="discard-candidate" title="将选中候选标记为废弃" ${planningWriteAttrs}>丢弃候选</button>`);
+    if (!modelRuntimeReady()) {
+      ['generate-chapter', 'generate-candidates'].forEach((action) => {
+        const button = toolbar.querySelector(`[data-sf-action="${action}"]`);
+        if (button) {
+          button.disabled = true;
+          button.setAttribute('aria-disabled', 'true');
+        }
+      });
+    }
     toolbar.querySelector('#sf-view-select').addEventListener('change', (event) => {
       changeStoryFlowView(event.target.value);
     });
@@ -501,6 +602,11 @@
     toolbar.querySelector('[data-sf-action="save-layout"]').addEventListener('click', saveLayout);
     toolbar.querySelector('[data-sf-action="undo-layout"]').addEventListener('click', undoLayout);
     toolbar.querySelector('[data-sf-action="redo-layout"]').addEventListener('click', redoLayout);
+    toolbar.querySelector('[data-sf-action="load-next-viewport-page"]')?.addEventListener('click', loadNextViewportPage);
+    toolbar.querySelector('[data-sf-action="load-next-viewport-edge-page"]')?.addEventListener('click', loadNextViewportEdgePage);
+    toolbar.querySelector('[data-sf-action="refresh-graph"]')?.addEventListener('click', refreshGraphFromCanon);
+    toolbar.querySelector('[data-sf-action="open-model-config"]')?.addEventListener('click', () => go('agent-config'));
+    toolbar.querySelector('[data-sf-action="refresh-model-readiness"]')?.addEventListener('click', loadModelReadiness);
   }
 
   function candidateBranchById(branchId) {
@@ -578,6 +684,9 @@
     const volumes = Array.isArray(graph.meta.availableVolumes) ? graph.meta.availableVolumes : [];
     const presentation = graph.meta.presentation || {};
     const displayNodes = canvasNodes();
+    const hiddenNodes = realNodes()
+      .filter((node) => node.hidden)
+      .sort((left, right) => `${left.type}:${left.title}`.localeCompare(`${right.type}:${right.title}`));
     const presentationNotice = (state.view === 'character' || state.view === 'story' || state.view === 'all') && presentation.mode === 'clustered'
       ? `<div class="sf-presentation-summary"><b>Progressive disclosure</b><span>${text(presentation.sourceNodeCount || graph.meta.returnedNodes || 0)} real nodes → ${text(displayNodes.length)} displayed</span><small>${text((presentation.clusters || []).length)} activity groups are view-only aggregates. Canon nodes remain in SQLite.</small></div>`
       : state.view === 'all'
@@ -621,6 +730,7 @@
          ${health.status !== 'HEALTHY' ? `<div class="sf-health-banner ${health.status === 'CONFLICT' ? 'is-conflict' : 'is-stale'}"><b>${text(health.status)}</b><span>${text((health.conflictNodes || []).length)} conflict · ${text((health.staleNodes || []).length)} stale</span><small>投影诊断来自 StoryCommit / Review；不会绕过 Canon 边界。</small></div>` : ''}
        </div>
        ${renderStoryHealthSection()}
+       ${hiddenNodes.length ? `<div class="sf-filter-block sf-hidden-node-section"><div class="sf-panel-title"><span>Hidden workspace nodes</span><small>${text(hiddenNodes.length)} hidden</small></div><div class="sf-node-list">${hiddenNodes.slice(0, 80).map((node) => `<div class="sf-hidden-node-row"><button class="sf-neighbor-row" data-sf-select-hidden="${attr(node.id)}" title="${attr(`Restore ${node.title}`)}"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><small style="color:var(--text-muted)">${text(nodeLabel(node.type))}</small> ${text(node.title)}</span><span class="sf-neighbor-edge">HIDDEN</span></button><button class="btn btn-sm btn-ghost sf-restore-hidden" data-sf-restore-hidden="${attr(node.id)}">Restore</button></div>`).join('')}</div>${hiddenNodes.length > 80 ? '<p class="dim-note">Showing the first 80 hidden workspace nodes.</p>' : ''}<p class="dim-note">Hidden is workspace state only. Restoring a node never writes StoryFact or StoryState.</p></div>` : ''}
        <div class="sf-filter-block">
          <div class="sf-panel-title"><span>节点清单</span><small>点击定位</small></div>
          <div class="sf-node-list">${displayNodes.slice(0, 80).map((node) => `<button class="sf-neighbor-row" data-sf-select="${attr(node.id)}"><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><small style="color:var(--text-muted)">${text(nodeLabel(node.type))}</small> ${text(node.title)}</span><span class="sf-neighbor-edge">${text(isPresentationCluster(node) ? 'VIEW ONLY' : statusLabel(node.status))}</span></button>`).join('') || '<p class="dim-note">当前焦点没有可显示节点。</p>'}</div>
@@ -683,6 +793,17 @@
       if (!isPresentationCluster(node)) loadNodeDetail(id);
       centerOn(node);
     }));
+    sidebar.querySelectorAll('[data-sf-select-hidden]').forEach((button) => button.addEventListener('click', () => {
+      const id = button.dataset.sfSelectHidden;
+      const node = nodeById(id);
+      if (!node) return;
+      restoreHiddenNode(node);
+    }));
+    sidebar.querySelectorAll('[data-sf-restore-hidden]').forEach((button) => button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const node = nodeById(button.dataset.sfRestoreHidden);
+      if (node) restoreHiddenNode(node);
+    }));
     sidebar.querySelectorAll('[data-sf-health-focus]').forEach((button) => button.addEventListener('click', () => {
       focusStoryHealth(button.dataset.sfHealthFocus, button.dataset.sfHealthType);
     }));
@@ -735,15 +856,54 @@
     state.canonicalDiff = null;
   }
 
+  function restoreHiddenNode(node) {
+    if (!node) return;
+    node.hidden = false;
+    state.layoutDirty = true;
+    state.focus = node.id;
+    state.depth = Math.max(1, Math.min(3, Number(state.depth) || 1));
+    state.selected = new Set([node.id]);
+    state.detail = null;
+    state.edgeSelectedId = null;
+    // Keep this local until the author explicitly saves the layout. Reloading
+    // here would re-apply the last persisted `hidden=true` workspace record
+    // and make the restore action appear to do nothing.
+    renderToolbar();
+    renderSidebar();
+    renderCanvas();
+    renderInspector();
+    centerOn(node);
+    loadNodeDetail(node.id);
+  }
+
+  function hideWorkspaceNodes(nodes) {
+    const hidden = (nodes || []).filter(Boolean);
+    if (!hidden.length) return;
+    hidden.forEach((node) => {
+      node.hidden = true;
+      state.selected.delete(node.id);
+      if (state.focus === node.id) state.focus = '';
+    });
+    state.layoutDirty = true;
+    state.detail = null;
+    state.edgeSelectedId = null;
+    renderToolbar();
+    renderSidebar();
+    renderCanvas();
+    renderInspector();
+  }
+
   function renderCanvas() {
     const canvas = document.getElementById('sf-canvas');
     if (!canvas) return;
     if (!state.canvasObserver && typeof ResizeObserver !== 'undefined') {
       state.canvasObserver = new ResizeObserver(() => {
         if (!state?.graph) return;
-        const focused = state.focus && selectedNodes()[0];
+      const focused = state.focus && selectedNodes()[0];
         if (focused) centerOn(focused);
         else fitGraph();
+        resizeEdgeCanvas();
+        if (denseEdgeRendererActive()) drawDenseEdges(renderedEdgeRecords());
       });
       state.canvasObserver.observe(canvas);
     }
@@ -756,6 +916,7 @@
       return;
     }
     canvas.innerHTML = `
+      <canvas id="sf-edge-canvas" class="sf-edge-canvas" aria-label="故事语义边 Canvas 渲染层"></canvas>
       <svg id="sf-edge-layer" class="sf-edge-layer" aria-label="故事语义连线"><defs><marker id="sf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f4a261"></path></marker></defs><g id="sf-edge-group"></g></svg>
       <div id="sf-world" class="sf-world"></div>
       ${state.view === 'timeline' ? '<div class="sf-timeline-axes" aria-label="Timeline axes"><span>← Narrative Order · 叙事顺序</span><span>Story Time · 故事时间 ↓</span></div>' : ''}
@@ -813,24 +974,43 @@
   function renderEdges() {
     const group = document.getElementById('sf-edge-group');
     if (!group || !state.graph) return;
+    const records = renderedEdgeRecords();
+    const canvas = document.getElementById('sf-canvas');
+    const edgeLayer = document.getElementById('sf-edge-layer');
+    const mode = edgeRendererMode(records);
+    if (canvas) {
+      canvas.dataset.edgeRenderer = mode;
+      canvas.dataset.renderedEdges = String(records.length);
+      canvas.classList.toggle('is-edge-canvas', mode === 'canvas-2d');
+    }
+    edgeLayer?.classList.toggle('is-dense', mode === 'canvas-2d');
+    if (mode === 'canvas-2d') {
+      group.innerHTML = '';
+      resizeEdgeCanvas();
+      drawDenseEdges(records);
+      return;
+    }
+    clearEdgeCanvas();
     const nodes = new Map(canvasNodes().map((node) => [node.id, node]));
-    const rendered = new Set(renderedNodes().map((node) => node.id));
-    const edges = canvasEdges().filter((edge) => rendered.has(edge.source) && rendered.has(edge.target));
+    const edges = records.map((item) => item.edge);
     group.innerHTML = edges.map((edge) => {
       const source = nodes.get(edge.source);
       const target = nodes.get(edge.target);
-      const x1 = Number(source.x || 0) + 104;
-      const y1 = Number(source.y || 0);
-      const x2 = Number(target.x || 0) - 104;
-      const y2 = Number(target.y || 0);
-      const bend = Math.max(42, Math.abs(x2 - x1) * .42);
-      const d = `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
+      const sourcePort = edge.sourcePort || edge.source_port || '';
+      const targetPort = edge.targetPort || edge.target_port || '';
+      const sourceAnchor = edgeAnchor(source, 'output', sourcePort);
+      const targetAnchor = edgeAnchor(target, 'input', targetPort);
+      const x1 = sourceAnchor.x;
+      const y1 = sourceAnchor.y;
+      const x2 = targetAnchor.x;
+      const y2 = targetAnchor.y;
+      const d = connectionPath(sourceAnchor, targetAnchor);
       const midX = (x1 + x2) / 2;
       const midY = (y1 + y2) / 2 - 4;
       const selected = state.selected.has(edge.source) || state.selected.has(edge.target) || state.edgeSelectedId === edge.id;
       const edgeStatus = String(edge.status || 'CANON').toLowerCase();
       const presentationClass = edge.presentationOnly ? ' is-presentation' : '';
-      return `<g class="sf-edge" data-edge-id="${attr(edge.id)}"><path class="sf-edge-path ${selected ? 'is-selected' : ''} is-${edgeStatus}${presentationClass}" d="${attr(d)}"></path><text class="sf-edge-label ${selected ? '' : 'is-muted'}${edge.presentationOnly ? ' is-presentation' : ''}" x="${midX}" y="${midY}">${text(edge.label || edge.type)}</text></g>`;
+      return `<g class="sf-edge" data-edge-id="${attr(edge.id)}" data-source-port="${attr(sourcePort)}" data-target-port="${attr(targetPort)}"><path class="sf-edge-path ${selected ? 'is-selected' : ''} is-${edgeStatus}${presentationClass}" d="${attr(d)}"></path><text class="sf-edge-label ${selected ? '' : 'is-muted'}${edge.presentationOnly ? ' is-presentation' : ''}" x="${midX}" y="${midY}">${text(edge.label || edge.type)}</text></g>`;
     }).join('');
     group.querySelectorAll('.sf-edge').forEach((element) => {
       const edge = canvasEdges().find((item) => item.id === element.dataset.edgeId);
@@ -845,6 +1025,164 @@
       element.addEventListener('mouseenter', () => element.classList.add('is-hovered'));
       element.addEventListener('mouseleave', () => element.classList.remove('is-hovered'));
     });
+  }
+
+  function resizeEdgeCanvas() {
+    const edgeCanvas = document.getElementById('sf-edge-canvas');
+    const canvas = document.getElementById('sf-canvas');
+    if (!edgeCanvas || !canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const width = Math.max(1, Math.round(rect.width * dpr));
+    const height = Math.max(1, Math.round(rect.height * dpr));
+    if (edgeCanvas.width !== width || edgeCanvas.height !== height) {
+      edgeCanvas.width = width;
+      edgeCanvas.height = height;
+    }
+    edgeCanvas.style.width = `${Math.max(1, rect.width)}px`;
+    edgeCanvas.style.height = `${Math.max(1, rect.height)}px`;
+    edgeCanvas.dataset.devicePixelRatio = String(dpr);
+    return { edgeCanvas, width: rect.width, height: rect.height, dpr };
+  }
+
+  function clearEdgeCanvas() {
+    const surface = resizeEdgeCanvas();
+    const context = surface?.edgeCanvas?.getContext('2d');
+    if (!context || !surface) return;
+    context.setTransform(surface.dpr, 0, 0, surface.dpr, 0, 0);
+    context.clearRect(0, 0, surface.width, surface.height);
+    const canvas = document.getElementById('sf-canvas');
+    if (canvas) canvas.dataset.edgePaintedEdges = '0';
+  }
+
+  function edgeScreenAnchor(node, direction, portName) {
+    const anchor = edgeAnchor(node, direction, portName);
+    return {
+      x: state.transform.tx + anchor.x * state.transform.scale,
+      y: state.transform.ty + anchor.y * state.transform.scale,
+    };
+  }
+
+  function denseEdgeStyle(edge, selected) {
+    const status = String(edge.status || 'CANON').toUpperCase();
+    if (selected) return { color: '#f4a261', width: 2.7, dash: [] };
+    if (status === 'CONFLICT') return { color: '#f85149', width: 2.1, dash: [] };
+    if (status === 'PLANNED') return { color: '#f4b566', width: 1.6, dash: [7, 5] };
+    if (status === 'CANDIDATE') return { color: '#9fb2d2', width: 1.5, dash: [3, 5] };
+    if (edge.presentationOnly) return { color: 'rgba(233,196,106,.72)', width: 1.35, dash: [2, 4] };
+    return { color: 'rgba(255,209,168,.58)', width: 1.45, dash: [] };
+  }
+
+  function drawDenseEdges(records = renderedEdgeRecords()) {
+    const surface = resizeEdgeCanvas();
+    const edgeCanvas = surface?.edgeCanvas;
+    if (!edgeCanvas) return;
+    const context = edgeCanvas.getContext('2d');
+    if (!context) return;
+    const dpr = surface.dpr;
+    context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    context.clearRect(0, 0, surface.width, surface.height);
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    const scale = Math.max(state.transform.scale, 0.01);
+    records.forEach(({ edge, source, target }) => {
+      const sourceAnchor = edgeScreenAnchor(source, 'output', edge.sourcePort || edge.source_port || '');
+      const targetAnchor = edgeScreenAnchor(target, 'input', edge.targetPort || edge.target_port || '');
+      const bend = Math.max(42 * scale, Math.abs(targetAnchor.x - sourceAnchor.x) * .42);
+      const controlOne = { x: sourceAnchor.x + bend, y: sourceAnchor.y };
+      const controlTwo = { x: targetAnchor.x - bend, y: targetAnchor.y };
+      const selected = state.selected.has(edge.source) || state.selected.has(edge.target) || state.edgeSelectedId === edge.id;
+      const style = denseEdgeStyle(edge, selected);
+      context.save();
+      context.strokeStyle = style.color;
+      context.lineWidth = style.width;
+      context.setLineDash(style.dash);
+      context.globalAlpha = edge.presentationOnly ? .82 : 1;
+      context.beginPath();
+      context.moveTo(sourceAnchor.x, sourceAnchor.y);
+      context.bezierCurveTo(controlOne.x, controlOne.y, controlTwo.x, controlTwo.y, targetAnchor.x, targetAnchor.y);
+      context.stroke();
+      context.setLineDash([]);
+      const angle = Math.atan2(targetAnchor.y - controlTwo.y, targetAnchor.x - controlTwo.x);
+      const arrowSize = Math.max(4, Math.min(8, 6 * scale));
+      context.fillStyle = style.color;
+      context.beginPath();
+      context.moveTo(targetAnchor.x, targetAnchor.y);
+      context.lineTo(targetAnchor.x - Math.cos(angle - Math.PI / 6) * arrowSize, targetAnchor.y - Math.sin(angle - Math.PI / 6) * arrowSize);
+      context.lineTo(targetAnchor.x - Math.cos(angle + Math.PI / 6) * arrowSize, targetAnchor.y - Math.sin(angle + Math.PI / 6) * arrowSize);
+      context.closePath();
+      context.fill();
+      const showLabel = selected || state.edgeHoveredId === edge.id;
+      if (showLabel && edge.label) {
+        const mid = cubicPoint(sourceAnchor, controlOne, controlTwo, targetAnchor, .5);
+        context.font = '10px system-ui, sans-serif';
+        context.textAlign = 'center';
+        context.textBaseline = 'middle';
+        context.lineWidth = 4;
+        context.strokeStyle = '#191714';
+        context.strokeText(String(edge.label), mid.x, mid.y - 5);
+        context.fillStyle = '#fff4de';
+        context.fillText(String(edge.label), mid.x, mid.y - 5);
+      }
+      context.restore();
+    });
+    const canvas = document.getElementById('sf-canvas');
+    if (canvas) canvas.dataset.edgePaintedEdges = String(records.length);
+  }
+
+  function cubicPoint(start, controlOne, controlTwo, end, t) {
+    const inverse = 1 - t;
+    return {
+      x: inverse ** 3 * start.x + 3 * inverse ** 2 * t * controlOne.x + 3 * inverse * t ** 2 * controlTwo.x + t ** 3 * end.x,
+      y: inverse ** 3 * start.y + 3 * inverse ** 2 * t * controlOne.y + 3 * inverse * t ** 2 * controlTwo.y + t ** 3 * end.y,
+    };
+  }
+
+  function denseEdgeHit(clientX, clientY) {
+    if (!denseEdgeRendererActive()) return null;
+    const canvas = document.getElementById('sf-canvas');
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const point = { x: clientX - rect.left, y: clientY - rect.top };
+    let closest = null;
+    renderedEdgeRecords().forEach(({ edge, source, target }) => {
+      const start = edgeScreenAnchor(source, 'output', edge.sourcePort || edge.source_port || '');
+      const end = edgeScreenAnchor(target, 'input', edge.targetPort || edge.target_port || '');
+      const bend = Math.max(42 * state.transform.scale, Math.abs(end.x - start.x) * .42);
+      const controlOne = { x: start.x + bend, y: start.y };
+      const controlTwo = { x: end.x - bend, y: end.y };
+      let bestDistance = Infinity;
+      for (let index = 0; index <= 20; index += 1) {
+        const candidate = cubicPoint(start, controlOne, controlTwo, end, index / 20);
+        bestDistance = Math.min(bestDistance, Math.hypot(candidate.x - point.x, candidate.y - point.y));
+      }
+      if (bestDistance <= 9 && (!closest || bestDistance < closest.distance)) closest = { edge, distance: bestDistance };
+    });
+    return closest?.edge || null;
+  }
+
+  function updateDenseEdgeHover(event) {
+    if (!denseEdgeRendererActive() || state.drag || state.pan || state.box || state.connection) return;
+    const edge = denseEdgeHit(event.clientX, event.clientY);
+    const next = edge?.id || null;
+    if (next === state.edgeHoveredId) return;
+    state.edgeHoveredId = next;
+    const canvas = document.getElementById('sf-canvas');
+    if (canvas) canvas.classList.toggle('is-edge-hover', Boolean(next));
+    drawDenseEdges(renderedEdgeRecords());
+  }
+
+  // Port-aware edges make the Story Graph's semantic direction visible.  A
+  // port can be absent when one endpoint is outside the incremental viewport
+  // or when a legacy edge has no port metadata; those cases intentionally use
+  // the old node-side anchor so historical graphs remain renderable.
+  function edgeAnchor(node, direction, portName) {
+    const port = node && portName ? portElement(node.id, direction, portName) : null;
+    if (port) return elementGraphCenter(port);
+    return {
+      x: Number(node?.x || 0) + (direction === 'output' ? 104 : -104),
+      y: Number(node?.y || 0),
+    };
   }
 
   function renderMinimap() {
@@ -867,7 +1205,7 @@
       const viewHeight = Math.min(height, rect.height / Math.max(state.transform.scale, .01) * scale);
       const viewX = Math.max(4, Math.min(4 + width - viewWidth, 4 + (-state.transform.tx / Math.max(state.transform.scale, .01) - bounds.minX) * scale));
       const viewY = Math.max(4, Math.min(4 + height - viewHeight, 4 + (-state.transform.ty / Math.max(state.transform.scale, .01) - bounds.minY) * scale));
-      minimap.insertAdjacentHTML('beforeend', `<span class="sf-minimap-viewport" style="left:${viewX}px;top:${viewY}px;width:${viewWidth}px;height:${viewHeight}px"></span>`);
+      minimap.insertAdjacentHTML('beforeend', `<span class="sf-minimap-viewport" data-sf-minimap-viewport="1" title="拖动视口浏览画布" style="left:${viewX}px;top:${viewY}px;width:${viewWidth}px;height:${viewHeight}px"></span>`);
     }
   }
 
@@ -875,6 +1213,42 @@
     const minimap = document.getElementById('sf-minimap');
     if (!minimap || minimap.dataset.sfControlsBound === '1') return;
     minimap.dataset.sfControlsBound = '1';
+    const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+    const worldPoint = (event, rect, bounds) => {
+      const mapWidth = Math.max(1, rect.width - 10);
+      const mapHeight = Math.max(1, rect.height - 10);
+      const scale = Math.min(mapWidth / Math.max(bounds.width, 1), mapHeight / Math.max(bounds.height, 1));
+      const localX = clamp(event.clientX - rect.left, 5, rect.width - 5);
+      const localY = clamp(event.clientY - rect.top, 5, rect.height - 5);
+      return {
+        x: bounds.minX + (localX - 5) / Math.max(scale, 0.0001),
+        y: bounds.minY + (localY - 5) / Math.max(scale, 0.0001),
+      };
+    };
+    const finishMinimapDrag = (event) => {
+      if (!state?.minimapDrag || (event?.pointerId != null && event.pointerId !== state.minimapDrag.pointerId)) return;
+      try { minimap.releasePointerCapture(state.minimapDrag.pointerId); } catch (_) { /* pointer may already be released */ }
+      state.minimapDrag = null;
+      minimap.classList.remove('is-dragging');
+      minimap.querySelector('.sf-minimap-viewport')?.classList.remove('is-dragging');
+      if (!state.pan) scheduleViewportFetch();
+    };
+    minimap.addEventListener('pointermove', (event) => {
+      const drag = state?.minimapDrag;
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      event.preventDefault();
+      const canvas = document.getElementById('sf-canvas');
+      if (!canvas) return;
+      const point = worldPoint(event, minimap.getBoundingClientRect(), graphBounds(visibleNodes()));
+      const canvasRect = canvas.getBoundingClientRect();
+      const centerX = point.x - drag.offsetX;
+      const centerY = point.y - drag.offsetY;
+      state.transform.tx = canvasRect.width / 2 - centerX * state.transform.scale;
+      state.transform.ty = canvasRect.height / 2 - centerY * state.transform.scale;
+      applyTransform();
+    });
+    minimap.addEventListener('pointerup', finishMinimapDrag);
+    minimap.addEventListener('pointercancel', finishMinimapDrag);
     minimap.addEventListener('pointerdown', (event) => {
       if (event.button !== 0 || !state?.graph?.nodes?.length) return;
       event.preventDefault();
@@ -883,16 +1257,26 @@
       if (!canvas) return;
       const rect = minimap.getBoundingClientRect();
       const bounds = graphBounds(visibleNodes());
-      const mapWidth = Math.max(1, rect.width - 10);
-      const mapHeight = Math.max(1, rect.height - 10);
-      const scale = Math.min(mapWidth / Math.max(bounds.width, 1), mapHeight / Math.max(bounds.height, 1));
-      const localX = Math.max(5, Math.min(rect.width - 5, event.clientX - rect.left));
-      const localY = Math.max(5, Math.min(rect.height - 5, event.clientY - rect.top));
-      const worldX = bounds.minX + (localX - 5) / Math.max(scale, 0.0001);
-      const worldY = bounds.minY + (localY - 5) / Math.max(scale, 0.0001);
+      const world = worldPoint(event, rect, bounds);
+      if (event.target.closest('.sf-minimap-viewport')) {
+        const canvasRect = canvas.getBoundingClientRect();
+        const currentCenter = {
+          x: (canvasRect.width / 2 - state.transform.tx) / state.transform.scale,
+          y: (canvasRect.height / 2 - state.transform.ty) / state.transform.scale,
+        };
+        state.minimapDrag = {
+          pointerId: event.pointerId,
+          offsetX: world.x - currentCenter.x,
+          offsetY: world.y - currentCenter.y,
+        };
+        minimap.classList.add('is-dragging');
+        event.target.closest('.sf-minimap-viewport')?.classList.add('is-dragging');
+        try { minimap.setPointerCapture(event.pointerId); } catch (_) { /* capture is optional */ }
+        return;
+      }
       const canvasRect = canvas.getBoundingClientRect();
-      state.transform.tx = canvasRect.width / 2 - worldX * state.transform.scale;
-      state.transform.ty = canvasRect.height / 2 - worldY * state.transform.scale;
+      state.transform.tx = canvasRect.width / 2 - world.x * state.transform.scale;
+      state.transform.ty = canvasRect.height / 2 - world.y * state.transform.scale;
       canvas.focus({ preventScroll: true });
       applyTransform();
     });
@@ -919,8 +1303,11 @@
     const label = document.getElementById('sf-zoom-label');
     if (label) label.textContent = `${Math.round(state.transform.scale * 100)}%`;
     updateRenderedViewport();
+    if (denseEdgeRendererActive()) drawDenseEdges(renderedEdgeRecords());
     renderMinimap();
-    scheduleViewportFetch();
+    // A pan emits many transform updates. Wait for pointerup so a long drag
+    // cannot fan out one expensive SQLite projection request per move event.
+    if (!state.pan && !state.minimapDrag) scheduleViewportFetch();
   }
 
   function updateRenderedViewport() {
@@ -931,6 +1318,8 @@
     if (canvas) {
       canvas.dataset.viewportCulling = 'enabled';
       canvas.dataset.graphNodes = String(visibleNodes().length);
+      canvas.dataset.loadedGraphNodes = String(realNodes().length);
+      canvas.dataset.loadedGraphEdges = String(state.graph.edges?.length || 0);
       canvas.dataset.renderedNodes = String(desired.length);
     }
     const current = [...world.querySelectorAll('.sf-node')].map((element) => element.dataset.nodeId);
@@ -1089,6 +1478,18 @@
     hideContextMenu();
     const canvas = document.getElementById('sf-canvas');
     canvas?.focus({ preventScroll: true });
+    const edge = denseEdgeHit(event.clientX, event.clientY);
+    if (edge) {
+      event.preventDefault();
+      event.stopPropagation();
+      state.edgeSelectedId = edge.id;
+      state.edgeHoveredId = edge.id;
+      state.selected = new Set();
+      state.detail = null;
+      renderEdges();
+      renderInspector();
+      return;
+    }
     const rect = canvas.getBoundingClientRect();
     if (event.shiftKey) {
       state.box = { startX: event.clientX - rect.left, startY: event.clientY - rect.top, x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -1125,7 +1526,9 @@
       state.box.x = event.clientX - rect.left;
       state.box.y = event.clientY - rect.top;
       renderSelectionBox();
+      return;
     }
+    updateDenseEdgeHover(event);
   }
 
   function onCanvasPointerUp() {
@@ -1137,6 +1540,7 @@
     if (state.pan) {
       state.pan = null;
       canvas.classList.remove('is-panning');
+      scheduleViewportFetch();
     }
     if (state.box) {
       const box = state.box;
@@ -1153,6 +1557,7 @@
       document.querySelector('.sf-selection-box')?.remove();
       if (ids.length) setSelected(ids, false);
     }
+    state.edgeHoveredId = null;
     renderMinimap();
   }
 
@@ -1191,6 +1596,7 @@
   function renderConnectionPreview(clientX, clientY) {
     const group = document.getElementById('sf-edge-group');
     if (!group || !state.connection) return;
+    document.getElementById('sf-canvas')?.classList.add('is-connecting');
     group.querySelector('#sf-connection-preview')?.remove();
     const sourceElement = portElement(state.connection.sourceNodeId, 'output', state.connection.sourcePort);
     if (!sourceElement) return;
@@ -1340,7 +1746,7 @@
       if (action === 'expand') { state.focus = node.id; state.depth = Math.min(3, state.depth + 1); state.selected = new Set([node.id]); loadGraph(); }
       if (action === 'collapse') { node.collapsed = !node.collapsed; renderCanvas(); }
       if (action === 'pin') { node.pinned = !node.pinned; state.layoutDirty = true; renderCanvas(); }
-      if (action === 'hide') { node.hidden = true; state.layoutDirty = true; renderCanvas(); }
+      if (action === 'hide') hideWorkspaceNodes([node]);
       if (action === 'inspect') { state.selected = new Set([node.id]); refreshNodeSelection(); renderInspector(); loadNodeDetail(node.id); }
       hideContextMenu();
     }));
@@ -1381,9 +1787,7 @@
       return;
     }
     if (event.key === 'Delete' || event.key === 'Backspace') {
-      selectedNodes().forEach((node) => { node.hidden = true; });
-      state.layoutDirty = true;
-      renderCanvas();
+      hideWorkspaceNodes(selectedNodes());
       event.preventDefault();
     }
     if (event.key === 'Escape') {
@@ -1619,12 +2023,48 @@
     }
     if (nodes.length > 1) {
       const planningWriteAttrs = state.editMode ? '' : 'disabled aria-disabled="true"';
-      const analysisAttrs = analysisNodes().length ? '' : 'disabled aria-disabled="true"';
-      inspector.innerHTML = `<div class="sf-inspector-head"><div><h3>${nodes.length} 个节点</h3><p>多选子图</p></div><span class="sf-status-badge status-planned">SELECTION</span></div>${planningEditBanner()}<div class="sf-context-banner">当前选择可以用于后续 AI 分析、生成章节计划或创建候选分支。此版本先提供真实子图与状态，不伪造模型结果。</div><div class="sf-inspector-section"><h4>选中节点</h4><ul class="sf-inspector-list">${nodes.slice(0, 12).map((node) => `<li>${text(nodeLabel(node.type))} · ${text(node.title)}</li>`).join('')}</ul></div>`;
+      const analysisAttrs = analysisNodes().length && modelRuntimeReady() ? '' : 'disabled aria-disabled="true"';
+      const selectionState = state.selectionProjection;
+      const projection = !selectionState?.loading && !selectionState?.error
+        && selectionProjectionMatches(nodes, selectionState)
+        ? selectionState
+        : null;
+      inspector.innerHTML = `<div class="sf-inspector-head"><div><h3>${nodes.length} 个节点</h3><p>多选子图 · StoryFlow working set</p></div><span class="sf-status-badge status-planned">SELECTION</span></div>${planningEditBanner()}<div class="sf-context-banner">这组节点是一个可执行的 StoryFlow 工作单元：其内部语义边会进入章节 Intent、AI 分析或候选推演。摘要来自 SQLite Story Graph；不会把布局或模型猜测当作事实。</div>${renderSelectionProjection(projection, nodes)}<div class="sf-inspector-section"><h4>选中节点</h4><ul class="sf-inspector-list">${nodes.slice(0, 12).map((node) => `<li><span>${text(nodeLabel(node.type))} · ${text(node.title)}</span><small>${text(statusLabel(node.status))}</small></li>`).join('')}</ul>${nodes.length > 12 ? `<p class="dim-note">还有 ${text(nodes.length - 12)} 个节点未在 Inspector 展开。</p>` : ''}</div>`;
       inspector.insertAdjacentHTML('beforeend', `<div class="sf-inspector-actions"><button class="btn btn-sm btn-secondary" data-sf-selection-action="intent" ${planningWriteAttrs}>保存章节计划</button><button class="btn btn-sm btn-primary" data-sf-selection-action="generate" ${planningWriteAttrs}>生成章节</button><button class="btn btn-sm btn-secondary" data-sf-selection-action="analyze" ${analysisAttrs}>AI 分析选择</button></div>`);
       inspector.querySelector('[data-sf-selection-action="intent"]')?.addEventListener('click', generateIntentFromSelection);
       inspector.querySelector('[data-sf-selection-action="generate"]')?.addEventListener('click', generateChapterFromSelection);
       inspector.querySelector('[data-sf-selection-action="analyze"]')?.addEventListener('click', analyzeSelection);
+      const externalPage = projection?.meta?.externalEdgesPage || projection?.externalEdgesPage || {};
+      if (externalPage.hasMore && externalPage.nextPageToken) {
+        inspector.querySelector('.sf-selection-projection')?.insertAdjacentHTML(
+          'beforeend',
+          `<button class="btn btn-sm btn-ghost sf-selection-load-more" data-sf-selection-load-more ${projection.externalEdgesLoading ? 'disabled' : ''}>${projection.externalEdgesLoading ? 'Loading…' : `Load more external edges (${text(externalPage.offset + externalPage.limit)} / ${text(externalPage.total)})`}</button>`,
+        );
+      }
+      inspector.querySelector('[data-sf-selection-load-more]')?.addEventListener('click', loadMoreSelectionEdges);
+      inspector.querySelectorAll('[data-sf-selection-focus]').forEach((button) => button.addEventListener('click', () => {
+        const targetId = button.dataset.sfSelectionFocus;
+        const target = nodeById(targetId);
+        if (!target) {
+          // The endpoint is intentionally outside the current bounded page.
+          // Use its recorded type to issue a fresh authoritative focus query
+          // instead of silently treating a known relationship as absent.
+          state.view = TYPE_VIEW[button.dataset.sfSelectionFocusType] || state.view;
+          state.focus = targetId;
+          state.selected = new Set([targetId]);
+          state.selectionProjection = null;
+          loadGraph();
+          return;
+        }
+        state.selected = new Set([target.id]);
+        state.focus = target.id;
+        state.selectionProjection = null;
+        refreshNodeSelection();
+        renderInspector();
+        loadNodeDetail(target.id);
+        centerOn(target);
+      }));
+      if (!projection && !selectionState?.loading && !selectionState?.error) loadSelectionProjection(nodes);
       if (state.analysisResult) renderAnalysisResult(inspector);
       return;
     }
@@ -1667,18 +2107,37 @@
     }
     const actionBar = inspector.querySelector('.sf-inspector-actions');
     if (actionBar) actionBar.insertAdjacentHTML('beforeend', `<button class="btn btn-sm btn-secondary" data-sf-inspector-action="history">${node.type === 'Chapter' ? 'StoryCommit / History' : 'History'}</button>`);
+    if (actionBar && state.view === 'all' && state.graph?.meta?.viewport?.crossBoundaryEdgesTruncated) {
+      const boundaryAction = state.graph.meta.viewport.nextBoundaryPageToken ? 'Load more boundary edges' : 'Load boundary edge page';
+      actionBar.insertAdjacentHTML('beforeend', `<button class="btn btn-sm btn-ghost" data-sf-boundary-next="${attr(node.id)}">${boundaryAction}</button>`);
+    }
     if (actionBar && detail?.pagination?.hasMore) actionBar.insertAdjacentHTML('beforeend', `<button class="btn btn-sm btn-ghost" data-sf-inspector-action="neighbors">${state.neighborLoading ? '读取中…' : '加载更多邻居'}</button>`);
     if (state.impact && state.impact.nodeId === node.id) renderImpactResult(inspector);
     if (state.chapterImpact && state.chapterImpact.nodeId === node.id) renderChapterEditImpactResult(inspector);
     if (state.history && state.history.nodeId === node.id) renderHistoryResult(inspector);
     if (state.analysisResult) renderAnalysisResult(inspector);
     const nodeMetadata = node.metadata || {};
-    inspector.querySelectorAll('[data-sf-neighbor]').forEach((button) => button.addEventListener('click', () => {
-      const target = nodeById(button.dataset.sfNeighbor);
-      if (target) { state.selected = new Set([target.id]); refreshNodeSelection(); renderInspector(); loadNodeDetail(target.id); centerOn(target); }
+   inspector.querySelectorAll('[data-sf-neighbor]').forEach((button) => button.addEventListener('click', () => {
+     const target = nodeById(button.dataset.sfNeighbor);
+     if (target) { state.selected = new Set([target.id]); refreshNodeSelection(); renderInspector(); loadNodeDetail(target.id); centerOn(target); }
+   }));
+    inspector.querySelectorAll('[data-sf-boundary-node]').forEach((button) => button.addEventListener('click', () => {
+      const targetId = button.dataset.sfBoundaryNode;
+      if (!targetId) return;
+      state.focus = targetId;
+      state.depth = 1;
+      state.selected = new Set([targetId]);
+      state.detail = null;
+      loadGraph();
+    }));
+    inspector.querySelectorAll('[data-sf-boundary-next]').forEach((button) => button.addEventListener('click', () => {
+      loadNextBoundaryPage(button.dataset.sfBoundaryNext || node.id);
     }));
     inspector.querySelectorAll('[data-sf-generation-trace]').forEach((button) => button.addEventListener('click', () => {
       loadGenerationRunTrace(button.dataset.sfGenerationTrace || '');
+    }));
+    inspector.querySelectorAll('[data-sf-reconcile-task]').forEach((button) => button.addEventListener('click', () => {
+      reconcilePlanningTask(button.dataset.sfReconcileTask || '');
     }));
     inspector.querySelector('[data-sf-candidate-lineage]')?.addEventListener('click', () => {
       loadCandidateLineage({
@@ -1725,6 +2184,112 @@
       if (chapter) centerOn(chapter);
     });
     inspector.querySelector('[data-sf-context-back]')?.addEventListener('click', () => renderContextInspector());
+  }
+
+  function selectionProjectionMatches(nodes, projection) {
+    const ids = [...new Set(nodes.map((node) => node.id))].sort();
+    const projectedIds = [...new Set(projection?.nodeIds || [])].sort();
+    return projectedIds.length === ids.length
+      && projectedIds.every((id, index) => id === ids[index]);
+  }
+
+  function renderSelectionProjection(projection, nodes) {
+    if (state.selectionProjection?.loading && !projection) {
+      return '<div class="sf-inspector-section sf-selection-projection"><h4>语义流摘要</h4><p class="dim-note">正在读取选区内的 SQLite 语义边…</p></div>';
+    }
+    if (state.selectionProjection?.error && !projection) {
+      return `<div class="sf-inspector-section sf-selection-projection"><h4>语义流摘要</h4><div class="sf-context-banner sf-context-excluded">选区摘要读取失败：${text(state.selectionProjection.error)}</div></div>`;
+    }
+    if (!projection) {
+      return '<div class="sf-inspector-section sf-selection-projection"><h4>语义流摘要</h4><p class="dim-note">等待 SQLite 选区投影…</p></div>';
+    }
+    const summary = projection.summary || {};
+    const typeCounts = Object.entries(summary.nodeTypeCounts || {}).map(([type, count]) => `${nodeLabel(type)} ${count}`).join(' · ');
+    const statusCounts = Object.entries(summary.nodeStatusCounts || {}).map(([status, count]) => `${statusLabel(status)} ${count}`).join(' · ');
+    const edgeCounts = Object.entries(summary.edgeTypeCounts || {}).map(([type, count]) => `${type} ${count}`).join(' · ');
+    const externalCounts = Object.entries(summary.externalEdgeTypeCounts || {}).map(([type, count]) => `${type} ${count}`).join(' · ');
+    const internalEdges = Array.isArray(projection.internalEdges) ? projection.internalEdges : [];
+    const externalEdges = Array.isArray(projection.externalEdges) ? projection.externalEdges : [];
+    const edgeRow = (edge, external = false) => {
+      const source = nodeById(edge.source) || edge.remoteEndpoint;
+      const target = nodeById(edge.target) || edge.remoteEndpoint;
+      const sourceTitle = source?.title || edge.source;
+      const targetTitle = target?.title || edge.target;
+      const focusId = external ? edge.remoteEndpointId : '';
+      const focusType = external ? (edge.remoteEndpoint?.type || '') : '';
+      return `<li class="sf-selection-edge-row">${focusId ? `<button data-sf-selection-focus="${attr(focusId)}" data-sf-selection-focus-type="${attr(focusType)}">${text(sourceTitle)} → ${text(edge.type)} → ${text(targetTitle)}</button>` : `<span>${text(sourceTitle)} → ${text(edge.type)} → ${text(targetTitle)}</span>`}<small>${text(statusLabel(edge.status || 'CANON'))}${external ? ' · outside selection' : ''}</small></li>`;
+    };
+    return `<div class="sf-inspector-section sf-selection-projection"><h4>语义流摘要</h4><div class="sf-selection-summary-grid"><div><b>${text(summary.nodeCount ?? nodes.length)}</b><span>nodes</span></div><div><b>${text(summary.internalEdgeCount ?? internalEdges.length)}</b><span>inside edges</span></div><div><b>${text(summary.externalEdgeCount ?? externalEdges.length)}</b><span>outbound edges</span></div></div><dl class="sf-kv"><dt>节点类型</dt><dd>${text(typeCounts || '未记录')}</dd><dt>状态</dt><dd>${text(statusCounts || '未记录')}</dd><dt>内部语义</dt><dd>${text(edgeCounts || '未记录')}</dd><dt>选区外连接</dt><dd>${text(externalCounts || '未记录')}</dd><dt>章节范围</dt><dd>${text(summary.chapterFrom != null ? `Ch.${summary.chapterFrom}–${summary.chapterTo}` : '未记录')}</dd><dt>来源</dt><dd>${text(projection.meta?.canonicalSource || 'sqlite.story_graph_projection')}</dd></dl>${internalEdges.length ? `<details open><summary>选区内语义流 (${text(internalEdges.length)}${projection.meta?.internalEdgesTruncated ? '+' : ''})</summary><ul class="sf-inspector-list sf-selection-edge-list">${internalEdges.slice(0, 12).map((edge) => edgeRow(edge)).join('')}</ul></details>` : '<p class="dim-note">选区内没有已记录的语义边；这些节点仍可作为新的规划 Intent 输入。</p>'}${externalEdges.length ? `<details><summary>选区外连接 (${text(externalEdges.length)}${projection.meta?.externalEdgesTruncated ? '+' : ''})</summary><ul class="sf-inspector-list sf-selection-edge-list">${externalEdges.slice(0, 12).map((edge) => edgeRow(edge, true)).join('')}</ul></details>` : ''}<p class="dim-note">选区外连接可点击定位远端节点；不会把未加载的节点伪装成当前画布事实。</p></div>`;
+  }
+
+  async function loadSelectionProjection(nodes) {
+    if (!state || !S.book || !nodes?.length) return;
+    const nodeIds = nodes.map((node) => node.id);
+    state.selectionProjection = { nodeIds, loading: true, error: null };
+    renderInspector();
+    try {
+      // Keep the Inspector's first edge page small enough for progressive
+      // disclosure on high-degree selections; the API still accepts an
+      // explicit larger page for non-UI callers.
+      const query = new URLSearchParams({ nodeIds: nodeIds.join(','), limit: '120', edgeLimit: '60' });
+      const result = await api('GET', `/books/${currentBook()}/story-graph/selection?${query.toString()}`);
+      if (!state || !selectionProjectionMatches(selectedNodes(), result)) return;
+      state.selectionProjection = { ...result, loading: false, error: null };
+    } catch (error) {
+      if (!state || !selectionProjectionMatches(selectedNodes(), { nodeIds })) return;
+      state.selectionProjection = { nodeIds, loading: false, error: error.message };
+    }
+    renderInspector();
+  }
+
+  async function loadMoreSelectionEdges() {
+    const projection = state?.selectionProjection;
+    const nodes = selectedNodes();
+    const page = projection?.meta?.externalEdgesPage || projection?.externalEdgesPage;
+    const pageToken = page?.nextPageToken;
+    if (!projection || !nodes.length || !page?.hasMore || !pageToken) return;
+    const nodeIds = nodes.map((node) => node.id);
+    if (!selectionProjectionMatches(nodes, projection)) return;
+    state.selectionProjection = { ...projection, externalEdgesLoading: true };
+    renderInspector();
+    try {
+      const query = new URLSearchParams({
+        nodeIds: nodeIds.join(','),
+        limit: '120',
+        edgeLimit: String(page.limit || 240),
+        externalPageToken: pageToken,
+      });
+      const result = await api('GET', `/books/${currentBook()}/story-graph/selection?${query.toString()}`);
+      if (
+        !state
+        || !selectionProjectionMatches(selectedNodes(), result)
+        || (state.selectionProjection?.meta?.externalEdgesPage || state.selectionProjection?.externalEdgesPage)?.nextPageToken !== pageToken
+      ) return;
+      const edgeKey = (edge) => edge.id || `${edge.source}|${edge.type}|${edge.target}|${edge.label || ''}`;
+      const merged = new Map(
+        [...(projection.externalEdges || []), ...(result.externalEdges || [])]
+          .map((edge) => [edgeKey(edge), edge]),
+      );
+      state.selectionProjection = {
+        ...result,
+        externalEdges: [...merged.values()],
+        externalEdgesLoading: false,
+        error: null,
+      };
+    } catch (error) {
+      if (
+        state
+        && selectionProjectionMatches(selectedNodes(), { nodeIds })
+        && (state.selectionProjection?.meta?.externalEdgesPage || state.selectionProjection?.externalEdgesPage)?.nextPageToken === pageToken
+      ) {
+        state.selectionProjection = {
+          ...projection,
+          externalEdgesLoading: false,
+          error: error.message,
+        };
+      }
+    }
+    renderInspector();
   }
 
   function renderContextSourceInspector(node) {
@@ -1827,8 +2392,19 @@
       ].filter(Boolean).join(' · ');
       return `<li class="sf-knowledge-row"><span>${text(item.text || item.name || item.title || JSON.stringify(item))}</span><small>${text(evidence)}</small></li>`;
     }).join('');
-    const relationSummary = neighbors.slice(0, 12).map((item) => `<div class="sf-neighbor-row"><button data-sf-neighbor="${attr(item.node.id)}">${text(nodeLabel(item.node.type))} · ${text(item.node.title)}</button><span class="sf-neighbor-edge">${text(item.edge.label || item.edge.type)}</span></div>`).join('');
-    const impactable = ['Chapter', 'Character', 'Foreshadow', 'PlotThread', 'Fact', 'Location', 'StoryBibleEntry', 'Scene', 'Item', 'Secret', 'StoryGoal', 'Conflict', 'TimelinePoint', 'Knowledge'].includes(node.type);
+   const relationSummary = neighbors.slice(0, 12).map((item) => `<div class="sf-neighbor-row"><button data-sf-neighbor="${attr(item.node.id)}">${text(nodeLabel(item.node.type))} · ${text(item.node.title)}</button><span class="sf-neighbor-edge">${text(item.edge.label || item.edge.type)}</span></div>`).join('');
+    const boundaryEdges = viewportBoundaryEdgesForNode(node.id);
+    const boundaryMeta = state.graph?.meta?.viewport || {};
+    const boundaryCount = Number(boundaryMeta.crossBoundaryEdgeCount || 0);
+    const boundaryRows = boundaryEdges.slice(0, 12).map((item) => {
+      const remote = item.remoteEndpoint || {};
+      const direction = item.source === node.id ? '→' : '←';
+      return `<div class="sf-neighbor-row sf-boundary-neighbor-row"><button data-sf-boundary-node="${attr(remote.id || '')}">${text(nodeLabel(remote.type || 'Node'))} · ${text(remote.title || remote.id || 'unavailable')}</button><span class="sf-neighbor-edge">${text(direction)} ${text(item.label || item.type || 'semantic')}</span></div>`;
+    }).join('');
+    const boundaryDetails = state.view === 'all' && boundaryMeta.requested && boundaryCount
+      ? `<div class="sf-inspector-section sf-viewport-boundary"><h4>Cross-viewport semantic edges · ${text(boundaryCount)}</h4><div class="sf-context-banner"><b>These are recorded SQLite relationships.</b><br>They cross the current world-coordinate page and are not drawn until both endpoints are loaded. Select a remote endpoint to focus and expand it.${boundaryMeta.crossBoundaryEdgesTruncated ? '<br><small>Only a bounded sample is shown; the count is complete.</small>' : ''}</div>${boundaryRows ? `<div class="sf-boundary-neighbor-list">${boundaryRows}</div>` : '<p class="dim-note">The current node is not in the returned boundary sample. Load its full neighbor page to inspect every edge.</p>'}</div>`
+      : '';
+   const impactable = ['Chapter', 'Character', 'Foreshadow', 'PlotThread', 'Fact', 'Location', 'StoryBibleEntry', 'Scene', 'Item', 'Secret', 'StoryGoal', 'Conflict', 'TimelinePoint', 'Knowledge'].includes(node.type);
     const neighborCount = detail?.pagination?.total != null ? ` · ${detail.pagination.total} 条` : '';
     const acceptedChapterNumber = metadata.acceptedChapterNumber || metadata.chapterNumber || metadata.acceptedChapterId;
     const contextEvidence = state.contextEvidence?.nodeId === node.id ? renderContextEvidence(state.contextEvidence) : '';
@@ -1956,7 +2532,7 @@
       ? '<button class="btn btn-sm btn-secondary" data-sf-inspector-action="audit">审查</button><button class="btn btn-sm btn-secondary" data-sf-inspector-action="rewrite">重写</button><button class="btn btn-sm btn-secondary" data-sf-inspector-action="versions">查看版本</button><button class="btn btn-sm btn-secondary" data-sf-inspector-action="chapter-impact">编辑影响</button>'
       : '';
     const characterActions = node.type === 'Character'
-      ? '<button class="btn btn-sm btn-secondary" data-sf-inspector-action="timeline">查看时间线</button><button class="btn btn-sm btn-secondary" data-sf-inspector-action="character-analyze">AI 分析</button>'
+      ? `<button class="btn btn-sm btn-secondary" data-sf-inspector-action="timeline">查看时间线</button><button class="btn btn-sm btn-secondary" data-sf-inspector-action="character-analyze" ${modelRuntimeReady() ? '' : 'disabled aria-disabled="true"'}>AI 分析</button>`
       : '';
     const openLabel = node.type === 'Chapter' ? '打开章节' : node.type === 'StoryBibleEntry' ? '打开 Story Bible' : '打开来源';
      return `<div class="sf-inspector-head"><div><h3>${text(node.title)}</h3><p>${text(nodeLabel(node.type))} · ${text(status)}</p></div><span class="sf-status-badge ${statusClass(node.status)}">${text(status)}</span></div>
@@ -1974,11 +2550,23 @@
       ${generationRunDetails}
       ${generationContextGraphDetails}
       ${fulfillment}
+      ${renderReconciliationBlock(node)}
       ${contextEvidence}
       ${knownKnowledge.length ? `<div class="sf-inspector-section"><h4>她/他知道 (${knownKnowledge.length})</h4><ul class="sf-inspector-list">${knowledgeEvidenceRows(knownKnowledge)}</ul><p class="dim-note">仅展示 SQLite character_states.knowledge 的显式记录。</p></div>` : ''}
-      ${unknownKnowledge.length ? `<div class="sf-inspector-section"><h4>她/他不知道 (${unknownKnowledge.length})</h4><ul class="sf-inspector-list sf-inspector-list-unknown">${knowledgeEvidenceRows(unknownKnowledge)}</ul><p class="dim-note">未知状态必须有显式记录；没有记录不等于人物知道全部信息。</p></div>` : ''}
-      <div class="sf-inspector-section"><h4>语义关系 ${detail ? `${neighbors.length}${neighborCount}` : ''}</h4>${detail ? (relationSummary || '<p class="dim-note">当前节点没有已投影的一阶语义边。</p>') : '<p class="dim-note">正在从 SQLite 读取邻接关系…</p>'}</div>
-      <div class="sf-inspector-section"><h4>Provenance</h4>${provenance.length ? `<div class="sf-provenance">${provenance.slice(0, 6).map((item) => `<div>· ${text(item.kind || 'source')} ${item.table ? `<code>${text(item.table)}</code>` : ''} ${item.id ? `<code>${text(item.id)}</code>` : ''}</div>`).join('')}</div>` : '<p class="sf-provenance">未记录可展示的来源链。</p>'}</div>`;
+     ${unknownKnowledge.length ? `<div class="sf-inspector-section"><h4>她/他不知道 (${unknownKnowledge.length})</h4><ul class="sf-inspector-list sf-inspector-list-unknown">${knowledgeEvidenceRows(unknownKnowledge)}</ul><p class="dim-note">未知状态必须有显式记录；没有记录不等于人物知道全部信息。</p></div>` : ''}
+     <div class="sf-inspector-section"><h4>语义关系 ${detail ? `${neighbors.length}${neighborCount}` : ''}</h4>${detail ? (relationSummary || '<p class="dim-note">当前节点没有已投影的一阶语义边。</p>') : '<p class="dim-note">正在从 SQLite 读取邻接关系…</p>'}</div>
+      ${boundaryDetails}
+     <div class="sf-inspector-section"><h4>Provenance</h4>${provenance.length ? `<div class="sf-provenance">${provenance.slice(0, 6).map((item) => `<div>· ${text(item.kind || 'source')} ${item.table ? `<code>${text(item.table)}</code>` : ''} ${item.id ? `<code>${text(item.id)}</code>` : ''}</div>`).join('')}</div>` : '<p class="sf-provenance">未记录可展示的来源链。</p>'}</div>`;
+  }
+
+  function viewportBoundaryEdgesForNode(nodeId) {
+    const viewport = state?.graph?.meta?.viewport;
+    if (!viewport?.requested || !nodeId) return [];
+    return (Array.isArray(viewport.crossBoundaryEdges) ? viewport.crossBoundaryEdges : [])
+      // Boundary means outside the current world-coordinate page.  A remote
+      // endpoint may already be cached from an earlier page; it still belongs
+      // in the Inspector because it is not part of the current viewport.
+      .filter((edge) => edge.loadedEndpointId === nodeId);
   }
 
   async function loadNodeDetail(nodeId) {
@@ -1999,6 +2587,7 @@
         renderInspector();
         if (generationRunId) loadGenerationRunTrace(String(generationRunId));
         if (result.node?.type === 'Chapter' && state.history?.nodeId !== nodeId) loadHistory(nodeId);
+        if (result.node?.type === 'PlanningNode') loadReconciliationCandidates(nodeId);
       }
     } catch (error) {
       if (state.selected.has(nodeId)) {
@@ -2061,7 +2650,10 @@
     state.neighborLoading = true;
     renderInspector();
     try {
-      const result = await api('GET', `/books/${currentBook()}/story-graph/neighbors/${encodeURIComponent(nodeId)}?limit=${pagination.limit}&offset=${pagination.nextOffset}`);
+      const continuation = pagination.nextPageToken
+        ? `&pageToken=${encodeURIComponent(pagination.nextPageToken)}`
+        : `&offset=${pagination.nextOffset}`;
+      const result = await api('GET', `/books/${currentBook()}/story-graph/neighbors/${encodeURIComponent(nodeId)}?limit=${pagination.limit}${continuation}`);
       if (state.detail?.node?.id === nodeId) {
         state.detail.neighbors = [...(state.detail.neighbors || []), ...(result.neighbors || [])];
         state.detail.pagination = result.pagination;
@@ -2154,6 +2746,24 @@
     }
   }
 
+  async function retryGraphSnapshot(commitId, nodeId) {
+    const normalizedCommitId = String(commitId || '').trim();
+    if (!normalizedCommitId) return;
+    try {
+      const result = await api('POST', `/books/${currentBook()}/story-graph/snapshots/retry`, {
+        commitId: normalizedCommitId,
+      });
+      if (result.captured) {
+        toast(result.recovered ? 'StoryFlow historical snapshot recovered.' : 'StoryFlow snapshot already exists.', 'success');
+      } else {
+        toast(result.reason || 'Snapshot was not safely reconstructed.', 'warning');
+      }
+      await loadHistory(nodeId);
+    } catch (error) {
+      toast(`StoryFlow snapshot retry failed: ${error.message}`, 'error');
+    }
+  }
+
   async function loadSnapshotDiff(fromSnapshot, toSnapshot, nodeId) {
     state.snapshotDiff = { fromSnapshot, toSnapshot, nodeId, loading: true };
     renderInspector();
@@ -2218,6 +2828,9 @@
       const projectionBoundary = entry.kind === 'graph_snapshot' && entry.reason === 'story_commit_accept'
         ? '<small>captured after accepted StoryCommit</small>'
         : '';
+      const projectionFailure = entry.kind === 'graph_snapshot_capture_failure'
+        ? `<small class="sf-history-warning">${text(entry.error || 'The accepted commit has no graph snapshot yet.')}</small><button class="btn btn-sm btn-secondary sf-history-diff-button" data-sf-history-snapshot-retry="${attr(entry.commitId || '')}">Retry safe capture</button>`
+        : '';
       const facts = Array.isArray(entry.facts) ? entry.facts : [];
       const factSummary = facts.slice(0, 3).map((fact) => {
         if (typeof fact === 'string') return fact;
@@ -2240,7 +2853,7 @@
       const chapterImpact = entry.kind === 'chapter_version' && entry.sourceId
         ? `<button class="btn btn-sm btn-ghost sf-history-diff-button" data-sf-history-chapter-impact="${attr(entry.sourceId)}">${state.chapterImpact?.versionId === entry.sourceId ? '\u5f53\u524d\u7f16\u8f91\u5f71\u54cd' : '\u67e5\u770b\u7f16\u8f91\u5f71\u54cd'}</button>`
         : '';
-      return `<div class="sf-history-row"><div><b>${text(entry.title || entry.kind)}</b><small>${text(entry.timestamp || 'time not recorded')}${chapter}</small>${changeMarkup}${projectionBoundary}${compare}${replay}${canonicalCompare}${chapterImpact}</div><span class="sf-status-badge ${statusClass(entry.status)}">${text(detail)}</span></div>`;
+      return `<div class="sf-history-row"><div><b>${text(entry.title || entry.kind)}</b><small>${text(entry.timestamp || 'time not recorded')}${chapter}</small>${changeMarkup}${projectionBoundary}${projectionFailure}${compare}${replay}${canonicalCompare}${chapterImpact}</div><span class="sf-status-badge ${statusClass(entry.status)}">${text(detail)}</span></div>`;
     };
     const defaultFrom = versionEntries[1]?.sourceId || '';
     const defaultTo = versionEntries[0]?.sourceId || '';
@@ -2255,13 +2868,37 @@
       : '';
     const note = history.meta?.canonicalReplayAvailable
       ? 'Canonical replay/diff below replays the accepted immutable ledger; observed projection snapshots remain a separate, explicitly scoped view.'
+      : history.meta?.graphSnapshotCaptureFailures
+        ? 'An accepted commit is missing a StoryFlow projection snapshot. Retry is allowed only when the recorded SQLite source boundary is unchanged; otherwise the UI will refuse historical backfill.'
       : history.meta?.graphSnapshotDiffAvailable
         ? 'Graph snapshot diff is available for observed StoryFlow projections; it is not a complete replay of unobserved writes.'
       : history.meta?.chapterVersionDiffAvailable
         ? 'Chapter text diff remains available through the existing Chapter Versions boundary; this view only reads durable history.'
         : 'No historical graph snapshot is fabricated; every row below comes from an existing SQLite record.';
-    inspector.insertAdjacentHTML('beforeend', `<div class="sf-inspector-section sf-history-result"><h4>${historyTitle} · ${text(history.meta?.returned || 0)}</h4><div class="sf-context-banner">${text(note)}${history.meta?.truncated ? ' Results are capped.' : ''}</div>${versionCompare}${entries.length ? entries.map(row).join('') : '<p class="dim-note">当前节点没有已记录的持久化历史。</p>'}</div>`);
+    const canonicalGraphHistory = history.canonicalGraphHistory || {};
+    const canonicalGraphEntries = Array.isArray(canonicalGraphHistory.entries)
+      ? canonicalGraphHistory.entries
+      : [];
+    const canonicalGraphRows = canonicalGraphEntries.map((entry) => {
+      const diff = entry.diffSummary || {};
+      const edgeChanges = Number(diff.addedEdges || 0) + Number(diff.removedEdges || 0);
+      const diffText = entry.comparisonAvailable
+        ? `${Number(diff.changedNodes || 0)} changed nodes · ${edgeChanges} edge changes`
+        : (entry.comparisonReason || 'No preceding accepted snapshot boundary');
+      const compare = entry.comparisonAvailable && entry.previousSnapshotId
+        ? `<button class="btn btn-sm btn-ghost sf-history-diff-button" data-sf-history-from="${attr(entry.previousSnapshotId)}" data-sf-history-to="${attr(entry.snapshotId)}">View accepted graph diff</button>`
+        : '';
+      const snapshotText = entry.snapshotAvailable
+        ? `${text(entry.snapshotNodeCount || 0)} nodes · ${text(entry.snapshotEdgeCount || 0)} edges`
+        : 'snapshot unavailable';
+      return `<div class="sf-history-row sf-canonical-graph-history-row"><div><b>Ch.${text(entry.chapterNumber ?? '—')} · ${text(entry.chapterTitle || entry.commitId || 'accepted commit')}</b><small>${text(entry.timestamp || 'time not recorded')} · ${text(entry.commitId || '')}</small><small class="sf-history-change">${text(snapshotText)} · ${text(diffText)}</small>${entry.snapshotAvailable && entry.snapshotId ? `<small>accepted snapshot · ${text(entry.snapshotId)}</small>` : `<small class="sf-history-warning">${text(entry.comparisonReason || 'Accepted commit has no valid graph snapshot.')}</small>`}${compare}</div><span class="sf-status-badge ${statusClass(entry.snapshotAvailable ? 'CANON' : 'STALE')}">${entry.snapshotAvailable ? 'CANON GRAPH' : 'STALE GRAPH'}</span></div>`;
+    }).join('');
+    const canonicalGraphHistoryMarkup = canonicalGraphHistory.available || canonicalGraphHistory.meta?.acceptedCommitCount
+      ? `<div class="sf-inspector-section sf-canonical-graph-history"><div class="sf-panel-title"><span>Canon Graph history</span><small>${canonicalGraphHistory.complete ? 'accepted boundaries complete' : 'partial evidence'}</small></div><div class="sf-context-banner"><b>Accepted StoryCommit graph snapshots only</b><br><small>${text(canonicalGraphHistory.meta?.snapshotCount || 0)} snapshots · ${text(canonicalGraphHistory.meta?.comparableCount || 0)} comparable transitions · mutable entity tables are not reconstructed</small></div>${canonicalGraphRows || '<p class="dim-note">No accepted graph snapshot is recorded.</p>'}${canonicalGraphHistory.warnings?.length ? `<div class="sf-edit-impact-warnings"><h5>Historical graph boundary</h5><ul>${canonicalGraphHistory.warnings.slice(0, 4).map((warning) => `<li>${text(warning)}</li>`).join('')}</ul></div>` : ''}</div>`
+      : '';
+    inspector.insertAdjacentHTML('beforeend', `<div class="sf-inspector-section sf-history-result"><h4>${historyTitle} · ${text(history.meta?.returned || 0)}</h4><div class="sf-context-banner">${text(note)}${history.meta?.truncated ? ' Results are capped.' : ''}</div>${versionCompare}${canonicalGraphHistoryMarkup}${entries.length ? entries.map(row).join('') : '<p class="dim-note">当前节点没有已记录的持久化历史。</p>'}</div>`);
     inspector.querySelectorAll('[data-sf-history-from]').forEach((button) => button.addEventListener('click', () => loadSnapshotDiff(button.dataset.sfHistoryFrom, button.dataset.sfHistoryTo, history.nodeId)));
+    inspector.querySelectorAll('[data-sf-history-snapshot-retry]').forEach((button) => button.addEventListener('click', () => retryGraphSnapshot(button.dataset.sfHistorySnapshotRetry, history.nodeId)));
     inspector.querySelectorAll('[data-sf-canonical-replay]').forEach((button) => button.addEventListener('click', () => loadCanonicalReplay(button.dataset.sfCanonicalReplay, history.nodeId)));
     inspector.querySelectorAll('[data-sf-canonical-from]').forEach((button) => button.addEventListener('click', () => loadCanonicalDiff(button.dataset.sfCanonicalFrom, button.dataset.sfCanonicalTo, history.nodeId)));
     inspector.querySelectorAll('[data-sf-history-chapter-impact]').forEach((button) => button.addEventListener('click', () => loadChapterEditImpact(history.nodeId, button.dataset.sfHistoryChapterImpact || '')));
@@ -2456,6 +3093,10 @@
     const historicalRemovedNodes = Array.isArray(historicalGraphDiff.removedNodes) ? historicalGraphDiff.removedNodes : [];
     const historicalAddedEdges = Array.isArray(historicalGraphDiff.addedEdges) ? historicalGraphDiff.addedEdges : [];
     const historicalRemovedEdges = Array.isArray(historicalGraphDiff.removedEdges) ? historicalGraphDiff.removedEdges : [];
+    const historicalDependency = canonical.historicalDependencySurface || {};
+    const historicalDependencyFuture = Array.isArray(historicalDependency.futureChapters) ? historicalDependency.futureChapters : [];
+    const historicalDependencyDirect = Array.isArray(historicalDependency.direct) ? historicalDependency.direct : [];
+    const historicalDependencyDownstream = Array.isArray(historicalDependency.downstream) ? historicalDependency.downstream : [];
     const historicalGraphSection = historicalGraph.complete
       ? `<div class="sf-context-banner"><b>Historical graph snapshot · complete</b><br><small>${text(historicalGraph.scope || 'accepted_commit_snapshot_diff')} · ${text(historicalGraph.from?.snapshotId || '—')} → ${text(historicalGraph.to?.snapshotId || '—')}</small></div><div class="sf-diff-summary"><span><b>${text(historicalAddedNodes.length)}</b> added nodes</span><span><b>${text(historicalRemovedNodes.length)}</b> removed nodes</span><span><b>${text(historicalChangedNodes.length)}</b> changed nodes</span><span><b>${text(historicalAddedEdges.length + historicalRemovedEdges.length)}</b> edge changes</span></div>`
       : `<div class="sf-context-banner sf-context-excluded"><b>Historical graph snapshot · unavailable</b><br><small>${text(historicalGraph.reason || 'No accepted projection snapshot covers both boundaries.')}</small></div>`;
@@ -2469,8 +3110,11 @@
     const section = (title, items) => items.length
       ? `<h5>${title}</h5><ul class="sf-inspector-list sf-edit-impact-list">${items.slice(0, 16).map(surfaceRow).join('')}</ul>`
       : '';
+    const historicalDependencySection = historicalDependency.complete
+      ? `<div class="sf-version-ledger sf-historical-dependency"><div class="sf-panel-title"><span>Historical dependency surface</span><small>accepted snapshots</small></div><div class="sf-context-banner"><b>Recorded downstream dependencies</b><br><small>${text(historicalDependency.scope || 'accepted_commit_snapshot_dependency_surface')} · ${text(historicalDependency.meta?.seedNodeCount || 0)} seed nodes · ${text(historicalDependency.meta?.returned || 0)} traversed nodes</small></div><div class="sf-diff-summary"><span><b>${text(historicalDependency.changedNodeIds?.length || 0)}</b> changed nodes</span><span><b>${text(historicalDependency.changedEdgeIds?.length || 0)}</b> changed edges</span><span><b>${text(historicalDependencyFuture.length)}</b> future chapters</span><span><b>${text(historicalDependency.meta?.depth || 0)}</b> depth</span></div>${section('Historical future chapters', historicalDependencyFuture)}${section('Historical direct dependencies', historicalDependencyDirect)}${section('Historical downstream dependencies', historicalDependencyDownstream)}<p class="dim-note">Evidence comes from the two accepted StoryCommit graph snapshots and target semantic edges; it is not a prose-causality prediction.</p></div>`
+      : `<div class="sf-version-ledger sf-historical-dependency"><div class="sf-panel-title"><span>Historical dependency surface</span><small>unavailable</small></div><p class="dim-note">${text(historicalDependency.reason || 'Both accepted graph snapshots are required for historical dependency traversal.')}</p></div>`;
     const warning = (comparison.warnings || []).slice(0, 4).map((item) => `<li>${text(item)}</li>`).join('');
-    inspector.insertAdjacentHTML('beforeend', `<div class="sf-inspector-section sf-version-compare-result"><h4>Version compare</h4><div class="sf-context-banner"><b>${text(from.title || `v${from.version || '—'}`)} → ${text(to.title || `v${to.version || '—'}`)}</b><br><small>${text(comparison.scope || 'chapter_version_comparison')} · ${text(comparison.canonicalSource || 'sqlite')} · read-only</small></div><div class="sf-diff-summary"><span><b>${text(diff.addedLines || 0)}</b> added lines</span><span><b>${text(diff.removedLines || 0)}</b> removed lines</span><span><b>${diff.changed ? 'changed' : 'unchanged'}</b> text</span><span><b>${text(future.length)}</b> future chapters</span><span><b>${text(facts.length)}</b> facts</span></div>${diff.unifiedDiff ? `<details class="sf-version-diff" open><summary>Text diff${diff.truncated ? ' · truncated' : ''}</summary><pre>${text(diff.unifiedDiff)}</pre></details>` : '<p class="dim-note">The two immutable versions have no text difference.</p>'}${canonicalSection}${warning ? `<div class="sf-edit-impact-warnings"><h5>Evidence boundary</h5><ul>${warning}</ul></div>` : ''}<p class="dim-note">Dependency surface: ${text(surface.scope || 'current_projection')}. It answers what the current projection records, not a fabricated historical graph for the older version.</p>${section('Future chapter dependencies', future)}${section('Affected facts', facts)}${section('Planning dependencies', planning)}${section('Hazards', hazards)}</div>`);
+    inspector.insertAdjacentHTML('beforeend', `<div class="sf-inspector-section sf-version-compare-result"><h4>Version compare</h4><div class="sf-context-banner"><b>${text(from.title || `v${from.version || '—'}`)} → ${text(to.title || `v${to.version || '—'}`)}</b><br><small>${text(comparison.scope || 'chapter_version_comparison')} · ${text(comparison.canonicalSource || 'sqlite')} · read-only</small></div><div class="sf-diff-summary"><span><b>${text(diff.addedLines || 0)}</b> added lines</span><span><b>${text(diff.removedLines || 0)}</b> removed lines</span><span><b>${diff.changed ? 'changed' : 'unchanged'}</b> text</span><span><b>${text(future.length)}</b> future chapters</span><span><b>${text(facts.length)}</b> facts</span></div>${diff.unifiedDiff ? `<details class="sf-version-diff" open><summary>Text diff${diff.truncated ? ' · truncated' : ''}</summary><pre>${text(diff.unifiedDiff)}</pre></details>` : '<p class="dim-note">The two immutable versions have no text difference.</p>'}${canonicalSection}${historicalDependencySection}${warning ? `<div class="sf-edit-impact-warnings"><h5>Evidence boundary</h5><ul>${warning}</ul></div>` : ''}<p class="dim-note">Dependency surface: ${text(surface.scope || 'current_projection')}. The historical section is shown only when both accepted graph snapshots exist.</p>${section('Future chapter dependencies', future)}${section('Affected facts', facts)}${section('Planning dependencies', planning)}${section('Hazards', hazards)}</div>`);
   }
 
   async function loadContext(chapterId, generationRunId = '', depth = state?.depth || 1) {
@@ -2497,6 +3141,7 @@
       state.canonicalReplay = null;
       state.canonicalDiff = null;
       state.graph = state.context.graph || { nodes: [], edges: [], meta: {} };
+      rememberGraphSnapshot(state.graph);
       renderToolbar();
       renderSidebar();
       renderCanvas();
@@ -2544,6 +3189,13 @@
       ? tokenSummary.componentAttribution
       : (Array.isArray(tokenSummary.promptComponents) ? tokenSummary.promptComponents : []);
     const graphSnapshot = context.trace?.contextGraphSnapshot || tokenSummary.contextGraphSnapshot || {};
+    const sourceAvailability = tokenSummary.sourceAvailability || context.trace?.manifest?.availability || {};
+    const availabilityRows = Object.entries(sourceAvailability).map(([sourceType, availability]) => {
+      const record = availability && typeof availability === 'object' ? availability : {};
+      const status = String(record.status || 'not_recorded');
+      const detail = record.reason || (status === 'included' ? 'recorded in Writer manifest' : 'not recorded');
+      return `<div class="sf-context-breakdown-row"><span>${text(sourceType)}</span><b>${text(status)}</b><small>${text(detail)}</small></div>`;
+    }).join('');
     const runs = Array.isArray(context.trace?.availableRuns) ? context.trace.availableRuns : [];
     const graphMeta = context.graph?.meta || {};
     const sourceRows = sources.slice(0, 80).map((source) => {
@@ -2562,6 +3214,9 @@
     }).join('');
     const tokenAttribution = tokenSummary.tokenAttribution || {};
     const tokenAttributionBanner = `<div class="sf-context-banner"><b>Token provenance · ${text(tokenAttribution.status || 'not recorded')}</b><br><small>Provider usage scope: ${text(tokenAttribution.providerUsageScope || 'not recorded')} · per-source provider offsets: ${tokenAttribution.exactPerSourceProviderTokens ? 'recorded' : 'not recorded'} · source estimate basis: ${text(tokenAttribution.sourceEstimateBasis || 'unavailable')}</small></div>`;
+    const inputAccounting = tokenSummary.inputAccounting || {};
+    const accountingMetric = (label, value, suffix = '') => `<div><b>${text(value ?? '—')}${suffix}</b><span>${text(label)}</span></div>`;
+    const inputAccountingBlock = `<div class="sf-inspector-section sf-context-accounting"><h4>Input accounting · character-level</h4><div class="sf-context-banner ${inputAccounting.status === 'exact_character_accounting' ? '' : 'sf-context-excluded'}"><b>${text(inputAccounting.status || 'unavailable')}</b><br><small>${text(inputAccounting.reason || '没有可用的 persisted prompt accounting。')}</small></div><div class="sf-selection-summary-grid">${accountingMetric('persisted prompt', inputAccounting.promptChars, ' chars')}${accountingMetric('manifest union', inputAccounting.uniqueCoveredChars, ' chars')}${accountingMetric('untracked message', inputAccounting.untrackedMessageChars, ' chars')}${accountingMetric('range overlap', inputAccounting.overlapChars, ' chars')}</div><dl class="sf-kv"><dt>Coverage</dt><dd>${text(inputAccounting.coveragePercent != null ? `${inputAccounting.coveragePercent}% of persisted input` : 'unavailable')}</dd><dt>Writer message</dt><dd>${text(inputAccounting.messageChars != null ? `${inputAccounting.coveredMessageChars || 0} / ${inputAccounting.messageChars} chars tracked` : 'segment boundary unavailable')}</dd><dt>Recorded ranges</dt><dd>${text(inputAccounting.recordedRangeCount ?? 0)} · ${text(inputAccounting.includedSourceWithoutPersistedRange ?? 0)} included sources without a persisted range</dd><dt>Provider token offsets</dt><dd>${inputAccounting.providerTokenOffsets ? 'recorded' : 'not recorded'}</dd></dl><p class="dim-note">覆盖值是 source / section / prompt-component 范围的 union；overlap 是层级 provenance 的重复覆盖，不是额外 prompt。字符计量不能冒充 provider token 计量。</p></div>`;
     const runPicker = runs.length
       ? `<div class="sf-context-run-picker"><label for="sf-context-run">Writer GenerationRun</label><select id="sf-context-run" data-sf-context-run>${runs.map((run) => {
         const selected = String(run.id || '') === String(context.trace?.selectedRunId || context.trace?.generationRunId || '') ? ' selected' : '';
@@ -2572,7 +3227,10 @@
     const graphSnapshotBanner = graphSnapshot.available
       ? `<div class="sf-context-banner ${graphSnapshot.valid ? '' : 'sf-context-excluded'}"><b>Context Graph snapshot · ${graphSnapshot.valid ? 'integrity verified' : 'integrity unavailable'}</b><br><small>${text(graphSnapshot.nodeCount || 0)} source/focus nodes · ${text(graphSnapshot.edgeCount || 0)} inclusion/selection edges · ${text(graphSnapshot.graphSha256 || 'no hash')}</small><br><small>${text(graphSnapshot.integrityReason || 'snapshot is embedded in the persisted GenerationRun manifest')}</small></div>`
       : '<div class="sf-context-banner sf-context-excluded"><b>Context Graph snapshot · not captured</b><br><small>该旧 GenerationRun 只有 source manifest；不会从当前图谱反推历史 Writer 输入。</small></div>';
-    inspector.innerHTML = planningEditBanner() + `<div class="sf-inspector-head"><div><h3>Chapter Context</h3><p>${text(context.chapterId)}</p></div><span class="sf-status-badge status-candidate">TRACE · D${text(context.graph?.meta?.contextDepth || context.graph?.meta?.depth || state.contextDepth || 1)}</span></div><div class="sf-context-banner">${context.trace?.available ? '这是 GenerationRun 持久化的实际上下文清单。' : text(context.trace?.reason || '当前没有持久化的 Writer token manifest；下面只显示可追溯的候选上下文。')}</div>${graphMeta.contextGraph ? `<div class="sf-context-banner">Canvas edges are the persisted GenerationRun manifest: ${text(graphMeta.contextIncludedSources || 0)} included, ${text(graphMeta.contextExcludedSources || 0)} excluded. Context nodes are read-only evidence. Graph depth ${text(graphMeta.contextDepth || graphMeta.depth || state.contextDepth || 1)} is an explicit bounded projection; it does not change the recorded Writer input.</div>` : ''}${graphSnapshotBanner}${context.excludedSources?.length ? `<div class="sf-context-banner sf-context-excluded">${text(context.excludedSources.length)} 个来源被记录但未纳入 Writer 输入；排除原因保持来自 manifest，不从图中推断。</div>` : ''}<div class="sf-inspector-section"><h4>${context.trace?.available ? '实际来源' : '候选来源'} ${sources.length}</h4><div>${sourceRows || '<p class="dim-note">没有候选上下文。</p>'}</div></div><div class="sf-inspector-section"><h4>上下文构成</h4>${breakdown.length ? `<div class="sf-context-breakdown">${breakdown.map((item) => `<div class="sf-context-breakdown-row"><span>${text(item.sourceType)}</span><b>${text(item.contentChars)} chars</b><small>≈ ${text(item.estimatedTokens)} tokens · ${text(item.includedItems)}/${text(item.items)} included</small></div>`).join('')}</div><p class="dim-note">分项 token 是 contentChars/4 的估算；Provider 只把实际 promptTokens/totalTokens 记录为整次 GenerationRun，不把估算冒充分项实测。</p>` : '<p class="dim-note">未记录分项 context manifest。不会把估算值冒充 Writer 实际输入。</p>'}</div>${sections.length ? `<div class="sf-inspector-section"><h4>Context sections</h4><div class="sf-context-breakdown">${sectionRows}</div></div>` : ''}${components.length ? `<div class="sf-inspector-section"><h4>Writer prompt components</h4><div class="sf-context-breakdown">${componentRows}</div></div>` : ''}<div class="sf-inspector-section"><h4>GenerationRun</h4><dl class="sf-kv"><dt>Run</dt><dd>${text(context.trace?.generationRunId || '—')}</dd><dt>Prompt</dt><dd>${text(tokenSummary.promptTokens ?? '—')} tokens</dd><dt>Total</dt><dd>${text(tokenSummary.totalTokens ?? '—')} tokens</dd><dt>Hash</dt><dd>${text(tokenSummary.promptSha256 || '—')}</dd><dt>Context Graph</dt><dd>${text(graphSnapshot.valid ? `${graphSnapshot.nodeCount || 0} nodes / ${graphSnapshot.edgeCount || 0} edges` : 'manifest-only / unavailable')}</dd><dt>Binding</dt><dd>${text(tokenSummary.contextBinding || 'manifest source list')}</dd></dl></div><div class="sf-inspector-actions"><button class="btn btn-sm btn-secondary" data-sf-back-inspector="1">返回节点</button></div>`;
+    inspector.innerHTML = planningEditBanner() + `<div class="sf-inspector-head"><div><h3>Chapter Context</h3><p>${text(context.chapterId)}</p></div><span class="sf-status-badge status-candidate">TRACE · D${text(context.graph?.meta?.contextDepth || context.graph?.meta?.depth || state.contextDepth || 1)}</span></div><div class="sf-context-banner">${context.trace?.available ? '这是 GenerationRun 持久化的实际上下文清单。' : text(context.trace?.reason || '当前没有持久化的 Writer token manifest；下面只显示可追溯的候选上下文。')}</div>${graphMeta.contextGraph ? `<div class="sf-context-banner">Canvas edges are the persisted GenerationRun manifest: ${text(graphMeta.contextIncludedSources || 0)} included, ${text(graphMeta.contextExcludedSources || 0)} excluded. Context nodes are read-only evidence. Graph depth ${text(graphMeta.contextDepth || graphMeta.depth || state.contextDepth || 1)} is an explicit bounded projection; it does not change the recorded Writer input.</div>` : ''}${graphSnapshotBanner}${inputAccountingBlock}${context.excludedSources?.length ? `<div class="sf-context-banner sf-context-excluded">${text(context.excludedSources.length)} 个来源被记录但未纳入 Writer 输入；排除原因保持来自 manifest，不从图中推断。</div>` : ''}<div class="sf-inspector-section"><h4>${context.trace?.available ? '实际来源' : '候选来源'} ${sources.length}</h4><div>${sourceRows || '<p class="dim-note">没有候选上下文。</p>'}</div></div><div class="sf-inspector-section"><h4>上下文构成</h4>${breakdown.length ? `<div class="sf-context-breakdown">${breakdown.map((item) => `<div class="sf-context-breakdown-row"><span>${text(item.sourceType)}</span><b>${text(item.contentChars)} chars</b><small>≈ ${text(item.estimatedTokens)} tokens · ${text(item.includedItems)}/${text(item.items)} included</small></div>`).join('')}</div><p class="dim-note">分项 token 是 contentChars/4 的估算；Provider 只把实际 promptTokens/totalTokens 记录为整次 GenerationRun，不把估算冒充分项实测。</p>` : '<p class="dim-note">未记录分项 context manifest。不会把估算值冒充 Writer 实际输入。</p>'}</div>${sections.length ? `<div class="sf-inspector-section"><h4>Context sections</h4><div class="sf-context-breakdown">${sectionRows}</div></div>` : ''}${components.length ? `<div class="sf-inspector-section"><h4>Writer prompt components</h4><div class="sf-context-breakdown">${componentRows}</div></div>` : ''}<div class="sf-inspector-section"><h4>GenerationRun</h4><dl class="sf-kv"><dt>Run</dt><dd>${text(context.trace?.generationRunId || '—')}</dd><dt>Prompt</dt><dd>${text(tokenSummary.promptTokens ?? '—')} tokens</dd><dt>Total</dt><dd>${text(tokenSummary.totalTokens ?? '—')} tokens</dd><dt>Hash</dt><dd>${text(tokenSummary.promptSha256 || '—')}</dd><dt>Context Graph</dt><dd>${text(graphSnapshot.valid ? `${graphSnapshot.nodeCount || 0} nodes / ${graphSnapshot.edgeCount || 0} edges` : 'manifest-only / unavailable')}</dd><dt>Binding</dt><dd>${text(tokenSummary.contextBinding || 'manifest source list')}</dd></dl></div><div class="sf-inspector-actions"><button class="btn btn-sm btn-secondary" data-sf-back-inspector="1">返回节点</button></div>`;
+    if (availabilityRows) {
+      inspector.insertAdjacentHTML('afterbegin', `<div class="sf-inspector-section"><h4>Source availability</h4><div class="sf-context-breakdown">${availabilityRows}</div></div>`);
+    }
     inspector.insertAdjacentHTML('beforeend', runPicker);
     inspector.insertAdjacentHTML('afterbegin', tokenAttributionBanner);
     const rangeRows = [...sources, ...sections, ...components]
@@ -2626,9 +3284,9 @@
       else go('chapters');
       return;
     }
-    if (node.type === 'Character') { go('characters'); return; }
-    if (node.type === 'Foreshadow') { go('foreshadowing'); return; }
-    if (node.type === 'Location' || node.type === 'Faction') { go('world-map'); return; }
+    if (node.type === 'Character') { openStoryFlowView('character', node.id); return; }
+    if (node.type === 'Foreshadow') { openStoryFlowView('foreshadow', node.id); return; }
+    if (node.type === 'Location' || node.type === 'Faction') { openStoryFlowView('world', node.id); return; }
     if (node.type === 'StoryBibleEntry') {
       const stepNumber = Number(node.metadata?.stepNumber);
       if (Number.isFinite(stepNumber) && typeof S !== 'undefined') S._wizardStepNumber = stepNumber;
@@ -2656,16 +3314,28 @@
       results.innerHTML = matches.length ? matches.map((match) => `<button class="sf-search-result" data-sf-search-id="${attr(match.id)}" data-sf-search-type="${attr(match.type)}"><small>${text(nodeLabel(match.type))}</small><strong>${text(match.title)}</strong></button>`).join('') : '<p class="dim-note" style="padding:8px">没有匹配的真实节点。</p>';
       results.querySelectorAll('[data-sf-search-id]').forEach((button) => button.addEventListener('click', () => {
         const id = button.dataset.sfSearchId;
+        const keepFullGraphViewport = state.view === 'all'
+          && Boolean(canvasViewportBounds())
+          && Boolean(state.graph?.meta?.viewport?.requested);
         state.focus = id;
         state.depth = 1;
-        state.view = TYPE_VIEW[button.dataset.sfSearchType] || 'story';
+        // Search is a navigation action inside the active projection.  In an
+        // expanded Full Graph, replacing the bounded graph with an unbounded
+        // focused response would discard the viewport/boundary contract and
+        // make the selected node's Inspector lose its semantic edge page.
+        // Keep that projection alive and inject the searched root through the
+        // bounded read path instead.  Other views retain their type-specific
+        // focus behavior.
+        if (!keepFullGraphViewport) state.view = TYPE_VIEW[button.dataset.sfSearchType] || 'story';
+        else state.presentationMode = 'expanded';
         state.selected = new Set([id]);
          state.detail = null;
          state.history = null;
          state.canonicalReplay = null;
          state.canonicalDiff = null;
          hideSearchResults();
-        loadGraph();
+        if (keepFullGraphViewport) loadFocusedSearchResultInViewport(id, canvasViewportBounds());
+        else loadGraph();
       }));
     } catch (error) {
       results.innerHTML = `<p class="dim-note" style="padding:8px">搜索失败：${text(error.message)}</p>`;
@@ -2673,10 +3343,14 @@
     }
   }
 
-  function queryString(viewport = null) {
-    const boundedLimit = state.view === 'all' ? '1200' : '240';
+  function queryString(viewport = null, pageToken = '', boundaryPageToken = '', boundaryNodeId = '', edgePageToken = '') {
+    // Full Graph is an explicit viewport-driven view.  Keep its initial
+    // response on the same bounded working-set budget as a viewport page so
+    // a large book does not serialize a 1200-node/3000-edge compatibility
+    // payload before the Canvas has even established its visible rectangle.
+    const boundedLimit = '240';
     const params = new URLSearchParams({ view: state.view, depth: String(state.depth), limit: boundedLimit });
-    if (state.view === 'all') params.set('edge_limit', '3000');
+    if (state.view === 'all') params.set('edge_limit', '600');
     if (state.view === 'character' || state.view === 'story' || state.view === 'all') params.set('presentation', state.presentationMode || 'clustered');
     if (state.focus) params.set('focus', state.focus);
     if (state.types.length) params.set('types', state.types.join(','));
@@ -2693,6 +3367,10 @@
       params.set('y_from', String(viewport.yFrom));
       params.set('y_to', String(viewport.yTo));
       params.set('viewport_padding', '0');
+      if (pageToken) params.set('page_token', pageToken);
+      if (edgePageToken) params.set('edge_page_token', edgePageToken);
+      if (boundaryPageToken) params.set('boundary_page_token', boundaryPageToken);
+      if (boundaryNodeId) params.set('boundary_node_id', boundaryNodeId);
     }
     return params.toString();
   }
@@ -2721,6 +3399,16 @@
       .join(':');
   }
 
+  function viewportBoundsFromMetadata(viewport) {
+    if (!viewport || [viewport.xFrom, viewport.xTo, viewport.yFrom, viewport.yTo].some((value) => value == null)) return null;
+    return {
+      xFrom: Number(viewport.xFrom),
+      xTo: Number(viewport.xTo),
+      yFrom: Number(viewport.yFrom),
+      yTo: Number(viewport.yTo),
+    };
+  }
+
   function viewportFetchEnabled() {
     return Boolean(
       state
@@ -2736,42 +3424,392 @@
     if (!viewportFetchEnabled()) return;
     const viewport = canvasViewportBounds();
     const key = viewportKey(viewport);
-    if (!viewport || !key || key === state.viewportLastKey || key === state.viewportRequestKey) return;
+    if (!viewport || !key || key === state.viewportRequestKey) return;
+    const continuation = currentViewportContinuation(key);
+    if (!continuation && state.viewportPages?.has(key)) return;
     window.clearTimeout(state.viewportFetchTimer);
     state.viewportFetchTimer = window.setTimeout(() => loadViewport(viewport, key), 180);
+  }
+
+  function currentViewportContinuation(key = viewportKey(canvasViewportBounds())) {
+    const continuation = state?.viewportContinuation;
+    if (!continuation?.key || continuation.key !== key) return null;
+    return continuation;
+  }
+
+  function currentViewportEdgeContinuation(key = viewportKey(canvasViewportBounds())) {
+    const continuation = state?.viewportEdgeContinuation;
+    if (!continuation?.key || continuation.key !== key) return null;
+    return continuation;
+  }
+
+  function mergeViewportGraph(base, page) {
+    if (!base || !Array.isArray(base.nodes)) return page;
+    const nodesById = new Map();
+    const nodeOrder = [];
+    base.nodes.forEach((node) => {
+      nodesById.set(node.id, node);
+      nodeOrder.push(node.id);
+    });
+    const preserveLocalLayout = Boolean(state.layoutDirty);
+    const layoutKeys = ['x', 'y', 'collapsed', 'pinned', 'hidden'];
+    (page.nodes || []).forEach((node) => {
+      const previous = nodesById.get(node.id);
+      if (!previous) {
+        nodesById.set(node.id, node);
+        nodeOrder.push(node.id);
+        return;
+      }
+      const merged = { ...previous, ...node };
+      // A viewport read must not overwrite unsaved workspace coordinates or
+      // visibility state. Those are UI state, not Story Graph canon.
+      if (preserveLocalLayout) {
+        layoutKeys.forEach((key) => {
+          if (Object.prototype.hasOwnProperty.call(previous, key)) merged[key] = previous[key];
+        });
+      }
+      nodesById.set(node.id, merged);
+    });
+
+    const baseMeta = base.meta || {};
+    const pageMeta = page.meta || {};
+    const baseViewport = baseMeta.viewport || {};
+    const pageViewport = pageMeta.viewport || {};
+    const enteringViewportProjection = Boolean(pageViewport.requested) && !Boolean(baseViewport.requested);
+    const edgesById = new Map();
+    const edgeOrder = [];
+    const edgeKey = (edge) => edge.id || `${edge.source}:${edge.type}:${edge.target}:${edge.label || ''}`;
+    if (!enteringViewportProjection) {
+      (base.edges || []).forEach((edge) => {
+        const key = edgeKey(edge);
+        edgesById.set(key, edge);
+        edgeOrder.push(key);
+      });
+    }
+    (page.edges || []).forEach((edge) => {
+      const key = edgeKey(edge);
+      if (!edgesById.has(key)) edgeOrder.push(key);
+      edgesById.set(key, edge);
+    });
+
+    const pageHasExplicitBoundaryPage = Object.prototype.hasOwnProperty.call(pageViewport, 'boundaryPageOffset')
+      || Object.prototype.hasOwnProperty.call(pageViewport, 'boundaryPageSize')
+      || Object.prototype.hasOwnProperty.call(pageViewport, 'nextBoundaryPageToken');
+    // A normal viewport continuation has no boundary cursor.  Once the user
+    // explicitly asks for a node's semantic boundary page, an asynchronous
+    // normal viewport fetch must not erase that cursor before the Inspector
+    // can request its next page.
+    const preserveBoundaryPage = Boolean(state.boundaryNodeId)
+      && state.selected?.has(state.boundaryNodeId)
+      && !pageHasExplicitBoundaryPage;
+    const totalAvailableNodes = Math.max(
+      Number(baseMeta.totalAvailableNodes || 0),
+      Number(pageMeta.totalAvailableNodes || 0),
+    );
+    const totalAvailableEdges = Math.max(
+      Number(baseMeta.totalAvailableEdges || 0),
+      Number(pageMeta.totalAvailableEdges || 0),
+    );
+    const nodes = nodeOrder.map((id) => nodesById.get(id)).filter(Boolean);
+    const edges = edgeOrder.map((id) => edgesById.get(id)).filter(Boolean);
+    return {
+      ...base,
+      ...page,
+      nodes,
+      edges,
+      meta: {
+        ...baseMeta,
+        ...pageMeta,
+        totalAvailableNodes: totalAvailableNodes || pageMeta.totalAvailableNodes || baseMeta.totalAvailableNodes,
+        totalAvailableEdges: totalAvailableEdges || pageMeta.totalAvailableEdges || baseMeta.totalAvailableEdges,
+        returnedNodes: nodes.length,
+        returnedEdges: edges.length,
+        truncated: totalAvailableNodes ? nodes.length < totalAvailableNodes : pageMeta.truncated,
+        viewport: {
+          ...baseViewport,
+          ...pageViewport,
+          requested: true,
+          incrementalMerge: true,
+          loadedNodeCount: nodes.length,
+          loadedEdgeCount: edges.length,
+          loadedInternalEdgeCount: edges.length,
+          internalEdgeCount: Math.max(
+            Number(baseViewport.internalEdgeCount || 0),
+            Number(pageViewport.internalEdgeCount || 0),
+          ),
+          internalEdgeScope: pageViewport.internalEdgeScope || baseViewport.internalEdgeScope || 'viewport_candidate_set',
+          returnedInternalEdges: Number(pageViewport.returnedInternalEdges || 0),
+          internalEdgesTruncated: Boolean(pageViewport.internalEdgesTruncated),
+          internalEdgePageSize: Number(pageViewport.internalEdgePageSize || baseViewport.internalEdgePageSize || 0),
+          internalEdgePageOffset: Number(pageViewport.internalEdgePageOffset || 0),
+          internalEdgePageIndex: Number(pageViewport.internalEdgePageIndex || 0),
+          nextInternalEdgePageToken: pageViewport.nextInternalEdgePageToken || null,
+          pagesLoaded: state.viewportPages?.size || 0,
+          returnedInViewport: pageViewport.returnedInViewport || page.nodes?.length || 0,
+          crossBoundaryEdgeCount: preserveBoundaryPage
+            ? Number(baseViewport.crossBoundaryEdgeCount || 0)
+            : pageViewport.crossBoundaryEdgeCount || 0,
+          returnedCrossBoundaryEdges: preserveBoundaryPage
+            ? Number(baseViewport.returnedCrossBoundaryEdges || 0)
+            : pageViewport.returnedCrossBoundaryEdges || 0,
+          crossBoundaryEdgesTruncated: preserveBoundaryPage
+            ? Boolean(baseViewport.crossBoundaryEdgesTruncated)
+            : Boolean(pageViewport.crossBoundaryEdgesTruncated),
+          crossBoundaryEdgeTypeCounts: preserveBoundaryPage
+            ? (baseViewport.crossBoundaryEdgeTypeCounts || {})
+            : (pageViewport.crossBoundaryEdgeTypeCounts || {}),
+          crossBoundaryEdges: preserveBoundaryPage
+            ? (Array.isArray(baseViewport.crossBoundaryEdges) ? baseViewport.crossBoundaryEdges : [])
+            : (Array.isArray(pageViewport.crossBoundaryEdges) ? pageViewport.crossBoundaryEdges : []),
+          boundaryPageOffset: preserveBoundaryPage
+            ? Number(baseViewport.boundaryPageOffset || 0)
+            : Number(pageViewport.boundaryPageOffset || 0),
+          boundaryPageIndex: preserveBoundaryPage
+            ? Number(baseViewport.boundaryPageIndex || 0)
+            : Number(pageViewport.boundaryPageIndex || 0),
+          boundaryHasMore: preserveBoundaryPage
+            ? Boolean(baseViewport.boundaryHasMore)
+            : Boolean(pageViewport.boundaryHasMore),
+          nextBoundaryPageToken: preserveBoundaryPage
+            ? (baseViewport.nextBoundaryPageToken || null)
+            : (pageViewport.nextBoundaryPageToken || null),
+       },
+      },
+    };
   }
 
   async function loadViewport(viewport, key) {
     if (!viewportFetchEnabled() || !viewport || !key) return;
     if (state.viewportFetchInFlight) return;
-    state.viewportRequestKey = key;
+    const requestGeneration = Number(state.viewportGeneration || 0);
+    const enteringViewport = state.viewportLastKey !== key;
+    if (enteringViewport) state.viewportEdgeExhausted = false;
+    const continuation = currentViewportContinuation(key);
+    const edgeContinuation = currentViewportEdgeContinuation(key);
+    const edgeWasExhausted = Boolean(state.viewportEdgeExhausted && !edgeContinuation);
+    const requestKey = continuation?.token ? `${key}:page:${continuation.offset}` : key;
+    if (state.viewportPages?.has(requestKey)) return;
+    state.viewportRequestKey = requestKey;
     state.viewportFetchInFlight = true;
     try {
-      const graph = await api('GET', `/books/${currentBook()}/story-graph?${queryString(viewport)}`);
-      if (!state || state.view !== 'all' || state.presentationMode !== 'expanded') return;
+      const graph = await api('GET', `/books/${currentBook()}/story-graph?${queryString(viewport, continuation?.token || '', '', '', edgeContinuation?.token || '')}`);
+      // A search focus or explicit view reload can invalidate a normal
+      // viewport request while it is in flight.  Its old page token belongs
+      // to the previous focus/query and must never update the new read model.
+      if (!state || requestGeneration !== Number(state.viewportGeneration || 0) || state.view !== 'all') return;
+      state.viewportFetchError = null;
       state.viewportLastKey = key;
+      state.viewportPages?.add(requestKey);
+      const page = graph.meta?.viewport || {};
+      state.viewportContinuation = page.hasMore && page.nextPageToken
+        ? {
+          key,
+          token: page.nextPageToken,
+          offset: Number(page.pageOffset || 0) + Number(page.returnedInViewport || graph.nodes?.length || 0),
+        }
+        : null;
+      state.viewportEdgeContinuation = edgeWasExhausted || (state.viewportEdgeExhausted && !edgeContinuation)
+        ? null
+        : page.internalEdgesTruncated && page.nextInternalEdgePageToken
+          ? {
+            key,
+            token: page.nextInternalEdgePageToken,
+            offset: Number(page.internalEdgePageOffset || 0) + Number(page.returnedInternalEdges || graph.edges?.length || 0),
+          }
+          : null;
+      if (!edgeWasExhausted) {
+        state.viewportEdgeExhausted = !page.internalEdgesTruncated
+          && Number(page.internalEdgeCount || 0) <= Number(page.internalEdgePageOffset || 0) + Number(page.returnedInternalEdges || 0);
+      }
       // An empty viewport must not replace the interactive Canvas with a
       // dead-end empty state. Keep the previous bounded page until the user
       // pans back into a populated region.
       if (Array.isArray(graph.nodes) && graph.nodes.length) {
-        state.graph = graph;
-        state.selected = new Set([...state.selected].filter((id) => graph.nodes.some((node) => node.id === id)));
-        state.edgeSelectedId = null;
-        state.detail = null;
-        state.expandedPresentationClusters = new Set();
+        state.graph = mergeViewportGraph(state.graph, graph);
+        if (edgeWasExhausted) {
+          const previousViewport = state.graph?.meta?.viewport || {};
+          state.graph.meta.viewport = {
+            ...previousViewport,
+            internalEdgesTruncated: false,
+            nextInternalEdgePageToken: null,
+            internalEdgePageOffset: Number(previousViewport.internalEdgePageOffset || 0),
+            internalEdgePageIndex: Number(previousViewport.internalEdgePageIndex || 0),
+            loadedInternalEdgeCount: state.graph.edges?.length || 0,
+          };
+        }
+        rememberGraphSnapshot(state.graph);
         renderToolbar();
         renderSidebar();
         renderCanvas();
         renderInspector();
       }
     } catch (error) {
+      if (requestGeneration !== Number(state.viewportGeneration || 0)) return;
       state.viewportFetchError = error.message;
       // Keep the current graph visible; the error remains observable in the
       // toolbar badge instead of being silently swallowed.
       renderToolbar();
     } finally {
+      if (requestGeneration !== Number(state.viewportGeneration || 0)) return;
       state.viewportFetchInFlight = false;
       state.viewportRequestKey = '';
+      const currentKey = viewportKey(canvasViewportBounds());
+      if (currentKey && currentKey !== state.viewportLastKey && !state.viewportFetchError) scheduleViewportFetch();
+    }
+  }
+
+  async function loadNextViewportPage() {
+    const viewport = canvasViewportBounds();
+    const key = viewportKey(viewport);
+    if (!viewport || !key || !currentViewportContinuation(key)) return;
+    await loadViewport(viewport, key);
+  }
+
+  async function loadNextViewportEdgePage() {
+    const viewport = canvasViewportBounds();
+    const key = viewportKey(viewport);
+    const continuation = currentViewportEdgeContinuation(key);
+    if (!viewport || !key || !continuation?.token || state.viewportEdgeFetchInFlight) return;
+    const requestGeneration = Number(state.viewportGeneration || 0);
+    state.viewportEdgeFetchInFlight = true;
+    try {
+      const graph = await api('GET', `/books/${currentBook()}/story-graph?${queryString(viewport, '', '', '', continuation.token)}`);
+      if (!state || requestGeneration !== Number(state.viewportGeneration || 0) || state.view !== 'all') return;
+      const page = graph.meta?.viewport || {};
+      const previousViewport = state.graph?.meta?.viewport || {};
+      state.viewportEdgeContinuation = page.internalEdgesTruncated && page.nextInternalEdgePageToken
+        ? {
+          key,
+          token: page.nextInternalEdgePageToken,
+          offset: Number(page.internalEdgePageOffset || 0) + Number(page.returnedInternalEdges || graph.edges?.length || 0),
+        }
+        : null;
+      state.viewportEdgeExhausted = !page.internalEdgesTruncated
+        && Number(page.internalEdgeCount || 0) <= Number(page.internalEdgePageOffset || 0) + Number(page.returnedInternalEdges || 0);
+      state.graph = mergeViewportGraph(state.graph, graph);
+      state.graph.meta.viewport = {
+        ...state.graph.meta.viewport,
+        pageOffset: Number(previousViewport.pageOffset || 0),
+        pageIndex: Number(previousViewport.pageIndex || 0),
+        hasMore: Boolean(previousViewport.hasMore),
+        nextPageToken: previousViewport.nextPageToken || null,
+        internalEdgePageOffset: Number(page.internalEdgePageOffset || 0),
+        internalEdgePageIndex: Number(page.internalEdgePageIndex || 0),
+        internalEdgesTruncated: Boolean(page.internalEdgesTruncated),
+        nextInternalEdgePageToken: page.nextInternalEdgePageToken || null,
+        loadedInternalEdgeCount: state.graph.edges?.length || 0,
+      };
+      rememberGraphSnapshot(state.graph);
+      renderToolbar();
+      renderSidebar();
+      renderCanvas();
+      renderInspector();
+    } catch (error) {
+      state.viewportFetchError = error.message;
+      renderToolbar();
+    } finally {
+      if (state) state.viewportEdgeFetchInFlight = false;
+    }
+  }
+
+  async function loadNextBoundaryPage(nodeId) {
+    // Boundary cursors are signed against the exact world-coordinate page
+    // that produced them.  The selected-node center/normal viewport fetch can
+    // move the Canvas before the user clicks the Inspector action, so reuse
+    // the recorded page bounds instead of silently mixing a fresh viewport
+    // with the old cursor.
+    const viewport = state.boundaryViewport || canvasViewportBounds();
+    const key = viewportKey(viewport);
+    const meta = state?.graph?.meta?.viewport || {};
+    if (!viewport || !key || !nodeId || (!meta.nextBoundaryPageToken && !meta.crossBoundaryEdgesTruncated)) return;
+    if (state.boundaryFetchInFlight) return;
+    state.boundaryNodeId = nodeId;
+    state.boundaryFetchInFlight = true;
+    try {
+      const boundaryToken = meta.nextBoundaryPageToken || '';
+      const graph = await api('GET', `/books/${currentBook()}/story-graph?${queryString(viewport, '', boundaryToken, nodeId)}`);
+      const nextMeta = graph.meta?.viewport || {};
+      const previous = state.graph?.meta?.viewport || {};
+      state.boundaryViewport = viewportBoundsFromMetadata(nextMeta) || viewport;
+      // A terminal boundary page must release the preservation latch.  This
+      // lets later ordinary viewport merges update their own counters without
+      // resurrecting an exhausted boundary cursor.
+      state.boundaryNodeId = nextMeta.nextBoundaryPageToken ? nodeId : '';
+      state.graph = {
+        ...state.graph,
+        meta: {
+          ...state.graph.meta,
+          viewport: {
+            ...previous,
+            ...nextMeta,
+            crossBoundaryEdgeCount: nextMeta.crossBoundaryEdgeCount || previous.crossBoundaryEdgeCount || 0,
+          },
+        },
+      };
+      renderToolbar();
+      renderInspector();
+    } catch (error) {
+      state.viewportFetchError = error.message;
+      renderToolbar();
+    } finally {
+      state.boundaryFetchInFlight = false;
+    }
+  }
+
+  async function loadFocusedSearchResultInViewport(nodeId, viewport) {
+    if (!state || !S.book || !nodeId || !viewport) {
+      loadGraph();
+      return;
+    }
+    // Invalidate any ordinary page continuation that was issued before this
+    // search. Its token is signed against the previous focus/filter query and
+    // would otherwise surface a truthful but user-visible 422 after the
+    // focused boundary response succeeds.
+    state.viewportGeneration = Number(state.viewportGeneration || 0) + 1;
+    state.viewportFetchInFlight = false;
+    state.viewportEdgeFetchInFlight = false;
+    state.viewportContinuation = null;
+    state.viewportEdgeContinuation = null;
+    state.viewportEdgeExhausted = false;
+    state.viewportPages = new Set();
+    state.viewportLastKey = '';
+    state.viewportRequestKey = '';
+    state.loading = true;
+    state.boundaryNodeId = nodeId;
+    state.viewportFetchError = null;
+    try {
+      const graph = await api(
+        'GET',
+        `/books/${currentBook()}/story-graph?${queryString(viewport, '', '', nodeId)}`,
+      );
+      if (!state || state.view !== 'all') return;
+      state.boundaryViewport = viewportBoundsFromMetadata(graph.meta?.viewport) || viewport;
+      // This is an explicit search/focus action.  Merge the authoritative
+      // target page into the current bounded graph so the target can be
+      // inspected even when its world-coordinate position was off-screen.
+      state.graph = mergeViewportGraph(state.graph, graph);
+      rememberGraphSnapshot(state.graph);
+      const focusedViewportKey = viewportKey(viewport);
+      state.viewportLastKey = focusedViewportKey;
+      if (focusedViewportKey) state.viewportPages.add(focusedViewportKey);
+      state.selected = new Set([nodeId]);
+      state.edgeSelectedId = null;
+      state.detail = null;
+      state.history = null;
+      state.canonicalReplay = null;
+      state.canonicalDiff = null;
+      renderToolbar();
+      renderSidebar();
+      renderCanvas();
+      renderInspector();
+      loadNodeDetail(nodeId);
+    } catch (error) {
+      state.viewportFetchError = error.message;
+      renderToolbar();
+      toast(`StoryFlow search focus failed: ${error.message}`, 'error');
+    } finally {
+      state.loading = false;
+      scheduleViewportFetch();
     }
   }
 
@@ -2794,13 +3832,114 @@
     state.modelWorkObserver.observe(indicator, { attributes: true, attributeFilter: ['aria-hidden'], childList: true });
   }
 
+  function rememberGraphSnapshot(graph) {
+    const snapshotId = String(graph?.meta?.graphSnapshotId || '').trim();
+    if (snapshotId) state.graphSnapshotId = snapshotId;
+  }
+
+  async function refreshGraphFromCanon() {
+    if (!state || !S.book) return;
+    state.graphFreshness = null;
+    state.graphFreshnessError = null;
+    if (state.view === 'context' && state.contextChapterId) {
+      await loadContext(
+        state.contextChapterId,
+        state.context?.trace?.selectedRunId || '',
+        state.depth,
+      );
+      return;
+    }
+    await loadGraph();
+  }
+
+  async function checkGraphFreshness() {
+    if (!state || !S.book || !state.graphSnapshotId || state.loading || state.graphFreshnessLoading) return;
+    state.graphFreshnessLoading = true;
+    try {
+      const query = new URLSearchParams({ fromSnapshot: state.graphSnapshotId });
+      if (state.focus) query.set('nodeId', state.focus);
+      const result = await api('GET', `/books/${currentBook()}/story-graph/changes?${query.toString()}`);
+      if (!state) return;
+      state.graphFreshnessError = null;
+      if (!result.changed) {
+        state.graphFreshness = null;
+        return;
+      }
+      state.graphFreshness = result;
+      const canAutoRefresh = !state.editMode && !state.connection && !state.layoutDirty;
+      if (canAutoRefresh) {
+        const changedNodeCount = Number(result.diff?.addedNodes?.length || 0)
+          + Number(result.diff?.changedNodes?.length || 0)
+          + Number(result.diff?.removedNodes?.length || 0);
+        toast(
+          `Canon updated in SQLite Story Graph${changedNodeCount ? ` · ${changedNodeCount} node changes` : ''}. Refreshing the focused view.`,
+          'success',
+        );
+        await refreshGraphFromCanon();
+      } else {
+        renderToolbar();
+      }
+    } catch (error) {
+      if (!state) return;
+      state.graphFreshnessError = error.message;
+      renderToolbar();
+    } finally {
+      if (state) state.graphFreshnessLoading = false;
+    }
+  }
+
+  function startGraphFreshnessMonitor() {
+    if (!state || state.graphFreshnessTimer) return;
+    // A long-lived StoryFlow page must notice an accepted StoryCommit made by
+    // Writing Studio, but polling remains bounded and read-only. The server
+    // compares immutable observed snapshots instead of diffing browser data.
+    state.graphFreshnessTimer = window.setInterval(checkGraphFreshness, 12000);
+  }
+
+  async function loadModelReadiness() {
+    if (!state || !S.book) return;
+    const requestId = Number(state.modelReadinessRequestId || 0) + 1;
+    state.modelReadinessRequestId = requestId;
+    state.modelReadinessLoading = true;
+    renderToolbar();
+    try {
+      const payload = await api('GET', `/creation/preflight?mode=planned&bookId=${currentBook()}`);
+      if (!state || state.modelReadinessRequestId !== requestId) return;
+      state.modelReadiness = payload.modelReadiness || {
+        ready: payload.ready === true,
+        message: payload.ready ? 'StoryFlow model actions are ready.' : 'AI model setup is required before model-backed actions can run.',
+      };
+    } catch (error) {
+      if (!state || state.modelReadinessRequestId !== requestId) return;
+      state.modelReadiness = {
+        ready: null,
+        message: `AI readiness check failed: ${error.message}`,
+      };
+    } finally {
+      if (state && state.modelReadinessRequestId === requestId) {
+        state.modelReadinessLoading = false;
+        renderToolbar();
+        renderInspector();
+      }
+    }
+  }
+
   async function loadGraph() {
     if (!state || !S.book) return;
     window.clearTimeout(state.viewportFetchTimer);
     state.viewportFetchTimer = null;
     state.viewportLastKey = '';
     state.viewportRequestKey = '';
+    state.viewportPages = new Set();
+    state.viewportContinuation = null;
+    state.viewportEdgeContinuation = null;
+    state.viewportEdgeExhausted = false;
+    state.viewportEdgeFetchInFlight = false;
     state.viewportFetchError = null;
+    state.boundaryNodeId = '';
+    state.boundaryViewport = null;
+    state.viewportGeneration = Number(state.viewportGeneration || 0) + 1;
+    state.selectionProjection = null;
     state.candidateComparison = null;
     state.candidateLineage = null;
     state.loading = true;
@@ -2816,6 +3955,7 @@
         }
         if (state.context && state.context.chapterId === contextChapterId) {
           state.graph = state.context.graph || { nodes: [], edges: [], meta: {} };
+          rememberGraphSnapshot(state.graph);
           state.focus = state.graph.focus || state.focus;
           state.selected = new Set([...state.selected].filter((id) => state.graph.nodes.some((node) => node.id === id)));
           state.edgeSelectedId = null;
@@ -2847,6 +3987,7 @@
       const graph = await api('GET', `/books/${currentBook()}/story-graph?${queryString()}`);
       const hadFocus = Boolean(state.focus);
       state.graph = graph;
+      rememberGraphSnapshot(graph);
       state.expandedPresentationClusters = new Set();
       applyPresentationLayout();
       state.focus = graph.focus || state.focus;
@@ -3057,6 +4198,62 @@
     return Number(payload.revision || 1);
   }
 
+  async function loadReconciliationCandidates(nodeId) {
+    if (!state || !nodeId || !S.book) return;
+    state.reconciliationCandidates = { nodeId, loading: true, error: null, candidates: [] };
+    renderInspector();
+    try {
+      const query = new URLSearchParams({ planNodeId: nodeId, limit: '20' });
+      const payload = await api('GET', `/books/${currentBook()}/story-graph/planning/reconciliation-candidates?${query.toString()}`);
+      if (!state || state.reconciliationCandidates?.nodeId !== nodeId) return;
+      state.reconciliationCandidates = {
+        nodeId,
+        loading: false,
+        error: null,
+        candidates: Array.isArray(payload.candidates) ? payload.candidates : [],
+      };
+    } catch (error) {
+      if (!state || state.reconciliationCandidates?.nodeId !== nodeId) return;
+      state.reconciliationCandidates = { nodeId, loading: false, error: error.message, candidates: [] };
+    }
+    renderInspector();
+  }
+
+  async function reconcilePlanningTask(taskId) {
+    if (!state || !taskId || !requirePlanningEditMode()) return;
+    const nodeId = state.reconciliationCandidates?.nodeId || state.selected.values().next().value;
+    try {
+      const revision = await planningRevision();
+      await api('POST', `/books/${currentBook()}/story-graph/planning/reconcile`, {
+        taskId,
+        expectedRevision: revision,
+      });
+      state.reconciliationCandidates = null;
+      await loadGraph();
+      if (nodeId && state.selected.has(nodeId)) loadNodeDetail(nodeId);
+      toast('已从真实写作任务结果完成规划 overlay 回写；Canon 未重复写入。', 'success');
+    } catch (error) {
+      toast(`规划 overlay 回写失败：${error.message}`, 'error');
+      if (nodeId) loadReconciliationCandidates(nodeId);
+    }
+  }
+
+  function renderReconciliationBlock(node) {
+    if (node?.type !== 'PlanningNode') return '';
+    const result = state.reconciliationCandidates?.nodeId === node.id
+      ? state.reconciliationCandidates
+      : null;
+    if (!result || (!result.loading && !result.error && !result.candidates?.length)) return '';
+    if (result.loading) {
+      return '<div class="sf-inspector-section sf-reconciliation"><h4>Canon 后规划回写</h4><p class="dim-note">正在读取已完成写作任务的恢复信息…</p></div>';
+    }
+    if (result.error) {
+      return `<div class="sf-inspector-section sf-reconciliation"><h4>Canon 后规划回写</h4><p class="dim-note">${text(result.error)}</p></div>`;
+    }
+    const rows = result.candidates.map((candidate) => `<li><span><b>${text(candidate.taskId)}</b><small>Ch ${text(candidate.chapterNumber || '—')} · Commit ${text(candidate.storyCommitId || '—')}<br>${text(candidate.error || 'overlay retry available')}</small></span><button class="btn btn-sm btn-secondary" data-sf-reconcile-task="${attr(candidate.taskId)}" ${state.editMode ? '' : 'disabled aria-disabled="true"'}>重试回写</button></li>`).join('');
+    return `<div class="sf-inspector-section sf-reconciliation"><h4>Canon 后规划回写</h4><div class="sf-context-banner sf-context-excluded"><b>ACCEPTED_PENDING_OVERLAY</b><br>Canon 已经由 StoryCommit 接受，但规划 overlay 尚未完成回写。下面的操作只会重试 revisioned planning overlay，不会重新写入 StoryFact、StoryState 或 StoryCommit。</div><ul class="sf-inspector-list">${rows}</ul>${state.editMode ? '' : '<p class="dim-note">请先切换到“规划编辑”模式，才可重试规划 overlay。</p>'}</div>`;
+  }
+
   function planningAnchorRelation(node) {
     const type = String(node?.type || '');
     const relations = {
@@ -3107,9 +4304,8 @@
         return;
       }
       submit.disabled = true;
-      let createdNode = null;
-      try {
-        let revision = await planningRevision();
+        try {
+        const revision = await planningRevision();
         const result = await api('POST', `/books/${currentBook()}/story-graph/planning/node`, {
           title,
           summary,
@@ -3121,29 +4317,18 @@
             anchorNodeId: anchor?.id || null,
             anchorNodeType: anchor?.type || null,
           },
+          anchorNodeId: linkToAnchor ? anchor.id : null,
+          anchorEdgeType: linkToAnchor ? anchorRelation.type : null,
+          anchorLabel: linkToAnchor ? anchorRelation.label : '',
+          anchorMetadata: linkToAnchor ? {
+            createdFrom: 'storyflow-canvas',
+            anchorNodeId: anchor.id,
+            anchorNodeType: anchor.type,
+          } : {},
           expectedRevision: revision,
         });
-        createdNode = result.node;
-        revision = Number(result.revision || revision + 1);
-        let linked = false;
-        if (linkToAnchor && createdNode?.id) {
-          const linkResult = await api('POST', `/books/${currentBook()}/story-graph/planning/edge`, {
-            sourceNodeId: createdNode.id,
-            targetNodeId: anchor.id,
-            edgeType: anchorRelation.type,
-            label: anchorRelation.label,
-            status: 'PLANNED',
-            metadata: {
-              createdFrom: 'storyflow-canvas',
-              anchorNodeId: anchor.id,
-              anchorNodeType: anchor.type,
-              planningNodeId: createdNode.id,
-            },
-            expectedRevision: revision,
-          });
-          revision = Number(linkResult.revision || revision + 1);
-          linked = true;
-        }
+        const createdNode = result.node;
+        const linked = Boolean(result.anchorEdge);
         if (typeof closeModal === 'function') closeModal();
         state.selected = createdNode?.id ? new Set([createdNode.id]) : state.selected;
         state.focus = createdNode?.id || state.focus;
@@ -3152,16 +4337,7 @@
         toast(`已创建 ${status} 规划节点：${title}${linked ? '，并建立了合法语义锚点' : ''}。它仍属于 planning overlay。`, 'success');
       } catch (error) {
         submit.disabled = false;
-        if (createdNode?.id) {
-          if (typeof closeModal === 'function') closeModal();
-          state.selected = new Set([createdNode.id]);
-          state.focus = createdNode.id;
-          state.detail = null;
-          await loadGraph();
-          toast(`规划节点已创建，但语义锚定失败：${error.message}。可稍后用 Story Ports 连接。`, 'warning');
-        } else {
-          toast(`规划节点创建失败：${error.message}`, 'error');
-        }
+        toast(`规划节点创建失败，节点与锚点边均未写入：${error.message}`, 'error');
       }
     });
   }
@@ -3660,7 +4836,7 @@
     } else if (trace?.available && run) {
       inspector.insertAdjacentHTML('beforeend', '<div class="sf-inspector-section sf-context-graph-evidence"><h4>AI Context Graph</h4><p class="dim-note">No persisted Context Graph snapshot is available for this run. The UI will not infer AI context from the current Story Graph or prompt text.</p></div>');
     }
-    const canGenerateBranches = !!state.editMode && (result.selectedNodeIds || []).some((id) => nodeById(id));
+    const canGenerateBranches = !!state.editMode && modelRuntimeReady() && (result.selectedNodeIds || []).some((id) => nodeById(id));
     inspector.insertAdjacentHTML('beforeend', '<div class="sf-inspector-section sf-analysis-actions"><div class="sf-inspector-actions"><button class="btn btn-sm btn-secondary" data-sf-analysis-action="generate-candidates" ' + (canGenerateBranches ? '' : 'disabled aria-disabled="true"') + '>生成三个候选分支</button></div>' + (canGenerateBranches ? '' : '<small class="dim-note">切换到“规划编辑”后，可将本次分析选择交给候选分支任务。</small>') + '</div>');
     inspector.querySelector('[data-sf-analysis-action="generate-candidates"]')?.addEventListener('click', () => generateCandidateBranches(state.analysisTaskId || ''));
     inspector.querySelectorAll('[data-sf-context-graph-load]').forEach((button) => button.addEventListener('click', () => {
@@ -3784,6 +4960,7 @@
     window.clearTimeout(state?.analysisTimer);
     window.clearTimeout(state?.generationTimer);
     window.clearTimeout(state?.viewportFetchTimer);
+    window.clearInterval(state?.graphFreshnessTimer);
     if (state?.connection) stopPortDrag();
     state?.modelWorkObserver?.disconnect();
     state?.canvasObserver?.disconnect();
@@ -3796,9 +4973,9 @@
     window.__storyflowRouteIntent = null;
     state = {
       view: VIEW_META[routeIntent.view] ? routeIntent.view : 'story', depth: 1, focus: routeIntent.focus || '', types: [], statuses: [], chapterFrom: '', chapterTo: '', volumeNumber: '', timeFrom: '', timeTo: '', plotThread: '',
-      graph: null, selected: new Set(), edgeSelectedId: null, detail: null, impact: null, history: null, layoutHistory: { view: 'story', headRevision: 0, latestRevision: 0, canUndo: false, canRedo: false, entries: [] }, context: null, contextChapterId: '', contextError: null, neighborLoading: false, transform: { tx: 0, ty: 0, scale: 1 }, presentationMode: 'clustered', expandedPresentationClusters: new Set(), presentationClusterPositions: {}, viewportFetchTimer: null, viewportLastKey: '', viewportRequestKey: '', viewportFetchInFlight: false, viewportFetchError: null,
+      graph: null, graphSnapshotId: '', graphFreshness: null, graphFreshnessError: null, graphFreshnessLoading: false, graphFreshnessTimer: null, modelReadiness: null, modelReadinessLoading: false, modelReadinessRequestId: 0, selected: new Set(), edgeSelectedId: null, edgeHoveredId: null, detail: null, impact: null, history: null, layoutHistory: { view: 'story', headRevision: 0, latestRevision: 0, canUndo: false, canRedo: false, entries: [] }, context: null, contextChapterId: '', contextError: null, neighborLoading: false, transform: { tx: 0, ty: 0, scale: 1 }, minimapDrag: null, presentationMode: 'clustered', expandedPresentationClusters: new Set(), presentationClusterPositions: {}, viewportFetchTimer: null, viewportLastKey: '', viewportRequestKey: '', viewportFetchInFlight: false, viewportEdgeFetchInFlight: false, boundaryFetchInFlight: false, viewportFetchError: null, viewportPages: new Set(), viewportContinuation: null, viewportEdgeContinuation: null, viewportEdgeExhausted: false,
       editMode: false,
-      contextEvidence: null, generationRunTrace: null, generationContextGraph: null, drag: null, pan: null, box: null, connection: null, layoutDirty: false, searchTimer: null, candidateTimer: null, candidateTaskId: null, analysisTimer: null, analysisTaskId: null, analysisResult: null, analysisTrace: null, generationTimer: null, generationTaskId: null, chapterImpact: null, chapterVersionCompare: null, modelWorkObserver: null,
+      contextEvidence: null, generationRunTrace: null, generationContextGraph: null, reconciliationCandidates: null, selectionProjection: null, drag: null, pan: null, box: null, connection: null, layoutDirty: false, searchTimer: null, candidateTimer: null, candidateTaskId: null, analysisTimer: null, analysisTaskId: null, analysisResult: null, analysisTrace: null, generationTimer: null, generationTaskId: null, chapterImpact: null, chapterVersionCompare: null, modelWorkObserver: null,
       analysisHistory: [], analysisHistoryLoaded: false, candidateSets: [], candidateSetsRevision: 0, candidateSetsLoading: false, candidateSetsError: null, recoverableForecastTasks: [], recoverableForecastTasksLoading: false, recoverableForecastTasksError: null, recoveringForecastTaskId: null, candidateComparison: null, candidateLineage: null, snapshotDiff: null, canonicalReplay: null, canonicalDiff: null,
       storyHealth: null, storyHealthLoading: false, storyHealthError: null, storyHealthLookback: 8, storyHealthRequestId: 0,
     };
@@ -3814,7 +4991,9 @@
     renderToolbar();
     renderSidebar();
     renderInspector();
+    loadModelReadiness();
     await loadGraph();
+    startGraphFreshnessMonitor();
   };
 
   window.storyflow = {
@@ -3831,19 +5010,23 @@
   };
   window.openStoryFlowView = openStoryFlowView;
   if (typeof S !== 'undefined' && S.book) {
-    const legacyRouteViews = {
-      mindmap: 'story',
-      flow: 'story',
-      timeline: 'timeline',
-      plot: 'story',
-      'world-map': 'world',
-      foreshadowing: 'foreshadow',
-      characters: 'character',
-    };
+    const legacyRouteViews = typeof STORYFLOW_COMPAT_ROUTES !== 'undefined'
+      ? STORYFLOW_COMPAT_ROUTES
+      : {
+        mindmap: 'story',
+        flow: 'story',
+        timeline: 'timeline',
+        plot: 'story',
+        'world-map': 'world',
+        foreshadowing: 'foreshadow',
+        characters: 'character',
+      };
+    const existingIntent = window.__storyflowRouteIntent || {};
     if (S.page === 'storyflow' || legacyRouteViews[S.page]) {
       window.__storyflowRouteIntent = {
-        view: legacyRouteViews[S.page] || 'story',
-        focus: '',
+        view: existingIntent.view || legacyRouteViews[S.page] || 'story',
+        focus: existingIntent.focus || '',
+        sourcePage: existingIntent.sourcePage || (legacyRouteViews[S.page] ? S.page : ''),
       };
       window.setTimeout(() => go('storyflow'), 0);
     }

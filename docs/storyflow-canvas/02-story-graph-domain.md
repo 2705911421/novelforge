@@ -241,6 +241,43 @@ viewport state never becomes a StoryFact, StoryState, or StoryCommit.
 
 ## Story Bible projection boundary
 
+## Indexed viewport read-model seam
+
+The spatial projection is now backed by two rebuildable SQLite-derived layers.
+`storyflow_graph_node_index` stores one node payload together with scalar
+filter keys (type, status, chapter range, volume, story-time order, and
+PlotThread keys), plus the normalized searchable text used by warm Graph
+search. `storyflow_spatial_layouts` and
+`storyflow_graph_edge_index` store stable coordinates and semantic edge
+payloads for the same source fingerprint. A warm viewport therefore applies
+rectangle/filter predicates in SQLite and hydrates only the selected node
+payloads; it does not deserialize the full JSON catalog merely to discover
+which nodes are visible.
+
+`storyflow_projection_epochs` is only a derived invalidation marker. SQLite
+triggers advance its revision and clear the cached fingerprint when an
+authoritative source row changes. The next cold read rebuilds the JSON
+catalog, node index, and spatial index, then restores the exact source
+fingerprint. Old page and boundary cursors consequently become invalid at the
+same source/workspace seam. None of these rows are story facts, and deleting
+or rebuilding them cannot change StoryFact, StoryState, or StoryCommit.
+
+The public `StoryGraphProjector.project()` interface is unchanged; the
+implementation chooses `json_catalog` for ordinary full projections and
+`sqlite_node_index` for warm bounded viewport reads. This keeps the seam deep
+for Canvas callers while leaving cold rebuild cost and full predicate pushdown
+explicitly observable rather than hidden.
+
+The same paired read model now includes
+`storyflow_graph_semantic_edge_index`. After the first full projection builds
+it, Inspector node/neighbor reads and focused Depth 1/2/3 projections can
+hydrate the selected node payloads and incident semantic edge frontier from
+SQLite without reopening the complete JSON catalog. The public metadata reports
+`sqlite_node_index+semantic_edge_index`; a missing or count-mismatched paired
+index falls back to `json_catalog` and rebuilds it. Port tuples are restored at
+the runtime seam after JSON hydration so the warm path has the same Story Port
+shape as the cold projector.
+
 `story_bible_workspaces`、`story_bible_steps` 和 `story_bible_snapshots` 是
 Story Bible 的 authoritative planning boundary；Graph 不复制 payload，也不从
 设定 prose 推导人物、地点或事件。Projector 只保留当前工作区需要的可重建
@@ -264,3 +301,67 @@ entered the request. Provider totals remain the only measured token values, and
 the UI labels per-source `/4` values as estimates. The prior-chapter Story Graph
 slice records its actual writer-eligible chapter status and selection depth, so
 Context View never turns a draft into an `ACCEPTED` claim.
+
+## Query-bound Inspector neighbor continuation
+
+The Inspector neighbor endpoint accepts an optional `pageToken` in addition to
+the legacy `offset`. The token is derived from the resolved node id, direction,
+node-type filter, page size, and current source fingerprint. The next page is
+rejected when the query changes or an authoritative source mutation invalidates
+the derived index. The browser prefers this opaque cursor and keeps offset as a
+compatibility fallback for older responses.
+
+Warm neighbor reads execute the count and ordered page in SQLite against the
+paired semantic-edge/node indexes. Only the requested page's edge and remote
+node payloads are hydrated; a high-degree node does not require loading its
+entire incident frontier before the page is returned. This remains a read-only
+projection boundary and never creates a StoryFact, StoryState, or StoryCommit.
+
+Full Graph cross-viewport boundary evidence follows the same bounded-read rule
+for ordinary Canvas working sets: a CTE counts/groups crossing edge types, then
+the page query hydrates only the requested edge sample. Extremely large
+explicit working sets retain a safe compatibility fallback because SQLite's
+bind-variable ceiling makes one CTE impractical; this is a recorded performance
+boundary rather than hidden behavior.
+
+## Indexed multi-selection projection
+
+The read-only `GET .../story-graph/selection` projection uses the same paired
+node/semantic-edge read model once it is warm. It resolves selected ids,
+source ids, or exact titles from `storyflow_graph_node_index`, reads the
+incident semantic edge frontier from `storyflow_graph_semantic_edge_index`,
+and hydrates only the selected nodes plus remote endpoint summaries needed for
+the external-edge Inspector. The response exposes
+`projectionReadModel=sqlite_node_index+semantic_edge_index`.
+
+If the source epoch has invalidated either derived table, the selection query
+falls back to the authoritative-derived catalog and rebuilds both indexes.
+The selected working set remains read-only: selection, Chapter Intent input,
+and AI analysis input do not write StoryFact, StoryState, or StoryCommit.
+## Selection external-edge cursor (2026-08-14)
+
+The multi-selection read model now separates the complete internal edge set
+from the selected-to-remote frontier. The latter is counted and type-aggregated
+in SQLite, then returned through a query-bound `externalPageToken` with a
+bounded `externalEdgesPage`. The token covers the selected node ids, page size,
+and source fingerprint; selection or authoritative-source changes therefore
+produce a truthful mismatch/expired error instead of silently mixing pages.
+
+Remote endpoint payloads are hydrated only for the returned page. The response
+remains read-only and does not create Canon facts, planning records, or layout
+state.
+
+## Accepted-commit snapshot recovery boundary (2026-08-14)
+
+`StoryRepository.accept_story_commit()` still commits `StoryCommit`,
+`StoryFact`, `StoryProjection`, and `StoryState` before touching the derived
+StoryFlow read model. If full-catalog snapshot capture fails, the projector
+records the source fingerprint and projection epoch observed at the failed
+boundary in `storyflow_graph_snapshot_capture_failures`. A later idempotent
+accept or `POST .../story-graph/snapshots/retry` may recover only when the
+commit remains the current `StoryState.last_commit_id` and both boundary
+values are unchanged. If a Character/Location/other source row changed, or
+there is no durable failure boundary (legacy missing snapshot), the retry
+returns an explicit non-recoverable result and never labels current mutable
+data as historical. This metadata is a rebuildable projection diagnostic, not
+a second Canon store.

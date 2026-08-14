@@ -1,9 +1,23 @@
 # StoryFlow 浏览器证据
 
+| [`storyflow-20260814-accepted-graph-history-1280.png`](storyflow-20260814-accepted-graph-history-1280.png) | 1280x720 headed-browser recheck on the real SQLite fixture: Chapter History shows the accepted StoryCommit graph-boundary timeline, snapshot provenance, bounded graph diff summary, and explicit Canon/STALE boundary status with zero page/console diagnostics. |
+
 测试环境：本地 FastAPI Studio，真实 SQLite 数据，Playwright 浏览器。
 
 | 证据 | 内容 |
 |---|---|
+| [`storyflow-20260814-api-gate-1280.png`](storyflow-20260814-api-gate-1280.png) | 1280x720 headed-browser recheck on the real 500-chapter SQLite fixture: the visible `SETUP REQUIRED` runtime state keeps model-backed actions disabled while the StoryFlow Canvas, focused graph, semantic edges, and Inspector remain usable; browser diagnostics were empty. Direct API no-enqueue behavior is covered by the companion pytest regression. |
+| [`storyflow-20260814-view-focus-continuity-1280.png`](storyflow-20260814-view-focus-continuity-1280.png) | 1280x720 headed-browser recheck on the real 500-chapter SQLite fixture: a Chapter focus survives Story Flow → Timeline → World → Context View switching; Context remains chapter-anchored and the Inspector retains the same real chapter. Browser diagnostics were empty. |
+| [`storyflow-20260814-paper-default-1280.png`](storyflow-20260814-paper-default-1280.png) | 1280x720 headed-browser recheck after the paper-default increment: warm paper Studio shell, StoryFlow Canvas, semantic edges, node cards, Inspector, and Minimap remain readable; browser diagnostics were empty. |
+| [`storyflow-20260814-ai-runtime-setup-1280.png`](storyflow-20260814-ai-runtime-setup-1280.png) | 1280x720 headed-browser recheck on the real SQLite fixture with no configured model contract: `AI RUNTIME · SETUP REQUIRED` and `Open AI config` are visible, model-backed buttons are disabled, planning controls remain distinct, and browser diagnostics were empty. |
+| [`storyflow-20260814-ai-runtime-planning-1280.png`](storyflow-20260814-ai-runtime-planning-1280.png) | 1280x720 headed-browser recheck after explicitly entering Planning Edit: `新建规划节点` and `保存章节计划` are enabled while model-backed generation, candidate, and analysis actions remain disabled; the read-only Canon boundary stays visible and browser diagnostics were empty. |
+| [`storyflow-20260814-paper-character-1280.png`](storyflow-20260814-paper-character-1280.png) | 1280x720 headed-browser recheck in the paper surface after searching and focusing a real Character node: radial Character View, Story Ports, semantic edges, current state, knowledge boundaries, and Inspector remain readable. |
+| [`storyflow-20260814-paper-dark-1280.png`](storyflow-20260814-paper-dark-1280.png) | 1280x720 headed-browser compatibility capture after explicitly toggling the existing dark preference: graphite Canvas, nodes, semantic edges, Inspector, and Minimap remain readable; browser diagnostics were empty. |
+| [`storyflow-20260814-neighbor-cursor-1280.png`](storyflow-20260814-neighbor-cursor-1280.png) | 1280x720 headed-browser recheck on the real SQLite fixture: Character Inspector, Story Ports, semantic relationships, and the current query-bound neighbor cursor implementation; the companion API observation returned 10/57 on page one, 10/57 at offset 10, and 422 for a direction-mismatched token; browser diagnostics remained empty. |
+| [`storyflow-20260814-selection-indexed-1280.png`](storyflow-20260814-selection-indexed-1280.png) | 1280x720 headed-browser recheck on the real SQLite fixture: Canvas Ctrl multi-select shows a two-node StoryFlow working set, inside/outbound semantic edge counts, type/status summaries, and the read-only Canon boundary; browser diagnostics remained empty. |
+| [`storyflow-20260814-selection-pagination-control-1280.png`](storyflow-20260814-selection-pagination-control-1280.png) | 1280x720 headed-browser recheck on the real SQLite fixture: the two-node selection Inspector shows 70 authoritative outbound edges, a bounded first page, and the explicit `Load more external edges (60 / 70)` control. |
+| [`storyflow-20260814-selection-pagination-1280.png`](storyflow-20260814-selection-pagination-1280.png) | 1280x720 headed-browser recheck after loading the next external-edge page: the Inspector reports the complete 70-edge selection summary, the continuation control is gone, the semantic evidence remains read-only, and browser diagnostics remained empty. |
+| [`storyflow-20260814-selection-pagination-final-1280.png`](storyflow-20260814-selection-pagination-final-1280.png) | Final fixed-frontend headed-browser capture after clicking the real continuation control: the complete 70-edge summary remains visible, the next-page action is gone, and browser diagnostics are empty. |
 | [`storyflow-20260813-worker-recheck-1920.png`](storyflow-20260813-worker-recheck-1920.png) | 1920x1080: clean headed-browser recheck of the SQLite-backed StoryFlow World Graph, semantic hierarchy, Inspector, search/depth shell, and no console errors/warnings |
 | [`storyflow-20260813-worker-recheck-1366.png`](storyflow-20260813-worker-recheck-1366.png) | 1366x768: responsive StoryFlow recheck with hierarchical World Graph, fixed Inspector, minimap, and readable three-pane layout |
 | [`storyflow-20260813-recovery-1920.png`](storyflow-20260813-recovery-1920.png) | 1920x1080: reopened real SQLite StoryFlow after a planning-only forecast recovery; candidate set, safe recoverable-task summary, read-only Canon boundary, Canvas and Inspector remain visible |
@@ -72,6 +86,21 @@ The run submitted the modal form through the real UI. `POST /story-graph/plannin
 | [`storyflow-20260812-planning-anchor-1366.png`](storyflow-20260812-planning-anchor-1366.png) | 1366x768 headed browser: the linked Chapter/PlanningNode pair remains readable with the Inspector and Minimap |
 
 The anchored run submitted `POST /story-graph/planning/node` and then `POST /story-graph/planning/edge`, both 200. After refresh the default Chapter-focused subgraph contained both nodes and the semantic edge; no StoryFact/StoryState/StoryCommit write was observed. Console remained at `0` errors / `0` warnings.
+
+## 2026-08-14 atomic planning-node anchor evidence
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-planning-atomic-1920.png`](storyflow-20260814-planning-atomic-1920.png) | 1920x1080 headed browser: the planning-edit modal creates a real author `PlanningNode` and its `originates_from` Chapter anchor in one StoryFlow action; the Inspector shows PLANNED status and SQLite `plot_workspaces` provenance. |
+| [`storyflow-20260814-planning-atomic-1366.png`](storyflow-20260814-planning-atomic-1366.png) | 1366x768 headed browser: the same atomic anchor remains readable in the responsive Canvas, with Minimap and fixed Inspector. |
+
+This follow-up used a disposable 120-chapter SQLite fixture. The request log
+contains one `POST /story-graph/planning/node` for the linked creation; there
+is no follow-up `planning/edge` write. A reload reprojected both objects from
+the revisioned planning workspace. Backend negative-path tests also submit an
+illegal anchor relation and verify HTTP 422, unchanged workspace revision, and
+no orphan planning node. The final headed session reported `0` console errors
+and `0` warnings at both required viewports.
 
 ## 2026-08-12 Context run selection and component attribution evidence
 
@@ -1041,3 +1070,343 @@ candidate, and history requests. The panel labels the evidence boundary as
 explicit lifecycle events, chapter appearance fields, and semantic-edge
 chapter evidence; it does not claim AI inference. The fixture option is
 opt-in so the existing density fixture remains stable.
+
+## 2026-08-13 long-lived Canvas freshness evidence
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260813-freshness-initial-1920.png`](storyflow-20260813-freshness-initial-1920.png) | 1920x1080 headed browser: the initial StoryFlow projection is loaded from the real 120-chapter SQLite fixture with a recorded graph snapshot boundary. |
+| [`storyflow-20260813-freshness-auto-refresh-1920.png`](storyflow-20260813-freshness-auto-refresh-1920.png) | 1920x1080 headed browser: after an external Accepted StoryCommit, read-only polling refreshes the focused graph and the new SQLite fact appears in the node list/Inspector. |
+| [`storyflow-20260813-freshness-pending-1920.png`](storyflow-20260813-freshness-pending-1920.png) | 1920x1080 headed browser: with Planning Edit and an unsaved node drag active, a second external Canon update is held behind `CANON UPDATE · REFRESH REQUIRED` rather than overwriting the workspace. |
+| [`storyflow-20260813-freshness-pending-1366.png`](storyflow-20260813-freshness-pending-1366.png) | 1366x768 responsive headed browser: the pending-refresh boundary remains visible without covering the Canvas or Inspector. |
+| [`storyflow-20260813-freshness-refresh-1366.png`](storyflow-20260813-freshness-refresh-1366.png) | 1366x768 headed browser: the explicit Refresh action reloads the current SQLite projection and reveals the second accepted fact. |
+
+The run used `scripts/seed_storyflow_browser_fixture.py --root
+.storyflow-freshness-20260813-a --chapters 120`. An external process accepted
+two real StoryCommits against the same disposable SQLite database. The first
+update was automatically reflected in read-only StoryFlow; the second update
+was held while an unsaved layout interaction was active and was then applied by
+the explicit Refresh action. The browser requests for Graph, node detail,
+history, health, layout, and the new `/story-graph/changes` seam were HTTP 200.
+The headed session reported `Total messages: 0 (Errors: 0, Warnings: 0)`. This
+is observed-projection polling over the existing immutable snapshot table; it
+does not claim server push or introduce a second story-fact store.
+
+## 2026-08-13 legacy navigation convergence evidence
+
+| Evidence | Contents |
+|---|---|
+| [`storyflow-20260813-legacy-character-1920.png`](storyflow-20260813-legacy-character-1920.png) | 1920x1080 headed browser: the historical Character Relations entry resolves to the shared StoryFlow `character` view, with the SQLite graph, radial layout, semantic ports, Minimap, and Inspector visible. |
+| [`storyflow-20260813-legacy-world-1366.png`](storyflow-20260813-legacy-world-1366.png) | 1366x768 headed browser: the historical World Map entry resolves to the shared StoryFlow `world` view with hierarchical layout and readable fixed Inspector. |
+
+The same real 120-chapter SQLite fixture exercised all six mappings:
+`mindmap -> story`, `timeline -> timeline`, `plot -> story`,
+`world-map -> world`, `foreshadowing -> foreshadow`, and
+`characters -> character`. Each transition rendered the same StoryFlow
+controller and returned HTTP 200 for the corresponding Graph API request; the
+legacy visualization APIs remained available but were not used by these normal
+navigation clicks. The session reported zero console errors and warnings.
+
+## 2026-08-13 writing pipeline → StoryFlow projection evidence
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260813-writing-before-1920.png`](storyflow-20260813-writing-before-1920.png) | 1920x1080 headed browser: the real 120-chapter SQLite StoryFlow is open before the external worker run, with a recorded snapshot boundary and selected Chapter Inspector. |
+| [`storyflow-20260813-writing-after-1920.png`](storyflow-20260813-writing-after-1920.png) | 1920x1080 headed browser: after the production Worker/Handler pipeline accepts the next chapter, freshness polling reloads the projection and the new Chapter 121 is visible as `CANON`; the Inspector shows the extracted Canon fact, StoryCommit history, and SQLite provenance. |
+| [`storyflow-20260813-writing-after-1366.png`](storyflow-20260813-writing-after-1366.png) | 1366x768 headed browser: the same newly projected Canon chapter, semantic edges, node list, and Inspector remain readable in the responsive workbench. |
+
+The run used `scripts/seed_storyflow_browser_fixture.py --root
+.storyflow-write-20260813-c --chapters 120`, then
+`scripts/run_storyflow_deterministic_write.py --root
+.storyflow-write-20260813-c --chapter 121`. The harness invoked the production
+`PersistentTaskWorker` and `LegacyTaskHandlers` against the same SQLite file;
+the deterministic model only removed provider credentials from this acceptance
+run. The task completed with `qualityGate=PASS`, one accepted StoryCommit, one
+StoryFact, and a captured observed projection snapshot. Graph, changes, node,
+history, health, and layout requests were HTTP 200. The headed session reported
+`Total messages: 0 (Errors: 0, Warnings: 0)`. This proves the task-to-Canon and
+read-model synchronization boundary, not live external-provider quality.
+
+## 2026-08-13 workspace recovery and focused node actions
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260813-hidden-restore-1920.png`](storyflow-20260813-hidden-restore-1920.png) | 1920x1080 headed browser: Hide removes a selected node from the Canvas and immediately exposes a recoverable `Hidden workspace nodes` section in the shared sidebar; Restore returns it to the Canvas and Inspector. |
+| [`storyflow-20260813-hidden-restore-1366.png`](storyflow-20260813-hidden-restore-1366.png) | 1366x768 headed browser: the recovery section remains usable at the narrow viewport. |
+| [`storyflow-20260813-node-action-focus-1366.png`](storyflow-20260813-node-action-focus-1366.png) | 1366x768 headed browser: opening a selected Character source keeps the same node id focused while switching to the shared radial Character View; the Inspector remains SQLite-backed. |
+
+This run used the real disposable 120-chapter SQLite fixture and the same
+StoryFlow controller as normal navigation. Hide/Delete only changes unsaved
+workspace state; Restore also remains local until the author saves the layout.
+The test session reported `Total messages: 0 (Errors: 0, Warnings: 0)`. Focused
+Character/Foreshadow/World node actions now call the shared StoryFlow route
+intent directly instead of discarding focus through a legacy page alias.
+
+## 2026-08-13 Canon-before-overlay recovery
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260813-reconciliation-1920.png`](storyflow-20260813-reconciliation-1920.png) | 1920x1080 headed browser: a real SQLite `ACCEPTED_PENDING_OVERLAY` task result is discovered on a focused `PlanningNode`; read-only Canon mode disables recovery and explains that retry cannot repeat the canonical commit. |
+| [`storyflow-20260813-reconciliation-accepted-1920.png`](storyflow-20260813-reconciliation-accepted-1920.png) | 1920x1080 headed browser: Planning Edit enables recovery; after the real reconcile request the node is `ACCEPTED`, the Inspector shows the linked StoryCommit, and the UI reports that Canon was not written twice. |
+| [`storyflow-20260813-reconciliation-accepted-1366.png`](storyflow-20260813-reconciliation-accepted-1366.png) | 1366x768 responsive evidence of the accepted overlay recovery state. |
+
+The disposable fixture used a completed durable `write-next` task whose
+`tasks.result` contained only recovery identifiers and an explicit
+`ACCEPTED_PENDING_OVERLAY` status. Browser verification observed the candidate
+endpoint before recovery, the read-only/edit-mode gate, the reconcile request,
+and an empty candidate list afterwards. The database still contains one
+accepted StoryCommit and its one extracted fact; reconciliation only advances
+`plot_workspaces`. Playwright reported `Total messages: 0 (Errors: 0,
+Warnings: 0)`.
+
+## 2026-08-14 legacy plot-canvas Canon boundary
+
+The retained `/plot-canvas/delta` API was exercised by the API regression
+suite against a real SQLite workspace. A normal layout mutation still used
+the existing optimistic revision contract. A forged `ACCEPTED` node mutation,
+even with a caller-supplied `storyCommitId`, returned `422` with code
+`PLOT_CANON_BOUNDARY`; the workspace revision stayed unchanged. The same
+preflight is applied before legacy full-graph replacement writes. No browser
+evidence is claimed for this API-only negative path; the StoryFlow UI/browser
+evidence above remains headed, real-fixture evidence.
+
+## 2026-08-14 Full Graph incremental viewport merge
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-viewport-merge-1920.png`](storyflow-20260814-viewport-merge-1920.png) | 1920x1080 headed browser: a real 500-chapter SQLite fixture is in Full Graph expanded mode; the toolbar reports `1891 loaded / 1891 total · incremental` after the Canvas traversed a previously unloaded world-coordinate region. |
+| [`storyflow-20260814-viewport-merge-1366.png`](storyflow-20260814-viewport-merge-1366.png) | 1366x768 headed browser: the merged projection remains usable at the narrow viewport with fixed sidebar/Inspector and Canvas culling. |
+
+The run started from a bounded 1200-node response against the real fixture,
+then used completed Canvas pans. Browser diagnostics grew from `1200` loaded
+nodes / `3415` edges to `1891` loaded nodes / `3963` edges while the
+authoritative total stayed `1891`; the second page was merged rather than
+replacing the existing read model. The viewport requests returned HTTP 200;
+the headed session reported `Total messages: 0 (Errors: 0, Warnings: 0)`. One
+observed request took 4.009 seconds and another 1.654 seconds on this
+workstation; these are local observations, not an SLA. The implementation is
+progressive loaded-projection merging with DOM culling, not true
+virtualization or complete cross-page edge paging.
+
+## 2026-08-14 Full Graph cross-viewport semantic boundary
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-boundary-1920.png`](storyflow-20260814-boundary-1920.png) | 1920x1080 headed browser: the real 500-chapter SQLite fixture shows `1688 loaded / 1891 total`, `3109 boundary edges`, and the selected StoryGoal Inspector displays the recorded relationship to `Fixture Character 01`. |
+| [`storyflow-20260814-boundary-1366.png`](storyflow-20260814-boundary-1366.png) | 1366x768 headed browser: the same boundary count and SQLite semantic-evidence section remain readable in the narrow workbench. |
+
+The browser first loaded the bounded Full Graph, switched to expanded evidence
+nodes, and selected the real `story-reference:fd432fbf12693cf6ef41` node from
+the viewport. The Inspector rendered `Cross-viewport semantic edges · 3109`
+and the bounded remote row `人物 · Fixture Character 01 ← advances`. Clicking
+that row issued a new HTTP 200 authoritative query with
+`focus=character:fixture-character-01`; the resulting focused graph contained
+176 loaded nodes. This verifies that boundary means “outside the current
+world-coordinate page”, even when a remote endpoint is cached from an earlier
+page. The session reported `Total messages: 0 (Errors: 0, Warnings: 0)`.
+
+## 2026-08-14 StoryFlow multi-selection working set
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-selection-flow-1920.png`](storyflow-20260814-selection-flow-1920.png) | 1920x1080 headed browser: two real SQLite nodes (`Fixture Character 09` and `Fixture event 0500`) are selected; the Inspector shows `2 nodes`, `1 inside edge`, `216 outbound edges`, `participates_in`, the Chapter 500 range, and the read-only `sqlite.story_graph_projection` source. |
+| [`storyflow-20260814-selection-flow-1366.png`](storyflow-20260814-selection-flow-1366.png) | 1366x768 headed browser: the same semantic working-set summary remains readable in the responsive workbench. |
+| [`storyflow-20260814-selection-1920.png`](storyflow-20260814-selection-1920.png) | 1920x1080 headed browser: a real Character/Character selection shows the bounded external-edge summary (`426 outbound edges`) without inventing internal edges. |
+| [`storyflow-20260814-selection-1366.png`](storyflow-20260814-selection-1366.png) | 1366x768 headed browser: the Character/Character selection and bounded external evidence remain usable at the narrow viewport. |
+
+The run used the real 500-chapter SQLite browser fixture. The selection endpoint
+returned HTTP 200 and the Inspector rendered the server projection rather than
+the DOM edge list. A selected external edge to `chapter:fixture-chapter-0005`
+was outside the current page; clicking it issued a fresh authoritative focus
+query and selected that Chapter. The headed session reported `Total messages: 0
+(Errors: 0, Warnings: 0)`. This verifies a read-only working-set boundary, not
+complete high-degree selection pagination or whole-graph virtualization.
+
+## 2026-08-14 Spatial viewport page continuation
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-viewport-next-1366.png`](storyflow-20260814-viewport-next-1366.png) | 1366x768 headed browser: the real 500-chapter Full Graph expanded viewport exposes an explicit `Load next viewport page` action after loading `1521 / 1891` nodes. |
+| [`storyflow-20260814-viewport-next-1920.png`](storyflow-20260814-viewport-next-1920.png) | 1920x1080 headed browser: the same bounded page continuation remains visible with the full workbench, Story Views, filters, Canvas, and Inspector. |
+
+The run switched the real SQLite fixture to Full Graph and expanded evidence
+nodes. The initial bounded world-coordinate response reported `1366 / 1891`
+nodes; the explicit continuation loaded a second stable page and reported
+`1521 / 1891` nodes. Both screenshots were captured from the headed browser
+after the continuation response. Browser diagnostics reported zero console or
+page errors. This proves the continuation seam and UI action, not complete
+server-side spatial indexing, high-degree edge paging, or whole-graph
+virtualization.
+
+## 2026-08-14 Indexed viewport and boundary-cursor browser recheck
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-spatial-index-boundary-500-1920.png`](storyflow-20260814-spatial-index-boundary-500-1920.png) | 1920x1080 headed browser: Full Graph expanded mode, Search for the real `Fixture Character 01`, SQLite-backed Character Inspector, cross-viewport semantic-edge evidence, and the boundary continuation action. |
+| [`storyflow-20260814-spatial-index-boundary-500-1366.png`](storyflow-20260814-spatial-index-boundary-500-1366.png) | 1366x768 headed browser: the same focused boundary evidence remains usable in the narrow workbench. |
+
+The browser used the disposable real 500-chapter SQLite fixture. Search stays in
+the active Full Graph projection instead of replacing it with an unbounded
+type-specific graph, so the Inspector retains its bounded semantic-edge
+contract. Boundary pagination records the exact world-coordinate window that
+signed its cursor; focus does not mix a new viewport with an old token. The
+successful page/API run observed the boundary action and reported no
+application console or API errors. The Browser Use harness emitted one
+environment-level `clipboard bridge is unavailable` diagnostic while taking
+the final screenshots; it is not emitted by NovelForge code and does not
+change the page state. This verifies cursor integrity and progressive
+disclosure, not complete graph virtualization or an unbounded high-degree edge
+editor.
+
+## 2026-08-14 Indexed search and interaction recheck
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-indexed-search-1280.png`](storyflow-20260814-indexed-search-1280.png) | Current source against the real 500-chapter SQLite fixture: StoryFlow Canvas, planning-edit mode, semantic Chapter ports, Canvas/Inspector layout, and the selected Chapter evidence surface. |
+
+The headed browser recheck opened the real fixture, searched `Fixture Character
+01`, clicked the result, and observed the Character-focused radial projection
+change from 24 displayed nodes at Depth 1 to 42 at Depth 2. Timeline and World
+Graph view switches returned bounded projections, and a planning-mode node drag
+changed its Canvas coordinates before `保存布局` reported success. Browser
+diagnostics reported zero page/console messages. Existing 1920x1080 and
+1366x768 evidence above remains the responsive visual acceptance record; this
+new screenshot is an additional current-code interaction check. The search
+index itself is covered by the unit/API seam test because the in-page browser
+surface does not expose the projector read-model label.
+
+## 2026-08-14 Semantic-edge Inspector recheck
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-semantic-edge-inspector-1280.png`](storyflow-20260814-semantic-edge-inspector-1280.png) | Current source against the real SQLite StoryFlow browser fixture: Character Inspector, Story Ports, semantic relationships, progressive Depth 2 control, Canvas and fixed Inspector layout. |
+
+After restarting the local Studio with the current source, the Chapter node
+endpoint returned HTTP 200 with
+`projectionReadModel=sqlite_node_index+semantic_edge_index` and 17 semantic
+neighbors. A focused Story View Depth 2 request returned HTTP 200 from the
+same read model. The browser selected the real `Fixture Character 01`, showed
+its Canon state/appearance/provenance, expanded Depth 2, and returned an empty
+page/console diagnostic list. This 1280x720 capture is an additional current
+code-version recheck; the 1920x1080 and 1366x768 responsive evidence above
+remain the required size acceptance record.
+
+## 2026-08-14 accepted-commit snapshot recovery boundary
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-history-recovery-ui-1280.png`](storyflow-20260814-history-recovery-ui-1280.png) | 1280x720 headed-browser History view on the real 120-chapter SQLite fixture: accepted StoryCommit history, observed StoryFlow snapshots, and the fixed Chapter Inspector remain readable. |
+| [`storyflow-20260814-history-recovery-failure-1280.png`](storyflow-20260814-history-recovery-failure-1280.png) | The same real fixture with an injected projection-capture failure: History renders the `STALE` failure boundary, source/commit provenance, and an explicit `Retry safe capture` action. |
+| [`storyflow-20260814-history-recovery-final-1280.png`](storyflow-20260814-history-recovery-final-1280.png) | After the real retry request, the failure row is cleared and the recovered graph snapshot is visible beside the accepted StoryCommit. |
+
+The browser run used a disposable real 120-chapter SQLite database. It verified
+the visible failure state, clicked the actual retry action, refreshed History,
+and confirmed that the retry row disappeared while the recovered projection
+snapshot remained. Browser diagnostics reported zero page/console errors or
+warnings. The retry is bounded by the recorded source fingerprint and source
+revision; a mutable-source change refuses historical backfill. Canon remains
+read-only in this action (`canonicalMutation=false`).
+
+## 2026-08-14 historical dependency surface in Version Compare
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-historical-dependency-1280.png`](storyflow-20260814-historical-dependency-1280.png) | 1280x720 headed-browser Version Compare on a real 120-chapter SQLite fixture with two accepted ChapterVersions: the Inspector shows the accepted snapshot diff and a separate historical downstream-dependency surface. |
+
+The fixture accepted two real StoryCommits for Chapter 120. The browser opened
+StoryCommit / History, compared Version 1 → Version 2, and displayed the
+recorded snapshot seeds, changed nodes/edges, direct dependencies, and bounded
+downstream traversal. The panel explicitly states that the evidence comes from
+accepted snapshots and semantic edges rather than prose-causality inference.
+Browser diagnostics reported zero page/console errors or warnings.
+
+## 2026-08-14 accepted Story Graph history timeline
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-accepted-graph-history-1280.png`](storyflow-20260814-accepted-graph-history-1280.png) | 1280x720 headed-browser Chapter Inspector on a real 120-chapter SQLite fixture: `Canon Graph history` shows two accepted graph snapshots, one comparable transition, immutable snapshot provenance, and `CANON GRAPH` status. |
+| [`storyflow-20260814-accepted-graph-history-1920.png`](storyflow-20260814-accepted-graph-history-1920.png) | 1920x1080 responsive headed-browser check of the same accepted graph history panel; the wide Canvas, browser, Inspector, and diff action remain separated and readable. |
+| [`storyflow-20260814-accepted-graph-history-1366.png`](storyflow-20260814-accepted-graph-history-1366.png) | 1366x768 responsive headed-browser check of the same panel; the Inspector remains independently scrollable without covering the Canvas or Minimap. |
+
+The browser loaded the real Chapter 120, opened `StoryCommit / History`, clicked
+the actual `View accepted graph diff` action, and received the exact snapshot
+pair from the existing diff API. A real page refresh restored the same accepted
+graph timeline and diff affordance. The Studio access log recorded HTTP 200 for
+Graph, node, history, freshness, and snapshot-diff requests; the headed session
+reported zero page/console errors or warnings. The same current-code panel was
+checked at 1920x1080 and 1366x768; both captures
+show the accepted-boundary rows without overlap or viewport overflow. The
+1280x720 capture additionally records the post-refresh interactive state.
+
+## 2026-08-14 Context input accounting
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-context-accounting-1920.png`](storyflow-20260814-context-accounting-1920.png) | 1920x1080 headed-browser Context View on the real SQLite Writer GenerationRun fixture: Context Graph integrity, read-only source overlay, and the accounting-enabled Inspector shell render together. |
+| [`storyflow-20260814-context-accounting-1920-inspector.png`](storyflow-20260814-context-accounting-1920-inspector.png) | Scrolled 1920x1080 Inspector view: persisted prompt chars, manifest union, untracked message chars, range overlap, coverage, missing-source count, and explicit no-provider-offset boundary are readable without covering the Canvas. |
+| [`storyflow-20260814-context-accounting-1366.png`](storyflow-20260814-context-accounting-1366.png) | 1366x768 responsive Context View check with the real bounded graph and fixed Inspector; the page loaded the exact-character accounting state with no console errors or warnings. |
+| [`storyflow-20260814-context-accounting-1366-inspector.png`](storyflow-20260814-context-accounting-1366-inspector.png) | Scrolled 1366x768 Inspector view: the accounting status and metrics remain readable while the Canvas and Minimap stay separate. |
+
+The browser used the real 120-chapter SQLite fixture and switched to Context
+View through the Studio navigation. The selected Writer run contained a
+persisted `promptLayout`, manifest source bindings, and `contextGraphSnapshot`;
+the UI showed `exact_character_accounting`, 95.2% persisted-input coverage,
+813/815 Writer-message characters tracked, and zero provider token offsets.
+Clicking a real included source opened `Context Explainability` with the
+recorded `generation_run.input_reference.context_manifest` boundary. The
+headed browser reported zero page/console errors or warnings at both required
+viewport sizes. Older-manifest degradation is covered by the unit/API
+contract; it is not represented by fabricated browser data.
+
+## 2026-08-14 dense semantic-edge Canvas renderer
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-dense-edge-canvas-1920.png`](storyflow-20260814-dense-edge-canvas-1920.png) | 1920x1080 headed-browser Full Graph on the real 500-chapter fixture: 1,200 projected nodes and 3,000 indexed edges are bounded to 38 DOM nodes while 334 semantic edges are painted by the Canvas layer; the selected edge Inspector remains readable. |
+| [`storyflow-20260814-dense-edge-canvas-1366.png`](storyflow-20260814-dense-edge-canvas-1366.png) | 1366x768 responsive dense-renderer check: the bounded Canvas and fixed Inspector remain separated, with 38 DOM nodes and 334 painted edges. |
+| [`storyflow-20260814-dense-edge-canvas-1366-inspector.png`](storyflow-20260814-dense-edge-canvas-1366-inspector.png) | 1366x768 edge hover/click evidence: Canvas hit testing opens the real Activity evidence Inspector with underlying edge count, semantic types, source/target, and SQLite projection boundary. |
+
+The browser moved across and clicked a painted semantic curve at both sizes.
+The final diagnostics list contained zero page/console errors or warnings.
+Switching back to Story Flow restored 15 sparse SVG semantic edges and cleared
+the Canvas paint counter, proving that the hybrid renderer does not leave
+stale pixels behind. The evidence demonstrates a real presentation and hit
+testing seam; it does not claim GPU virtualization or a production FPS SLA.
+
+## 2026-08-14 bounded Full Graph first-page transport
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-bounded-viewport-1280.png`](storyflow-20260814-bounded-viewport-1280.png) | 1280x720 headed-browser recheck on the real 500-chapter SQLite fixture: explicit Full Graph uses a bounded first page, then the viewport working set is incrementally merged; the selected Character Inspector shows recorded state/knowledge, boundary semantic edges, and SQLite provenance. |
+
+The browser access log recorded the initial expanded request as
+`view=all&limit=240&edge_limit=600&presentation=expanded`, followed by real
+world-coordinate requests. The authoritative response contained 1,892 nodes
+and 7,489 edges; the first response returned 240 nodes / 476 internal edges,
+the automatic continuation reached 480 loaded nodes, and the explicit next-page
+action reached 720. The toolbar exposed `loaded / total`, boundary edge counts,
+and the next-page action. Search for `Fixture Character 01` opened the real
+SQLite Character Inspector; Story, Timeline, and World view changes returned
+HTTP 200, and the final page/console diagnostics were empty.
+
+This evidence records a transport-budget and progressive-disclosure increment;
+it does not claim GPU virtualization or a production performance SLA. The
+independent internal-edge page contract is covered by the evidence below.
+
+## 2026-08-14 independent viewport semantic-edge pages
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-edge-pages-action-1280.png`](storyflow-20260814-edge-pages-action-1280.png) | 1280x720 headed-browser Full Graph on the real 500-chapter SQLite fixture: the toolbar exposes `480 / 1,892` loaded nodes, `600 / 1,622` viewport semantic edges, and both “Load more semantic edges” and “Load next viewport page” actions. |
+| [`storyflow-20260814-edge-pages-1280.png`](storyflow-20260814-edge-pages-1280.png) | After the real edge-page action and node-page continuation, the toolbar reports `1,622 / 1,622` semantic edges with no remaining edge-page action; the bounded Canvas/Inspector shell remains visible. |
+
+The headed browser generated HTTP 200 requests carrying opaque
+`edge_page_token` values, merged edge pages without console/page diagnostics,
+and kept the node working set independent. The final response remained a
+bounded read-model view; no Canon mutation or GPU-virtualization claim is made.
+
+## 2026-08-14 Minimap viewport navigation
+
+| Evidence | What it proves |
+|---|---|
+| [`storyflow-20260814-minimap-drag-1280.png`](storyflow-20260814-minimap-drag-1280.png) | 1280x720 headed-browser recheck on the real 500-chapter SQLite fixture: the Minimap viewport rectangle is draggable, the Canvas transform follows without changing zoom or Inspector focus, and the viewport exits the drag state cleanly. |

@@ -19,6 +19,12 @@ setup(
         "uvicorn>=0.23.0",
         "python-docx>=1.0.0",
         "pydantic>=2.0.0",
+        "jinja2>=3.1.0",
+        "aiosqlite>=0.19.0",
+        "sqlite-utils>=3.35",
+        "markdown>=3.5",
+        "python-multipart>=0.0.6",
+        "websockets>=12.0",
     ],
     entry_points={
         "console_scripts": [

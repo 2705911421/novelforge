@@ -1353,6 +1353,8 @@ class Database:
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
         try:
             yield conn
         finally:
@@ -1380,7 +1382,9 @@ class Database:
     def executemany(self, sql: str, params_list: list) -> sqlite3.Cursor:
         """批量执行SQL语句"""
         with self.connect() as conn:
-            return conn.executemany(sql, params_list)
+            cursor = conn.executemany(sql, params_list)
+            conn.commit()
+            return cursor
     
     def fetchone(self, sql: str, params: tuple = ()) -> Optional[Dict]:
         """查询单条记录"""
@@ -1395,11 +1399,20 @@ class Database:
             cursor = conn.execute(sql, params)
             return [dict(row) for row in cursor.fetchall()]
     
+    _IDENTIFIER_RE = __import__('re').compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+    @classmethod
+    def _validate_identifier(cls, name: str, label: str = "identifier") -> None:
+        """校验 SQL 标识符，防止注入"""
+        if not cls._IDENTIFIER_RE.match(name):
+            raise ValueError(f"Invalid SQL {label}: {name!r}")
+
     def insert(self, table: str, data: Dict) -> str:
         """插入记录，返回ID"""
+        self._validate_identifier(table, "table name")
         if 'id' not in data:
             data['id'] = generate_id()
-        
+
         columns = ', '.join(data.keys())
         placeholders = ', '.join(['?'] * len(data))
         sql = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
@@ -1412,6 +1425,7 @@ class Database:
     
     def update(self, table: str, data: Dict, where: str, where_params: tuple) -> int:
         """更新记录"""
+        self._validate_identifier(table, "table name")
         # Some append-only audit tables intentionally have no ``updated_at``.
         # The generic legacy helper remains compatible without manufacturing a
         # column those tables do not own.
@@ -1429,6 +1443,7 @@ class Database:
     
     def delete(self, table: str, where: str, where_params: tuple) -> int:
         """删除记录"""
+        self._validate_identifier(table, "table name")
         sql = f"DELETE FROM {table} WHERE {where}"
         
         with self.connect() as conn:
@@ -1438,11 +1453,13 @@ class Database:
     
     def get_by_id(self, table: str, id: str) -> Optional[Dict]:
         """根据ID获取记录"""
+        self._validate_identifier(table, "table name")
         return self.fetchone(f"SELECT * FROM {table} WHERE id = ?", (id,))
     
-    def list_all(self, table: str, where: str = "", params: tuple = (), 
+    def list_all(self, table: str, where: str = "", params: tuple = (),
                  order_by: str = "created_at DESC", limit: int = 100) -> List[Dict]:
         """列出记录"""
+        self._validate_identifier(table, "table name")
         sql = f"SELECT * FROM {table}"
         if where:
             sql += f" WHERE {where}"
@@ -1451,6 +1468,7 @@ class Database:
     
     def count(self, table: str, where: str = "", params: tuple = ()) -> int:
         """统计记录数"""
+        self._validate_identifier(table, "table name")
         sql = f"SELECT COUNT(*) as cnt FROM {table}"
         if where:
             sql += f" WHERE {where}"
@@ -1471,10 +1489,16 @@ class Database:
         return result['version'] if result else 0
     
     def backup(self, backup_path: str):
-        """备份数据库"""
+        """备份数据库（仅允许备份到 .novelforge-backups 目录）"""
         import shutil
-        shutil.copy2(str(self.db_path), backup_path)
-        logger.info(f"数据库备份完成: {backup_path}")
+        dest = Path(backup_path).resolve()
+        backups_dir = Path(self.db_path).resolve().parent / ".novelforge-backups"
+        try:
+            dest.relative_to(backups_dir)
+        except ValueError:
+            raise ValueError(f"Backup path must be under {backups_dir}, got: {dest}")
+        shutil.copy2(str(self.db_path), str(dest))
+        logger.info(f"数据库备份完成: {dest}")
     
     def vacuum(self):
         """压缩数据库"""
@@ -1483,7 +1507,9 @@ class Database:
         logger.info("数据库压缩完成")
 
 
-# 全局数据库实例
+# 全局数据库实例（线程安全）
+import threading as _threading
+_db_lock = _threading.Lock()
 _db_instance: Optional[Database] = None
 
 
@@ -1491,14 +1517,17 @@ def get_db() -> Database:
     """获取全局数据库实例"""
     global _db_instance
     if _db_instance is None:
-        _db_instance = Database()
+        with _db_lock:
+            if _db_instance is None:
+                _db_instance = Database()
     return _db_instance
 
 
 def init_db(db_path: Optional[str] = None) -> Database:
     """初始化数据库"""
     global _db_instance
-    _db_instance = Database(db_path)
+    with _db_lock:
+        _db_instance = Database(db_path)
     return _db_instance
 
 

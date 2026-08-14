@@ -4,7 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NovelForge Studio</title>
-<script>try{document.documentElement.dataset.theme=localStorage.getItem('novelforge-theme')==='light'?'light':'dark';}catch(_){document.documentElement.dataset.theme='dark';}</script>
+<!-- NovelForge's authoring surface opens on paper by default; an explicit dark
+     preference remains opt-in and is preserved in localStorage. -->
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('novelforge-theme')==='dark'?'dark':'light';}catch(_){document.documentElement.dataset.theme='light';}</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23e94560'/%3E%3Cpath d='M18 15h28v34H18z' fill='%23ffffff'/%3E%3Cpath d='M25 23h14M25 31h14M25 39h9' stroke='%23e94560' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js"></script>
 <style>
@@ -194,23 +196,6 @@ select.input{cursor:pointer}
 .prog{height:8px;background:var(--secondary);border-radius:4px;overflow:hidden;margin-bottom:6px}
 .prog-bar{height:100%;background:linear-gradient(90deg,var(--primary),#58a6ff);transition:width .4s;border-radius:4px}
 .log-box{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px;height:220px;overflow-y:auto;font-size:12px}
-/* extra */
-.muted{color:var(--text-muted)}
-.card-title{font-size:15px;margin-bottom:12px;font-weight:700}
-.fld{display:block;margin-bottom:14px;color:var(--text-muted);font-size:12.5px;font-weight:500}
-.fld .input{margin-top:6px}
-.ta{min-height:90px;resize:vertical;line-height:1.6}
-.prog{height:8px;background:var(--secondary);border-radius:4px;overflow:hidden;margin-bottom:6px}
-.prog-bar{height:100%;background:linear-gradient(90deg,var(--primary),#58a6ff);transition:width .4s;border-radius:4px;width:0}
-.log-box{max-height:260px;overflow-y:auto;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;margin-top:8px}
-.kv{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px}
-.kv:last-child{border-bottom:none}
-.kv span{color:var(--text-muted)}
-.list-row{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
-.list-row:last-child{border-bottom:none}
-.book-card{cursor:pointer;transition:all .15s}
-.book-card:hover{border-color:var(--accent);transform:translateY(-2px)}
-.book-cover{width:48px;height:48px;border-radius:var(--radius-sm);background:linear-gradient(135deg,var(--primary),var(--accent));display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:800;color:#fff;margin-bottom:10px}
 .node-tag{display:inline-block;padding:2px 8px;border-radius:6px;background:var(--secondary);font-size:11px;margin-left:6px}
 .fs-card{border-left:3px solid var(--accent);padding:12px 14px;background:var(--bg);border-radius:var(--radius-sm);margin-bottom:10px}
 .fs-card.planted{border-left-color:var(--warning)}
@@ -239,8 +224,8 @@ select.input{cursor:pointer}
 .markdown-body a{color:var(--accent);text-decoration:underline}
 @media(max-width:700px){.task-detail-modal .kv{display:block}.task-detail-modal .kv span{display:block;margin-bottom:4px}.task-detail-modal .kv b{display:block}.task-run{padding:10px}.task-prompt,.task-output{max-height:420px}}
 </style>
-<link rel="stylesheet" href="/static/studio-theme.css?v=20260811-model-progress-2" onerror="this.onerror=null;this.href='studio-theme.css'">
-<link rel="stylesheet" href="/static/storyflow.css?v=20260813-storyflow-22" onerror="this.onerror=null;this.href='storyflow.css'">
+<link rel="stylesheet" href="/static/studio-theme.css?v=20260814-paper-default-1" onerror="this.onerror=null;this.href='studio-theme.css'">
+<link rel="stylesheet" href="/static/storyflow.css?v=20260814-paper-workbench-3" onerror="this.onerror=null;this.href='storyflow.css'">
 </head>
 <body>
 <button class="mobile-nav-toggle" id="mobile-nav-toggle" type="button" aria-controls="studio-sidebar" aria-expanded="false"><span class="mobile-nav-icon" aria-hidden="true"></span><span>导航</span></button>
@@ -319,6 +304,38 @@ const NAV = [
 
 const globalSettingsNav = NAV.find((item) => item.id === 'settings');
 if (globalSettingsNav) globalSettingsNav.label = '全局创作参数';
+
+// The historical visualization entries remain in NAV for muscle memory and
+// deep-link compatibility, but they now resolve to a projection of the one
+// SQLite-backed Story Graph. Keep this mapping in the base router so clicks
+// made before the StoryFlow module finishes loading cannot render a second
+// visualization source for one frame and then silently switch later.
+const STORYFLOW_COMPAT_ROUTES = Object.freeze({
+  mindmap: 'story',
+  flow: 'story',
+  timeline: 'timeline',
+  plot: 'story',
+  'world-map': 'world',
+  foreshadowing: 'foreshadow',
+  characters: 'character',
+});
+
+function routeStoryFlowCompatibility(page, focus = '') {
+  const view = STORYFLOW_COMPAT_ROUTES[page];
+  if (!view) return false;
+  window.__storyflowRouteIntent = {
+    view,
+    focus: focus || '',
+    sourcePage: page,
+  };
+  S.page = 'storyflow';
+  localStorage.setItem(ACTIVE_PAGE_KEY, 'storyflow');
+  if (S.book) S.expandedExtensions[S.book] = true;
+  persistNavState();
+  renderNav();
+  render();
+  return true;
+}
 
 // ===== Model work visibility =====
 // Every UI entry point that can reach a text/image model is surfaced here.
@@ -752,8 +769,14 @@ function markdownInline(value){
   let text=esc(value);
   const codeTokens=[];
   text=text.replace(/`([^`\n]+)`/g,(_,content)=>{const index=codeTokens.push(`<code>${content}</code>`)-1;return `\u0000${index}\u0000`;});
-  text=text.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>');
-  text=text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>');
+  text=text.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g,(match,label,url)=>{
+    if(/^javascript:/i.test(url))return esc(match);
+    return `<a href="${escAttr(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`;
+  });
+  text=text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,(match,label,url)=>{
+    if(/^javascript:/i.test(url))return esc(match);
+    return `<a href="${escAttr(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`;
+  });
   text=text.replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>').replace(/__([^_\n]+)__/g,'<strong>$1</strong>');
   text=text.replace(/_([^_\n]+)_/g,'<em>$1</em>');
   text=text.replace(/\u0000(\d+)\u0000/g,(_,index)=>codeTokens[Number(index)]||'');
@@ -854,25 +877,7 @@ function renderBookBranch(book){
       '<button type="button" class="nav-extension-toggle '+(extensionsAreOpen?'is-open':'')+'" onclick="toggleBookExtensions(\''+escAttr(book.id)+'\')" aria-expanded="'+(extensionsAreOpen?'true':'false')+'"><span class="nav-extension-glyph" aria-hidden="true">+</span><span>规划与结构 / 创作与审查</span><span class="nav-extension-count">'+extensionItems.length+'</span><span class="nav-chevron '+(extensionsAreOpen?'is-open':'')+'" aria-hidden="true">›</span></button>'+
       (extensionsAreOpen?'<div class="nav-extension-list">'+groupHtml+'</div>':'')+'</div>':'')+
     '</div>';
-  const bookItems=NAV.filter(item=>item.id&&item.bookOnly);
-  const primary=bookItems.filter(item=>BOOK_PRIMARY_NAV_IDS.has(item.id));
-  const extensions=bookItems.filter(item=>!BOOK_PRIMARY_NAV_IDS.has(item.id));
-  const active=S.book===book.id;
-  const bookOpen=Boolean(S.expandedBooks[book.id]||active);
-  const extensionsOpen=Boolean(S.expandedExtensions[book.id]||active&&extensions.some(item=>item.id===S.page));
-  const firstLetter=String(book.title||'作').trim().slice(0,1)||'作';
-  return `<div class="nav-book-branch ${active?'is-active':''}">
-    <div class="nav-book-row">
-      <button type="button" class="nav-book-toggle" onclick="toggleBookBranch('${escAttr(book.id)}')" aria-expanded="${bookOpen?'true':'false'}" title="${escAttr(book.title||'作品')}">
-        <span class="nav-book-mark">${esc(firstLetter)}</span><span class="nav-book-name">${esc(book.title||'未命名作品')}</span><span class="nav-chevron ${bookOpen?'is-open':''}" aria-hidden="true">›</span>
-      </button>
-    </div>
-    ${bookOpen?`<div class="nav-book-children">
-      ${primary.map(item=>renderNavItem(item,book.id,'nav-child')).join('')}
-      <button type="button" class="nav-extension-toggle ${extensionsOpen?'is-open':''}" onclick="toggleBookExtensions('${escAttr(book.id)}')" aria-expanded="${extensionsOpen?'true':'false'}">
-        <span class="nav-extension-glyph" aria-hidden="true">+</span><span>拓展</span><span class="nav-extension-count">${extensions.length}</span><span class="nav-chevron ${extensionsOpen?'is-open':''}" aria-hidden="true">›</span>
-      </button>
-      ${extensionsOpen?`<div class="nav-extension-list">${extensions.map(item=>renderNavItem(item,book.id,'nav-child nav-extension-child')).join('')}</div>`:''}
+  // Dead code below removed (duplicate renderBookBranch implementation)
     </div>`:''}
   </div>`;
 }
@@ -913,6 +918,7 @@ function loadBooksForNav(){
 }
 function goForBook(page,bookId){
   setActiveBook(bookId);
+  if(routeStoryFlowCompatibility(page)) return;
   if(!BOOK_PRIMARY_NAV_IDS.has(page))S.expandedExtensions[bookId]=true;
   S.page=page;
   localStorage.setItem(ACTIVE_PAGE_KEY,page);
@@ -923,6 +929,7 @@ function goForBook(page,bookId){
 function go(page){
   const bookOnly=NAV.some(item=>item.id===page&&item.bookOnly);
   if(bookOnly&&!S.book){toast('请先在「我的创作」中打开一本作品。','warning');return;}
+  if(routeStoryFlowCompatibility(page)) return;
   if(S.book)loadBooksForNav();
   S.page=page;localStorage.setItem(ACTIVE_PAGE_KEY,page);renderNav();render();
 }
@@ -1634,9 +1641,9 @@ async function monitorWriteTask(tid){
 function taskDetail(task){
   return task.error || task.error_code || task.checkpoint?.state?.message || task.stage || task.status || '处理中';
 }
-async function waitForTask(taskId, renderStatus){
+async function waitForTask(taskId, renderStatus, maxPolls=300){
   let polls=0;
-  while(true){
+  while(polls<maxPolls){
     const task=await api('GET','/tasks/'+taskId); S.activeTasks[taskId]=task;
     if(window.modelWork) window.modelWork.attachTask(taskId,task.displayName||task.operationLabel||task.type,task);
     if(renderStatus)renderStatus(task);
@@ -2528,8 +2535,8 @@ go(S.book?bootPage:'dashboard');
     document.body.appendChild(script);
   }
 loadStudioAsset('/static/studio-enhancements.js?v=20260812-model-progress-2','studio-enhancements.js',function(){
-    loadStudioAsset('/static/studio-visual.js?v=20260811-model-progress-1','studio-visual.js',function(){
-      loadStudioAsset('/static/studio-storyflow.js?v=20260813-storyflow-33','studio-storyflow.js');
+    loadStudioAsset('/static/studio-visual.js?v=20260814-paper-default-2','studio-visual.js',function(){
+      loadStudioAsset('/static/studio-storyflow.js?v=20260814-runtime-readiness-1','studio-storyflow.js');
     });
   });
 })();

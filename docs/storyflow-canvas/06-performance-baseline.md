@@ -474,3 +474,376 @@ The observed timings vary between local runs. They remain a bounded
 projector/query observation, not an interactive-FPS or production-capacity
 claim; browser rendering, GPU acceleration, true virtualization, and
 tens-of-thousands-of-edge behavior still require separate work.
+
+## Latest synthetic benchmark run (2026-08-13, after Worker/Canon acceptance seam)
+
+Command:
+
+```text
+python scripts/benchmark_story_graph.py --sizes 100 500 1000
+```
+
+| target nodes | available nodes | available edges | depth 1 returned | depth 3 returned | cold depth 1 | cached depth 3 | cold cache hit | cached cache hit |
+|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|
+| 100 | 101 | 99 | 3 | 7 | 161.12 ms | 82.82 ms | false | true |
+| 500 | 501 | 499 | 3 | 7 | 233.65 ms | 106.71 ms | false | true |
+| 1000 | 1001 | 999 | 3 | 7 | 448.57 ms | 157.05 ms | false | true |
+
+This is a fresh local observation of the same rebuildable projector/cache
+harness, not a production SLA, interactive-FPS claim, or browser DOM benchmark.
+The Worker/Canon acceptance seam does not alter the bounded query contract;
+true GPU virtualization, complete high-degree rendering virtualization, and
+tens-of-thousands-of-edge behavior remain unimplemented.
+
+## Latest browser viewport-merge observation (2026-08-14)
+
+Against the real 500-chapter fixture, the initial Full Graph expanded request
+loaded `1200` nodes / `3415` edges while the authoritative projection reported
+`1891` nodes. After a completed pan into a new world-coordinate region, the
+Canvas merged the page and exposed `1891` loaded nodes / `3963` edges. Observed
+viewport request durations were 4.009s and 1.654s on this workstation. The
+single drag was request-gated until pointerup; these are local request
+observations, not interactive FPS, memory, or production SLA measurements.
+The browser still uses bounded server projection plus DOM culling; true
+virtualization and complete cross-page edge paging remain unimplemented.
+
+## Latest synthetic projector run (2026-08-14)
+
+Command:
+
+```text
+python scripts/benchmark_story_graph.py --sizes 100 500 1000
+```
+
+Observed on this workstation:
+
+| target nodes | available nodes | available edges | depth 1 returned | depth 3 returned | cold depth 1 | cached depth 3 | cold cache hit | cached cache hit |
+|---:|---:|---:|---:|---:|---:|:---:|:---:|:---:|
+| 100 | 101 | 99 | 3 | 7 | 150.23 ms | 77.65 ms | false | true |
+| 500 | 501 | 499 | 3 | 7 | 656.59 ms | 404.83 ms | false | true |
+| 1000 | 1001 | 999 | 3 | 7 | 813.62 ms | 318.09 ms | false | true |
+
+These are one local synthetic projector/cache run, not a production SLA or
+interactive FPS claim. The response remains bounded at 3/7 focused nodes;
+browser DOM rendering and tens-of-thousands-of-edge behavior are not measured
+by this harness.
+
+## Latest cross-viewport boundary observation (2026-08-14)
+
+Against the same real 500-chapter SQLite fixture, the bounded viewport response
+reported `1688 loaded / 1891 total` and `3109` exact cross-page semantic edges;
+the bounded sample returned 120 edge records. At 1366x768 the current page
+reported `3031` boundary edges after the responsive viewport changed. Selecting
+the real StoryGoal Inspector rendered the remote `advances` evidence, and its
+focus action returned a bounded 176-node focused graph. These are local
+observations of query correctness and progressive loading, not an interactive
+FPS or production latency claim. Boundary sample/high-degree neighbor paging
+and true GPU virtualization remain future work.
+
+## Latest selection-projection observation (2026-08-14)
+
+The multi-selection endpoint was exercised from the headed browser against the
+real 500-chapter SQLite fixture with two selected nodes. The Character/Event
+working set returned HTTP 200 with `2` nodes, `1` internal edge, and `216`
+bounded external edge records in the Inspector; the full external count remains
+explicitly separate from the capped list. At both 1920x1080 and 1366x768 the
+selection summary rendered without console errors/warnings. A remote endpoint
+focus query returned HTTP 200 and loaded the bounded Chapter subgraph.
+
+These are correctness and bounded-payload observations, not a whole-selection
+latency, interactive-FPS, or high-degree edge-pagination benchmark. The current
+Canvas still relies on server bounds plus DOM viewport culling; true graph
+virtualization remains unimplemented.
+
+## Spatial page continuation contract (2026-08-14)
+
+The Graph API now supports an opaque `meta.viewport.nextPageToken` for a
+world-coordinate response. The cursor is bound to the normalized query,
+authoritative projection fingerprint, and workspace layout fingerprint. The
+unit/API contract covers page offsets, no-duplicate continuation pages,
+malformed tokens, query mismatch, and source mutation invalidation. The Canvas
+exposes an explicit next-page action and keeps the existing read model visible
+while a page request is in flight.
+
+This reduces page transport and client working-set size for dense viewports, but
+does not change the current server-side layout complexity: the filtered
+candidate read model is still laid out before the spatial slice. No production
+latency claim is made from this seam alone; indexed spatial layout and exact
+cross-page edge paging remain future performance work.
+
+The headed browser evidence used the real 500-chapter SQLite fixture at both
+1366x768 and 1920x1080. After switching to expanded Full Graph evidence nodes,
+the first response reported `1366 / 1891` loaded nodes and the explicit next
+page action reported `1521 / 1891`; the browser reported zero console/page
+errors. These are correctness and payload-boundary observations, not a
+production latency or interactive-FPS claim.
+
+## Latest indexed viewport benchmark (2026-08-14)
+
+The benchmark harness now also performs one cold and one warm Full Graph
+world-coordinate read after the focused projection. The observed output was:
+
+| target nodes | viewport rows | indexed edges | viewport cold | viewport warm |
+|---:|---:|---:|---:|---:|
+| 100 | 2 | 99 | 2632.40 ms | 1102.46 ms |
+| 500 | 2 | 499 | 849.70 ms | 2267.59 ms |
+| 1000 | 2 | 999 | 2221.26 ms | 737.59 ms |
+
+The values are rounded local observations from the same workstation; exact
+numbers vary with process load. They demonstrate the new rebuild/reuse path,
+not a production SLA. The cold path still builds the candidate index from the
+rebuildable catalog, and the benchmark does not represent tens of thousands of
+edges, browser layout, or GPU virtualization. The warm path can be slower than
+the cold path under process contention; it is a cache-path observation, not a
+monotonic performance guarantee.
+
+The browser boundary continuation recheck exposed and fixed a cursor-integrity
+race. Search focus no longer recenters the Canvas before an Inspector-only
+boundary cursor is continued, and the continuation request reuses the exact
+`x_from/x_to/y_from/y_to` values recorded in the response. A changed viewport
+therefore requires a fresh boundary page rather than silently reusing an old
+cursor; the API's observable `422` validation remains in place.
+
+## Indexed node candidate read (2026-08-14)
+
+The warm Full Graph viewport now reports `meta.projectionReadModel=
+sqlite_node_index`. The node index stores filter scalars and one derived node
+payload per row, so SQLite applies the view/type/status/chapter/volume/time/
+PlotThread candidate predicates before the selected rectangle is hydrated.
+`storyflow_projection_epochs` triggers invalidate the index identity on
+authoritative row changes; the next read rebuilds it and restores the exact
+content fingerprint. The contract test deliberately makes the full catalog
+reader fail after warm-up and still receives the same viewport nodes, proving
+the warm path is using the derived SQLite index rather than merely carrying a
+Python catalog in memory. Search now uses the same node index and has an
+equivalent warm-read seam test; it does not introduce a second search source.
+Cold rebuild cost remains explicit and is not being presented as zero-cost
+virtualization.
+
+The same harness now records repeat focused projection and Inspector reads:
+
+| target nodes | cold depth 1 | warm depth 3 | warm focused read model | warm focus | warm neighbors |
+|---:|---:|---:|---|---:|---:|
+| 100 | 342.07 ms | 50.18 ms | `sqlite_node_index+semantic_edge_index` | 48.82 ms | 32.72 ms |
+| 500 | 968.59 ms | 94.24 ms | `sqlite_node_index+semantic_edge_index` | 89.27 ms | 48.20 ms |
+| 1000 | 1091.70 ms | 116.95 ms | `sqlite_node_index+semantic_edge_index` | 118.68 ms | 54.46 ms |
+
+These are one local run of `python scripts/benchmark_story_graph.py --sizes
+100 500 1000`, with synthetic linear chapter data and 99/499/999 semantic
+edges. They are observations of the projector/read-model seam, not a
+production SLA, browser FPS, memory limit, or tens-of-thousands-edge result.
+
+## Indexed Inspector and focused subgraph read (2026-08-14)
+
+The paired node/semantic-edge index now covers the highest-frequency focused
+interaction as well as Full Graph viewport reads. A first cold
+`/story-graph/nodes/{id}` or focused `project(depth=1|2|3)` request still uses
+the authoritative-derived JSON catalog and builds the rebuildable index. A
+subsequent Inspector neighbor page or focused subgraph reads scalar candidate
+rows, hydrates only selected node payloads, and traverses the requested
+semantic edge frontier from SQLite. The response exposes
+`projectionReadModel=sqlite_node_index+semantic_edge_index` so this is
+observable rather than inferred from latency.
+
+The paired contract is guarded by the same source fingerprint, schema version,
+and stored edge count. A trigger-invalidated source or missing/mismatched edge
+rows takes the cold fallback and rebuilds; no StoryFact, StoryState, or
+StoryCommit row is changed. This reduces repeat Inspector/focus work but does
+not claim that Full Graph layout is GPU-virtualized, that history is complete,
+or that provider-backed AI analysis is instant.
+
+## High-degree page read amplification (2026-08-14)
+
+The Inspector neighbor seam now performs its page boundary in SQLite: a count
+query and a sorted `LIMIT/OFFSET` payload query run against the paired
+node/semantic-edge indexes, and only the returned remote node payloads are
+hydrated. The response exposes a query-bound `nextPageToken`; a changed
+direction/filter or source fingerprint returns a typed 422 instead of silently
+continuing an old offset.
+
+Full Graph cross-viewport boundary pages use the same principle for ordinary
+Canvas working sets: a selected-endpoint CTE computes the complete crossing
+count and edge-type counts, while the payload query is page-bounded. The
+explicit >900-selected-node compatibility fallback remains documented because
+one SQLite CTE cannot safely bind an arbitrarily large working set. No latency
+or FPS claim is made for that fallback, GPU rendering, or tens of thousands of
+edges.
+
+### Latest post-cursor rerun (2026-08-14)
+
+The same benchmark was rerun after the SQLite page-boundary changes. Process
+load makes these values non-monotonic; they replace neither the earlier table
+nor the stated absence of a production SLA.
+
+| target nodes | depth 1 cold | depth 3 warm | warm focus | warm neighbors | viewport cold | viewport warm |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 628.95 ms | 117.15 ms | 135.55 ms | 72.90 ms | 474.13 ms | 156.71 ms |
+| 500 | 1005.87 ms | 129.75 ms | 103.44 ms | 54.78 ms | 437.27 ms | 150.67 ms |
+| 1000 | 1554.80 ms | 164.56 ms | 152.40 ms | 60.36 ms | 548.10 ms | 180.13 ms |
+
+The warm focus and warm neighbor responses reported
+`sqlite_node_index+semantic_edge_index`; the synthetic graph contained
+99/499/999 semantic edges. These are local read-model observations, not
+browser FPS, memory, GPU virtualization, or tens-of-thousands-edge evidence.
+
+## Indexed multi-selection read amplification (2026-08-14)
+
+The selection projection used by multi-select Inspector, Chapter Intent, and
+AI analysis now reuses the paired SQLite node/semantic-edge index after its
+first build. The warm path resolves only the requested node payloads, reads
+their incident semantic edges, and hydrates remote endpoint summaries for the
+bounded external-edge section. A source-epoch mutation invalidates the pair
+and forces the existing authoritative-derived cold rebuild; no Canon table is
+used as a cache or mutated by the selection read.
+
+This is a bounded read-amplification reduction, not a claim that arbitrary
+large selections or the first cold index build are free of catalog work.
+
+### Selection seam rerun (2026-08-14)
+
+The benchmark harness now measures the same two-node selection after the focus
+projection has warmed the paired index:
+
+| target nodes | selection warm | selection read model | returned nodes |
+|---:|---:|---|---:|
+| 100 | 43.06 ms | `sqlite_node_index+semantic_edge_index` | 2 |
+| 500 | 40.33 ms | `sqlite_node_index+semantic_edge_index` | 2 |
+| 1000 | 42.14 ms | `sqlite_node_index+semantic_edge_index` | 2 |
+
+This is a single local rerun of `python scripts/benchmark_story_graph.py
+--sizes 100 500 1000`; it measures the read-model seam, not provider latency,
+large arbitrary selections, browser FPS, or a production SLA.
+## Multi-selection external-edge paging (2026-08-14)
+
+The high-degree selection path now performs the external-edge count, type
+aggregate, and page slice in SQLite. The browser starts with 60 external edges
+and continues with the opaque `externalPageToken`; remote node payloads are
+hydrated only for the page. This is read-amplification control, not a claim of
+GPU rendering or a global graph virtualization SLA.
+
+The 120-chapter browser fixture returned 70 external edges for a two-node
+selection. The headed browser loaded page one (`60 / 70`) and page two (final
+70-edge working set) with HTTP 200 and zero page/console diagnostics.
+
+The synthetic rerun also exercised a one-edge page and its continuation after
+the paired index was warm:
+
+| target nodes | page read model | external total | first page | continuation |
+|---:|---|---:|---:|---:|
+| 100 | `sqlite_node_index+semantic_edge_index` | 4 | 50.43 ms | 54.73 ms |
+| 500 | `sqlite_node_index+semantic_edge_index` | 4 | 101.86 ms | 107.26 ms |
+| 1000 | `sqlite_node_index+semantic_edge_index` | 4 | 75.08 ms | 58.65 ms |
+
+These are observed local timings from the benchmark harness, not a production
+SLA.
+
+## Accepted-commit recovery rerun (2026-08-14)
+
+After the snapshot-capture recovery changes, the same synthetic SQLite harness
+was rerun with `python scripts/benchmark_story_graph.py --sizes 100 500 1000`.
+The recovery path does not participate in ordinary projection reads; this
+rerun records the current read-model baseline for the final source state.
+
+| target nodes | depth 1 cold | depth 3 warm | warm focus | warm neighbors | selection page | continuation | viewport cold | viewport warm |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 368.39 ms | 60.42 ms | 71.20 ms | 31.14 ms | 49.74 ms | 53.63 ms | 331.22 ms | 133.66 ms |
+| 500 | 909.76 ms | 115.87 ms | 117.95 ms | 63.04 ms | 86.75 ms | 91.61 ms | 526.22 ms | 159.88 ms |
+| 1000 | 1419.21 ms | 127.47 ms | 141.43 ms | 57.36 ms | 79.59 ms | 89.69 ms | 620.03 ms | 188.53 ms |
+
+The synthetic graphs contained 99/499/999 semantic edges and used the
+`sqlite_node_index+semantic_edge_index` warm read model. These are local
+single-run observations, not browser FPS, memory, GPU virtualization, or a
+production SLA.
+
+## Dense edge renderer browser observation (2026-08-14)
+
+The headed browser used the real 500-chapter SQLite fixture. Full Graph was
+explicitly selected so the large working set was bounded before painting:
+
+| viewport | loaded graph | DOM nodes | SVG edge DOM | Canvas painted edges | renderer | diagnostics |
+|---|---:|---:|---:|---:|---|---|
+| 1920x1080 | 1,200 nodes / 3,000 edges | 38 | 0 | 334 | `canvas-2d` | 0 page/console errors or warnings |
+| 1366x768 | 1,200 nodes / 3,000 edges | 38 | 0 | 334 | `canvas-2d` | 0 page/console errors or warnings |
+
+Moving over a dense curve set the edge-hover presentation state; clicking a
+curve opened the real Activity evidence Inspector with semantic type counts,
+source/target, and the `sqlite.story_graph_projection` boundary. Switching
+back to sparse Story Flow returned 15 SVG edges and `edgePaintedEdges=0`.
+
+The browser check demonstrates bounded DOM pressure and semantic hit testing,
+not GPU acceleration, frame-rate guarantees, memory guarantees, or a
+production-scale 10,000-edge SLA. The read-model benchmark below remains the
+authoritative synthetic performance record.
+
+## Synthetic read-model rerun (2026-08-14)
+
+Command: `python scripts/benchmark_story_graph.py --sizes 100 500 1000`.
+Timings are milliseconds from one local run; the fixture contains `n-1`
+semantic edges and the warm paths use
+`sqlite_node_index+semantic_edge_index`.
+
+| target nodes | depth 1 cold | depth 3 warm | warm focus | warm neighbors | selection page | continuation | viewport cold | viewport warm | indexed edges |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 450.13 | 59.81 | 59.77 | 27.62 | 43.09 | 55.48 | 247.34 | 87.41 | 99 |
+| 500 | 599.80 | 82.53 | 80.50 | 29.44 | 59.89 | 64.01 | 264.91 | 82.44 | 499 |
+| 1000 | 905.91 | 105.78 | 99.35 | 37.87 | 59.50 | 78.15 | 406.76 | 131.96 | 999 |
+
+These measurements cover projection/query behavior only. They do not replace
+browser interaction testing or claim production latency, FPS, memory, or full
+GPU virtualization.
+
+## Full Graph first-page transport rerun (2026-08-14)
+
+The real headed-browser rerun used `.storyflow-density-20260813-500` and the
+same SQLite-authoritative Studio API. The explicit Full Graph request changed
+from the historical `1200/3000` compatibility budget to
+`limit=240&edge_limit=600`:
+
+| read | returned nodes | returned internal edges | authoritative totals | observation |
+|---|---:|---:|---:|---|
+| initial expanded Full Graph | 240 | 476 | 1,892 / 7,489 | bounded first page |
+| automatic viewport continuation | 240 | 0 new internal edges | 1,892 / 7,489 | merged to 480 loaded nodes; 240 boundary edges |
+| explicit next viewport page | 240 | 0 new internal edges | 1,892 / 7,489 | merged to 720 loaded nodes; 350 boundary edges |
+
+The zero values in the continuation edge column are truthful: those pages had
+no newly returned edge whose two endpoints were in the same page; boundary
+semantic edges remained available in the Inspector and were counted separately.
+The browser then searched for `Fixture Character 01`, opened the real
+Character Inspector, and showed recorded state/knowledge and 217 boundary
+relationships. Story, Timeline, and World view switches all returned HTTP 200;
+the page/console diagnostic log was empty. A 1280x720 capture is recorded at
+`docs/storyflow-canvas/evidence/storyflow-20260814-bounded-viewport-1280.png`;
+the existing 1920x1080 and 1366x768 dense-renderer captures remain the
+responsive-size evidence for the Canvas shell.
+
+This rerun demonstrates transport pressure reduction and incremental loading.
+It does not claim GPU virtualization, browser FPS, memory bounds, or a
+production SLA. Independent semantic-edge page coverage is documented below.
+
+## Latest synthetic read-model rerun (2026-08-14)
+
+Command: `python scripts/benchmark_story_graph.py --sizes 100 500 1000`.
+This run was performed after the browser working-set change; the backend
+read-model contract is unchanged. Values are one local Windows run in
+milliseconds, not a production SLA:
+
+| target nodes | depth 1 cold | depth 3 warm | warm focus | warm neighbors | selection page | continuation | viewport cold | viewport warm |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 585.15 | 88.91 | 71.55 | 34.78 | 76.16 | 78.88 | 325.26 | 117.82 |
+| 500 | 773.47 | 88.22 | 98.86 | 41.32 | 61.65 | 63.54 | 322.86 | 115.87 |
+| 1000 | 1183.80 | 118.84 | 112.63 | 42.08 | 65.62 | 62.85 | 429.25 | 118.71 |
+
+The synthetic graphs contained 99/499/999 indexed semantic edges. Warm focus,
+neighbor, selection, and viewport reads reported the SQLite node/semantic-edge
+read model. These measurements do not represent browser FPS, memory, GPU
+virtualization, or the 500-chapter browser payload.
+
+## 2026-08-14 independent semantic-edge page boundary
+
+Full Graph now also pages semantic edges independently from node pages. Each
+`edge_limit` page is counted and ordered by the rebuildable SQLite edge index
+for the current world-coordinate viewport. This avoids requiring a full edge
+rescan when a later node page is hydrated and keeps relationships between
+not-yet-hydrated cards available for rendering once their endpoints arrive.
+The change has contract coverage; no fixed FPS, memory, or GPU-virtualization
+claim is made.

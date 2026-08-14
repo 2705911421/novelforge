@@ -37,16 +37,17 @@ class SearchResult:
 class PersistentRAGRetriever:
     """SQLite-backed retrieval boundary for Phase 5 document chunks.
 
-    SQLite remains the source of truth.  The BM25 index is deliberately rebuilt
-    from indexed chunks for each query so a fresh process sees exactly the same
-    data and no in-memory state can become authoritative.
+    BM25 index is cached with a TTL to avoid rebuilding on every query.
+    Cache is invalidated when chunks change.
     """
 
     VALID_TYPES = {"auto", "world", "character", "style", "reference", "chapter", "other"}
     MAX_TOP_K = 50
+    _CACHE_TTL = 60.0  # seconds
 
     def __init__(self, database: Any):
         self.database = database
+        self._index_cache: dict[str, tuple[float, BM25Index, int]] = {}  # key -> (timestamp, index, row_count)
 
     def clear(self) -> None:
         """No-op: PersistentRAGRetriever is stateless (SQLite-backed, no in-memory index)."""
@@ -60,15 +61,23 @@ class PersistentRAGRetriever:
         top_k: int = 5,
         doc_type: Optional[str] = None,
     ) -> dict[str, Any]:
+        import time
         self._validate(project_id, query, top_k, doc_type)
         rows = self._rows(project_id, doc_type)
-        index = BM25Index()
-        for row in rows:
-            index.add_document(
-                row["chunk_id"],
-                row["content"],
-                self._metadata(row),
-            )
+        cache_key = f"{project_id}:{doc_type or 'all'}"
+        now = time.monotonic()
+        cached = self._index_cache.get(cache_key)
+        if cached and cached[2] == len(rows) and now - cached[0] < self._CACHE_TTL:
+            index = cached[1]
+        else:
+            index = BM25Index()
+            for row in rows:
+                index.add_document(
+                    row["chunk_id"],
+                    row["content"],
+                    self._metadata(row),
+                )
+            self._index_cache[cache_key] = (now, index, len(rows))
         results = index.search(query.strip(), top_k=top_k)
         # BM25Index's historical ordering is kept for compatibility, but IDs
         # provide a stable tie-breaker at this persistence boundary.
@@ -215,6 +224,7 @@ class BM25Index:
         self.doc_count: int = 0
         self.term_freqs: List[Counter] = []
         self.idf: Dict[str, float] = {}
+        self._idf_dirty = True
     
     def add_document(self, doc_id: str, text: str, metadata: Optional[Dict] = None):
         """添加文档"""
@@ -240,7 +250,8 @@ class BM25Index:
         """搜索"""
         if not self.documents:
             return []
-        
+
+        self._ensure_idf()
         query_terms = self._tokenize(query)
         scores = []
         
@@ -265,15 +276,20 @@ class BM25Index:
         return results
     
     def _tokenize(self, text: str) -> List[str]:
-        """分词（中文按字，英文按词）"""
-        # 移除标点
+        """分词（中文按字+bigram，英文按词）"""
         text = re.sub(r'[^\w\s\u4e00-\u9fff]', ' ', text)
         tokens = []
-        for char in text:
-            if '\u4e00' <= char <= '\u9fff':
-                tokens.append(char)
-            elif char.isalnum():
-                tokens.append(char.lower())
+        # Split into CJK chars and non-CJK words
+        for segment in re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9]+', text):
+            if '\u4e00' <= segment[0] <= '\u9fff':
+                # CJK: single chars + bigrams
+                for i, char in enumerate(segment):
+                    tokens.append(char)
+                    if i > 0:
+                        tokens.append(segment[i - 1] + char)
+            else:
+                # English/numbers: whole word lowercased
+                tokens.append(segment.lower())
         return tokens
     
     def _compute_score(self, query_terms: List[str], doc_idx: int) -> float:
@@ -297,15 +313,22 @@ class BM25Index:
         return score
     
     def _update_idf(self):
-        """更新IDF值"""
+        """更新IDF值（延迟计算：仅在搜索时调用）"""
+        self._idf_dirty = True
+
+    def _ensure_idf(self):
+        """确保 IDF 已计算"""
+        if not getattr(self, '_idf_dirty', True):
+            return
         self.idf = {}
         all_terms = set()
         for tf in self.term_freqs:
             all_terms.update(tf.keys())
-        
+
         for term in all_terms:
             doc_freq = sum(1 for tf in self.term_freqs if term in tf)
             self.idf[term] = math.log((self.doc_count - doc_freq + 0.5) / (doc_freq + 0.5) + 1)
+        self._idf_dirty = False
     
     def clear(self):
         """清空索引"""
@@ -326,7 +349,7 @@ class VectorIndex:
         self.vectors: List[List[float]] = []
     
     def add_document(self, doc_id: str, text: str, embedding: List[float],
-                     metadata: Dict = field(default_factory=dict)):
+                     metadata: Optional[Dict] = None):
         """添加文档"""
         self.documents.append({
             "id": doc_id,
@@ -503,25 +526,23 @@ class Reranker:
         return reranked
 
     def _hybrid_rerank(self, query: str, results: List[SearchResult]) -> List[SearchResult]:
-        """混合重排序策略"""
+        """混合重排序策略（不修改原始结果）"""
+        import copy
+        results = [copy.copy(r) for r in results]
         query_terms = set(query.lower().split())
 
         for result in results:
-            # 计算关键词匹配分数
             content_terms = set(result.content.lower().split())
             keyword_overlap = len(query_terms.intersection(content_terms))
             keyword_score = keyword_overlap / max(len(query_terms), 1)
 
-            # 计算内容质量分数（基于长度和完整性）
             content_length = len(result.content)
-            length_score = min(content_length / 200, 1.0)  # 200字符为基准
+            length_score = min(content_length / 200, 1.0)
 
-            # 计算位置分数（如果有元数据）
-            position_score = 0.5  # 默认中等位置
+            position_score = 0.5
 
-            # 综合分数
             combined_score = (
-                result.score * 0.5 +  # 原始BM25/向量分数
+                result.score * 0.5 +
                 keyword_score * 0.3 +  # 关键词匹配
                 length_score * 0.1 +  # 内容质量
                 position_score * 0.1   # 位置

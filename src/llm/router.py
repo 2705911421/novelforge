@@ -36,10 +36,14 @@ class ModelRouter:
     def configure(self, role_mapping: Dict[str, str]):
         """
         配置角色映射
-        
+
         Args:
             role_mapping: 角色到Provider的映射，例如 {"planner": "primary", "reviewer": "review"}
         """
+        valid_roles = {r.value for r in AgentRole}
+        for role in role_mapping:
+            if role not in valid_roles:
+                logger.warning("Unknown role in mapping: %s (valid: %s)", role, valid_roles)
         self._role_mapping = role_mapping
         logger.info(f"配置角色映射: {role_mapping}")
     

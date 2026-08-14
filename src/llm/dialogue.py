@@ -29,8 +29,9 @@ class DialogueWriterError(Exception):
 class DialogueWriter:
     """Generate character dialogue using LLM."""
 
-    def __init__(self, model_manager: Any):
+    def __init__(self, model_manager: Any, client_role: str = "primary"):
         self.model_manager = model_manager
+        self.client_role = client_role
 
     def generate(
         self,
@@ -91,7 +92,7 @@ class DialogueWriter:
         )
 
         try:
-            client = self.model_manager.get_client("primary")
+            client = self.model_manager.get_client(self.client_role)
             response = client.chat(
                 [{"role": "user", "content": prompt}],
                 system=system,

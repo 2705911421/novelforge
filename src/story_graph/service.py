@@ -6,12 +6,22 @@ authoritative SQLite tables, derives semantic nodes and edges, applies focus
 and filters, and returns a bounded read model.  Canvas state is persisted by
 the same module in a separate UI workspace table and never enters StoryFact or
 StoryState.
+
+Split plan (TODO):
+- schema.py (lines 35-400): NODE_TYPES, EDGE_TYPES, PORTS, EDGE_RULES constants
+- query.py (lines 400-585): StoryGraphQuery and validation
+- adapters.py (lines 600-1100): data adapters and conversion functions
+- catalog.py (lines 1100-1316): catalog fingerprint SQL queries
+- projector.py (lines 1319-end): StoryGraphProjector core (further split into
+  layout, spatial_index, snapshot sub-modules)
 """
 
 from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+import base64
+import binascii
 import difflib
 import hashlib
 import json
@@ -23,6 +33,11 @@ from src.core.database import Database
 
 
 GRAPH_CATALOG_SCHEMA_VERSION = 10
+SPATIAL_INDEX_SCHEMA_VERSION = 3
+# The node index and the semantic-edge index are one paired read-model
+# contract.  Bumping this version forces an older database to rebuild both
+# sides before the warm Inspector path is allowed to answer.
+NODE_INDEX_SCHEMA_VERSION = 3
 
 
 class StoryGraphError(ValueError):
@@ -498,6 +513,10 @@ class StoryGraphQuery:
     viewport_y_from: Optional[float] = None
     viewport_y_to: Optional[float] = None
     viewport_padding: float = 0.0
+    viewport_page_token: Optional[str] = None
+    viewport_edge_page_token: Optional[str] = None
+    boundary_page_token: Optional[str] = None
+    boundary_node_id: Optional[str] = None
 
     def normalized(self) -> "StoryGraphQuery":
         view = normalize_view(self.view)
@@ -515,6 +534,22 @@ class StoryGraphQuery:
                 "viewport queries require x_from, x_to, y_from, and y_to"
             )
         viewport_padding = max(0.0, min(float(self.viewport_padding or 0.0), 2000.0))
+        page_token = str(self.viewport_page_token or "").strip() or None
+        edge_page_token = str(self.viewport_edge_page_token or "").strip() or None
+        boundary_page_token = str(self.boundary_page_token or "").strip() or None
+        boundary_node_id = str(self.boundary_node_id or "").strip() or None
+        if page_token and not all(value is not None for value in viewport_values):
+            raise StoryGraphError("viewport page tokens require x_from, x_to, y_from, and y_to")
+        if page_token and len(page_token) > 4096:
+            raise StoryGraphError("viewport page token is too long")
+        if edge_page_token and not all(value is not None for value in viewport_values):
+            raise StoryGraphError("viewport edge page tokens require x_from, x_to, y_from, and y_to")
+        if edge_page_token and len(edge_page_token) > 4096:
+            raise StoryGraphError("viewport edge page token is too long")
+        if boundary_page_token and not all(value is not None for value in viewport_values):
+            raise StoryGraphError("boundary page tokens require x_from, x_to, y_from, and y_to")
+        if boundary_page_token and len(boundary_page_token) > 4096:
+            raise StoryGraphError("boundary page token is too long")
         if (
             self.viewport_x_from is not None
             and self.viewport_x_to is not None
@@ -550,6 +585,10 @@ class StoryGraphQuery:
             viewport_y_from=float(self.viewport_y_from) if self.viewport_y_from is not None else None,
             viewport_y_to=float(self.viewport_y_to) if self.viewport_y_to is not None else None,
             viewport_padding=viewport_padding,
+            viewport_page_token=page_token,
+            viewport_edge_page_token=edge_page_token,
+            boundary_page_token=boundary_page_token,
+            boundary_node_id=boundary_node_id,
         )
 
 
@@ -559,6 +598,7 @@ class _Catalog:
     project_id: str
     nodes: dict[str, dict[str, Any]] = field(default_factory=dict)
     edges: list[dict[str, Any]] = field(default_factory=list)
+    indexed: bool = False
 
 
 @dataclass(frozen=True)
@@ -568,6 +608,7 @@ class _CatalogRead:
     catalog: _Catalog
     source_fingerprint: str
     cache_hit: bool
+    read_model: str = "json_catalog"
 
 
 def _load_json(value: Any, default: Any) -> Any:
@@ -589,6 +630,21 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _restore_indexed_node(value: Any) -> Optional[dict[str, Any]]:
+    """Restore the small runtime shape lost when a derived node is JSON-loaded."""
+    if not isinstance(value, dict) or not value.get("id"):
+        return None
+    node = dict(value)
+    raw_ports = node.get("ports")
+    if isinstance(raw_ports, dict):
+        node["ports"] = {
+            **raw_ports,
+            "inputs": tuple(raw_ports.get("inputs") or ()),
+            "outputs": tuple(raw_ports.get("outputs") or ()),
+        }
+    return node
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -951,6 +1007,145 @@ def _stable_id(prefix: str, *parts: Any) -> str:
     return f"{prefix}:{digest}"
 
 
+def _viewport_query_signature(query: StoryGraphQuery, *, purpose: str = "nodes") -> str:
+    """Return the immutable identity of a spatial projection query.
+
+    The page cursor deliberately excludes the cursor itself.  This lets the
+    projector validate that a continuation belongs to the same view/filter/
+    viewport contract without exposing a node list or creating a client-side
+    source of truth.
+    """
+    payload = {
+        "purpose": purpose,
+        "view": query.view,
+        "focus": query.focus,
+        "depth": query.depth,
+        "types": list(query.types),
+        "statuses": list(query.statuses),
+        "chapterFrom": query.chapter_from,
+        "chapterTo": query.chapter_to,
+        "volumeNumber": query.volume_number,
+        "timeFrom": query.time_from,
+        "timeTo": query.time_to,
+        "plotThread": query.plot_thread,
+        "presentation": query.presentation,
+        "limit": query.limit,
+        "edgeLimit": query.edge_limit,
+        "xFrom": query.viewport_x_from,
+        "xTo": query.viewport_x_to,
+        "yFrom": query.viewport_y_from,
+        "yTo": query.viewport_y_to,
+        "padding": query.viewport_padding,
+        "boundaryNodeId": query.boundary_node_id,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+
+def _spatial_projection_signature(query: StoryGraphQuery) -> str:
+    """Identify the candidate set whose coordinates a spatial index serves.
+
+    Viewport bounds and page sizes are deliberately excluded.  A single
+    rebuildable index can therefore answer many pans and continuation pages
+    for the same filtered Full Graph query.  This is a read-model identity,
+    never a Canon identity.
+    """
+    payload = {
+        "view": query.view,
+        "focus": query.focus,
+        "depth": query.depth,
+        "types": list(query.types),
+        "statuses": list(query.statuses),
+        "chapterFrom": query.chapter_from,
+        "chapterTo": query.chapter_to,
+        "volumeNumber": query.volume_number,
+        "timeFrom": query.time_from,
+        "timeTo": query.time_to,
+        "plotThread": query.plot_thread,
+        "presentation": query.presentation,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+
+def _boundary_query_signature(query: StoryGraphQuery, selected_ids: Iterable[str]) -> str:
+    payload = {
+        "query": _viewport_query_signature(query, purpose="boundary"),
+        "selectedNodeIds": sorted({str(node_id) for node_id in selected_ids}),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+
+def _neighbor_query_signature(
+    node_id: str,
+    direction: str,
+    node_types: Iterable[str],
+    limit: int,
+) -> str:
+    payload = {
+        "purpose": "neighbors",
+        "nodeId": str(node_id),
+        "direction": str(direction),
+        "types": sorted({canonical_node_type(item) for item in node_types if item}),
+        "limit": int(limit),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+
+def _selection_external_query_signature(
+    selected_ids: Iterable[str],
+    limit: int,
+) -> str:
+    """Identify one ordered page of edges leaving a multi-selection."""
+    payload = {
+        "purpose": "selection-external-edges",
+        "selectedNodeIds": sorted({str(node_id) for node_id in selected_ids}),
+        "limit": int(limit),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+
+def _encode_viewport_page_token(source_fingerprint: str, query_signature: str, offset: int) -> str:
+    payload = {
+        "version": 1,
+        "sourceFingerprint": source_fingerprint,
+        "querySignature": query_signature,
+        "offset": int(offset),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return base64.urlsafe_b64encode(encoded.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_viewport_page_token(token: str) -> dict[str, Any]:
+    """Decode a continuation token without trusting any client-provided field."""
+    try:
+        padding = "=" * (-len(token) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(f"{token}{padding}").decode("utf-8"))
+    except (ValueError, TypeError, UnicodeError, binascii.Error, json.JSONDecodeError) as exc:
+        raise StoryGraphError("invalid viewport page token") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise StoryGraphError("unsupported viewport page token")
+    source_fingerprint = str(payload.get("sourceFingerprint") or "").strip()
+    query_signature = str(payload.get("querySignature") or "").strip()
+    offset_raw = payload.get("offset")
+    if isinstance(offset_raw, bool) or not isinstance(offset_raw, (int, str)):
+        raise StoryGraphError("invalid viewport page token offset")
+    try:
+        offset = int(offset_raw)
+    except (TypeError, ValueError) as exc:
+        raise StoryGraphError("invalid viewport page token offset") from exc
+    if not source_fingerprint or not query_signature or offset < 0:
+        raise StoryGraphError("invalid viewport page token")
+    return {
+        "sourceFingerprint": source_fingerprint,
+        "querySignature": query_signature,
+        "offset": offset,
+    }
+
+
 # These are the authoritative fields that the projector currently reads.
 # The fingerprint intentionally hashes source content rather than relying only
 # on timestamps: legacy callers can update JSON or text columns without
@@ -1207,6 +1402,25 @@ class StoryGraphProjector:
             "CREATE INDEX IF NOT EXISTS idx_storyflow_graph_snapshots_book_commit "
             "ON storyflow_graph_snapshots(book_id, source_commit_id, created_at DESC)"
         )
+        # A failed post-acceptance projection must be recoverable without
+        # guessing what the mutable entity tables looked like later.  This is
+        # derived operational metadata only: it records the source boundary
+        # observed when capture failed, never story facts or UI state.
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS storyflow_graph_snapshot_capture_failures (
+                book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                commit_id TEXT NOT NULL REFERENCES story_commits(id) ON DELETE CASCADE,
+                source_fingerprint TEXT NOT NULL,
+                source_revision INTEGER NOT NULL,
+                error TEXT NOT NULL,
+                failed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (book_id, commit_id)
+            )"""
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_snapshot_capture_failures_book "
+            "ON storyflow_graph_snapshot_capture_failures(book_id, failed_at DESC)"
+        )
         # The current catalog is a separate rebuildable read cache.  Keeping
         # it separate from observed history means ordinary search/neighbor
         # reads do not manufacture History entries, while the same serialized
@@ -1229,6 +1443,321 @@ class StoryGraphProjector:
             "CREATE INDEX IF NOT EXISTS idx_storyflow_graph_catalog_fingerprint "
             "ON storyflow_graph_catalog_cache(source_fingerprint)"
         )
+        # A durable source epoch makes read-model invalidation cheap without
+        # weakening the authoritative boundary.  The triggers only advance a
+        # derived revision marker; they never copy or mutate StoryFact,
+        # StoryState, or StoryCommit.  The first projector read seeds the
+        # marker from the full source fingerprint so databases created before
+        # this seam remain safe.
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS storyflow_projection_epochs (
+                book_id TEXT PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+                source_revision INTEGER NOT NULL DEFAULT 0,
+                source_fingerprint TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_projection_epochs_fingerprint "
+            "ON storyflow_projection_epochs(source_fingerprint)"
+        )
+        self._ensure_projection_epoch_triggers()
+        # One row per derived node is the payload seam for indexed viewport
+        # reads.  It lets a query fetch only selected node JSON instead of
+        # deserializing the full catalog cache on every pan/search request.
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS storyflow_graph_node_index (
+                book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                source_fingerprint TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                lifecycle_status TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                chapter_min INTEGER,
+                chapter_max INTEGER,
+                volume_number INTEGER,
+                story_time_order REAL,
+                story_time_label TEXT NOT NULL DEFAULT '',
+                plot_thread_keys TEXT NOT NULL DEFAULT '',
+                graph_status_reason TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT '',
+                search_text TEXT NOT NULL DEFAULT '',
+                payload JSON NOT NULL,
+                PRIMARY KEY (book_id, source_fingerprint, node_id)
+            )"""
+        )
+        node_index_columns = {
+            str(row.get("name"))
+            for row in self.db.fetchall("PRAGMA table_info(storyflow_graph_node_index)")
+        }
+        for column, definition in (
+            ("summary", "TEXT NOT NULL DEFAULT ''"),
+            ("source_type", "TEXT NOT NULL DEFAULT ''"),
+            ("search_text", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in node_index_columns:
+                self.db.execute(
+                    f"ALTER TABLE storyflow_graph_node_index ADD COLUMN {column} {definition}"
+                )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_node_index_filter "
+            "ON storyflow_graph_node_index(book_id, source_fingerprint, node_type, status, chapter_min, chapter_max, volume_number)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_node_index_lookup "
+            "ON storyflow_graph_node_index(book_id, source_fingerprint, source_id, title)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_node_index_search "
+            "ON storyflow_graph_node_index(book_id, source_fingerprint, node_type, search_text)"
+        )
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS storyflow_graph_node_index_meta (
+                book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                source_fingerprint TEXT NOT NULL,
+                node_count INTEGER NOT NULL DEFAULT 0,
+                edge_count INTEGER NOT NULL DEFAULT 0,
+                index_schema INTEGER NOT NULL DEFAULT 0,
+                project_id TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (book_id, source_fingerprint)
+            )"""
+        )
+        node_index_columns = {
+            str(row.get("name"))
+            for row in self.db.fetchall("PRAGMA table_info(storyflow_graph_node_index_meta)")
+        }
+        if "edge_count" not in node_index_columns:
+            self.db.execute(
+                "ALTER TABLE storyflow_graph_node_index_meta ADD COLUMN edge_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "index_schema" not in node_index_columns:
+            self.db.execute(
+                "ALTER TABLE storyflow_graph_node_index_meta ADD COLUMN index_schema INTEGER NOT NULL DEFAULT 0"
+            )
+        # The node payload index is paired with a complete semantic edge
+        # index.  Keeping this separate from the viewport edge cache matters:
+        # viewport rows are scoped to one filtered/layout fingerprint, while
+        # Inspector expansion needs the same canonical semantic frontier no
+        # matter which view was opened first.
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS storyflow_graph_semantic_edge_index (
+                book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                source_fingerprint TEXT NOT NULL,
+                edge_key TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                edge_type TEXT NOT NULL,
+                payload JSON NOT NULL,
+                PRIMARY KEY (book_id, source_fingerprint, edge_key)
+            )"""
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_semantic_edge_source "
+            "ON storyflow_graph_semantic_edge_index(book_id, source_fingerprint, source_id, target_id)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_semantic_edge_target "
+            "ON storyflow_graph_semantic_edge_index(book_id, source_fingerprint, target_id, source_id)"
+        )
+        # Rebuildable spatial read model.  It is deliberately keyed by the
+        # authoritative catalog fingerprint plus the UI workspace fingerprint:
+        # it accelerates world-coordinate reads without becoming a second
+        # StoryFact/StoryState source.  The edge rows below are the same
+        # semantic catalog records, stored only to make high-degree boundary
+        # reads indexable instead of rescanning the whole JSON projection.
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS storyflow_spatial_layouts (
+                book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                view TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                workspace_fingerprint TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                sort_order INTEGER NOT NULL,
+                collapsed BOOLEAN NOT NULL DEFAULT FALSE,
+                pinned BOOLEAN NOT NULL DEFAULT FALSE,
+                hidden BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (book_id, view, source_fingerprint, workspace_fingerprint, node_id)
+            )"""
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_spatial_layout_bounds "
+            "ON storyflow_spatial_layouts(book_id, view, source_fingerprint, workspace_fingerprint, x, y, sort_order)"
+        )
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS storyflow_graph_edge_index (
+                book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                source_fingerprint TEXT NOT NULL,
+                edge_key TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                edge_type TEXT NOT NULL,
+                payload JSON NOT NULL,
+                PRIMARY KEY (book_id, source_fingerprint, edge_key)
+            )"""
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_graph_edge_source "
+            "ON storyflow_graph_edge_index(book_id, source_fingerprint, source_id, target_id)"
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_graph_edge_target "
+            "ON storyflow_graph_edge_index(book_id, source_fingerprint, target_id, source_id)"
+        )
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS storyflow_spatial_index_meta (
+                book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                view TEXT NOT NULL,
+                index_fingerprint TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                workspace_fingerprint TEXT NOT NULL,
+                node_count INTEGER NOT NULL DEFAULT 0,
+                edge_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (book_id, view, index_fingerprint, workspace_fingerprint)
+            )"""
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_storyflow_spatial_index_source "
+            "ON storyflow_spatial_index_meta(book_id, view, source_fingerprint)"
+        )
+
+    def _ensure_projection_epoch_triggers(self) -> None:
+        """Install derived-cache invalidation triggers at the read-model seam.
+
+        The triggers advance only ``storyflow_projection_epochs``.  They do
+        not materialize graph facts and therefore cannot become a competing
+        Canon source.  Keeping this implementation private gives the public
+        projector interface a small, deep contract: a source mutation makes
+        the next derived read rebuildable and makes old cursors stale.
+        """
+
+        def touch_sql(expression: str) -> str:
+            return (
+                "INSERT INTO storyflow_projection_epochs("
+                "book_id, source_revision, source_fingerprint, updated_at) "
+                f"SELECT ({expression}), 1, '', CURRENT_TIMESTAMP "
+                f"WHERE ({expression}) IS NOT NULL "
+                "ON CONFLICT(book_id) DO UPDATE SET "
+                "source_revision=storyflow_projection_epochs.source_revision + 1, "
+                "source_fingerprint='', updated_at=CURRENT_TIMESTAMP;"
+            )
+
+        # Direct book ownership is common and covers the tables that carry
+        # the largest mutable payloads.  Trigger creation is idempotent so a
+        # long-running Studio process can initialize older databases safely.
+        direct_tables = (
+            "volumes",
+            "chapters",
+            "characters",
+            "factions",
+            "locations",
+            "relationships",
+            "timeline_events",
+            "foreshadows",
+            "story_facts",
+            "story_states",
+            "world_rules",
+            "plot_workspaces",
+        )
+        for table in direct_tables:
+            if not self.db.table_exists(table):
+                continue
+            for event, expression, action in (
+                ("ai", "NEW.book_id", "INSERT"),
+                ("au", "NEW.book_id", "UPDATE"),
+                ("ad", "OLD.book_id", "DELETE"),
+            ):
+                self.db.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS storyflow_epoch_{table}_{event} "
+                    f"AFTER {action} ON {table} BEGIN {touch_sql(expression)} END;"
+                )
+
+        # A book DELETE cascades its derived rows; an AFTER DELETE trigger
+        # cannot safely insert a new epoch row because the parent is gone.
+        # INSERT/UPDATE still invalidate every graph projection that can be
+        # queried while the book exists.
+        if self.db.table_exists("books"):
+            for event, expression, action in (
+                ("ai", "NEW.id", "INSERT"),
+                ("au", "NEW.id", "UPDATE"),
+            ):
+                self.db.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS storyflow_epoch_books_{event} "
+                    f"AFTER {action} ON books BEGIN {touch_sql(expression)} END;"
+                )
+
+        # Child rows are joined to their book by the existing authoritative
+        # foreign-key path.  These expressions are intentionally explicit:
+        # the projector must never guess a book from a frontend id.
+        child_sources = {
+            "arcs": "(SELECT v.book_id FROM volumes v WHERE v.id=NEW.volume_id)",
+            "chapter_versions": "(SELECT c.book_id FROM chapters c WHERE c.id=NEW.chapter_id)",
+            "character_states": "(SELECT c.book_id FROM chapters c WHERE c.id=NEW.chapter_id)",
+            "faction_states": "(SELECT f.book_id FROM factions f WHERE f.id=NEW.faction_id)",
+            "location_states": "(SELECT c.book_id FROM chapters c WHERE c.id=NEW.chapter_id)",
+            "story_commits": "(SELECT c.book_id FROM chapters c WHERE c.id=NEW.chapter_id)",
+            "reviews": "(SELECT c.book_id FROM chapters c WHERE c.id=NEW.chapter_id)",
+            "review_issues": "(SELECT c.book_id FROM chapters c JOIN reviews r ON r.id=NEW.review_id WHERE c.id=r.chapter_id)",
+            "story_bible_workspaces": "(SELECT b.id FROM books b WHERE b.project_id=NEW.project_id)",
+            "story_bible_steps": "(SELECT b.id FROM books b JOIN story_bible_workspaces w ON w.project_id=b.project_id WHERE w.id=NEW.workspace_id)",
+            "story_bible_snapshots": "(SELECT b.id FROM books b JOIN story_bible_workspaces w ON w.project_id=b.project_id WHERE w.id=NEW.workspace_id)",
+            "plot_workspace_revisions": "(SELECT w.book_id FROM plot_workspaces w WHERE w.id=NEW.workspace_id)",
+        }
+        for table, new_expression in child_sources.items():
+            if not self.db.table_exists(table):
+                continue
+            old_expression = new_expression.replace("NEW.", "OLD.")
+            for event, expression, action in (
+                ("ai", new_expression, "INSERT"),
+                ("au", new_expression, "UPDATE"),
+                ("ad", old_expression, "DELETE"),
+            ):
+                self.db.execute(
+                    f"CREATE TRIGGER IF NOT EXISTS storyflow_epoch_{table}_{event} "
+                    f"AFTER {action} ON {table} BEGIN {touch_sql(expression)} END;"
+                )
+
+    @staticmethod
+    def _epoch_fingerprint(book_id: str, source_revision: int) -> str:
+        payload = f"storyflow-source-epoch:{book_id}:{int(source_revision)}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _source_identity(self, book_id: str) -> str:
+        """Return a cheap, trigger-backed source identity for derived reads."""
+        row = self.db.fetchone(
+            "SELECT source_revision, source_fingerprint FROM storyflow_projection_epochs WHERE book_id=?",
+            (book_id,),
+        )
+        if row is None:
+            # Existing databases predate the epoch seam.  Pay the full source
+            # scan once, then all subsequent reads use the trigger-backed
+            # revision marker.
+            source_fingerprint = self._source_fingerprint(book_id)
+            self.db.execute(
+                """INSERT INTO storyflow_projection_epochs(
+                       book_id, source_revision, source_fingerprint, updated_at
+                   ) VALUES (?, 0, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(book_id) DO NOTHING""",
+                (book_id, source_fingerprint),
+            )
+            return source_fingerprint
+        source_fingerprint = str(row.get("source_fingerprint") or "")
+        if source_fingerprint:
+            return source_fingerprint
+        revision = int(row.get("source_revision") or 0)
+        source_fingerprint = self._epoch_fingerprint(book_id, revision)
+        self.db.execute(
+            "UPDATE storyflow_projection_epochs SET source_fingerprint=?, updated_at=CURRENT_TIMESTAMP WHERE book_id=? AND source_revision=?",
+            (source_fingerprint, book_id, revision),
+        )
+        return source_fingerprint
 
     def project(
         self,
@@ -1253,6 +1782,10 @@ class StoryGraphProjector:
         viewport_y_from: Optional[float] = None,
         viewport_y_to: Optional[float] = None,
         viewport_padding: float = 0.0,
+        viewport_page_token: Optional[str] = None,
+        viewport_edge_page_token: Optional[str] = None,
+        boundary_page_token: Optional[str] = None,
+        boundary_node_id: Optional[str] = None,
     ) -> dict[str, Any]:
         query = StoryGraphQuery(
             view=view,
@@ -1274,6 +1807,10 @@ class StoryGraphProjector:
             viewport_y_from=viewport_y_from,
             viewport_y_to=viewport_y_to,
             viewport_padding=viewport_padding,
+            viewport_page_token=viewport_page_token,
+            viewport_edge_page_token=viewport_edge_page_token,
+            boundary_page_token=boundary_page_token,
+            boundary_node_id=boundary_node_id,
         ).normalized()
         if not self.db.fetchone("SELECT id FROM books WHERE id=?", (book_id,)):
             return {
@@ -1323,33 +1860,202 @@ class StoryGraphProjector:
                     "worldGraph": self._world_graph_metadata(query.view),
                     "viewport": self._viewport_metadata(query, 0, 0, False),
                 },
-        }
-        catalog_read = self._read_catalog(book_id)
-        catalog = catalog_read.catalog
-        snapshot = self._capture_snapshot(catalog, reason="projection_query")
+            }
+        viewport_query = query.viewport_x_from is not None
+        if viewport_query:
+            catalog_read = self._read_catalog_for_viewport(book_id, query)
+            catalog = catalog_read.catalog
+            # A viewport read is a bounded projection read.  Rebuilding a
+            # full observed snapshot here would defeat the point of the node
+            # index by serializing the whole graph on every pan.  Freshness
+            # remains truthful: the latest observed snapshot id is exposed,
+            # and a normal bounded read can capture a new one when needed.
+            snapshot = self._latest_snapshot(book_id)
+        elif query.focus or query.view != "all":
+            catalog_read = self._read_catalog_for_focus(book_id, query)
+            if catalog_read is None:
+                catalog_read = self._read_catalog(book_id)
+                catalog = catalog_read.catalog
+                snapshot = self._capture_snapshot(catalog, reason="projection_query")
+            else:
+                catalog = catalog_read.catalog
+                # Never manufacture an observed snapshot from scalar stubs
+                # and a bounded edge frontier.  The cold build above has
+                # already captured the full catalog when this index became
+                # available; otherwise history remains explicitly absent.
+                snapshot = self._latest_snapshot(book_id)
+        else:
+            catalog_read = self._read_catalog(book_id)
+            catalog = catalog_read.catalog
+            snapshot = self._capture_snapshot(catalog, reason="projection_query")
+
+        # The indexed viewport candidate rows carry only scalar filter keys;
+        # resolve aliases and focus against the bounded set first, then fall
+        # back to the authoritative-derived catalog only when a requested
+        # focus is outside that rectangle.  This keeps ordinary pans deep
+        # while preserving the existing focus contract.
         available_volumes = self._available_volumes(catalog)
         allowed = VIEW_NODE_TYPES[query.view]
-        candidates = {
-            node_id: node
-            for node_id, node in catalog.nodes.items()
-            if node["type"] in allowed and self._matches(node, query)
-        }
+        if catalog.indexed:
+            # SQLite has already applied the scalar predicates for an
+            # indexed viewport read.  Re-running the legacy matcher against
+            # stubs would make long appearance ranges look empty because
+            # those stubs intentionally omit the full chapter list.
+            candidates = dict(catalog.nodes)
+        else:
+            candidates = {
+                node_id: node
+                for node_id, node in catalog.nodes.items()
+                if node["type"] in allowed and self._matches(node, query)
+            }
         focus_id = self._resolve_focus(catalog.nodes, query.focus)
         if focus_id and focus_id not in candidates and focus_id in catalog.nodes:
             candidates[focus_id] = catalog.nodes[focus_id]
+        boundary_target_id = self._resolve_focus(catalog.nodes, query.boundary_node_id)
+        if query.boundary_node_id and boundary_target_id is None:
+            raise StoryGraphError(f"boundary node not found: {query.boundary_node_id}")
+        if boundary_target_id and boundary_target_id not in candidates:
+            candidates[boundary_target_id] = catalog.nodes[boundary_target_id]
         if not focus_id:
             focus_id = self._default_focus(candidates, query.view)
 
         adjacency: dict[str, set[str]] = defaultdict(set)
-        candidate_edge_count = 0
-        for edge in catalog.edges:
-            if edge["source"] in candidates and edge["target"] in candidates:
-                adjacency[edge["source"]].add(edge["target"])
-                adjacency[edge["target"]].add(edge["source"])
-                candidate_edge_count += 1
+        candidate_edges: list[dict[str, Any]] = []
+        spatial_index: Optional[dict[str, str | int]] = None
+        if query.viewport_x_from is not None:
+            # A missing spatial index is the one intentional cold-build
+            # fallback.  The indexed node seam can answer the rectangle, but
+            # it cannot invent the complete semantic edge set needed to build
+            # that index.  Read the authoritative-derived catalog once,
+            # build the rebuildable index, and let all later pans stay on the
+            # SQLite node/edge path.
+            spatial_index = self._read_spatial_index_meta(
+                book_id,
+                query,
+                catalog_read.source_fingerprint,
+                candidates,
+            )
+            if spatial_index is None:
+                # Node-index reads are sufficient for a warm rectangle, but a
+                # missing spatial edge index needs the complete authoritative
+                # derived edge set exactly once to build its rebuildable
+                # cache.  Do not persist a false zero-edge index from the
+                # scalar node seam.
+                if catalog.indexed:
+                    authoritative_read = self._read_catalog(book_id)
+                    catalog = authoritative_read.catalog
+                    catalog_read = authoritative_read
+                    candidates = {
+                        node_id: node
+                        for node_id, node in catalog.nodes.items()
+                        if node["type"] in allowed and self._matches(node, query)
+                    }
+                    focus_id = self._resolve_focus(catalog.nodes, query.focus)
+                    if focus_id and focus_id not in candidates and focus_id in catalog.nodes:
+                        candidates[focus_id] = catalog.nodes[focus_id]
+                    boundary_target_id = self._resolve_focus(catalog.nodes, query.boundary_node_id)
+                    if query.boundary_node_id and boundary_target_id is None:
+                        raise StoryGraphError(f"boundary node not found: {query.boundary_node_id}")
+                    if boundary_target_id and boundary_target_id not in candidates:
+                        candidates[boundary_target_id] = catalog.nodes[boundary_target_id]
+                    if not focus_id:
+                        focus_id = self._default_focus(candidates, query.view)
+                # The first read for a source/filter builds the rebuildable
+                # index from the authoritative-derived catalog.  Subsequent
+                # pans do not rescan or relayout this edge set.
+                candidate_edges = [
+                    edge for edge in catalog.edges
+                    if edge["source"] in candidates and edge["target"] in candidates
+                ]
+                spatial_index = self._ensure_spatial_index(
+                    book_id,
+                    query,
+                    list(candidates.values()),
+                    candidate_edges,
+                    focus_id,
+                    catalog_read.source_fingerprint,
+                )
+            if focus_id:
+                # Focused viewport reads need only the incident edge frontier
+                # to honor depth.  The Full Graph/no-focus path never builds
+                # an in-memory adjacency map for the whole catalog.
+                frontier: set[str] = {focus_id}
+                visited: set[str] = set()
+                for _ in range(query.depth):
+                    frontier -= visited
+                    if not frontier:
+                        break
+                    frontier_edges = self._indexed_edges_for_nodes(spatial_index, book_id, frontier)
+                    candidate_edges.extend(frontier_edges)
+                    for edge in frontier_edges:
+                        if edge["source"] in candidates and edge["target"] in candidates:
+                            adjacency[edge["source"]].add(edge["target"])
+                            adjacency[edge["target"]].add(edge["source"])
+                    visited.update(frontier)
+                    frontier = {
+                        endpoint
+                        for edge in frontier_edges
+                        for endpoint in (str(edge.get("source") or ""), str(edge.get("target") or ""))
+                        if endpoint in candidates and endpoint not in visited
+                    }
+                candidate_edges = list({
+                    str(edge.get("id") or _stable_id("edge-index", edge.get("source"), edge.get("type"), edge.get("target"))): edge
+                    for edge in candidate_edges
+                }.values())
+            candidate_edge_count = int(spatial_index["edgeCount"])
+        else:
+            if catalog.indexed:
+                adjacency, candidate_edges = self._indexed_focus_frontier(
+                    book_id,
+                    catalog_read.source_fingerprint,
+                    candidates,
+                    focus_id,
+                    query.depth,
+                )
+            else:
+                for edge in catalog.edges:
+                    if edge["source"] in candidates and edge["target"] in candidates:
+                        adjacency[edge["source"]].add(edge["target"])
+                        adjacency[edge["target"]].add(edge["source"])
+                        candidate_edges.append(edge)
+            candidate_edge_count = len(candidate_edges)
 
         layout_positions: Optional[dict[str, dict[str, float]]] = None
-        if query.viewport_x_from is not None or (query.view == "all" and not focus_id):
+        viewport_page_offset = 0
+        viewport_query_signature = _viewport_query_signature(query, purpose="nodes")
+        viewport_edge_page_offset = 0
+        viewport_edge_query_signature = ""
+        boundary_page_offset = 0
+        boundary_query_signature = ""
+        viewport_cursor_fingerprint = catalog_read.source_fingerprint
+        if query.viewport_x_from is not None:
+            viewport_cursor_fingerprint = self._viewport_cursor_fingerprint(
+                book_id,
+                query.view,
+                catalog_read.source_fingerprint,
+            )
+        if query.viewport_page_token:
+            token = _decode_viewport_page_token(query.viewport_page_token)
+            if token["querySignature"] != viewport_query_signature:
+                raise StoryGraphError("viewport page token does not match the current query")
+            if token["sourceFingerprint"] != viewport_cursor_fingerprint:
+                raise StoryGraphError("viewport page token expired; reload the current viewport")
+            viewport_page_offset = token["offset"]
+        if query.viewport_x_from is not None:
+            viewport_edge_query_signature = _viewport_query_signature(query, purpose="edges")
+            if query.viewport_edge_page_token:
+                edge_token = _decode_viewport_page_token(query.viewport_edge_page_token)
+                if edge_token["querySignature"] != viewport_edge_query_signature:
+                    raise StoryGraphError("viewport edge page token does not match the current query")
+                if edge_token["sourceFingerprint"] != viewport_cursor_fingerprint:
+                    raise StoryGraphError("viewport edge page token expired; reload the current viewport")
+                viewport_edge_page_offset = edge_token["offset"]
+        if query.viewport_x_from is not None:
+            # The spatial index owns the stable world coordinates.  A query
+            # reads only the rows intersecting this rectangle; it no longer
+            # calls the O(N) layout implementation on every pan or cursor.
+            layout_positions = {}
+        elif query.view == "all" and not focus_id:
             # Full Graph and viewport reads share one coordinate space.  This
             # prevents the first bounded page from assigning different grid
             # coordinates than a later pan/zoom fetch.
@@ -1357,14 +2063,13 @@ class StoryGraphProjector:
                 book_id,
                 query.view,
                 list(candidates.values()),
-                [
-                    edge for edge in catalog.edges
-                    if edge["source"] in candidates and edge["target"] in candidates
-                ],
+                candidate_edges,
                 focus_id,
             )
 
-        if focus_id:
+        if boundary_target_id:
+            base_selected_ids = {boundary_target_id}
+        elif focus_id:
             base_selected_ids = self._depth_ids(focus_id, adjacency, query.depth, query.limit)
         else:
             # A viewport query is the page boundary.  Do not pre-slice by the
@@ -1373,12 +2078,13 @@ class StoryGraphProjector:
             base_selected_ids = set(candidates) if query.viewport_x_from is not None else set(list(candidates)[: query.limit])
 
         viewport_ids: Optional[set[str]] = None
+        viewport_result_count: Optional[int] = None
         if query.viewport_x_from is not None:
             # Layout against the complete filtered candidate set before
             # slicing it.  A viewport request must not re-rank nodes and move
             # them merely because a different page was fetched.
-            if layout_positions is None:
-                raise StoryGraphError("viewport layout positions were not prepared")
+            if spatial_index is None:
+                raise StoryGraphError("viewport spatial index was not prepared")
             x_from = query.viewport_x_from
             x_to = query.viewport_x_to
             y_from = query.viewport_y_from
@@ -1389,29 +2095,116 @@ class StoryGraphProjector:
             right = x_to + query.viewport_padding
             top = y_from - query.viewport_padding
             bottom = y_to + query.viewport_padding
-            viewport_ids = {
-                node_id
-                for node_id, position in layout_positions.items()
-                if left <= float(position["x"]) <= right
-                and top <= float(position["y"]) <= bottom
-            }
-            selected_ids = base_selected_ids & viewport_ids
-            # A focused node is a navigation anchor.  Keep it available even
-            # when the caller's viewport is stale after a focus transition.
-            if focus_id in candidates:
-                selected_ids.add(focus_id)
-            selected_ids = set(
-                sorted(selected_ids, key=lambda node_id: self._node_sort_key(candidates[node_id]))[: query.limit]
-            )
+            if boundary_target_id:
+                # A boundary inspection deliberately addresses a node outside
+                # the current rectangle.  It is an indexed evidence query;
+                # the remote node is returned to the Inspector, not merged
+                # into the Canvas page by the browser.
+                ordered_viewport_ids = [boundary_target_id]
+            else:
+                viewport_rows = self._spatial_rows_in_viewport(
+                    spatial_index,
+                    book_id,
+                    query.view,
+                    left,
+                    right,
+                    top,
+                    bottom,
+                    allowed_ids=base_selected_ids,
+                )
+                ordered_viewport_ids = [str(row["node_id"]) for row in viewport_rows if str(row["node_id"]) in candidates]
+            viewport_ids = set(ordered_viewport_ids)
+            viewport_result_count = len(ordered_viewport_ids)
+            page_ids = ordered_viewport_ids[viewport_page_offset:viewport_page_offset + query.limit]
+            selected_ids = {boundary_target_id} if boundary_target_id else set(page_ids)
+            # A focused node is a navigation anchor for the first page.  A
+            # continuation page remains a strict slice so callers can reason
+            # about hasMore/nextPageToken without duplicate anchor nodes.
+            if viewport_page_offset == 0 and focus_id in candidates and focus_id in viewport_ids:
+                if focus_id not in selected_ids:
+                    if len(page_ids) >= query.limit:
+                        selected_ids.remove(page_ids[-1])
+                    selected_ids.add(focus_id)
         else:
             selected_ids = base_selected_ids
         selected_ids = {node_id for node_id in selected_ids if node_id in candidates}
+        if spatial_index is not None or catalog.indexed:
+            hydrated = self._hydrate_indexed_nodes(
+                book_id,
+                catalog_read.source_fingerprint,
+                selected_ids,
+            )
+            for node_id, node in hydrated.items():
+                if node_id in candidates:
+                    candidates[node_id] = node
+            catalog.nodes.update(hydrated)
         selected_nodes = [candidates[node_id] for node_id in candidates if node_id in selected_ids]
         selected_nodes.sort(key=self._node_sort_key)
-        selected_edges = [
-            edge for edge in catalog.edges
-            if edge["source"] in selected_ids and edge["target"] in selected_ids
-        ][: query.edge_limit]
+        viewport_internal_edges: list[dict[str, Any]] = []
+        viewport_internal_edge_count = 0
+        if spatial_index is not None:
+            indexed_selected_edges = self._indexed_edges_for_nodes(spatial_index, book_id, selected_ids)
+            selected_edges = [
+                edge for edge in indexed_selected_edges
+                if edge["source"] in selected_ids and edge["target"] in selected_ids
+            ][: query.edge_limit]
+            layout_positions = self._spatial_positions_by_ids(spatial_index, book_id, query.view, selected_ids)
+        else:
+            selected_edges = [
+                edge for edge in candidate_edges
+                if edge["source"] in selected_ids and edge["target"] in selected_ids
+            ][: query.edge_limit]
+        if query.viewport_x_from is not None:
+            # Node pages and semantic edge pages have different boundaries.
+            # Edges are ordered over the complete world-coordinate viewport,
+            # not just the current node page, so a later node page can reveal
+            # both endpoints of an already fetched relationship without
+            # forcing the client to rescan the full graph.
+            edge_scope_ids = viewport_ids if viewport_ids is not None else selected_ids
+            if spatial_index is not None:
+                viewport_internal_edges, viewport_internal_edge_count = self._indexed_internal_edge_page(
+                    spatial_index,
+                    book_id,
+                    edge_scope_ids,
+                    offset=viewport_edge_page_offset,
+                    limit=query.edge_limit,
+                )
+            else:
+                all_internal = [
+                    edge for edge in candidate_edges
+                    if edge["source"] in edge_scope_ids and edge["target"] in edge_scope_ids
+                ]
+                all_internal.sort(key=self._edge_sort_key)
+                viewport_internal_edge_count = len(all_internal)
+                viewport_internal_edges = all_internal[
+                    viewport_edge_page_offset:viewport_edge_page_offset + query.edge_limit
+                ]
+        graph_edges = viewport_internal_edges if query.viewport_x_from is not None else selected_edges
+        boundary_page_size = min(max(query.edge_limit, 1), 120)
+        boundary_edges: list[dict[str, Any]] = []
+        boundary_edge_count = 0
+        boundary_edge_type_counts: dict[str, int] = {}
+        if query.viewport_x_from is not None:
+            boundary_query_signature = _boundary_query_signature(query, selected_ids)
+            if query.boundary_page_token:
+                boundary_token = _decode_viewport_page_token(query.boundary_page_token)
+                if boundary_token["querySignature"] != boundary_query_signature:
+                    raise StoryGraphError("boundary page token does not match the current query")
+                if boundary_token["sourceFingerprint"] != viewport_cursor_fingerprint:
+                    raise StoryGraphError("boundary page token expired; reload the current viewport")
+                boundary_page_offset = boundary_token["offset"]
+            if spatial_index is None:
+                raise StoryGraphError("viewport spatial index was not prepared")
+            boundary_edges, boundary_edge_count, boundary_edge_type_counts = self._indexed_boundary_page(
+                spatial_index,
+                book_id,
+                query.view,
+                selected_ids,
+                candidates,
+                layout_positions,
+                offset=boundary_page_offset,
+                limit=boundary_page_size,
+            )
         if layout_positions is None:
             self._apply_layout(book_id, query.view, selected_nodes, selected_edges, focus_id)
         else:
@@ -1454,18 +2247,19 @@ class StoryGraphProjector:
                 "presentation": query.presentation,
             },
             "nodes": selected_nodes,
-            "edges": selected_edges,
+            "edges": graph_edges,
             "meta": {
                 "totalAvailableNodes": len(candidates),
                 "totalAvailableEdges": candidate_edge_count,
                 "returnedNodes": len(selected_nodes),
-                "returnedEdges": len(selected_edges),
-                "truncated": len(selected_nodes) < len(candidates) or len(selected_edges) < candidate_edge_count,
+                "returnedEdges": len(graph_edges),
+                "truncated": len(selected_nodes) < len(candidates) or len(graph_edges) < candidate_edge_count,
                 "focused": bool(focus_id),
                 "presentation": presentation_meta,
                 "canonicalSource": "sqlite",
-                "graphSnapshotId": snapshot["id"],
+                "graphSnapshotId": snapshot.get("id") if snapshot else None,
                 "projectionCacheHit": catalog_read.cache_hit,
+                "projectionReadModel": catalog_read.read_model,
                 "projectionSourceFingerprint": catalog_read.source_fingerprint,
                 "projectionHealth": projection_health,
                 "availableVolumes": available_volumes,
@@ -1473,9 +2267,28 @@ class StoryGraphProjector:
                 "worldGraph": self._world_graph_metadata(query.view),
                 "viewport": self._viewport_metadata(
                     query,
-                    len(viewport_ids) if viewport_ids is not None else len(candidates),
+                    viewport_result_count if viewport_result_count is not None else len(candidates),
                     len(selected_nodes),
-                    bool(viewport_ids is not None and len(selected_ids) < len(viewport_ids)),
+                    bool(
+                        viewport_ids is not None
+                        and viewport_page_offset + len(selected_ids) < len(viewport_ids)
+                    ),
+                    source_fingerprint=viewport_cursor_fingerprint,
+                    query_signature=viewport_query_signature,
+                    page_offset=viewport_page_offset,
+                    internal_edge_count=viewport_internal_edge_count,
+                    returned_internal_edges=len(viewport_internal_edges),
+                    internal_edge_page_offset=viewport_edge_page_offset,
+                    internal_edge_page_size=query.edge_limit,
+                    internal_edge_source_fingerprint=viewport_cursor_fingerprint,
+                    internal_edge_query_signature=viewport_edge_query_signature,
+                    boundary_page_size=boundary_page_size,
+                    cross_boundary_edge_count=boundary_edge_count,
+                    boundary_edges=boundary_edges,
+                    boundary_edge_type_counts=boundary_edge_type_counts,
+                    boundary_page_offset=boundary_page_offset,
+                    boundary_source_fingerprint=viewport_cursor_fingerprint,
+                    boundary_query_signature=boundary_query_signature,
                 ),
             },
         }
@@ -1486,44 +2299,42 @@ class StoryGraphProjector:
             return {"query": query, "matches": []}
         if not self.db.fetchone("SELECT id FROM books WHERE id=?", (book_id,)):
             return {"query": query, "matches": []}
-        catalog = self._read_catalog(book_id).catalog
-        allowed = VIEW_NODE_TYPES[normalize_view(view)]
-        matches = []
-        for node in catalog.nodes.values():
-            if node["type"] not in allowed:
-                continue
-            raw_metadata = node.get("metadata")
-            metadata: dict[str, Any] = raw_metadata if isinstance(raw_metadata, dict) else {}
-            metadata_search = " ".join(
-                str(metadata.get(key, ""))
-                for key in (
-                    "referenceId", "referenceType", "stepKey", "subtype",
-                    "sourceRecordId", "payloadSummary", "lifecycleStatus",
-                )
-            )
-            haystack = " ".join(
-                [
-                    str(node.get("id", "")),
-                    str(node.get("title", "")),
-                    str(node.get("summary", "")),
-                    metadata_search,
-                ]
-            ).lower()
-            if term not in haystack:
-                continue
-            matches.append(
-                {
-                    "id": node["id"],
-                    "type": node["type"],
-                    "title": node["title"],
-                    "summary": node.get("summary", ""),
-                    "status": node["status"],
-                    "sourceType": node.get("source_type"),
-                    "sourceId": node.get("source_id"),
-                }
-            )
-        matches.sort(key=lambda item: (item["type"], item["title"]))
-        return {"query": query, "matches": matches[: max(1, min(limit, 100))]}
+        normalized_view = normalize_view(view)
+        allowed = VIEW_NODE_TYPES[normalized_view]
+        bounded_limit = max(1, min(limit, 100))
+
+        # Search is a read-model query too.  The first request after an
+        # authoritative change rebuilds the index through _read_catalog; warm
+        # searches read only scalar match rows and never deserialize the full
+        # catalog.  The index remains rebuildable and carries no Canon data.
+        source_fingerprint = self._source_identity(book_id)
+        if not self._node_index_ready(book_id, source_fingerprint):
+            catalog_read = self._read_catalog(book_id)
+            source_fingerprint = catalog_read.source_fingerprint
+        placeholders = ",".join("?" for _ in allowed)
+        rows = self.db.fetchall(
+            f"""SELECT node_id, node_type, title, summary, status, source_type, source_id
+                  FROM storyflow_graph_node_index
+                 WHERE book_id=? AND source_fingerprint=?
+                   AND node_type IN ({placeholders})
+                   AND instr(search_text, ?) > 0
+                 ORDER BY node_type, title, node_id
+                 LIMIT ?""",
+            (book_id, source_fingerprint, *sorted(allowed), term.casefold(), bounded_limit),
+        )
+        matches = [
+            {
+                "id": str(row.get("node_id") or ""),
+                "type": str(row.get("node_type") or ""),
+                "title": str(row.get("title") or ""),
+                "summary": str(row.get("summary") or ""),
+                "status": str(row.get("status") or "CANON"),
+                "sourceType": row.get("source_type"),
+                "sourceId": row.get("source_id"),
+            }
+            for row in rows
+        ]
+        return {"query": query, "matches": matches}
 
     def story_health(
         self,
@@ -1795,6 +2606,7 @@ class StoryGraphProjector:
         offset: int = 0,
         direction: str = "both",
         node_types: Iterable[str] = (),
+        page_token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Read one bounded page of semantic neighbors.
 
@@ -1803,6 +2615,18 @@ class StoryGraphProjector:
         ordered page and a continuation offset instead of loading every edge
         attached to a high-degree node.
         """
+        normalized_node_types = tuple(node_types)
+        indexed = self._indexed_neighbors(
+            book_id,
+            node_id,
+            limit=limit,
+            offset=offset,
+            direction=direction,
+            node_types=normalized_node_types,
+            page_token=page_token,
+        )
+        if indexed is not None:
+            return indexed
         catalog_read = self._read_catalog(book_id)
         catalog = catalog_read.catalog
         resolved = self._resolve_focus(catalog.nodes, node_id) or node_id
@@ -1814,7 +2638,20 @@ class StoryGraphProjector:
             raise StoryGraphError("neighbor direction must be one of: in, out, both")
         bounded_limit = max(1, min(int(limit or 60), 200))
         bounded_offset = max(0, int(offset or 0))
-        allowed_types = {canonical_node_type(item) for item in node_types if item}
+        allowed_types = {canonical_node_type(item) for item in normalized_node_types if item}
+        query_signature = _neighbor_query_signature(
+            resolved,
+            normalized_direction,
+            allowed_types,
+            bounded_limit,
+        )
+        if page_token:
+            token = _decode_viewport_page_token(page_token)
+            if token["querySignature"] != query_signature:
+                raise StoryGraphError("neighbor page token does not match the current query")
+            if token["sourceFingerprint"] != catalog_read.source_fingerprint:
+                raise StoryGraphError("neighbor page token expired; reload the current node")
+            bounded_offset = token["offset"]
         related: list[dict[str, Any]] = []
         for edge in catalog.edges:
             is_out = edge["source"] == resolved
@@ -1840,6 +2677,15 @@ class StoryGraphProjector:
         total = len(related)
         page = related[bounded_offset : bounded_offset + bounded_limit]
         next_offset = bounded_offset + bounded_limit if bounded_offset + bounded_limit < total else None
+        next_page_token = (
+            _encode_viewport_page_token(
+                catalog_read.source_fingerprint,
+                query_signature,
+                next_offset,
+            )
+            if next_offset is not None
+            else None
+        )
         return {
             "node": node,
             "neighbors": page,
@@ -1849,9 +2695,281 @@ class StoryGraphProjector:
                 "total": total,
                 "nextOffset": next_offset,
                 "hasMore": next_offset is not None,
+                "nextPageToken": next_page_token,
+                "cursorSourceFingerprint": catalog_read.source_fingerprint,
+                "querySignature": query_signature,
             },
             "canonicalSource": "sqlite",
             "projectionCacheHit": catalog_read.cache_hit,
+            "projectionReadModel": "json_catalog",
+        }
+
+    def selection_projection(
+        self,
+        book_id: str,
+        node_ids: Iterable[str],
+        *,
+        limit: int = 120,
+        edge_limit: int = 240,
+        external_offset: int = 0,
+        external_page_token: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Explain one author-selected StoryFlow working set.
+
+        A multi-selection is a first-class workflow input: it may become a
+        Chapter Intent, an analysis task, or a candidate forecast.  The
+        selection summary therefore needs more than the browser's current
+        bounded page.  This read-only projection resolves the selected ids
+        against the SQLite-backed catalog, returns semantic edges inside the
+        selection, and exposes a bounded sample of edges leaving it.  It does
+        not persist selection state and never mutates Canon.
+        """
+        bounded_limit = max(1, min(int(limit or 120), 240))
+        bounded_edge_limit = max(1, min(int(edge_limit or 240), 600))
+        requested: list[str] = []
+        seen_requested: set[str] = set()
+        for raw in node_ids:
+            value = str(raw or "").strip()
+            if not value or value in seen_requested:
+                continue
+            seen_requested.add(value)
+            requested.append(value)
+
+        book_exists = self.db.fetchone("SELECT id FROM books WHERE id=?", (book_id,)) is not None
+        indexed_selection = False
+        indexed_source_fingerprint = ""
+        if book_exists:
+            # Selection is the common hand-off into Intent, analysis, and
+            # candidate generation.  Once the paired read model is warm,
+            # resolve only the requested node payloads and their incident
+            # semantic edges.  The cold path deliberately remains the
+            # authoritative-derived catalog fallback so older databases and
+            # partially built indexes are still compatible.
+            indexed_source_fingerprint = self._source_identity(book_id)
+            indexed_selection = (
+                self._node_index_ready(book_id, indexed_source_fingerprint)
+                and self._semantic_edge_index_ready(book_id, indexed_source_fingerprint)
+            )
+            if indexed_selection:
+                meta = self.db.fetchone(
+                    """SELECT project_id FROM storyflow_graph_node_index_meta
+                         WHERE book_id=? AND source_fingerprint=?""",
+                    (book_id, indexed_source_fingerprint),
+                ) or {}
+                catalog = _Catalog(
+                    book_id=book_id,
+                    project_id=str(meta.get("project_id") or book_id),
+                    nodes={},
+                    edges=[],
+                    indexed=True,
+                )
+                catalog_read = _CatalogRead(
+                    catalog,
+                    indexed_source_fingerprint,
+                    True,
+                    "sqlite_node_index+semantic_edge_index",
+                )
+            else:
+                catalog_read = self._read_catalog(book_id)
+                catalog = catalog_read.catalog
+        else:
+            catalog_read = _CatalogRead(
+                _Catalog(book_id=book_id, project_id=book_id),
+                source_fingerprint="",
+                cache_hit=False,
+            )
+            catalog = catalog_read.catalog
+
+        selected: list[dict[str, Any]] = []
+        missing: list[str] = []
+        resolved_ids: set[str] = set()
+        for requested_id in requested:
+            if indexed_selection:
+                node = self._indexed_node_reference(
+                    book_id,
+                    indexed_source_fingerprint,
+                    requested_id,
+                )
+                resolved_id = str(node.get("id")) if node else requested_id
+            else:
+                resolved_id = self._resolve_focus(catalog.nodes, requested_id) or requested_id
+                node = catalog.nodes.get(resolved_id)
+            if node is None:
+                missing.append(requested_id)
+                continue
+            if resolved_id in resolved_ids:
+                continue
+            resolved_ids.add(resolved_id)
+            selected.append(node)
+
+        selected_truncated = len(selected) > bounded_limit
+        if selected_truncated:
+            selected.sort(key=self._node_sort_key)
+            selected = selected[:bounded_limit]
+            resolved_ids = {node["id"] for node in selected}
+
+        def count_by(items: Iterable[dict[str, Any]], key: str) -> dict[str, int]:
+            counts: dict[str, int] = defaultdict(int)
+            for item in items:
+                value = str(item.get(key) or "UNKNOWN")
+                counts[value] += 1
+            return dict(sorted(counts.items()))
+
+        indexed_edge_page: Optional[dict[str, Any]] = None
+        if indexed_selection and resolved_ids:
+            indexed_edge_page = self._indexed_selection_edge_page(
+                book_id,
+                indexed_source_fingerprint,
+                resolved_ids,
+                limit=bounded_edge_limit,
+                offset=external_offset,
+                page_token=external_page_token,
+            )
+
+        if indexed_edge_page is not None:
+            internal_edges = list(indexed_edge_page["internalEdges"])
+            external_edges = list(indexed_edge_page["externalEdges"])
+            external_edge_count = int(indexed_edge_page["externalEdgeCount"])
+            external_edge_type_counts = dict(indexed_edge_page["externalEdgeTypeCounts"])
+            external_pagination = dict(indexed_edge_page["externalPagination"])
+        else:
+            internal_edges = [
+                edge for edge in catalog.edges
+                if edge["source"] in resolved_ids and edge["target"] in resolved_ids
+            ]
+            internal_edges.sort(
+                key=lambda edge: (
+                    str(edge.get("type") or ""),
+                    str(edge.get("source") or ""),
+                    str(edge.get("target") or ""),
+                    str(edge.get("id") or ""),
+                )
+            )
+
+            all_external_edges: list[dict[str, Any]] = []
+            for edge in catalog.edges:
+                source_selected = edge["source"] in resolved_ids
+                target_selected = edge["target"] in resolved_ids
+                if source_selected == target_selected:
+                    continue
+                selected_endpoint_id = edge["source"] if source_selected else edge["target"]
+                remote_endpoint_id = edge["target"] if source_selected else edge["source"]
+                remote_endpoint = catalog.nodes.get(remote_endpoint_id)
+                if remote_endpoint is None:
+                    continue
+                all_external_edges.append({
+                    **edge,
+                    "selectedEndpointId": selected_endpoint_id,
+                    "remoteEndpointId": remote_endpoint_id,
+                    "remoteEndpoint": remote_endpoint,
+                    "direction": "out" if source_selected else "in",
+                })
+            all_external_edges.sort(
+                key=lambda edge: (
+                    str(edge.get("type") or ""),
+                    str(edge.get("selectedEndpointId") or ""),
+                    str(edge.get("remoteEndpointId") or ""),
+                    str(edge.get("id") or ""),
+                )
+            )
+            external_edge_count = len(all_external_edges)
+            external_edge_type_counts = count_by(all_external_edges, "type")
+            external_query_signature = _selection_external_query_signature(
+                resolved_ids,
+                bounded_edge_limit,
+            )
+            external_offset_value = max(0, int(external_offset or 0))
+            if external_page_token:
+                token = _decode_viewport_page_token(external_page_token)
+                if token["querySignature"] != external_query_signature:
+                    raise StoryGraphError(
+                        "selection external-edge page token does not match the current query"
+                    )
+                if token["sourceFingerprint"] != catalog_read.source_fingerprint:
+                    raise StoryGraphError(
+                        "selection external-edge page token expired; reload the current selection"
+                    )
+                external_offset_value = token["offset"]
+            next_offset = (
+                external_offset_value + bounded_edge_limit
+                if external_offset_value + bounded_edge_limit < external_edge_count
+                else None
+            )
+            external_edges = all_external_edges[
+                external_offset_value : external_offset_value + bounded_edge_limit
+            ]
+            external_pagination = {
+                "limit": bounded_edge_limit,
+                "offset": external_offset_value,
+                "total": external_edge_count,
+                "nextOffset": next_offset,
+                "hasMore": next_offset is not None,
+                "nextPageToken": (
+                    _encode_viewport_page_token(
+                        catalog_read.source_fingerprint,
+                        external_query_signature,
+                        next_offset,
+                    )
+                    if next_offset is not None
+                    else None
+                ),
+                "cursorSourceFingerprint": catalog_read.source_fingerprint,
+                "querySignature": external_query_signature,
+            }
+
+        chapter_numbers: list[int] = []
+        for node in selected:
+            metadata = node.get("metadata") or {}
+            for key in ("number", "chapterNumber", "narrativeOrder", "createdChapter"):
+                value = metadata.get(key)
+                try:
+                    if value is not None:
+                        chapter_numbers.append(int(value))
+                        break
+                except (TypeError, ValueError):
+                    continue
+
+        return {
+            "bookId": book_id,
+            "nodeIds": [node["id"] for node in selected],
+            "requestedNodeIds": requested,
+            "missingNodeIds": missing,
+            "nodes": selected,
+            "edges": internal_edges[:bounded_edge_limit],
+            "internalEdges": internal_edges[:bounded_edge_limit],
+            "externalEdges": external_edges[:bounded_edge_limit],
+            "summary": {
+                "nodeCount": len(selected),
+                "internalEdgeCount": len(internal_edges),
+                "externalEdgeCount": external_edge_count,
+                "nodeTypeCounts": count_by(selected, "type"),
+                "nodeStatusCounts": count_by(selected, "status"),
+                "edgeTypeCounts": count_by(internal_edges, "type"),
+                "edgeStatusCounts": count_by(internal_edges, "status"),
+                "externalEdgeTypeCounts": external_edge_type_counts,
+                "chapterFrom": min(chapter_numbers) if chapter_numbers else None,
+                "chapterTo": max(chapter_numbers) if chapter_numbers else None,
+            },
+            "meta": {
+                "canonicalSource": "sqlite.story_graph_projection",
+                "readOnly": True,
+                "canonicalMutation": False,
+                "requestedNodeCount": len(requested),
+                "resolvedNodeCount": len(selected),
+                "missingNodeCount": len(missing),
+                "selectionLimit": bounded_limit,
+                "edgeLimit": bounded_edge_limit,
+                "selectionTruncated": selected_truncated,
+                "internalEdgesTruncated": len(internal_edges) > bounded_edge_limit,
+                "externalEdgesTruncated": bool(
+                    external_pagination.get("hasMore") or external_pagination.get("offset")
+                ),
+                "externalEdgesPage": external_pagination,
+                "projectionCacheHit": catalog_read.cache_hit,
+                "projectionReadModel": catalog_read.read_model,
+                "projectionSourceFingerprint": catalog_read.source_fingerprint,
+                "evidenceBoundary": "selected node ids and recorded semantic SQLite edges; no layout or AI inference",
+            },
         }
 
     def node_detail(self, book_id: str, node_id: str) -> dict[str, Any]:
@@ -2346,9 +3464,10 @@ class StoryGraphProjector:
                  LEFT JOIN storyflow_graph_snapshots gs
                    ON gs.id = (
                         SELECT candidate.id
-                          FROM storyflow_graph_snapshots candidate
+                         FROM storyflow_graph_snapshots candidate
                          WHERE candidate.book_id=?
                            AND candidate.source_commit_id=sc.id
+                           AND candidate.reason='story_commit_accept'
                          ORDER BY candidate.created_at DESC, candidate.id DESC
                          LIMIT 1
                    )
@@ -2434,6 +3553,8 @@ class StoryGraphProjector:
             commit_by_version.get(from_id),
             commit_by_version.get(to_id),
             catalog,
+            depth=depth,
+            limit=limit,
         )
         warnings = [
             "文本差异来自 immutable ChapterVersion SQLite 记录。",
@@ -2486,6 +3607,9 @@ class StoryGraphProjector:
         source_commit: Optional[dict[str, Any]],
         target_commit: Optional[dict[str, Any]],
         catalog: _Catalog,
+        *,
+        depth: int = 3,
+        limit: int = 120,
     ) -> dict[str, Any]:
         """Expose immutable commit evidence at two ChapterVersion boundaries.
 
@@ -2584,6 +3708,14 @@ class StoryGraphProjector:
             target_commit,
             None,
         )
+        historical_dependency = self._historical_dependency_surface(
+            book_id,
+            source_commit,
+            target_commit,
+            chapter_id=chapter_id,
+            depth=depth,
+            limit=limit,
+        )
         if historical_graph.get("complete"):
             warnings.append(
                 "实体节点与语义边来自两个 accepted StoryCommit 的不可变 graph projection snapshot；它们不是从当前 mutable entity tables 反推的历史状态。"
@@ -2591,6 +3723,10 @@ class StoryGraphProjector:
         else:
             warnings.append(
                 "canonicalSurface 只重放已持久化的 StoryCommit / StoryFact / StoryState projection；缺失 accepted graph snapshot 时，mutable entity tables 仍不是历史快照。"
+            )
+        if historical_dependency.get("complete"):
+            warnings.append(
+                "历史影响面沿 target accepted graph snapshot 的已记录语义出边展开；它不是模型对正文的因果预测。"
             )
 
         source_facts = (source_record or {}).get("facts") or []
@@ -2655,6 +3791,7 @@ class StoryGraphProjector:
             "affectedNodeIds": sorted(affected_ids),
             "graphRefs": graph_refs,
             "historicalGraph": historical_graph,
+            "historicalDependencySurface": historical_dependency,
             "commitEvidenceComplete": source_record is not None and target_record is not None,
             "stateComplete": bool(
                 source_record
@@ -2675,6 +3812,7 @@ class StoryGraphProjector:
                 "changedStateCount": len(changed_state),
                 "mutableDomainTablesHistorical": False,
                 "historicalGraphSnapshot": bool(historical_graph.get("complete")),
+                "historicalDependencySurface": bool(historical_dependency.get("complete")),
             },
         }
 
@@ -3018,6 +4156,49 @@ class StoryGraphProjector:
                 payload=snapshot_entry,
             )
 
+        canonical_graph_history = self._canonical_graph_history(
+            book_id,
+            resolved,
+            limit=bounded_limit,
+        )
+
+        failure_chapter_id = None
+        if resolved and str(resolved).startswith("chapter:"):
+            failure_chapter_id = str(resolved).split(":", 1)[1]
+        failure_rows = self.db.fetchall(
+            """SELECT f.book_id, f.commit_id, f.source_fingerprint,
+                      f.source_revision, f.error, f.failed_at,
+                      sc.chapter_id, c.number AS chapter_number,
+                      c.title AS chapter_title
+                 FROM storyflow_graph_snapshot_capture_failures f
+                 JOIN story_commits sc ON sc.id=f.commit_id
+                 JOIN chapters c ON c.id=sc.chapter_id
+                WHERE f.book_id=?
+                  AND (? IS NULL OR sc.chapter_id=?)
+                ORDER BY f.failed_at DESC, f.commit_id DESC""",
+            (book_id, failure_chapter_id, failure_chapter_id),
+        )
+        for failure in failure_rows:
+            append_entry(
+                entry_id=f"graph-snapshot-failure:{failure['commit_id']}",
+                kind="graph_snapshot_capture_failure",
+                timestamp=failure.get("failed_at"),
+                status="STALE",
+                title="StoryFlow projection capture failed",
+                source_table="storyflow_graph_snapshot_capture_failures",
+                source_id=str(failure["commit_id"]),
+                payload={
+                    "commitId": failure.get("commit_id"),
+                    "chapterId": failure.get("chapter_id"),
+                    "chapterNumber": failure.get("chapter_number"),
+                    "chapterTitle": failure.get("chapter_title") or "",
+                    "sourceFingerprint": failure.get("source_fingerprint"),
+                    "sourceRevision": failure.get("source_revision"),
+                    "error": failure.get("error") or "",
+                    "recoveryAvailable": True,
+                },
+            )
+
         canonical_predecessors: dict[str, Optional[str]] = {}
         previous_commit_id: Optional[str] = None
         for canonical_row in self._canonical_commit_rows(book_id):
@@ -3036,6 +4217,7 @@ class StoryGraphProjector:
             "nodeId": resolved,
             "node": node,
             "entries": entries[:bounded_limit],
+            "canonicalGraphHistory": canonical_graph_history,
             "meta": {
                 "limit": bounded_limit,
                 "returned": min(len(entries), bounded_limit),
@@ -3045,8 +4227,12 @@ class StoryGraphProjector:
                 "graphSnapshotCount": snapshot_meta["count"],
                 "graphSnapshotScope": "observed_projection",
                 "graphSnapshotHistoryComplete": False,
+                "graphSnapshotCaptureFailures": len(failure_rows),
+                "graphSnapshotRecoveryAvailable": bool(failure_rows),
                 "canonicalReplayAvailable": bool(canonical_predecessors),
                 "canonicalReplayScope": "accepted_story_commits",
+                "canonicalGraphHistoryAvailable": bool(canonical_graph_history.get("available")),
+                "canonicalGraphHistoryComplete": bool(canonical_graph_history.get("complete")),
                 "chapterVersionDiffAvailable": bool(node_type == "Chapter" and len(entries) > 1),
             },
             "canonicalSource": "sqlite",
@@ -3113,6 +4299,106 @@ class StoryGraphProjector:
             "replayComplete": False,
             "canonicalSource": "sqlite",
         }
+
+    def changes_since_snapshot(
+        self,
+        book_id: str,
+        from_snapshot_id: Optional[str],
+        *,
+        node_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Return a read-only freshness check against the current projection.
+
+        The Canvas is a long-lived client while the Writing Studio and worker
+        can accept a StoryCommit in another task.  Reusing the immutable
+        observed snapshot table gives that client a safe change boundary
+        without adding a second event log or treating layout state as Canon.
+        A missing old snapshot is a resync condition rather than a 500: the
+        caller can reload the current projection and keep the boundary
+        explicit.
+        """
+        normalized_from = str(from_snapshot_id or "").strip() or None
+        normalized_node = str(node_id or "").strip() or None
+        catalog_read = self._read_catalog(book_id)
+        current = self._capture_snapshot(catalog_read.catalog, reason="storyflow_freshness_poll")
+        current_metadata = {
+            "id": current.get("id"),
+            "snapshotHash": current.get("snapshot_hash"),
+            "sourceCommitId": current.get("source_commit_id"),
+            "sourceStateVersion": current.get("source_state_version"),
+            "reason": current.get("reason"),
+            "nodeCount": current.get("node_count") or 0,
+            "edgeCount": current.get("edge_count") or 0,
+            "createdAt": current.get("created_at"),
+        }
+        empty_diff = {
+            "initial": normalized_from is None,
+            "addedNodes": [],
+            "removedNodes": [],
+            "changedNodes": [],
+            "addedEdges": [],
+            "removedEdges": [],
+            "hasRelevantChange": normalized_from is None,
+        }
+        if normalized_from is None:
+            return {
+                "bookId": book_id,
+                "from": None,
+                "to": current_metadata,
+                "changed": True,
+                "resyncRequired": True,
+                "diff": empty_diff,
+                "nodeId": normalized_node,
+                "scope": "observed_projection",
+                "canonicalSource": "sqlite",
+            }
+        current_id = str(current.get("id") or "")
+        if normalized_from == current_id:
+            empty_diff["initial"] = False
+            empty_diff["hasRelevantChange"] = False
+            return {
+                "bookId": book_id,
+                "from": current_metadata,
+                "to": current_metadata,
+                "changed": False,
+                "resyncRequired": False,
+                "diff": empty_diff,
+                "nodeId": normalized_node,
+                "scope": "observed_projection",
+                "canonicalSource": "sqlite",
+            }
+
+        try:
+            result = self.snapshot_diff(
+                book_id,
+                normalized_from,
+                current_id,
+                node_id=normalized_node,
+            )
+        except StoryGraphError as exc:
+            if "snapshot not found" not in str(exc).lower():
+                raise
+            return {
+                "bookId": book_id,
+                "from": {"id": normalized_from},
+                "to": current_metadata,
+                "changed": True,
+                "resyncRequired": True,
+                "diff": {
+                    **empty_diff,
+                    "initial": True,
+                    "hasRelevantChange": True,
+                },
+                "nodeId": normalized_node,
+                "scope": "observed_projection",
+                "canonicalSource": "sqlite",
+                "reason": "the previous observed StoryFlow snapshot is not available; reload the current projection",
+            }
+        result.update({
+            "changed": bool(result.get("diff", {}).get("hasRelevantChange")),
+            "resyncRequired": False,
+        })
+        return result
 
     def canonical_replay(
         self,
@@ -3347,13 +4633,221 @@ class StoryGraphProjector:
                  LEFT JOIN storyflow_graph_snapshots gs
                    ON gs.id = (
                         SELECT candidate.id
-                          FROM storyflow_graph_snapshots candidate
+                         FROM storyflow_graph_snapshots candidate
                          WHERE candidate.book_id=c.book_id
                            AND candidate.source_commit_id=sc.id
+                           AND candidate.reason='story_commit_accept'
                          ORDER BY candidate.created_at DESC, candidate.id DESC
                          LIMIT 1
                    )
                 WHERE c.book_id=? AND sc.status='accepted'
+             ORDER BY c.number, COALESCE(sc.accepted_at, sc.created_at), sc.created_at, sc.id""",
+            (book_id,),
+        )
+
+    def _canonical_graph_history(
+        self,
+        book_id: str,
+        node_id: Optional[str],
+        *,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Return a commit-scoped timeline of accepted graph snapshots.
+
+        ``history()`` already exposes individual ChapterVersion and
+        StoryCommit records.  This companion surface answers the graph
+        question: which accepted projection boundary changed, and what
+        semantic nodes/edges changed between two consecutive accepted
+        snapshots?  It never bridges across a missing snapshot, because doing
+        so would silently turn a current mutable catalog into historical
+        evidence.
+        """
+        bounded_limit = max(1, min(int(limit or 100), 500))
+        resolved_node = node_id
+        if node_id:
+            catalog = self._read_catalog(book_id).catalog
+            resolved_node = self._resolve_focus(catalog.nodes, node_id) or node_id
+            if resolved_node not in catalog.nodes:
+                raise StoryGraphError(f"Story Graph node not found: {node_id}")
+
+        rows = self._canonical_graph_boundary_rows(book_id)
+        all_entries: list[dict[str, Any]] = []
+        missing_snapshot_commit_ids: list[str] = []
+        snapshot_count = 0
+        comparable_count = 0
+        previous_snapshot: Optional[dict[str, Any]] = None
+        gap_reason: Optional[str] = None
+
+        for row in rows:
+            commit_id = str(row.get("id"))
+            commit_summary = self._canonical_commit_summary(row) or {}
+            snapshot = self._canonical_snapshot_catalog(book_id, row)
+            entry: dict[str, Any] = {
+                "id": f"accepted-graph-history:{commit_id}",
+                "kind": "accepted_graph_snapshot",
+                "scope": "accepted_commit_snapshot_history",
+                "status": "CANON",
+                "timestamp": (
+                    snapshot.get("createdAt")
+                    if snapshot
+                    else row.get("accepted_at") or row.get("created_at")
+                ),
+                "commitId": commit_id,
+                "commit": commit_summary,
+                "chapterId": row.get("chapter_id"),
+                "chapterNumber": row.get("chapter_number"),
+                "chapterTitle": row.get("chapter_title") or "",
+                "chapterVersionId": row.get("chapter_version_id"),
+                "canonicalMutation": False,
+                "snapshotAvailable": bool(snapshot),
+                "comparisonAvailable": False,
+                "previousSnapshotId": None,
+                "diffSummary": None,
+                "changedNodeIds": [],
+                "changedEdgeIds": [],
+            }
+            if snapshot is None:
+                missing_snapshot_commit_ids.append(commit_id)
+                entry["comparisonReason"] = (
+                    "This accepted StoryCommit has no valid story_commit_accept graph snapshot."
+                )
+                entry["gapBeforeNextSnapshot"] = True
+                gap_reason = (
+                    "The previous accepted commit boundary is unavailable; no historical diff was inferred."
+                )
+                previous_snapshot = None
+                all_entries.append(entry)
+                continue
+
+            snapshot_count += 1
+            entry.update({
+                "snapshotId": snapshot["id"],
+                "snapshotHash": snapshot.get("hash"),
+                "sourceCommitId": snapshot.get("sourceCommitId"),
+                "sourceStateVersion": snapshot.get("sourceStateVersion"),
+                "snapshotNodeCount": len(snapshot["catalog"].nodes),
+                "snapshotEdgeCount": len(snapshot["catalog"].edges),
+            })
+            if previous_snapshot is not None:
+                diff = self._snapshot_diff(
+                    previous_snapshot["payload"],
+                    snapshot["payload"],
+                    resolved_node,
+                )
+                counts = diff.get("counts") or {}
+                changed_node_ids = {
+                    str(item.get("id"))
+                    for item in (
+                        diff.get("addedNodes", [])
+                        + diff.get("removedNodes", [])
+                        + diff.get("changedNodes", [])
+                    )
+                    if item.get("id")
+                }
+                changed_edge_ids = {
+                    str(item.get("id"))
+                    for item in (
+                        diff.get("addedEdges", [])
+                        + diff.get("removedEdges", [])
+                    )
+                    if item.get("id")
+                }
+                entry.update({
+                    "comparisonAvailable": True,
+                    "previousSnapshotId": previous_snapshot["id"],
+                    "diffSummary": {
+                        "addedNodes": int(counts.get("addedNodes") or 0),
+                        "removedNodes": int(counts.get("removedNodes") or 0),
+                        "changedNodes": int(counts.get("changedNodes") or 0),
+                        "addedEdges": int(counts.get("addedEdges") or 0),
+                        "removedEdges": int(counts.get("removedEdges") or 0),
+                        "hasRelevantChange": bool(diff.get("hasRelevantChange")),
+                    },
+                    "changedNodeIds": sorted(changed_node_ids)[:200],
+                    "changedEdgeIds": sorted(changed_edge_ids)[:200],
+                })
+                comparable_count += 1
+            else:
+                entry["comparisonReason"] = gap_reason or (
+                    "First available accepted graph snapshot; no earlier snapshot boundary was compared."
+                )
+            previous_snapshot = snapshot
+            gap_reason = None
+            all_entries.append(entry)
+
+        visible_entries = list(reversed(all_entries[-bounded_limit:]))
+        warnings: list[str] = []
+        if missing_snapshot_commit_ids:
+            warnings.append(
+                "One or more accepted commits have no valid graph snapshot; the timeline does not infer across those gaps."
+            )
+        if not rows:
+            warnings.append("No accepted StoryCommit graph boundaries are recorded for this book.")
+        return {
+            "available": snapshot_count > 0,
+            "complete": bool(rows) and not missing_snapshot_commit_ids,
+            "scope": "accepted_commit_snapshot_history",
+            "historical": True,
+            "canonicalSource": "sqlite",
+            "nodeId": resolved_node,
+            "entries": visible_entries,
+            "warnings": warnings,
+            "meta": {
+                "limit": bounded_limit,
+                "returned": len(visible_entries),
+                "acceptedCommitCount": len(rows),
+                "snapshotCount": snapshot_count,
+                "comparableCount": comparable_count,
+                "missingSnapshotCommitIds": missing_snapshot_commit_ids[:100],
+                "truncated": len(all_entries) > bounded_limit,
+                "mutableDomainTablesHistorical": False,
+                "evidence": "accepted StoryCommit graph snapshots only",
+            },
+        }
+
+    def _canonical_graph_boundary_rows(self, book_id: str) -> list[dict[str, Any]]:
+        """Load every accepted graph boundary, including later supersessions.
+
+        A ChapterVersion can become ``superseded`` when a newer version is
+        accepted, but its post-acceptance graph snapshot remains an immutable
+        historical boundary.  Canonical replay intentionally follows the
+        current accepted ledger; graph history must retain these prior
+        accepted boundaries instead of dropping them with the mutable status.
+        """
+        if not self.db.fetchone("SELECT id FROM books WHERE id=?", (book_id,)):
+            raise StoryGraphError(f"book not found: {book_id}")
+        return self.db.fetchall(
+            """SELECT sc.id, sc.chapter_id, sc.status, sc.facts_extracted,
+                      sc.state_changes, sc.review_score, sc.blocking_issues,
+                      sc.chapter_version_id, sc.accepted_at, sc.created_at,
+                      c.number AS chapter_number, c.title AS chapter_title,
+                      sp.id AS projection_id, sp.projection_type,
+                      sp.payload AS projection_payload, sp.applied_at AS projection_applied_at,
+                      gs.id AS graph_snapshot_id, gs.snapshot_hash AS graph_snapshot_hash,
+                      gs.source_commit_id AS graph_snapshot_commit_id,
+                      gs.source_state_version AS graph_snapshot_state_version,
+                      gs.payload AS graph_snapshot_payload,
+                      gs.created_at AS graph_snapshot_created_at
+                 FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id
+                 LEFT JOIN story_projections sp
+                   ON sp.book_id=c.book_id AND sp.commit_id=sc.id
+                  AND sp.projection_type='story_state'
+                 LEFT JOIN storyflow_graph_snapshots gs
+                   ON gs.id = (
+                        SELECT candidate.id
+                         FROM storyflow_graph_snapshots candidate
+                         WHERE candidate.book_id=c.book_id
+                           AND candidate.source_commit_id=sc.id
+                           AND candidate.reason='story_commit_accept'
+                         ORDER BY candidate.created_at DESC, candidate.id DESC
+                         LIMIT 1
+                   )
+                WHERE c.book_id=?
+                  AND (
+                        sc.status='accepted'
+                        OR gs.id IS NOT NULL
+                        OR (sc.status='superseded' AND sc.accepted_at IS NOT NULL)
+                  )
              ORDER BY c.number, COALESCE(sc.accepted_at, sc.created_at), sc.created_at, sc.id""",
             (book_id,),
         )
@@ -3748,6 +5242,395 @@ class StoryGraphProjector:
             "focusedNodeId": resolved_node,
         }
 
+    def _historical_dependency_surface(
+        self,
+        book_id: str,
+        from_row: Optional[dict[str, Any]],
+        to_row: Optional[dict[str, Any]],
+        *,
+        chapter_id: str,
+        depth: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Traverse recorded downstream dependencies between accepted snapshots.
+
+        chapter_edit_impact answers a current-projection question. Version
+        comparison needs a separate historical seam: when both boundaries
+        have immutable accepted-commit graph snapshots, seed the traversal with
+        changed nodes/endpoints and follow the target snapshot's semantic
+        outgoing edges. This is recorded dependency evidence, not prose or AI
+        causality.
+        """
+        from_snapshot = self._canonical_snapshot_catalog(book_id, from_row)
+        to_snapshot = self._canonical_snapshot_catalog(book_id, to_row)
+        if from_snapshot is None or to_snapshot is None:
+            missing: list[str] = []
+            if from_snapshot is None:
+                missing.append("from")
+            if to_snapshot is None:
+                missing.append("to")
+            return {
+                **self._historical_graph_unavailable(
+                    "missing valid graph projection snapshot for " + ", ".join(missing)
+                ),
+                "scope": "accepted_commit_snapshot_dependency_surface",
+                "missingBoundaries": missing,
+                "historical": False,
+            }
+
+        bounded_depth = max(1, min(int(depth or 3), 3))
+        bounded_limit = max(1, min(int(limit or 120), 500))
+        before_catalog = from_snapshot["catalog"]
+        after_catalog = to_snapshot["catalog"]
+        before_nodes = before_catalog.nodes
+        after_nodes = after_catalog.nodes
+
+        def edge_key(edge: dict[str, Any]) -> str:
+            return str(edge.get("id") or "|".join(
+                [
+                    str(edge.get("source") or ""),
+                    str(edge.get("type") or ""),
+                    str(edge.get("target") or ""),
+                    str(edge.get("label") or ""),
+                ]
+            ))
+
+        before_edges = {
+            edge_key(edge): edge
+            for edge in before_catalog.edges
+            if isinstance(edge, dict)
+        }
+        after_edges = {
+            edge_key(edge): edge
+            for edge in after_catalog.edges
+            if isinstance(edge, dict)
+        }
+        changed_node_ids = {
+            node_id
+            for node_id in set(before_nodes) | set(after_nodes)
+            if before_nodes.get(node_id) != after_nodes.get(node_id)
+        }
+        changed_edge_ids = {
+            edge_id
+            for edge_id in set(before_edges) | set(after_edges)
+            if before_edges.get(edge_id) != after_edges.get(edge_id)
+        }
+
+        changed_edge_endpoints: set[str] = set()
+        for edge_id in changed_edge_ids:
+            edge = after_edges.get(edge_id) or before_edges.get(edge_id) or {}
+            for endpoint in (edge.get("source"), edge.get("target")):
+                if endpoint:
+                    changed_edge_endpoints.add(str(endpoint))
+
+        chapter_node_id = f"chapter:{chapter_id}"
+        seed_ids = (changed_node_ids | changed_edge_endpoints) & set(after_nodes)
+        if chapter_node_id in after_nodes:
+            seed_ids.add(chapter_node_id)
+        seed_nodes = [after_nodes[node_id] for node_id in sorted(seed_ids)]
+
+        outgoing: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for edge in after_catalog.edges:
+            source = str(edge.get("source") or "")
+            target = str(edge.get("target") or "")
+            if source in after_nodes and target in after_nodes:
+                outgoing[source].append(edge)
+        for edges in outgoing.values():
+            edges.sort(key=lambda edge: (
+                str(edge.get("type") or ""),
+                str(edge.get("target") or ""),
+                str(edge.get("id") or ""),
+            ))
+
+        queue: deque[tuple[str, int]] = deque(
+            (node_id, 0) for node_id in sorted(seed_ids)
+        )
+        visited = set(seed_ids)
+        affected: list[dict[str, Any]] = []
+        while queue and len(affected) < bounded_limit:
+            current, current_depth = queue.popleft()
+            if current_depth >= bounded_depth:
+                continue
+            for edge in outgoing.get(current, []):
+                target = str(edge.get("target") or "")
+                if target in visited:
+                    continue
+                neighbor = after_nodes.get(target)
+                if neighbor is None:
+                    continue
+                visited.add(target)
+                next_depth = current_depth + 1
+                affected.append({
+                    "node": neighbor,
+                    "edge": edge,
+                    "depth": next_depth,
+                    "category": "direct" if next_depth == 1 else "downstream",
+                    "reason": self._impact_reason(edge),
+                    "evidenceStatus": "accepted_graph_snapshot",
+                    "impactBoundary": _raw_status(neighbor.get("status")).upper() or "CANON",
+                })
+                queue.append((target, next_depth))
+                if len(affected) >= bounded_limit:
+                    break
+
+        future_chapters: list[dict[str, Any]] = []
+        chapter_node = after_nodes.get(chapter_node_id) or {}
+        chapter_metadata = chapter_node.get("metadata")
+        chapter_number = (
+            chapter_metadata.get("chapterNumber") or chapter_metadata.get("narrativeOrder")
+            if isinstance(chapter_metadata, dict)
+            else None
+        )
+        if chapter_number is not None:
+            try:
+                chapter_number_int = int(chapter_number)
+            except (TypeError, ValueError):
+                chapter_number_int = None
+            if chapter_number_int is not None:
+                for item in affected:
+                    node = item.get("node") or {}
+                    if node.get("type") != "Chapter":
+                        continue
+                    metadata = node.get("metadata")
+                    if not isinstance(metadata, dict):
+                        continue
+                    candidate_number = metadata.get("chapterNumber") or metadata.get("narrativeOrder")
+                    try:
+                        if candidate_number is not None and int(candidate_number) > chapter_number_int:
+                            future_chapters.append(item)
+                    except (TypeError, ValueError):
+                        continue
+
+        direct = [item for item in affected if item["category"] == "direct"]
+        downstream = [item for item in affected if item["category"] == "downstream"]
+        return {
+            "available": True,
+            "complete": True,
+            "scope": "accepted_commit_snapshot_dependency_surface",
+            "historical": True,
+            "from": {
+                "snapshotId": from_snapshot["id"],
+                "snapshotHash": from_snapshot.get("hash"),
+                "sourceCommitId": from_snapshot.get("sourceCommitId"),
+                "sourceStateVersion": from_snapshot.get("sourceStateVersion"),
+            },
+            "to": {
+                "snapshotId": to_snapshot["id"],
+                "snapshotHash": to_snapshot.get("hash"),
+                "sourceCommitId": to_snapshot.get("sourceCommitId"),
+                "sourceStateVersion": to_snapshot.get("sourceStateVersion"),
+            },
+            "seedNodeIds": sorted(seed_ids)[:1000],
+            "seedNodes": seed_nodes[:200],
+            "changedNodeIds": sorted(changed_node_ids)[:1000],
+            "changedEdgeIds": sorted(changed_edge_ids)[:1000],
+            "direct": direct,
+            "downstream": downstream,
+            "affectedNodes": [item["node"] for item in affected],
+            "affectedEdges": [item["edge"] for item in affected],
+            "futureChapters": future_chapters,
+            "meta": {
+                "depth": bounded_depth,
+                "limit": bounded_limit,
+                "seedNodeCount": len(seed_ids),
+                "changedNodeCount": len(changed_node_ids),
+                "changedEdgeCount": len(changed_edge_ids),
+                "returned": len(affected),
+                "truncated": len(affected) >= bounded_limit,
+                "futureChapterCount": len(future_chapters),
+                "dependencyEvidence": "accepted StoryCommit graph snapshots and target semantic edges",
+                "mutableDomainTablesHistorical": False,
+            },
+        }
+
+    def record_snapshot_capture_failure(
+        self,
+        book_id: str,
+        commit_id: str,
+        error: str,
+    ) -> dict[str, Any]:
+        """Persist the exact derived-source boundary of a failed capture.
+
+        StoryRepository calls this only after the authoritative acceptance
+        transaction has committed.  Keeping the boundary in a rebuildable
+        StoryFlow table lets a later explicit/idempotent retry prove that no
+        source rows changed in the meantime.  Without that proof, rebuilding
+        a snapshot for an old commit would silently turn the current mutable
+        catalog into false history.
+        """
+        normalized_book_id = str(book_id or "").strip()
+        normalized_commit_id = str(commit_id or "").strip()
+        if not normalized_book_id or not normalized_commit_id:
+            raise StoryGraphError("book_id and commit_id are required")
+        commit = self.db.fetchone(
+            """SELECT sc.id, sc.status, c.book_id
+                 FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id
+                WHERE sc.id=? AND c.book_id=?""",
+            (normalized_commit_id, normalized_book_id),
+        )
+        if not commit or str(commit.get("status") or "").lower() != "accepted":
+            raise StoryGraphError(
+                f"accepted StoryCommit not found: {normalized_commit_id}"
+            )
+        source_fingerprint = self._source_identity(normalized_book_id)
+        epoch = self.db.fetchone(
+            """SELECT source_revision, source_fingerprint
+                 FROM storyflow_projection_epochs WHERE book_id=?""",
+            (normalized_book_id,),
+        ) or {}
+        source_revision = int(epoch.get("source_revision") or 0)
+        self.db.execute(
+            """INSERT OR IGNORE INTO storyflow_graph_snapshot_capture_failures(
+                    book_id, commit_id, source_fingerprint, source_revision, error
+                ) VALUES (?, ?, ?, ?, ?)""",
+            (
+                normalized_book_id,
+                normalized_commit_id,
+                source_fingerprint,
+                source_revision,
+                str(error or "unknown StoryFlow snapshot capture failure")[:4000],
+            ),
+        )
+        failure = self.db.fetchone(
+            """SELECT book_id, commit_id, source_fingerprint, source_revision,
+                      error, failed_at
+                 FROM storyflow_graph_snapshot_capture_failures
+                WHERE book_id=? AND commit_id=?""",
+            (normalized_book_id, normalized_commit_id),
+        )
+        return {
+            "recorded": failure is not None,
+            "bookId": normalized_book_id,
+            "commitId": normalized_commit_id,
+            "sourceFingerprint": failure.get("source_fingerprint") if failure else source_fingerprint,
+            "sourceRevision": failure.get("source_revision") if failure else source_revision,
+            "failedAt": failure.get("failed_at") if failure else None,
+        }
+
+    def retry_accepted_commit_snapshot(self, book_id: str, commit_id: str) -> dict[str, Any]:
+        """Repair one failed accepted-commit capture only at the same source boundary.
+
+        This is deliberately narrower than a generic historical backfill.  A
+        missing failure record, a changed source epoch/fingerprint, or a
+        StoryState boundary that moved after acceptance all produce an
+        explicit non-recoverable result.  The current mutable entity catalog
+        is never relabeled as an older commit in those cases.
+        """
+        normalized_book_id = str(book_id or "").strip()
+        normalized_commit_id = str(commit_id or "").strip()
+        if not normalized_book_id or not normalized_commit_id:
+            raise StoryGraphError("book_id and commit_id are required")
+
+        existing = self.db.fetchone(
+                """SELECT id, snapshot_hash, source_commit_id, source_state_version,
+                      reason, node_count, edge_count, created_at
+                 FROM storyflow_graph_snapshots
+                WHERE book_id=? AND source_commit_id=? AND reason='story_commit_accept'
+                ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (normalized_book_id, normalized_commit_id),
+        )
+        if existing is not None:
+            return {
+                "captured": True,
+                "recovered": False,
+                "bookId": normalized_book_id,
+                "commitId": normalized_commit_id,
+                "snapshotId": existing.get("id"),
+                "snapshotHash": existing.get("snapshot_hash"),
+                "sourceCommitId": existing.get("source_commit_id"),
+                "sourceStateVersion": existing.get("source_state_version"),
+                "reason": existing.get("reason"),
+                "nodeCount": existing.get("node_count") or 0,
+                "edgeCount": existing.get("edge_count") or 0,
+                "historicalScope": "observed_projection",
+                "canonicalSource": "sqlite",
+            }
+
+        failure = self.db.fetchone(
+            """SELECT source_fingerprint, source_revision, error, failed_at
+                 FROM storyflow_graph_snapshot_capture_failures
+                WHERE book_id=? AND commit_id=?""",
+            (normalized_book_id, normalized_commit_id),
+        )
+        base = {
+            "captured": False,
+            "recovered": False,
+            "bookId": normalized_book_id,
+            "commitId": normalized_commit_id,
+            "historicalScope": "observed_projection",
+            "canonicalSource": "sqlite",
+        }
+        if failure is None:
+            return {
+                **base,
+                "recoveryAllowed": False,
+                "reason": "no durable StoryFlow capture failure boundary exists; historical backfill is unsafe",
+            }
+
+        commit = self.db.fetchone(
+            """SELECT sc.id, sc.status, c.book_id
+                 FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id
+                WHERE sc.id=? AND c.book_id=?""",
+            (normalized_commit_id, normalized_book_id),
+        )
+        state = self.db.fetchone(
+            "SELECT last_commit_id FROM story_states WHERE book_id=?",
+            (normalized_book_id,),
+        ) or {}
+        if (
+            not commit
+            or str(commit.get("status") or "").lower() != "accepted"
+            or str(state.get("last_commit_id") or "") != normalized_commit_id
+        ):
+            return {
+                **base,
+                "recoveryAllowed": False,
+                "reason": "accepted StoryCommit is no longer the current StoryState boundary; historical backfill was not attempted",
+                "failureAt": failure.get("failed_at"),
+            }
+
+        current_fingerprint = self._source_identity(normalized_book_id)
+        current_epoch = self.db.fetchone(
+            """SELECT source_revision, source_fingerprint
+                 FROM storyflow_projection_epochs WHERE book_id=?""",
+            (normalized_book_id,),
+        ) or {}
+        expected_fingerprint = str(failure.get("source_fingerprint") or "")
+        expected_revision = int(failure.get("source_revision") or 0)
+        current_revision = int(current_epoch.get("source_revision") or 0)
+        if current_fingerprint != expected_fingerprint or current_revision != expected_revision:
+            return {
+                **base,
+                "recoveryAllowed": False,
+                "sourceChanged": True,
+                "reason": "StoryFlow source epoch changed after capture failure; current mutable data was not relabeled as historical",
+                "failureAt": failure.get("failed_at"),
+                "expectedSourceRevision": expected_revision,
+                "currentSourceRevision": current_revision,
+            }
+
+        snapshot = self.capture_accepted_commit_snapshot(
+            normalized_book_id,
+            normalized_commit_id,
+        )
+        if snapshot.get("captured"):
+            self.db.execute(
+                "DELETE FROM storyflow_graph_snapshot_capture_failures WHERE book_id=? AND commit_id=?",
+                (normalized_book_id, normalized_commit_id),
+            )
+            return {
+                **snapshot,
+                "recovered": True,
+                "recoveryAllowed": True,
+                "failureAt": failure.get("failed_at"),
+            }
+        return {
+            **base,
+            "recoveryAllowed": True,
+            "failureAt": failure.get("failed_at"),
+            "reason": "StoryFlow snapshot capture still did not produce a durable snapshot",
+        }
+
     def capture_accepted_commit_snapshot(self, book_id: str, commit_id: str) -> dict[str, Any]:
         """Capture the observed Story Graph immediately after Canon acceptance.
 
@@ -3978,6 +5861,30 @@ class StoryGraphProjector:
         added_edge_ids = sorted(set(after_edges) - set(before_edges))
         removed_edge_ids = sorted(set(before_edges) - set(after_edges))
 
+        def edge_touches(item: dict[str, Any]) -> bool:
+            return node_id in {item.get("id"), item.get("source"), item.get("target")}
+
+        if node_id:
+            counts = {
+                "addedNodes": int(node_id in set(added_node_ids)),
+                "removedNodes": int(node_id in set(removed_node_ids)),
+                "changedNodes": int(node_id in set(changed_node_ids)),
+                "addedEdges": sum(
+                    1 for edge_id in added_edge_ids if edge_touches(after_edges[edge_id])
+                ),
+                "removedEdges": sum(
+                    1 for edge_id in removed_edge_ids if edge_touches(before_edges[edge_id])
+                ),
+            }
+        else:
+            counts = {
+                "addedNodes": len(added_node_ids),
+                "removedNodes": len(removed_node_ids),
+                "changedNodes": len(changed_node_ids),
+                "addedEdges": len(added_edge_ids),
+                "removedEdges": len(removed_edge_ids),
+            }
+
         def edge_signature(item: dict[str, Any]) -> dict[str, Any]:
             return {
                 "id": edge_key(item),
@@ -4002,7 +5909,7 @@ class StoryGraphProjector:
         removed_edges = [edge_signature(before_edges[item]) for item in removed_edge_ids[:200]]
         if node_id:
             def touches(item: dict[str, Any]) -> bool:
-                return node_id in {item.get("id"), item.get("source"), item.get("target")}
+                return edge_touches(item)
 
             added_nodes = [item for item in added_nodes if touches(item)]
             removed_nodes = [item for item in removed_nodes if touches(item)]
@@ -4016,6 +5923,7 @@ class StoryGraphProjector:
             "changedNodes": changed_nodes,
             "addedEdges": added_edges,
             "removedEdges": removed_edges,
+            "counts": counts,
             "hasRelevantChange": previous is None or bool(
                 added_nodes or removed_nodes or changed_nodes or added_edges or removed_edges
             ),
@@ -4093,6 +6001,9 @@ class StoryGraphProjector:
         construction; all public queries still apply their own view, focus,
         depth and filter rules after loading the read model.
         """
+        # The exact content fingerprint is still authoritative for cache
+        # correctness.  The epoch-backed node index is used by viewport reads
+        # to avoid paying this full scan on every interaction.
         source_fingerprint = self._source_fingerprint(book_id)
         cached = self.db.fetchone(
             """SELECT payload FROM storyflow_graph_catalog_cache
@@ -4103,11 +6014,918 @@ class StoryGraphProjector:
             payload = _load_json(cached.get("payload"), {})
             catalog = self._catalog_from_payload(book_id, payload)
             if catalog is not None:
+                if not self._node_index_ready(book_id, source_fingerprint):
+                    self._store_node_index(catalog, source_fingerprint)
                 return _CatalogRead(catalog, source_fingerprint, True)
 
         catalog = self._build_catalog(book_id)
         self._store_catalog_cache(catalog, source_fingerprint)
+        self._store_node_index(catalog, source_fingerprint)
+        self.db.execute(
+            """INSERT INTO storyflow_projection_epochs(
+                   book_id, source_revision, source_fingerprint, updated_at
+               ) VALUES (?, 0, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(book_id) DO UPDATE SET
+                   source_fingerprint=excluded.source_fingerprint,
+                   updated_at=CURRENT_TIMESTAMP""",
+            (book_id, source_fingerprint),
+        )
         return _CatalogRead(catalog, source_fingerprint, False)
+
+    def _node_index_ready(self, book_id: str, source_fingerprint: str) -> bool:
+        row = self.db.fetchone(
+            """SELECT index_schema FROM storyflow_graph_node_index_meta
+                 WHERE book_id=? AND source_fingerprint=?""",
+            (book_id, source_fingerprint),
+        )
+        return bool(row and int(row.get("index_schema") or 0) == NODE_INDEX_SCHEMA_VERSION)
+
+    def _read_catalog_for_viewport(
+        self,
+        book_id: str,
+        query: StoryGraphQuery,
+    ) -> _CatalogRead:
+        """Read the bounded spatial catalog through the node-index seam.
+
+        The index is keyed by the same source identity as the JSON catalog,
+        but stores one JSON payload per node plus scalar filter columns.  A
+        viewport query can therefore fetch the selected rectangle's nodes
+        after SQLite has applied the indexed bounds.  If the index is absent
+        or stale, this method deliberately falls back to the existing
+        projector once to build it; callers never observe fabricated nodes.
+        """
+        source_fingerprint = self._source_identity(book_id)
+        meta = self.db.fetchone(
+            """SELECT node_count, index_schema, project_id FROM storyflow_graph_node_index_meta
+               WHERE book_id=? AND source_fingerprint=?""",
+            (book_id, source_fingerprint),
+        )
+        if meta is None or int(meta.get("index_schema") or 0) != NODE_INDEX_SCHEMA_VERSION:
+            catalog_read = self._read_catalog(book_id)
+            self._store_node_index(catalog_read.catalog, source_fingerprint)
+            self._sync_epoch_fingerprint(book_id, source_fingerprint, catalog_read.source_fingerprint)
+            return catalog_read
+
+        candidates = self._indexed_candidate_nodes(
+            book_id,
+            source_fingerprint,
+            query,
+        )
+        catalog = _Catalog(
+            book_id=book_id,
+            project_id=str(meta.get("project_id") or book_id),
+            nodes=candidates,
+            edges=[],
+            indexed=True,
+        )
+        return _CatalogRead(catalog, source_fingerprint, True, "sqlite_node_index")
+
+    def _read_catalog_for_focus(
+        self,
+        book_id: str,
+        query: StoryGraphQuery,
+    ) -> Optional[_CatalogRead]:
+        """Read scalar candidates for a focused subgraph when the paired index is warm.
+
+        This seam deliberately returns ``None`` until the full projector has
+        built both derived indexes.  That makes the first request compatible
+        with the existing JSON catalog while making repeated search/focus/
+        depth requests independent of full-catalog JSON deserialization.
+        """
+        source_fingerprint = self._source_identity(book_id)
+        if not self._node_index_ready(book_id, source_fingerprint):
+            return None
+        if not self._semantic_edge_index_ready(book_id, source_fingerprint):
+            return None
+        meta = self.db.fetchone(
+            """SELECT project_id FROM storyflow_graph_node_index_meta
+                 WHERE book_id=? AND source_fingerprint=?""",
+            (book_id, source_fingerprint),
+        ) or {}
+        candidates = self._indexed_candidate_nodes(book_id, source_fingerprint, query)
+        return _CatalogRead(
+            _Catalog(
+                book_id=book_id,
+                project_id=str(meta.get("project_id") or book_id),
+                nodes=candidates,
+                edges=[],
+                indexed=True,
+            ),
+            source_fingerprint,
+            True,
+            "sqlite_node_index+semantic_edge_index",
+        )
+
+    def _sync_epoch_fingerprint(
+        self,
+        book_id: str,
+        expected_fingerprint: str,
+        actual_fingerprint: str,
+    ) -> None:
+        """Reconcile the cheap epoch identity with the content fingerprint.
+
+        Trigger invalidation intentionally clears the content fingerprint.
+        After one authoritative rebuild, the exact fingerprint is restored so
+        subsequent viewport reads stay on the indexed path until the next
+        source mutation.
+        """
+        if not actual_fingerprint or actual_fingerprint == expected_fingerprint:
+            return
+        self.db.execute(
+            """UPDATE storyflow_projection_epochs
+                  SET source_fingerprint=?, updated_at=CURRENT_TIMESTAMP
+                WHERE book_id=? AND source_fingerprint=?""",
+            (actual_fingerprint, book_id, expected_fingerprint),
+        )
+
+    def _store_node_index(self, catalog: _Catalog, source_fingerprint: str) -> None:
+        """Materialize the paired node/semantic-edge read model.
+
+        Both tables are rebuildable projections of the same catalog build.
+        They share the exact source fingerprint so a warm Inspector read
+        cannot accidentally combine nodes from one authoritative revision
+        with edges from another.
+        """
+        rows: list[tuple[Any, ...]] = []
+        for node in catalog.nodes.values():
+            metadata_raw = node.get("metadata")
+            metadata: dict[str, Any] = metadata_raw if isinstance(metadata_raw, dict) else {}
+            chapter_values: list[int] = []
+            raw_values = metadata.get("appearanceChapters") or metadata.get("appearance_chapters") or []
+            if not isinstance(raw_values, (list, tuple)):
+                raw_values = [raw_values] if raw_values not in (None, "") else []
+            raw_number = (
+                metadata.get("number")
+                or metadata.get("chapterNumber")
+                or metadata.get("narrativeOrder")
+                or metadata.get("createdChapter")
+            )
+            raw_values = [raw_number, *raw_values]
+            for value in raw_values:
+                try:
+                    if value not in (None, ""):
+                        chapter_values.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            volume_number: Optional[int] = None
+            try:
+                raw_volume = metadata.get("volumeNumber")
+                if node.get("type") == "Volume":
+                    raw_volume = metadata.get("number")
+                if raw_volume not in (None, ""):
+                    volume_number = int(raw_volume)
+            except (TypeError, ValueError):
+                volume_number = None
+            story_time = metadata.get("storyTime") or metadata.get("event_time")
+            story_time_order = _story_time_order(story_time) if story_time else None
+            plot_keys: list[str] = []
+            for key in ("plotThread", "plot_thread", "plotThreadIds", "plotThreadTitles"):
+                value = metadata.get(key) or []
+                plot_keys.extend(value if isinstance(value, list) else [value])
+            plot_thread_keys = "\u001f".join(sorted({str(item).strip().casefold() for item in plot_keys if str(item).strip()}))
+            lifecycle_status = str(metadata.get("lifecycleStatus") or "").upper()
+            metadata_search = " ".join(
+                str(metadata.get(key, ""))
+                for key in (
+                    "referenceId", "referenceType", "stepKey", "subtype",
+                    "sourceRecordId", "payloadSummary", "lifecycleStatus",
+                )
+            )
+            search_text = " ".join(
+                (
+                    str(node.get("id") or ""),
+                    str(node.get("title") or ""),
+                    str(node.get("summary") or ""),
+                    str(node.get("source_type") or ""),
+                    str(node.get("source_id") or ""),
+                    metadata_search,
+                )
+            ).casefold()
+            rows.append(
+                (
+                    catalog.book_id,
+                    source_fingerprint,
+                    str(node["id"]),
+                    str(node.get("type") or ""),
+                    str(node.get("status") or "CANON"),
+                    lifecycle_status,
+                    str(node.get("source_id") or ""),
+                    str(node.get("title") or node["id"]),
+                    min(chapter_values) if chapter_values else None,
+                    max(chapter_values) if chapter_values else None,
+                    volume_number,
+                    story_time_order,
+                    str(story_time or ""),
+                    plot_thread_keys,
+                    str(metadata.get("graphStatusReason") or ""),
+                    str(node.get("summary") or ""),
+                    str(node.get("source_type") or ""),
+                    search_text,
+                    json.dumps(_json_safe(node), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                )
+            )
+        edge_rows: list[tuple[Any, ...]] = []
+        seen_edge_keys: set[str] = set()
+        for edge in sorted(
+            catalog.edges,
+            key=lambda item: (
+                str(item.get("id") or ""),
+                str(item.get("source") or ""),
+                str(item.get("target") or ""),
+                str(item.get("type") or ""),
+            ),
+        ):
+            source_id = str(edge.get("source") or "")
+            target_id = str(edge.get("target") or "")
+            if not source_id or not target_id:
+                continue
+            base_key = str(
+                edge.get("id")
+                or _stable_id(
+                    "semantic-edge-index",
+                    source_id,
+                    edge.get("type"),
+                    target_id,
+                    edge.get("label"),
+                )
+            )
+            edge_key = base_key
+            suffix = 1
+            while edge_key in seen_edge_keys:
+                suffix += 1
+                edge_key = f"{base_key}:{suffix}"
+            seen_edge_keys.add(edge_key)
+            edge_rows.append(
+                (
+                    catalog.book_id,
+                    source_fingerprint,
+                    edge_key,
+                    source_id,
+                    target_id,
+                    str(edge.get("type") or "semantic"),
+                    json.dumps(_json_safe(edge), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                )
+            )
+        with self.db.transaction() as conn:
+            conn.execute(
+                "DELETE FROM storyflow_graph_node_index WHERE book_id=? AND source_fingerprint=?",
+                (catalog.book_id, source_fingerprint),
+            )
+            conn.execute(
+                "DELETE FROM storyflow_graph_semantic_edge_index WHERE book_id=? AND source_fingerprint=?",
+                (catalog.book_id, source_fingerprint),
+            )
+            if rows:
+                conn.executemany(
+                    """INSERT INTO storyflow_graph_node_index(
+                           book_id, source_fingerprint, node_id, node_type, status,
+                           lifecycle_status, source_id, title, chapter_min,
+                           chapter_max, volume_number, story_time_order,
+                           story_time_label, plot_thread_keys, graph_status_reason,
+                       summary, source_type, search_text,
+                       payload
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+            if edge_rows:
+                conn.executemany(
+                    """INSERT INTO storyflow_graph_semantic_edge_index(
+                           book_id, source_fingerprint, edge_key, source_id,
+                           target_id, edge_type, payload
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    edge_rows,
+                )
+            conn.execute(
+                """INSERT INTO storyflow_graph_node_index_meta(
+                       book_id, source_fingerprint, node_count, edge_count,
+                       index_schema, project_id, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(book_id, source_fingerprint) DO UPDATE SET
+                       node_count=excluded.node_count,
+                       edge_count=excluded.edge_count,
+                       index_schema=excluded.index_schema,
+                       project_id=excluded.project_id,
+                       updated_at=CURRENT_TIMESTAMP""",
+                (
+                    catalog.book_id,
+                    source_fingerprint,
+                    len(rows),
+                    len(edge_rows),
+                    NODE_INDEX_SCHEMA_VERSION,
+                    catalog.project_id,
+                ),
+            )
+
+    def _indexed_candidate_nodes(
+        self,
+        book_id: str,
+        source_fingerprint: str,
+        query: StoryGraphQuery,
+    ) -> dict[str, dict[str, Any]]:
+        """Apply scalar query predicates in SQLite and hydrate only matches."""
+        allowed_types = VIEW_NODE_TYPES[query.view]
+        params: list[Any] = [book_id, source_fingerprint]
+        clauses = ["book_id=?", "source_fingerprint=?"]
+        if len(allowed_types) < len(NODE_TYPES):
+            placeholders = ",".join("?" for _ in allowed_types)
+            clauses.append(f"node_type IN ({placeholders})")
+            params.extend(sorted(allowed_types))
+        if query.types:
+            placeholders = ",".join("?" for _ in query.types)
+            clauses.append(f"node_type IN ({placeholders})")
+            params.extend(query.types)
+        if query.statuses:
+            placeholders = ",".join("?" for _ in query.statuses)
+            clauses.append(f"(status IN ({placeholders}) OR lifecycle_status IN ({placeholders}))")
+            params.extend(query.statuses)
+            params.extend(query.statuses)
+        if query.chapter_from is not None:
+            clauses.append("chapter_max >= ?")
+            params.append(query.chapter_from)
+        if query.chapter_to is not None:
+            clauses.append("chapter_min <= ?")
+            params.append(query.chapter_to)
+        if query.volume_number is not None:
+            clauses.append("volume_number = ?")
+            params.append(query.volume_number)
+        if query.time_from:
+            lower = _story_time_order(query.time_from)
+            if lower is not None:
+                clauses.append("story_time_order >= ?")
+                params.append(lower)
+            else:
+                clauses.append("story_time_label >= ?")
+                params.append(query.time_from)
+        if query.time_to:
+            upper = _story_time_order(query.time_to)
+            if upper is not None:
+                clauses.append("story_time_order <= ?")
+                params.append(upper)
+            else:
+                clauses.append("story_time_label <= ?")
+                params.append(query.time_to)
+        if query.plot_thread:
+            needle = str(query.plot_thread).strip().casefold()
+            clauses.append(
+                "instr(char(31) || plot_thread_keys || char(31), char(31) || ? || char(31)) > 0"
+            )
+            params.append(needle)
+        sql = (
+            "SELECT node_id, node_type, status, lifecycle_status, source_id, title, "
+            "chapter_min, chapter_max, volume_number, story_time_order, "
+            "story_time_label, plot_thread_keys, graph_status_reason "
+            "FROM storyflow_graph_node_index WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY chapter_min IS NULL, chapter_min, node_type, title, node_id"
+        )
+        rows = self.db.fetchall(sql, tuple(params))
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            node_id = str(row.get("node_id") or "")
+            if not node_id:
+                continue
+            chapter_min = row.get("chapter_min")
+            chapter_max = row.get("chapter_max")
+            story_time_label = str(row.get("story_time_label") or "")
+            plot_threads = [
+                item for item in str(row.get("plot_thread_keys") or "").split("\u001f")
+                if item
+            ]
+            # This is intentionally a scalar stub.  The selected rectangle
+            # is hydrated from payload JSON after SQLite has applied the
+            # viewport/filter predicates; the full node catalog is not
+            # deserialized merely to discover its coordinates.
+            metadata: dict[str, Any] = {
+                "number": chapter_min,
+                "chapterNumber": chapter_min,
+                "appearanceChapters": (
+                    list(range(int(chapter_min), int(chapter_max) + 1))
+                    if chapter_min is not None
+                    and chapter_max is not None
+                    and int(chapter_max) - int(chapter_min) <= 64
+                    else []
+                ),
+                "volumeNumber": row.get("volume_number"),
+                "storyTime": story_time_label or None,
+                "event_time": story_time_label or None,
+                "plotThreadKeys": plot_threads,
+                "lifecycleStatus": row.get("lifecycle_status") or "",
+                "graphStatusReason": row.get("graph_status_reason") or "",
+                "indexedProjection": True,
+            }
+            result[node_id] = {
+                "id": node_id,
+                "type": str(row.get("node_type") or ""),
+                "kind": str(row.get("node_type") or "").lower(),
+                "subtype": "",
+                "title": str(row.get("title") or node_id),
+                "summary": "",
+                "status": str(row.get("status") or "CANON"),
+                "project_id": "",
+                "book_id": book_id,
+                "source_type": "",
+                "source_id": str(row.get("source_id") or ""),
+                "chapter_id": None,
+                "metadata": metadata,
+                "version": 1,
+                "confidence": 1.0,
+                "provenance": [],
+                "ports": PORTS.get(str(row.get("node_type") or ""), {"inputs": (), "outputs": ()}),
+            }
+        special_ids = sorted({
+            str(value).strip()
+            for value in (query.focus, query.boundary_node_id)
+            if str(value or "").strip()
+        })
+        missing_special_ids = [node_id for node_id in special_ids if node_id not in result]
+        if missing_special_ids:
+            placeholders = ",".join("?" for _ in missing_special_ids)
+            special_rows = self.db.fetchall(
+                f"""SELECT node_id, payload FROM storyflow_graph_node_index
+                     WHERE book_id=? AND source_fingerprint=?
+                       AND node_id IN ({placeholders})""",
+                (book_id, source_fingerprint, *missing_special_ids),
+            )
+            for row in special_rows:
+                node = _restore_indexed_node(_load_json(row.get("payload"), {}))
+                if node is not None:
+                    result[str(node["id"])] = node
+        return result
+
+    def _hydrate_indexed_nodes(
+        self,
+        book_id: str,
+        source_fingerprint: str,
+        node_ids: Iterable[str],
+    ) -> dict[str, dict[str, Any]]:
+        ids = sorted({str(node_id) for node_id in node_ids})
+        result: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.fetchall(
+                f"""SELECT node_id, payload FROM storyflow_graph_node_index
+                     WHERE book_id=? AND source_fingerprint=?
+                       AND node_id IN ({placeholders})""",
+                (book_id, source_fingerprint, *chunk),
+            )
+            for row in rows:
+                node = _restore_indexed_node(_load_json(row.get("payload"), {}))
+                if node is not None:
+                    result[str(node["id"])] = node
+        return result
+
+    def _semantic_edge_index_ready(self, book_id: str, source_fingerprint: str) -> bool:
+        """Check the paired semantic-edge read model without opening catalog JSON."""
+        row = self.db.fetchone(
+            """SELECT index_schema, edge_count
+                 FROM storyflow_graph_node_index_meta
+                WHERE book_id=? AND source_fingerprint=?""",
+            (book_id, source_fingerprint),
+        )
+        if not row or int(row.get("index_schema") or 0) != NODE_INDEX_SCHEMA_VERSION:
+            return False
+        expected_count = int(row.get("edge_count") or 0)
+        actual = self.db.fetchone(
+            """SELECT COUNT(*) AS count
+                 FROM storyflow_graph_semantic_edge_index
+                WHERE book_id=? AND source_fingerprint=?""",
+            (book_id, source_fingerprint),
+        )
+        return actual is not None and int(actual.get("count") or 0) == expected_count
+
+    def _indexed_semantic_edges_for_nodes(
+        self,
+        book_id: str,
+        source_fingerprint: str,
+        node_ids: Iterable[str],
+    ) -> list[dict[str, Any]]:
+        """Read incident semantic edges in bounded SQLite batches."""
+        ids = sorted({str(node_id) for node_id in node_ids if str(node_id).strip()})
+        if not ids:
+            return []
+        edges_by_key: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(ids), 350):
+            chunk = ids[start:start + 350]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.fetchall(
+                f"""SELECT edge_key, payload
+                      FROM storyflow_graph_semantic_edge_index
+                     WHERE book_id=? AND source_fingerprint=?
+                       AND (source_id IN ({placeholders}) OR target_id IN ({placeholders}))""",
+                (book_id, source_fingerprint, *chunk, *chunk),
+            )
+            for row in rows:
+                payload = _load_json(row.get("payload"), {})
+                if isinstance(payload, dict) and payload.get("source") and payload.get("target"):
+                    edges_by_key[str(row.get("edge_key") or _stable_id("semantic-edge-row", payload))] = payload
+        return sorted(
+            edges_by_key.values(),
+            key=lambda item: (
+                str(item.get("type") or ""),
+                str(item.get("source") or ""),
+                str(item.get("target") or ""),
+                str(item.get("id") or ""),
+            ),
+        )
+
+    def _indexed_selection_edge_page(
+        self,
+        book_id: str,
+        source_fingerprint: str,
+        selected_ids: Iterable[str],
+        *,
+        limit: int,
+        offset: int,
+        page_token: Optional[str],
+    ) -> dict[str, Any]:
+        """Read a multi-selection edge frontier with SQLite-side paging.
+
+        Internal edges are kept complete for the selected working set.  Edges
+        crossing out of that set are independently counted, type-aggregated,
+        and paged before remote endpoint payloads are hydrated.  The cursor is
+        bound to the selected ids, page size, and source fingerprint so a
+        changed selection or authoritative source cannot silently reuse it.
+        """
+        ids = sorted({str(node_id) for node_id in selected_ids if str(node_id).strip()})
+        bounded_limit = max(1, min(int(limit or 240), 600))
+        bounded_offset = max(0, int(offset or 0))
+        query_signature = _selection_external_query_signature(ids, bounded_limit)
+        if page_token:
+            token = _decode_viewport_page_token(page_token)
+            if token["querySignature"] != query_signature:
+                raise StoryGraphError(
+                    "selection external-edge page token does not match the current query"
+                )
+            if token["sourceFingerprint"] != source_fingerprint:
+                raise StoryGraphError(
+                    "selection external-edge page token expired; reload the current selection"
+                )
+            bounded_offset = token["offset"]
+
+        if not ids:
+            empty_pagination = {
+                "limit": bounded_limit,
+                "offset": bounded_offset,
+                "total": 0,
+                "nextOffset": None,
+                "hasMore": False,
+                "nextPageToken": None,
+                "cursorSourceFingerprint": source_fingerprint,
+                "querySignature": query_signature,
+            }
+            return {
+                "internalEdges": [],
+                "externalEdges": [],
+                "externalEdgeCount": 0,
+                "externalEdgeTypeCounts": {},
+                "externalPagination": empty_pagination,
+            }
+
+        placeholders = ",".join("?" for _ in ids)
+        internal_rows = self.db.fetchall(
+            f"""SELECT edge_key, payload
+                   FROM storyflow_graph_semantic_edge_index
+                  WHERE book_id=? AND source_fingerprint=?
+                    AND source_id IN ({placeholders})
+                    AND target_id IN ({placeholders})""",
+            (book_id, source_fingerprint, *ids, *ids),
+        )
+        internal_by_key: dict[str, dict[str, Any]] = {}
+        for row in internal_rows:
+            payload = _load_json(row.get("payload"), {})
+            if isinstance(payload, dict) and payload.get("source") and payload.get("target"):
+                internal_by_key[str(row.get("edge_key") or _stable_id("selection-edge", payload))] = payload
+        internal_edges = sorted(
+            internal_by_key.values(),
+            key=lambda item: (
+                str(item.get("type") or ""),
+                str(item.get("source") or ""),
+                str(item.get("target") or ""),
+                str(item.get("id") or ""),
+            ),
+        )
+
+        external_where = f"""(
+            (e.source_id IN ({placeholders}) AND e.target_id NOT IN ({placeholders}))
+            OR
+            (e.target_id IN ({placeholders}) AND e.source_id NOT IN ({placeholders}))
+        )"""
+        external_params: list[Any] = [
+            book_id,
+            source_fingerprint,
+            *ids,
+            *ids,
+            *ids,
+            *ids,
+        ]
+        type_rows = self.db.fetchall(
+            f"""SELECT e.edge_type, COUNT(*) AS count
+                   FROM storyflow_graph_semantic_edge_index e
+                  WHERE e.book_id=? AND e.source_fingerprint=?
+                    AND {external_where}
+                  GROUP BY e.edge_type
+                  ORDER BY e.edge_type""",
+            tuple(external_params),
+        )
+        external_type_counts = {
+            str(row.get("edge_type") or "UNKNOWN"): int(row.get("count") or 0)
+            for row in type_rows
+        }
+        external_total = sum(external_type_counts.values())
+
+        remote_expr = f"CASE WHEN e.source_id IN ({placeholders}) THEN e.target_id ELSE e.source_id END"
+        page_rows = self.db.fetchall(
+            f"""SELECT e.edge_key, e.payload AS edge_payload,
+                          n.payload AS node_payload,
+                          e.source_id AS edge_source_id,
+                          e.target_id AS edge_target_id
+                     FROM storyflow_graph_semantic_edge_index e
+                     JOIN storyflow_graph_node_index n
+                       ON n.book_id=e.book_id
+                      AND n.source_fingerprint=e.source_fingerprint
+                      AND n.node_id={remote_expr}
+                    WHERE e.book_id=? AND e.source_fingerprint=?
+                      AND {external_where}
+                    ORDER BY e.edge_type,
+                             CASE WHEN e.source_id IN ({placeholders}) THEN e.source_id ELSE e.target_id END,
+                             CASE WHEN e.source_id IN ({placeholders}) THEN e.target_id ELSE e.source_id END,
+                             e.edge_key
+                    LIMIT ? OFFSET ?""",
+            tuple([
+                *ids,
+                book_id,
+                source_fingerprint,
+                *ids,
+                *ids,
+                *ids,
+                *ids,
+                *ids,
+                *ids,
+                bounded_limit,
+                bounded_offset,
+            ]),
+        )
+        external_edges: list[dict[str, Any]] = []
+        for row in page_rows:
+            edge = _load_json(row.get("edge_payload"), {})
+            remote_endpoint = _restore_indexed_node(_load_json(row.get("node_payload"), {}))
+            if not isinstance(edge, dict) or not isinstance(remote_endpoint, dict):
+                continue
+            source_id = str(row.get("edge_source_id") or edge.get("source") or "")
+            target_id = str(row.get("edge_target_id") or edge.get("target") or "")
+            source_selected = source_id in ids
+            selected_endpoint_id = source_id if source_selected else target_id
+            external_edges.append({
+                **edge,
+                "selectedEndpointId": selected_endpoint_id,
+                "remoteEndpointId": target_id if source_selected else source_id,
+                "remoteEndpoint": remote_endpoint,
+                "direction": "out" if source_selected else "in",
+            })
+        next_offset = bounded_offset + bounded_limit if bounded_offset + bounded_limit < external_total else None
+        next_page_token = (
+            _encode_viewport_page_token(source_fingerprint, query_signature, next_offset)
+            if next_offset is not None
+            else None
+        )
+        return {
+            "internalEdges": internal_edges,
+            "externalEdges": external_edges,
+            "externalEdgeCount": external_total,
+            "externalEdgeTypeCounts": external_type_counts,
+            "externalPagination": {
+                "limit": bounded_limit,
+                "offset": bounded_offset,
+                "total": external_total,
+                "nextOffset": next_offset,
+                "hasMore": next_offset is not None,
+                "nextPageToken": next_page_token,
+                "cursorSourceFingerprint": source_fingerprint,
+                "querySignature": query_signature,
+            },
+        }
+
+    def _indexed_focus_frontier(
+        self,
+        book_id: str,
+        source_fingerprint: str,
+        candidates: dict[str, dict[str, Any]],
+        focus: Optional[str],
+        depth: int,
+    ) -> tuple[dict[str, set[str]], list[dict[str, Any]]]:
+        """Traverse only the requested focus frontier through indexed edges."""
+        if not focus or focus not in candidates:
+            return defaultdict(set), []
+        adjacency: dict[str, set[str]] = defaultdict(set)
+        frontier: set[str] = {focus}
+        visited: set[str] = set()
+        edge_by_key: dict[str, dict[str, Any]] = {}
+        for _ in range(max(1, min(int(depth or 1), 3))):
+            frontier -= visited
+            if not frontier:
+                break
+            frontier_edges = self._indexed_semantic_edges_for_nodes(
+                book_id,
+                source_fingerprint,
+                frontier,
+            )
+            next_frontier: set[str] = set()
+            for edge in frontier_edges:
+                source = str(edge.get("source") or "")
+                target = str(edge.get("target") or "")
+                if source not in candidates or target not in candidates:
+                    continue
+                edge_key = str(
+                    edge.get("id")
+                    or _stable_id("semantic-edge-frontier", source, edge.get("type"), target, edge.get("label"))
+                )
+                edge_by_key[edge_key] = edge
+                adjacency[source].add(target)
+                adjacency[target].add(source)
+                next_frontier.update({source, target})
+            visited.update(frontier)
+            frontier = {
+                node_id
+                for node_id in next_frontier
+                if node_id not in visited
+            }
+        return adjacency, sorted(
+            edge_by_key.values(),
+            key=lambda item: (
+                str(item.get("source") or ""),
+                str(item.get("target") or ""),
+                str(item.get("type") or ""),
+                str(item.get("id") or ""),
+            ),
+        )
+
+    def _indexed_node_reference(
+        self,
+        book_id: str,
+        source_fingerprint: str,
+        node_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Resolve one node id/source id/title from the scalar index, then hydrate it."""
+        raw = str(node_id or "").strip()
+        if not raw:
+            return None
+        row = self.db.fetchone(
+            """SELECT node_id, payload
+                 FROM storyflow_graph_node_index
+                WHERE book_id=? AND source_fingerprint=? AND node_id=?""",
+            (book_id, source_fingerprint, raw),
+        )
+        if row is None:
+            row = self.db.fetchone(
+                """SELECT node_id, payload
+                     FROM storyflow_graph_node_index
+                    WHERE book_id=? AND source_fingerprint=?
+                      AND (source_id=? OR title=?)
+                    ORDER BY CASE WHEN source_id=? THEN 0 ELSE 1 END, node_id
+                    LIMIT 1""",
+                (book_id, source_fingerprint, raw, raw, raw),
+            )
+        return _restore_indexed_node(_load_json(row.get("payload"), {}) if row else {})
+
+    def _indexed_neighbors(
+        self,
+        book_id: str,
+        node_id: str,
+        *,
+        limit: int,
+        offset: int,
+        direction: str,
+        node_types: Iterable[str],
+        page_token: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        """Serve Inspector neighbors from the paired node/edge index when warm.
+
+        ``None`` is an intentional fallback signal: callers retain the full
+        projector path until the derived index has been built once.
+        """
+        source_fingerprint = self._source_identity(book_id)
+        if not self._node_index_ready(book_id, source_fingerprint):
+            return None
+        if not self._semantic_edge_index_ready(book_id, source_fingerprint):
+            return None
+        node = self._indexed_node_reference(book_id, source_fingerprint, node_id)
+        if node is None:
+            raise StoryGraphError(f"Story Graph node not found: {node_id}")
+        resolved = str(node["id"])
+        normalized_direction = str(direction or "both").strip().lower()
+        if normalized_direction not in {"in", "out", "both"}:
+            raise StoryGraphError("neighbor direction must be one of: in, out, both")
+        bounded_limit = max(1, min(int(limit or 60), 200))
+        bounded_offset = max(0, int(offset or 0))
+        allowed_types = {canonical_node_type(item) for item in node_types if item}
+        query_signature = _neighbor_query_signature(
+            resolved,
+            normalized_direction,
+            allowed_types,
+            bounded_limit,
+        )
+        if page_token:
+            token = _decode_viewport_page_token(page_token)
+            if token["querySignature"] != query_signature:
+                raise StoryGraphError("neighbor page token does not match the current query")
+            if token["sourceFingerprint"] != source_fingerprint:
+                raise StoryGraphError("neighbor page token expired; reload the current node")
+            bounded_offset = token["offset"]
+        # Keep the pagination boundary at SQLite.  Reading every incident
+        # payload before slicing would make a high-degree Character or
+        # Chapter expensive even though the API advertises a bounded page.
+        # The CASE expression resolves the remote endpoint once, allowing the
+        # node index to apply the type predicate and sort before hydration.
+        join_sql = """
+            FROM storyflow_graph_semantic_edge_index e
+            JOIN storyflow_graph_node_index n
+              ON n.book_id=e.book_id
+             AND n.source_fingerprint=e.source_fingerprint
+             AND n.node_id=CASE WHEN e.source_id=? THEN e.target_id ELSE e.source_id END
+        """
+        where_clauses = [
+            "e.book_id=?",
+            "e.source_fingerprint=?",
+        ]
+        query_params: list[Any] = [resolved, book_id, source_fingerprint]
+        if normalized_direction == "out":
+            where_clauses.append("e.source_id=?")
+            query_params.append(resolved)
+        elif normalized_direction == "in":
+            where_clauses.append("e.target_id=?")
+            query_params.append(resolved)
+        else:
+            where_clauses.append("(e.source_id=? OR e.target_id=?)")
+            query_params.extend([resolved, resolved])
+        if allowed_types:
+            placeholders = ",".join("?" for _ in allowed_types)
+            where_clauses.append(f"n.node_type IN ({placeholders})")
+            query_params.extend(sorted(allowed_types))
+        where_sql = " AND ".join(where_clauses)
+        total_row = self.db.fetchone(
+            f"SELECT COUNT(*) AS count {join_sql} WHERE {where_sql}",
+            tuple(query_params),
+        )
+        total = int((total_row or {}).get("count") or 0)
+        page_rows = self.db.fetchall(
+            f"""SELECT e.payload AS edge_payload,
+                       e.source_id AS edge_source_id,
+                       e.target_id AS edge_target_id,
+                       n.payload AS node_payload
+                  {join_sql}
+                 WHERE {where_sql}
+                 ORDER BY e.edge_type, n.title, n.node_id
+                 LIMIT ? OFFSET ?""",
+            tuple([*query_params, bounded_limit, bounded_offset]),
+        )
+        related: list[dict[str, Any]] = []
+        for row in page_rows:
+            edge = _load_json(row.get("edge_payload"), {})
+            neighbor = _restore_indexed_node(_load_json(row.get("node_payload"), {}))
+            if not isinstance(edge, dict) or not isinstance(neighbor, dict):
+                continue
+            is_out = str(row.get("edge_source_id") or "") == resolved
+            related.append({
+                "node": neighbor,
+                "edge": edge,
+                "direction": "out" if is_out else "in",
+            })
+        page = related
+        next_offset = bounded_offset + bounded_limit if bounded_offset + bounded_limit < total else None
+        next_page_token = (
+            _encode_viewport_page_token(source_fingerprint, query_signature, next_offset)
+            if next_offset is not None
+            else None
+        )
+        return {
+            "node": node,
+            "neighbors": page,
+            "pagination": {
+                "limit": bounded_limit,
+                "offset": bounded_offset,
+                "total": total,
+                "nextOffset": next_offset,
+                "hasMore": next_offset is not None,
+                "nextPageToken": next_page_token,
+                "cursorSourceFingerprint": source_fingerprint,
+                "querySignature": query_signature,
+            },
+            "canonicalSource": "sqlite",
+            "projectionCacheHit": True,
+            "projectionReadModel": "sqlite_node_index+semantic_edge_index",
+        }
+
+    def _latest_snapshot(self, book_id: str) -> Optional[dict[str, Any]]:
+        return self.db.fetchone(
+            """SELECT id, snapshot_hash, source_commit_id, source_state_version,
+                      reason, node_count, edge_count, created_at
+                 FROM storyflow_graph_snapshots
+                WHERE book_id=? ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (book_id,),
+        )
 
     @staticmethod
     def _catalog_payload(catalog: _Catalog) -> dict[str, Any]:
@@ -4338,6 +7156,8 @@ class StoryGraphProjector:
                 "status": run.get("status"),
             }
         type_by_source = {
+            "style": "ContextSource",
+            "constraints": "ContextSource",
             "story_bible": "StoryBibleEntry",
             "planning_source": "StoryBibleEntry",
             "chapter_summary": "Chapter",
@@ -4376,6 +7196,8 @@ class StoryGraphProjector:
 
         context_graph_snapshot = self._context_graph_snapshot_surface(manifest)
         table_by_source = {
+            "style": "projects",
+            "constraints": "projects",
             "story_bible": "story_bible_snapshots",
             "planning_source": "reference_documents",
             "chapter_summary": "chapters",
@@ -4646,6 +7468,8 @@ class StoryGraphProjector:
             ),
             "promptBinding": manifest.get("promptBinding"),
             "contextGraphSnapshot": context_graph_snapshot,
+            "inputAccounting": self._context_input_accounting(manifest, input_reference),
+            "sourceAvailability": manifest.get("availability") or {},
             "breakdown": [
                 {
                     "sourceType": source_type,
@@ -4678,6 +7502,229 @@ class StoryGraphProjector:
             },
             "contextGraphSnapshot": context_graph_snapshot,
             "tokenSummary": token_summary,
+        }
+
+    @staticmethod
+    def _context_input_accounting(
+        manifest: dict[str, Any],
+        input_reference: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Reconcile persisted character ranges without inventing token usage.
+
+        ``GenerationRun.input_reference.promptLayout`` is the durable boundary
+        for the exact prompt string.  Manifest item/section/component ranges
+        are intentionally allowed to overlap: a source item may roll up into
+        a section and the section may roll up into the ``context`` component.
+        This read model reports both the union and the overlap so callers do
+        not mistake a sum of provenance rows for prompt length.  Provider
+        tokenization remains outside this module and is still represented only
+        by the whole-run usage columns.
+        """
+
+        def non_negative_int(value: Any) -> Optional[int]:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                return None
+            return number if number >= 0 else None
+
+        def interval(value: Any) -> Optional[tuple[int, int, str]]:
+            if not isinstance(value, dict):
+                return None
+            if value.get("scope") != "persisted_generation_input":
+                return None
+            start = non_negative_int(value.get("start"))
+            end = non_negative_int(value.get("end"))
+            if start is None or end is None or end <= start:
+                return None
+            return start, end, str(value.get("precision") or "recorded")
+
+        def merge(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+            ordered = sorted((start, end) for start, end in ranges if end > start)
+            merged: list[tuple[int, int]] = []
+            for start, end in ordered:
+                if not merged or start > merged[-1][1]:
+                    merged.append((start, end))
+                else:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            return merged
+
+        def length(ranges: Iterable[tuple[int, int]]) -> int:
+            return sum(end - start for start, end in ranges)
+
+        def intersection(
+            left: Iterable[tuple[int, int]],
+            right: Iterable[tuple[int, int]],
+        ) -> list[tuple[int, int]]:
+            result: list[tuple[int, int]] = []
+            for left_start, left_end in left:
+                for right_start, right_end in right:
+                    start = max(left_start, right_start)
+                    end = min(left_end, right_end)
+                    if end > start:
+                        result.append((start, end))
+            return result
+
+        writer_input = manifest.get("writerInput")
+        writer_input = writer_input if isinstance(writer_input, dict) else {}
+        raw_layout = input_reference.get("promptLayout")
+        prompt_layout = raw_layout if isinstance(raw_layout, dict) else {}
+        prompt_chars = non_negative_int(prompt_layout.get("charCount"))
+        if prompt_chars is None:
+            raw_prompt = input_reference.get("prompt")
+            if isinstance(raw_prompt, str):
+                prompt_chars = len(raw_prompt)
+
+        layout_segments: list[dict[str, Any]] = []
+        for raw_segment in prompt_layout.get("segments") or []:
+            if not isinstance(raw_segment, dict):
+                continue
+            start = non_negative_int(raw_segment.get("contentStart"))
+            end = non_negative_int(raw_segment.get("contentEnd"))
+            if start is None or end is None or end <= start:
+                continue
+            if prompt_chars is not None and end > prompt_chars:
+                continue
+            layout_segments.append({
+                "id": raw_segment.get("id"),
+                "role": raw_segment.get("role"),
+                "messageIndex": raw_segment.get("messageIndex"),
+                "start": start,
+                "end": end,
+            })
+
+        message_ranges = merge(
+            (item["start"], item["end"])
+            for item in layout_segments
+            if item.get("messageIndex") is not None
+        )
+        system_ranges = merge(
+            (item["start"], item["end"])
+            for item in layout_segments
+            if str(item.get("role") or "").casefold() == "system"
+        )
+
+        range_records: list[tuple[int, int, str, str]] = []
+        range_status_counts: dict[str, int] = defaultdict(int)
+        range_precision_counts: dict[str, int] = defaultdict(int)
+        included_source_count = 0
+        included_source_without_range = 0
+        excluded_source_with_range = 0
+
+        collections: list[tuple[str, Any]] = [
+            ("source", manifest.get("items")),
+            ("section", manifest.get("contextSections")),
+        ]
+        writer_components = writer_input.get("components")
+        if not isinstance(writer_components, list):
+            writer_components = manifest.get("promptComponents")
+        collections.append(("component", writer_components))
+
+        for kind, raw_collection in collections:
+            if not isinstance(raw_collection, list):
+                continue
+            for item in raw_collection:
+                if not isinstance(item, dict):
+                    continue
+                included = bool(item.get("included", True))
+                if kind == "source":
+                    if included:
+                        included_source_count += 1
+                    else:
+                        # An excluded manifest row should never have entered
+                        # the persisted prompt. Keep the contradiction visible
+                        # rather than allowing it to inflate coverage.
+                        if interval(item.get("persistedPromptRange")) is not None:
+                            excluded_source_with_range += 1
+                raw_range = item.get("persistedPromptRange")
+                parsed = interval(raw_range)
+                status = str(
+                    item.get("persistedPromptRangeStatus")
+                    or ("exact" if parsed is not None else "not_recorded")
+                )
+                range_status_counts[status] += 1
+                if parsed is None:
+                    if kind == "source" and included:
+                        included_source_without_range += 1
+                    continue
+                if not included and kind == "source":
+                    continue
+                start, end, precision = parsed
+                if prompt_chars is not None and end > prompt_chars:
+                    range_status_counts["outside_prompt"] += 1
+                    continue
+                range_precision_counts[precision] += 1
+                range_records.append((start, end, precision, kind))
+
+        raw_ranges = [(start, end) for start, end, _, _ in range_records]
+        merged_ranges = merge(raw_ranges)
+        covered_chars = length(merged_ranges)
+        raw_range_chars = length(raw_ranges)
+        overlap_chars = max(0, raw_range_chars - covered_chars)
+        covered_message_chars = length(intersection(merged_ranges, message_ranges))
+        message_chars = length(message_ranges)
+        layout_prompt_chars = prompt_chars
+        untracked_prompt_chars = (
+            max(0, layout_prompt_chars - covered_chars)
+            if layout_prompt_chars is not None
+            else None
+        )
+        untracked_message_chars = max(0, message_chars - covered_message_chars) if message_ranges else None
+
+        if prompt_chars is None:
+            status = "ranges_without_prompt_length" if range_records else "unavailable"
+            reason = (
+                "persisted manifest ranges exist, but input_reference.promptLayout/prompt did not persist total length"
+                if range_records
+                else "input_reference.promptLayout and prompt were not persisted"
+            )
+        elif not range_records:
+            status = "layout_only"
+            reason = "the persisted prompt length is known, but no manifest range is exact enough to account for coverage"
+        elif not prompt_layout:
+            status = "ranges_without_prompt_layout"
+            reason = "prompt length and manifest ranges are available, but message/system segment boundaries were not persisted"
+        else:
+            status = "exact_character_accounting"
+            reason = "coverage is computed from the persisted prompt layout and the union of included manifest ranges"
+
+        def percentage(part: Optional[int], whole: Optional[int]) -> Optional[float]:
+            if part is None or whole in (None, 0):
+                return None
+            return round(part * 100 / whole, 2)
+
+        return {
+            "status": status,
+            "reason": reason,
+            "scope": "persisted_generation_input",
+            "promptLayoutAvailable": bool(prompt_layout),
+            "promptChars": layout_prompt_chars,
+            "systemChars": length(system_ranges) if system_ranges else None,
+            "messageChars": message_chars if message_ranges else None,
+            "recordedRangeCount": len(range_records),
+            "uniqueCoveredChars": covered_chars,
+            "rawAttributedChars": raw_range_chars,
+            "overlapChars": overlap_chars,
+            "untrackedPromptChars": untracked_prompt_chars,
+            "untrackedMessageChars": untracked_message_chars,
+            "coveragePercent": percentage(covered_chars, layout_prompt_chars),
+            "messageCoveragePercent": percentage(covered_message_chars, message_chars) if message_ranges else None,
+            "coveredMessageChars": covered_message_chars if message_ranges else None,
+            "estimatedCoveredTokens": round(covered_chars / 4),
+            "estimatedUntrackedMessageTokens": (
+                round(untracked_message_chars / 4)
+                if untracked_message_chars is not None
+                else None
+            ),
+            "rangeStatusCounts": dict(sorted(range_status_counts.items())),
+            "rangePrecisionCounts": dict(sorted(range_precision_counts.items())),
+            "includedSourceCount": included_source_count,
+            "includedSourceWithoutPersistedRange": included_source_without_range,
+            "excludedSourceWithPersistedRange": excluded_source_with_range,
+            "sourceRangePolicy": "union_of_included_manifest_items_sections_and_prompt_components",
+            "tokenBasis": "character accounting only; provider tokenization is not persisted per source",
+            "providerUsageScope": "whole_generation_run",
+            "providerTokenOffsets": False,
         }
 
     @staticmethod
@@ -7780,6 +10827,15 @@ class StoryGraphProjector:
             numeric = 0
         return (numeric, node.get("type", ""), node.get("title", ""))
 
+    @staticmethod
+    def _edge_sort_key(edge: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            str(edge.get("type") or ""),
+            str(edge.get("source") or ""),
+            str(edge.get("target") or ""),
+            str(edge.get("id") or ""),
+        )
+
     @classmethod
     def _presentation_metadata(
         cls,
@@ -8031,9 +11087,59 @@ class StoryGraphProjector:
         total_in_viewport: int,
         returned_in_viewport: int,
         truncated: bool,
+        *,
+        source_fingerprint: Optional[str] = None,
+        query_signature: Optional[str] = None,
+        page_offset: int = 0,
+        internal_edge_count: int = 0,
+        returned_internal_edges: int = 0,
+        internal_edge_page_offset: int = 0,
+        internal_edge_page_size: int = 0,
+        internal_edge_source_fingerprint: Optional[str] = None,
+        internal_edge_query_signature: Optional[str] = None,
+        cross_boundary_edge_count: int = 0,
+        boundary_edges: Optional[list[dict[str, Any]]] = None,
+        boundary_edge_type_counts: Optional[dict[str, int]] = None,
+        boundary_page_size: int = 0,
+        boundary_page_offset: int = 0,
+        boundary_source_fingerprint: Optional[str] = None,
+        boundary_query_signature: Optional[str] = None,
     ) -> dict[str, Any]:
         requested = query.viewport_x_from is not None
-        return {
+        returned_boundary_edges = list(boundary_edges or []) if requested else []
+        page_size = max(1, int(query.limit)) if requested else 0
+        page_has_more = bool(requested and page_offset + returned_in_viewport < total_in_viewport)
+        next_page_token = None
+        if page_has_more and source_fingerprint and query_signature:
+            next_page_token = _encode_viewport_page_token(
+                source_fingerprint,
+                query_signature,
+                page_offset + returned_in_viewport,
+            )
+        effective_boundary_page_size = max(1, int(boundary_page_size or page_size or 1))
+        returned_boundary_edges_has_more = bool(
+            requested and boundary_page_offset + len(returned_boundary_edges) < int(cross_boundary_edge_count)
+        )
+        next_boundary_page_token = None
+        if returned_boundary_edges_has_more and boundary_source_fingerprint and boundary_query_signature:
+            next_boundary_page_token = _encode_viewport_page_token(
+                boundary_source_fingerprint,
+                boundary_query_signature,
+                boundary_page_offset + len(returned_boundary_edges),
+            )
+        effective_internal_edge_page_size = max(1, int(internal_edge_page_size or query.edge_limit or 1))
+        internal_edge_has_more = bool(
+            requested
+            and internal_edge_page_offset + int(returned_internal_edges) < int(internal_edge_count)
+        )
+        next_internal_edge_page_token = None
+        if internal_edge_has_more and internal_edge_source_fingerprint and internal_edge_query_signature:
+            next_internal_edge_page_token = _encode_viewport_page_token(
+                internal_edge_source_fingerprint,
+                internal_edge_query_signature,
+                internal_edge_page_offset + int(returned_internal_edges),
+            )
+        response = {
             "requested": requested,
             "mode": "world_coordinate_filter" if requested else "not_requested",
             "xFrom": query.viewport_x_from,
@@ -8045,7 +11151,570 @@ class StoryGraphProjector:
             "returnedInViewport": returned_in_viewport if requested else None,
             "truncated": bool(truncated) if requested else False,
             "layoutScope": "filtered_candidates" if requested else "query_candidates",
+            "pageSize": page_size if requested else None,
+            "pageOffset": int(page_offset) if requested else 0,
+            "pageIndex": int(page_offset // page_size) if requested and page_size else 0,
+            "hasMore": page_has_more,
+            "nextPageToken": next_page_token,
+            "cursorSourceFingerprint": source_fingerprint if requested else None,
+            "querySignature": query_signature if requested else None,
+            "pageBoundary": "loaded_page" if requested else "none",
+            "internalEdgeScope": "viewport_candidate_set" if requested else "none",
+            "internalEdgeCount": int(internal_edge_count) if requested else 0,
+            "returnedInternalEdges": int(returned_internal_edges) if requested else 0,
+            "internalEdgesTruncated": internal_edge_has_more,
+            "internalEdgePageSize": effective_internal_edge_page_size if requested else None,
+            "internalEdgePageOffset": int(internal_edge_page_offset) if requested else 0,
+            "internalEdgePageIndex": int(internal_edge_page_offset // effective_internal_edge_page_size) if requested else 0,
+            "nextInternalEdgePageToken": next_internal_edge_page_token,
+            # The Canvas must be able to distinguish “not loaded in this
+            # viewport” from “no semantic relationship exists”.  These are
+            # still read-model records from the same candidate edge set; the
+            # remote endpoint is intentionally summarized rather than added
+            # to the current page.
+            "crossBoundaryEdgeCount": int(cross_boundary_edge_count) if requested else 0,
+            "returnedCrossBoundaryEdges": len(returned_boundary_edges),
+            "crossBoundaryEdgesTruncated": returned_boundary_edges_has_more,
+            "crossBoundaryEdgeTypeCounts": dict(boundary_edge_type_counts or {}) if requested else {},
+            "crossBoundaryEdges": returned_boundary_edges,
         }
+        if requested and (query.boundary_node_id or query.boundary_page_token):
+            response.update({
+                "boundaryPageSize": effective_boundary_page_size,
+                "boundaryPageOffset": int(boundary_page_offset),
+                "boundaryPageIndex": int(boundary_page_offset // effective_boundary_page_size) if effective_boundary_page_size else 0,
+                "boundaryHasMore": returned_boundary_edges_has_more,
+                "nextBoundaryPageToken": next_boundary_page_token,
+            })
+        return response
+
+    def _viewport_cursor_fingerprint(self, book_id: str, view: str, source_fingerprint: str) -> str:
+        """Bind spatial continuations to both Canon and workspace coordinates.
+
+        Layout coordinates are UI workspace state, not story authority, but a
+        continuation that was issued before a layout move could otherwise
+        return a page from the wrong world-space ordering.  Hashing only the
+        coordinate/visibility fields keeps this a read-only invalidation seam
+        without treating layout rows as Canon.
+        """
+        workspace_fingerprint = self._workspace_layout_fingerprint(book_id, view)
+        payload = {
+            "sourceFingerprint": source_fingerprint,
+            "view": normalize_view(view),
+            "workspaceFingerprint": workspace_fingerprint,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+    def _workspace_layout_fingerprint(self, book_id: str, view: str) -> str:
+        rows = self.db.fetchall(
+            """SELECT node_id, x, y, collapsed, pinned, hidden
+               FROM storyflow_layouts WHERE book_id=? AND view=? ORDER BY node_id""",
+            (book_id, normalize_view(view)),
+        )
+        payload = [
+            {
+                "nodeId": row.get("node_id"),
+                "x": row.get("x"),
+                "y": row.get("y"),
+                "collapsed": bool(row.get("collapsed")),
+                "pinned": bool(row.get("pinned")),
+                "hidden": bool(row.get("hidden")),
+            }
+            for row in rows
+        ]
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+    @staticmethod
+    def _spatial_index_fingerprint(
+        source_fingerprint: str,
+        query: StoryGraphQuery,
+        candidate_ids: Iterable[str],
+    ) -> str:
+        payload = {
+            "schemaVersion": SPATIAL_INDEX_SCHEMA_VERSION,
+            "sourceFingerprint": source_fingerprint,
+            "querySignature": _spatial_projection_signature(query),
+            "candidateIds": sorted({str(node_id) for node_id in candidate_ids}),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:32]
+
+    def _read_spatial_index_meta(
+        self,
+        book_id: str,
+        query: StoryGraphQuery,
+        source_fingerprint: str,
+        candidate_ids: Iterable[str],
+    ) -> Optional[dict[str, str | int]]:
+        candidate_id_list = list(candidate_ids)
+        index_fingerprint = self._spatial_index_fingerprint(source_fingerprint, query, candidate_id_list)
+        workspace_fingerprint = self._workspace_layout_fingerprint(book_id, query.view)
+        row = self.db.fetchone(
+            """SELECT node_count, edge_count FROM storyflow_spatial_index_meta
+               WHERE book_id=? AND view=? AND index_fingerprint=? AND workspace_fingerprint=?
+                 AND source_fingerprint=?""",
+            (book_id, normalize_view(query.view), index_fingerprint, workspace_fingerprint, source_fingerprint),
+        )
+        if row is None or int(row.get("node_count") or 0) != len(candidate_id_list):
+            return None
+        return {
+            "indexFingerprint": index_fingerprint,
+            "workspaceFingerprint": workspace_fingerprint,
+            "nodeCount": int(row.get("node_count") or 0),
+            "edgeCount": int(row.get("edge_count") or 0),
+        }
+
+    def _ensure_spatial_index(
+        self,
+        book_id: str,
+        query: StoryGraphQuery,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        focus: Optional[str],
+        source_fingerprint: str,
+    ) -> dict[str, str | int]:
+        """Build or reuse the rebuildable spatial/edge read model.
+
+        The external interface is intentionally one operation: callers ask
+        for the index identity, while this implementation hides layout,
+        workspace overlay, edge serialization, invalidation, and SQLite
+        indexing.  It is a deep read-model module: the only mutable rows are
+        derived cache rows, and a changed source/layout fingerprint selects a
+        new rebuild rather than mutating Canon.
+        """
+        normalized_view = normalize_view(query.view)
+        workspace_fingerprint = self._workspace_layout_fingerprint(book_id, normalized_view)
+        index_fingerprint = self._spatial_index_fingerprint(source_fingerprint, query, (node["id"] for node in nodes))
+        existing = self.db.fetchone(
+            """SELECT node_count, edge_count FROM storyflow_spatial_index_meta
+               WHERE book_id=? AND view=? AND index_fingerprint=? AND workspace_fingerprint=?
+                 AND source_fingerprint=?""",
+            (book_id, normalized_view, index_fingerprint, workspace_fingerprint, source_fingerprint),
+        )
+        if existing and int(existing.get("node_count") or 0) == len(nodes) and int(existing.get("edge_count") or 0) == len(edges):
+            return {
+                "indexFingerprint": index_fingerprint,
+                "workspaceFingerprint": workspace_fingerprint,
+                "nodeCount": len(nodes),
+                "edgeCount": len(edges),
+            }
+
+        positions = self._layout_positions(book_id, normalized_view, nodes, edges, focus)
+        ordered_nodes = sorted(nodes, key=self._node_sort_key)
+        layout_items = []
+        saved = {item["nodeId"]: item for item in self.read_layout(book_id, normalized_view)}
+        for sort_order, node in enumerate(ordered_nodes):
+            position = positions.get(node["id"], {"x": 120.0, "y": 120.0})
+            saved_item = saved.get(node["id"])
+            layout_items.append(
+                (
+                    book_id,
+                    normalized_view,
+                    index_fingerprint,
+                    workspace_fingerprint,
+                    node["id"],
+                    float(saved_item["x"] if saved_item else position["x"]),
+                    float(saved_item["y"] if saved_item else position["y"]),
+                    sort_order,
+                    int(bool(saved_item.get("collapsed"))) if saved_item else 0,
+                    int(bool(saved_item.get("pinned"))) if saved_item else 0,
+                    int(bool(saved_item.get("hidden"))) if saved_item else 0,
+                )
+            )
+        edge_items = []
+        seen_edge_keys: set[str] = set()
+        ordered_edges = sorted(
+            edges,
+            key=lambda item: (
+                str(item.get("id") or ""),
+                str(item.get("source") or ""),
+                str(item.get("target") or ""),
+                str(item.get("type") or ""),
+            ),
+        )
+        for edge in ordered_edges:
+            base_key = str(edge.get("id") or _stable_id("edge-index", edge.get("source"), edge.get("type"), edge.get("target"), edge.get("label")))
+            edge_key = base_key
+            suffix = 1
+            while edge_key in seen_edge_keys:
+                suffix += 1
+                edge_key = f"{base_key}:{suffix}"
+            seen_edge_keys.add(edge_key)
+            edge_items.append(
+                (
+                    book_id,
+                    index_fingerprint,
+                    edge_key,
+                    str(edge.get("source") or ""),
+                    str(edge.get("target") or ""),
+                    str(edge.get("type") or "semantic"),
+                    json.dumps(_json_safe(edge), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                )
+            )
+        with self.db.transaction() as conn:
+            conn.execute(
+                """DELETE FROM storyflow_spatial_layouts
+                   WHERE book_id=? AND view=? AND source_fingerprint=? AND workspace_fingerprint=?""",
+                (book_id, normalized_view, index_fingerprint, workspace_fingerprint),
+            )
+            conn.execute(
+                """DELETE FROM storyflow_graph_edge_index
+                   WHERE book_id=? AND source_fingerprint=?""",
+                (book_id, index_fingerprint),
+            )
+            if layout_items:
+                conn.executemany(
+                    """INSERT INTO storyflow_spatial_layouts(
+                        book_id, view, source_fingerprint, workspace_fingerprint,
+                        node_id, x, y, sort_order, collapsed, pinned, hidden
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    layout_items,
+                )
+            if edge_items:
+                conn.executemany(
+                    """INSERT INTO storyflow_graph_edge_index(
+                        book_id, source_fingerprint, edge_key, source_id,
+                        target_id, edge_type, payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    edge_items,
+                )
+            conn.execute(
+                """INSERT INTO storyflow_spatial_index_meta(
+                    book_id, view, index_fingerprint, source_fingerprint,
+                    workspace_fingerprint, node_count, edge_count, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(book_id, view, index_fingerprint, workspace_fingerprint) DO UPDATE SET
+                    source_fingerprint=excluded.source_fingerprint,
+                    node_count=excluded.node_count,
+                    edge_count=excluded.edge_count,
+                    updated_at=CURRENT_TIMESTAMP""",
+                (
+                    book_id,
+                    normalized_view,
+                    index_fingerprint,
+                    source_fingerprint,
+                    workspace_fingerprint,
+                    len(nodes),
+                    len(edges),
+                ),
+            )
+        return {
+            "indexFingerprint": index_fingerprint,
+            "workspaceFingerprint": workspace_fingerprint,
+            "nodeCount": len(nodes),
+            "edgeCount": len(edges),
+        }
+
+    def _spatial_rows_in_viewport(
+        self,
+        index: dict[str, str | int],
+        book_id: str,
+        view: str,
+        x_from: float,
+        x_to: float,
+        y_from: float,
+        y_to: float,
+        *,
+        allowed_ids: Optional[set[str]] = None,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = [book_id, normalize_view(view), index["indexFingerprint"], index["workspaceFingerprint"], x_from, x_to, y_from, y_to]
+        sql = """SELECT node_id, x, y, sort_order, collapsed, pinned, hidden
+                 FROM storyflow_spatial_layouts
+                WHERE book_id=? AND view=? AND source_fingerprint=? AND workspace_fingerprint=?
+                  AND x>=? AND x<=? AND y>=? AND y<=?"""
+        if allowed_ids and len(allowed_ids) <= 800:
+            placeholders = ",".join("?" for _ in allowed_ids)
+            sql += f" AND node_id IN ({placeholders})"
+            params.extend(sorted(allowed_ids))
+        sql += " ORDER BY sort_order"
+        rows = self.db.fetchall(sql, tuple(params))
+        if allowed_ids and len(allowed_ids) > 800:
+            rows = [row for row in rows if str(row.get("node_id")) in allowed_ids]
+        return rows
+
+    def _spatial_positions_by_ids(self, index: dict[str, str | int], book_id: str, view: str, node_ids: Iterable[str]) -> dict[str, dict[str, float]]:
+        ids = sorted({str(node_id) for node_id in node_ids})
+        positions: dict[str, dict[str, float]] = {}
+        for start in range(0, len(ids), 700):
+            chunk = ids[start:start + 700]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.fetchall(
+                f"""SELECT node_id, x, y FROM storyflow_spatial_layouts
+                     WHERE book_id=? AND view=? AND source_fingerprint=?
+                       AND workspace_fingerprint=? AND node_id IN ({placeholders})""",
+                (book_id, normalize_view(view), index["indexFingerprint"], index["workspaceFingerprint"], *chunk),
+            )
+            for row in rows:
+                positions[str(row["node_id"])] = {"x": float(row["x"]), "y": float(row["y"])}
+        return positions
+
+    def _indexed_edges_for_nodes(self, index: dict[str, str | int], book_id: str, node_ids: Iterable[str]) -> list[dict[str, Any]]:
+        ids = sorted({str(node_id) for node_id in node_ids})
+        edges_by_key: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(ids), 350):
+            chunk = ids[start:start + 350]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _ in chunk)
+            params = (book_id, index["indexFingerprint"], *chunk, *chunk)
+            rows = self.db.fetchall(
+                f"""SELECT edge_key, payload FROM storyflow_graph_edge_index
+                     WHERE book_id=? AND source_fingerprint=?
+                       AND (source_id IN ({placeholders}) OR target_id IN ({placeholders}))""",
+                params,
+            )
+            for row in rows:
+                payload = _load_json(row.get("payload"), {})
+                if isinstance(payload, dict):
+                    edges_by_key[str(row["edge_key"])] = payload
+        return sorted(
+            edges_by_key.values(),
+            key=lambda item: (str(item.get("source") or ""), str(item.get("target") or ""), str(item.get("type") or ""), str(item.get("id") or "")),
+        )
+
+    def _indexed_internal_edge_page(
+        self,
+        index: dict[str, str | int],
+        book_id: str,
+        node_ids: Iterable[str],
+        *,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Read a page of edges whose two endpoints are in one viewport.
+
+        The node cursor and this edge cursor intentionally have separate
+        scopes.  A viewport can contain more nodes than one transport page;
+        paging the internal edge set independently prevents relationships
+        between two not-yet-hydrated nodes from disappearing when the next
+        node page arrives.  The edge index is rebuildable SQLite state, so
+        this helper never reads or writes StoryFact/StoryState/StoryCommit.
+        """
+        selected = sorted({str(node_id) for node_id in node_ids if str(node_id).strip()})
+        bounded_offset = max(0, int(offset or 0))
+        bounded_limit = max(1, min(int(limit or 1), 6000))
+        if not selected:
+            return [], 0
+        if len(selected) > 900:
+            all_edges = [
+                edge for edge in self._indexed_edges_for_nodes(index, book_id, selected)
+                if edge.get("source") in selected and edge.get("target") in selected
+            ]
+            all_edges.sort(key=self._edge_sort_key)
+            return all_edges[bounded_offset:bounded_offset + bounded_limit], len(all_edges)
+
+        values_sql = ",".join("(?)" for _ in selected)
+        cte = f"WITH selected(node_id) AS (VALUES {values_sql})"
+        base_params = (*selected, book_id, index["indexFingerprint"])
+        count_row = self.db.fetchone(
+            f"""{cte}
+                SELECT COUNT(*) AS count
+                  FROM storyflow_graph_edge_index e
+                 WHERE e.book_id=?
+                   AND e.source_fingerprint=?
+                   AND EXISTS (SELECT 1 FROM selected s WHERE s.node_id=e.source_id)
+                   AND EXISTS (SELECT 1 FROM selected s WHERE s.node_id=e.target_id)""",
+            base_params,
+        )
+        total = int((count_row or {}).get("count") or 0)
+        rows = self.db.fetchall(
+            f"""{cte}
+                SELECT e.payload
+                  FROM storyflow_graph_edge_index e
+                 WHERE e.book_id=?
+                   AND e.source_fingerprint=?
+                   AND EXISTS (SELECT 1 FROM selected s WHERE s.node_id=e.source_id)
+                   AND EXISTS (SELECT 1 FROM selected s WHERE s.node_id=e.target_id)
+                 ORDER BY e.edge_type, e.source_id, e.target_id, e.edge_key
+                 LIMIT ? OFFSET ?""",
+            (*base_params, bounded_limit, bounded_offset),
+        )
+        page: list[dict[str, Any]] = []
+        for row in rows:
+            edge = _load_json(row.get("payload"), {})
+            if isinstance(edge, dict):
+                page.append(edge)
+        return page, total
+
+    def _indexed_boundary_page(
+        self,
+        index: dict[str, str | int],
+        book_id: str,
+        view: str,
+        selected_ids: set[str],
+        candidates: dict[str, dict[str, Any]],
+        layout_positions: Optional[dict[str, dict[str, float]]],
+        *,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+        """Read an exact, paged semantic boundary from the indexed edge seam."""
+        if not selected_ids:
+            return [], 0, {}
+        selected = sorted({str(node_id) for node_id in selected_ids if str(node_id).strip()})
+        if not selected:
+            return [], 0, {}
+        # A VALUES CTE keeps one bind per selected endpoint instead of four
+        # repeated IN lists.  The normal Canvas page is well below SQLite's
+        # variable limit; retain the old read path as a safe fallback for a
+        # caller that explicitly asks for an unusually large working set.
+        if len(selected) > 900:
+            all_edges = self._indexed_edges_for_nodes(index, book_id, selected)
+            crossing = [
+                edge for edge in all_edges
+                if (edge.get("source") in selected_ids) != (edge.get("target") in selected_ids)
+            ]
+            crossing.sort(key=lambda item: (
+                str(item.get("type") or ""),
+                str(item.get("source") or ""),
+                str(item.get("target") or ""),
+                str(item.get("id") or ""),
+            ))
+            type_counts: defaultdict[str, int] = defaultdict(int)
+            for edge in crossing:
+                type_counts[str(edge.get("type") or "semantic")] += 1
+            page = crossing[offset:offset + max(1, limit)]
+        else:
+            values_sql = ",".join("(?)" for _ in selected)
+            crossing_sql = """
+                (EXISTS (SELECT 1 FROM selected s WHERE s.node_id=e.source_id)
+                 AND NOT EXISTS (SELECT 1 FROM selected s WHERE s.node_id=e.target_id))
+                OR
+                (EXISTS (SELECT 1 FROM selected s WHERE s.node_id=e.target_id)
+                 AND NOT EXISTS (SELECT 1 FROM selected s WHERE s.node_id=e.source_id))
+            """
+            cte = f"WITH selected(node_id) AS (VALUES {values_sql})"
+            base_params = (*selected, book_id, index["indexFingerprint"])
+            count_row = self.db.fetchone(
+                f"""{cte}
+                    SELECT COUNT(*) AS count
+                      FROM storyflow_graph_edge_index e
+                     WHERE e.book_id=?
+                       AND e.source_fingerprint=?
+                       AND ({crossing_sql})""",
+                base_params,
+            )
+            total = int((count_row or {}).get("count") or 0)
+            type_rows = self.db.fetchall(
+                f"""{cte}
+                    SELECT e.edge_type, COUNT(*) AS count
+                      FROM storyflow_graph_edge_index e
+                     WHERE e.book_id=?
+                       AND e.source_fingerprint=?
+                       AND ({crossing_sql})
+                     GROUP BY e.edge_type""",
+                base_params,
+            )
+            type_counts = defaultdict(int)
+            for row in type_rows:
+                type_counts[str(row.get("edge_type") or "semantic")] = int(row.get("count") or 0)
+            page_rows = self.db.fetchall(
+                f"""{cte}
+                    SELECT e.edge_key, e.source_id, e.target_id, e.payload
+                      FROM storyflow_graph_edge_index e
+                     WHERE e.book_id=?
+                       AND e.source_fingerprint=?
+                       AND ({crossing_sql})
+                     ORDER BY e.edge_type, e.source_id, e.target_id, e.edge_key
+                     LIMIT ? OFFSET ?""",
+                (*base_params, max(1, limit), max(0, offset)),
+            )
+            page = []
+            for row in page_rows:
+                edge = _load_json(row.get("payload"), {})
+                if isinstance(edge, dict):
+                    page.append(edge)
+        if len(selected) > 900:
+            total = len(crossing)
+        else:
+            total = int(total)
+        remote_ids = {
+            str(edge.get("target") if edge.get("source") in selected_ids else edge.get("source"))
+            for edge in page
+        }
+        positions = dict(layout_positions or {})
+        missing = remote_ids.difference(positions)
+        if missing:
+            positions.update(self._spatial_positions_by_ids(index, book_id, view, missing))
+        enriched: list[dict[str, Any]] = []
+        for edge in page:
+            loaded_id = str(edge["source"] if edge.get("source") in selected_ids else edge["target"])
+            remote_id = str(edge["target"] if loaded_id == edge.get("source") else edge["source"])
+            remote = candidates.get(remote_id)
+            if remote is None:
+                continue
+            enriched.append({
+                **edge,
+                "boundary": True,
+                "loadedEndpointId": loaded_id,
+                "remoteEndpoint": {
+                    "id": remote["id"],
+                    "type": remote["type"],
+                    "title": remote.get("title", remote["id"]),
+                    "status": remote.get("status", "CANON"),
+                    "x": positions.get(remote_id, {}).get("x"),
+                    "y": positions.get(remote_id, {}).get("y"),
+                },
+            })
+        return enriched, total, dict(sorted(type_counts.items()))
+
+    @staticmethod
+    def _viewport_boundary_edges(
+        candidate_edges: list[dict[str, Any]],
+        selected_ids: set[str],
+        candidates: dict[str, dict[str, Any]],
+        layout_positions: Optional[dict[str, dict[str, float]]],
+        *,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+        """Return semantic evidence crossing the current viewport boundary.
+
+        Boundary edges are not rendered until both endpoints are loaded.  A
+        bounded summary keeps the Canvas honest without turning panning into
+        a full-graph fetch.  The exact count is retained separately so a
+        capped sample cannot be mistaken for the complete set.
+        """
+        if not selected_ids:
+            return [], 0, {}
+        crossing: list[dict[str, Any]] = []
+        type_counts: defaultdict[str, int] = defaultdict(int)
+        for edge in candidate_edges:
+            source_loaded = edge["source"] in selected_ids
+            target_loaded = edge["target"] in selected_ids
+            if source_loaded == target_loaded:
+                continue
+            type_counts[str(edge.get("type") or "semantic")] += 1
+            loaded_id = edge["source"] if source_loaded else edge["target"]
+            remote_id = edge["target"] if source_loaded else edge["source"]
+            remote = candidates.get(remote_id)
+            if remote is None:
+                continue
+            position = (layout_positions or {}).get(remote_id, {})
+            remote_endpoint = {
+                "id": remote["id"],
+                "type": remote["type"],
+                "title": remote.get("title", remote["id"]),
+                "status": remote.get("status", "CANON"),
+                "x": position.get("x"),
+                "y": position.get("y"),
+            }
+            crossing.append({
+                **edge,
+                "boundary": True,
+                "loadedEndpointId": loaded_id,
+                "remoteEndpoint": remote_endpoint,
+            })
+        crossing.sort(key=lambda item: (
+            str(item.get("type") or ""),
+            str(item.get("source") or ""),
+            str(item.get("target") or ""),
+            str(item.get("id") or ""),
+        ))
+        return crossing[: max(1, limit)], len(crossing), dict(sorted(type_counts.items()))
 
     @staticmethod
     def _world_graph_metadata(view: str) -> Optional[dict[str, Any]]:
@@ -8302,7 +11971,11 @@ class StoryGraphProjector:
                     "y": row_offsets[row] + slot * slot_stride,
                 }
             return positions
-        for index, node in enumerate(nodes):
+        # Catalog reads may come from SQLite or the serialized projection
+        # cache.  Their insertion order is not a layout contract; sorting the
+        # bounded Full Graph page keeps viewport requests in one coordinate
+        # space across cache hits and incremental fetches.
+        for index, node in enumerate(sorted(nodes, key=self._node_sort_key)):
             positions[node["id"]] = {"x": 140 + (index % 8) * 230, "y": 120 + (index // 8) * 150}
         return positions
 

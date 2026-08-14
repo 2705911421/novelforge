@@ -29,7 +29,7 @@
   --success: #62b486;
   --warning: #cfa04d;
   --error: #df756c;
-  --accent: var(--primary);
+  --accent: #58a6ff;
   --radius: 12px;
   --radius-sm: 8px;
   --control-radius: 9px;
@@ -58,7 +58,7 @@ html[data-theme="light"] {
   --success: #2f7d58;
   --warning: #956116;
   --error: #ad4137;
-  --accent: var(--primary);
+  --accent: #58a6ff;
   --shadow-soft: 0 14px 36px rgba(63, 57, 48, 0.1);
   --shadow-accent: 0 12px 30px rgba(199, 93, 72, 0.14);
 }

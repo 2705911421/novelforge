@@ -9,6 +9,14 @@ from typing import Optional, Dict, Any, List
 
 from .database import get_db, generate_id
 
+
+def _safe_json_loads(value: str, default: Any = None) -> Any:
+    """安全 JSON 反序列化，失败时返回默认值"""
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return default
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,7 +39,7 @@ class ProjectDAL:
         """获取项目"""
         row = self.db.get_by_id('projects', project_id)
         if row and row.get('world_setting'):
-            row['world_setting'] = json.loads(row['world_setting'])
+            row['world_setting'] = _safe_json_loads(row['world_setting'], {})
         return row
     
     def update(self, project_id: str, data: Dict) -> bool:
@@ -126,7 +134,10 @@ class ChapterDAL:
         if row:
             for field in ['key_events', 'characters_appeared', 'locations_used']:
                 if row.get(field):
-                    row[field] = json.loads(row[field])
+                    try:
+                        row[field] = _safe_json_loads(row[field], [])
+                    except (json.JSONDecodeError, TypeError):
+                        row[field] = []
         return row
     
     def get_by_number(self, book_id: str, number: int) -> Optional[Dict]:
@@ -138,7 +149,7 @@ class ChapterDAL:
         if row:
             for field in ['key_events', 'characters_appeared', 'locations_used']:
                 if row.get(field):
-                    row[field] = json.loads(row[field])
+                    row[field] = _safe_json_loads(row[field], [])
         return row
     
     def get_latest_number(self, book_id: str) -> int:
@@ -259,7 +270,7 @@ class CharacterDAL:
         for row in rows:
             for field in ['relationships', 'knowledge']:
                 if row.get(field):
-                    row[field] = json.loads(row[field])
+                    row[field] = _safe_json_loads(row[field], [])
         return rows
 
 
@@ -324,13 +335,12 @@ class LocationDAL:
     
     def get_tree(self, book_id: str) -> List[Dict]:
         """获取地点层级树"""
-        locations = self.list_by_book(book_id)
-        # 构建树结构
+        locations = [dict(loc) for loc in self.list_by_book(book_id)]
         location_map = {loc['id']: loc for loc in locations}
         tree = []
         for loc in locations:
             loc['children'] = []
-            if loc['parent_id'] and loc['parent_id'] in location_map:
+            if loc.get('parent_id') and loc['parent_id'] in location_map:
                 location_map[loc['parent_id']]['children'].append(loc)
             else:
                 tree.append(loc)
@@ -424,7 +434,7 @@ class StoryFactDAL:
         )
         for row in rows:
             if row.get('entities'):
-                row['entities'] = json.loads(row['entities'])
+                row['entities'] = _safe_json_loads(row['entities'], [])
         return rows
     
     def list_by_chapter(self, chapter_id: str) -> List[Dict]:
@@ -435,18 +445,18 @@ class StoryFactDAL:
         )
         for row in rows:
             if row.get('entities'):
-                row['entities'] = json.loads(row['entities'])
+                row['entities'] = _safe_json_loads(row['entities'], [])
         return rows
     
     def search(self, book_id: str, query: str) -> List[Dict]:
         """搜索 Story Facts"""
         rows = self.db.fetchall(
-            "SELECT * FROM story_facts WHERE book_id = AND content LIKE ? ORDER BY created_at DESC",
+            "SELECT * FROM story_facts WHERE book_id = ? AND content LIKE ? ORDER BY created_at DESC",
             (book_id, f"%{query}%")
         )
         for row in rows:
             if row.get('entities'):
-                row['entities'] = json.loads(row['entities'])
+                row['entities'] = _safe_json_loads(row['entities'], [])
         return rows
 
 
@@ -550,7 +560,7 @@ class StoryCommitDAL:
         if row:
             for field in ['facts_extracted', 'state_changes']:
                 if row.get(field):
-                    row[field] = json.loads(row[field])
+                    row[field] = _safe_json_loads(row[field], [])
         return row
     
     def get_by_chapter(self, chapter_id: str) -> Optional[Dict]:
@@ -562,7 +572,7 @@ class StoryCommitDAL:
         if row:
             for field in ['facts_extracted', 'state_changes']:
                 if row.get(field):
-                    row[field] = json.loads(row[field])
+                    row[field] = _safe_json_loads(row[field], [])
         return row
     
     def update(self, commit_id: str, data: Dict) -> bool:
@@ -597,7 +607,7 @@ class TimelineDAL:
         )
         for row in rows:
             if row.get('characters_involved'):
-                row['characters_involved'] = json.loads(row['characters_involved'])
+                row['characters_involved'] = _safe_json_loads(row['characters_involved'], [])
         return rows
 
 
@@ -632,7 +642,7 @@ class OperationLogDAL:
         )
         for row in rows:
             if row.get('details'):
-                row['details'] = json.loads(row['details'])
+                row['details'] = _safe_json_loads(row['details'], {})
         return rows
     
     def get_stats(self) -> Dict[str, Any]:
@@ -647,27 +657,31 @@ class OperationLogDAL:
         return stats or {}
 
 
-# 全局 DAL 实例
+# 全局 DAL 实例（线程安全）
+import threading as _threading
+_dal_lock = _threading.Lock()
 _dal_instances = {}
 
 
 def get_dal(name: str):
     """获取 DAL 实例"""
     if name not in _dal_instances:
-        dal_classes = {
-            'project': ProjectDAL,
-            'book': BookDAL,
-            'chapter': ChapterDAL,
-            'character': CharacterDAL,
-            'faction': FactionDAL,
-            'location': LocationDAL,
-            'foreshadow': ForeshadowDAL,
-            'story_fact': StoryFactDAL,
-            'review': ReviewDAL,
-            'story_commit': StoryCommitDAL,
-            'timeline': TimelineDAL,
-            'operation_log': OperationLogDAL,
-        }
-        if name in dal_classes:
-            _dal_instances[name] = dal_classes[name]()
+        with _dal_lock:
+            if name not in _dal_instances:
+                dal_classes = {
+                    'project': ProjectDAL,
+                    'book': BookDAL,
+                    'chapter': ChapterDAL,
+                    'character': CharacterDAL,
+                    'faction': FactionDAL,
+                    'location': LocationDAL,
+                    'foreshadow': ForeshadowDAL,
+                    'story_fact': StoryFactDAL,
+                    'review': ReviewDAL,
+                    'story_commit': StoryCommitDAL,
+                    'timeline': TimelineDAL,
+                    'operation_log': OperationLogDAL,
+                }
+                if name in dal_classes:
+                    _dal_instances[name] = dal_classes[name]()
     return _dal_instances.get(name)

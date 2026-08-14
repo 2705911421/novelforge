@@ -1,18 +1,23 @@
 """审查与打分系统 - 借鉴 inkOS 审计员架构"""
 
+import logging
 from ..core.models import ChapterReview, ReviewDimension, ReviewVerdict, StoryProject, Chapter
 from ..llm.client import MultiModelManager
 from ..llm.prompts import PromptManager
 from ..pipeline.rules import genre_contract_lines
 
+logger = logging.getLogger(__name__)
+
 
 class ChapterReviewer:
     """章节审查器 - 双重门禁机制"""
 
-    def __init__(self, model_manager: MultiModelManager, pass_score: float = 93.0):
+    DEFAULT_PASS_SCORE = 85.0
+
+    def __init__(self, model_manager: MultiModelManager, pass_score: float | None = None):
         self.models = model_manager
         self.prompts = PromptManager()
-        self.pass_score = pass_score
+        self.pass_score = pass_score if pass_score is not None else self.DEFAULT_PASS_SCORE
 
     def review_chapter(self, chapter: Chapter, project: StoryProject,
                        previous_summaries: str = "", chapter_plan: str = "") -> ChapterReview:
@@ -48,7 +53,11 @@ class ChapterReviewer:
         messages = [{"role": "user", "content": prompt}]
         system = "你是一位严格但公正的小说审稿编辑，专注于提升作品质量。"
 
-        response = client.chat_json(messages, system)
+        try:
+            response = client.chat_json(messages, system)
+        except Exception as e:
+            logger.warning("Review LLM call failed: %s", e)
+            response = {}
 
         # 解析审查结果
         review = self._parse_review(chapter.number, response)

@@ -553,7 +553,9 @@ class DatabaseAdapter:
         )
 
 
-# 全局适配器实例
+# 全局适配器实例（线程安全）
+import threading as _threading
+_adapter_lock = _threading.Lock()
 _adapter: Optional[DatabaseAdapter] = None
 
 
@@ -561,5 +563,7 @@ def get_adapter() -> DatabaseAdapter:
     """获取全局数据库适配器"""
     global _adapter
     if _adapter is None:
-        _adapter = DatabaseAdapter()
+        with _adapter_lock:
+            if _adapter is None:
+                _adapter = DatabaseAdapter()
     return _adapter

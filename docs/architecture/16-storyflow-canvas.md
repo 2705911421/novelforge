@@ -1,6 +1,30 @@
 # StoryFlow Canvas architecture
 
-状态：`PARTIAL`（2026-08-13）。本文件描述当前已落地的 vertical slice，不把规划节点、候选分支或 AI provenance 写成已完成能力。
+## Authoring surface
+
+StoryFlow follows NovelForge's warm paper / fiction-studio direction by
+default. The bootstrap keeps an explicit `novelforge-theme=dark` preference,
+so the graphite variant remains available and is not silently removed. Theme
+choice is UI state only; it does not alter the Story Graph projection,
+semantic edge data, or saved workspace layout.
+
+StoryFlow also calls the existing `/creation/preflight` read model when the
+workbench opens. Its `modelReadiness` result controls only model-backed UI
+actions: saving a revisioned planning node or Chapter Intent remains available,
+while generation, candidate forecasting, and AI analysis are disabled until
+the configured Provider/model role contract is ready. A missing or failed
+readiness check is visible in the toolbar and can route to the existing Agent
+Config page; no provider credentials are copied into Story Graph state.
+
+The same boundary is enforced server-side for direct API callers. The explicit
+model actions `POST /forecast`, `POST /story-graph/actions/analyze`, and
+`POST /story-graph/planning/generate` reuse `require_model_setup(..., force=True)`
+and return `LLM_PROVIDER_REQUIRED` before enqueueing when the role contract is
+not ready. This prevents a queued task from pretending to have started and
+then failing only inside a worker. Planning-only writes remain separate and
+continue to use revisioned `plot_workspaces` state without requiring a model.
+
+状态：`PARTIAL`（2026-08-14）。本文件描述当前已落地的 vertical slice，不把规划节点、候选分支或 AI provenance 写成已完成能力。
 
 ## Authority and projection
 
@@ -24,6 +48,7 @@ commit-scoped 增量投影。
 - `GET /api/v1/books/{book_id}/story-graph/search`
 - `GET /api/v1/books/{book_id}/story-graph/nodes/{node_id}`
 - `GET /api/v1/books/{book_id}/story-graph/neighbors/{node_id}`
+- `GET /api/v1/books/{book_id}/story-graph/selection`
 - `GET /api/v1/books/{book_id}/story-graph/impact/{node_id}`
 - `GET /api/v1/books/{book_id}/story-graph/history`
 - `GET /api/v1/books/{book_id}/story-graph/diff`
@@ -45,6 +70,16 @@ commit-scoped 增量投影。
 - `GET /api/v1/books/{book_id}/story-graph/actions/analyze/{task_id}`
 
 Graph 请求支持 view、focus、depth、节点类型/状态、章节范围、卷、剧情线和故事时间范围过滤。章节节点的卷号来自真实 `chapters.arc_id → arcs.volume_id → volumes.number` 链路；默认 focus + depth 1，服务端限制 depth 为 1–3，并保留响应上限；Full Graph 不是默认入口。
+
+`GET .../selection?nodeIds=id1,id2&limit=120&edgeLimit=240` 是多选
+StoryFlow working set 的只读投影。它重新从 SQLite catalog 解析请求的节点
+ID，返回选区内完整的语义边、一个有界的选区外连接样本、远端节点摘要、节点/边
+类型与状态计数、章节范围和 `canonicalSource`。`missingNodeIds` 保留无法解析的
+请求，不用前端当前页面猜测事实；`meta.readOnly=true`、
+`meta.canonicalMutation=false` 和 `evidenceBoundary` 明确表示它不会写入
+StoryFact、StoryState、StoryCommit 或布局。选区外连接仍是同一 catalog 的语义
+证据，而不是第二个前端图数据库；点击未加载的远端节点会重新发起带 `focus` 的
+权威 Graph 查询。
 
 ## Canvas boundary
 
@@ -402,7 +437,7 @@ token attribution.
 
 ## Direct planning-node authoring addendum (2026-08-12)
 
-The Canvas exposes `新建规划节点` only in the explicit planning-edit mode. The modal writes through `POST .../story-graph/planning/node` with the current revision, author source, status, summary, and optional anchor metadata. When the selected anchor has a schema-legal relation, the checked default option follows with a second revision-checked `POST .../story-graph/planning/edge` (`originates_from`, `planned_for`, `depends_on`, or `affects`); the edge is semantic planning state rather than an inferred canonical fact. The response is immediately reprojected by `StoryGraphProjector`, selected, focused, and shown in the Inspector with `plot_workspaces` provenance. This is an authoring overlay: it does not insert StoryFact, StoryState, or StoryCommit rows. A linked planning node remains in the bounded anchor subgraph after refresh; an explicitly unlinked node remains supported and is found through the real Graph Search/type filter.
+The Canvas exposes `新建规划节点` only in the explicit planning-edit mode. The modal writes through `POST .../story-graph/planning/node` with the current revision, author source, status, summary, and optional anchor metadata. When the selected anchor has a schema-legal relation, the checked default option sends `anchorNodeId`, `anchorEdgeType`, ports, and edge metadata in the same request. The service validates the anchor and applies the node plus semantic edge as one revisioned `plot_workspace` operation batch; an illegal anchor therefore leaves neither an orphan node nor a revision. Supported preset relations include `originates_from`, `planned_for`, `depends_on`, and `affects`; the edge is semantic planning state rather than an inferred canonical fact. The response is immediately reprojected by `StoryGraphProjector`, selected, focused, and shown in the Inspector with `plot_workspaces` provenance. This is an authoring overlay: it does not insert StoryFact, StoryState, or StoryCommit rows. A linked planning node remains in the bounded anchor subgraph after refresh; an explicitly unlinked node remains supported and is found through the real Graph Search/type filter.
 
 ## Foreshadow lifecycle projection addendum (2026-08-12)
 
@@ -919,3 +954,450 @@ chapter number and optional guidance into the existing
 `story-graph/planning/generate` boundary, which compiles the Flow into the
 existing `ChapterIntent`/Control Surface and queues the standard `write-next`
 runtime. The Canvas never directly creates Canon facts from this interaction.
+
+## Canon freshness for long-lived Canvas sessions (2026-08-13)
+
+The StoryFlow page now has an explicit read-only freshness seam for the case in
+which Writing Studio or a worker accepts a StoryCommit while the Canvas remains
+open. The API is:
+
+`GET /api/v1/books/{book_id}/story-graph/changes?fromSnapshot={id}&nodeId={id}`
+
+`StoryGraphProjector.changes_since_snapshot()` rebuilds the current projection
+from SQLite, captures/deduplicates the current observed graph snapshot, and
+compares it with the client snapshot through the existing scoped snapshot diff.
+The response reports `changed`, `resyncRequired`, current source commit/state
+metadata, and a truthful diff boundary. A missing old snapshot is an explicit
+resync response, not a fabricated diff or an HTTP 500. This is a read model
+boundary: it does not write StoryFact, StoryState, StoryCommit, planning data,
+or UI layout coordinates.
+
+The browser polls this endpoint every 12 seconds while StoryFlow is open. In
+read-only mode with no unsaved workspace interaction, a relevant update shows a
+toast and reloads the current focused projection from SQLite. If planning edit,
+port connection, or unsaved layout state is active, the page keeps the current
+graph intact and renders `CANON UPDATE · REFRESH REQUIRED` with an explicit
+Refresh action. This prevents an external Canon update from silently replacing
+an author's in-progress planning surface. The browser evidence is recorded in
+`docs/storyflow-canvas/evidence/storyflow-20260813-freshness-*`; product
+verdict remains `PARTIAL`.
+
+## Legacy navigation convergence (2026-08-13)
+
+Within the shared controller, View switching preserves the current real-node
+anchor whenever that node belongs to the target projection. A selected
+Character, Chapter, Location, Foreshadow, or other compatible node therefore
+remains the focus while the author moves between Story Flow, Character,
+Timeline, World, and Foreshadow projections. Context View is intentionally
+stricter and accepts only a Chapter focus, because a non-chapter anchor cannot
+identify the recorded Writer context. This is UI workspace navigation only; it
+does not alter the Graph projection, Canon rows, or persisted story facts.
+
+The base Studio router now resolves the historical visualization entries to the
+shared StoryFlow controller before invoking any legacy renderer. `mindmap` and
+`plot` open `view=story`; `timeline`, `world-map`, `foreshadowing`, and
+`characters` open their corresponding `timeline`, `world`, `foreshadow`, and
+`character` projections. The mapping is stored in the base router so it works
+even while the StoryFlow asset is still loading, and the route intent is then
+consumed by `studio-storyflow.js`.
+
+This is navigation convergence, not deletion: the historical `PAGES.*`
+renderers and their APIs remain compatibility fallbacks for old deep links and
+external callers. Normal Studio clicks now use only the SQLite-backed
+`StoryGraphProjector -> story-graph API -> StoryFlow Canvas` path. Browser
+evidence for all six mappings is recorded in
+`docs/storyflow-canvas/evidence/storyflow-20260813-legacy-*`.
+
+## Writing pipeline to projection boundary (2026-08-13)
+
+The writing path now has an explicit acceptance contract across the production
+task seam. `PersistentTaskWorker` claims a durable `write-next` task,
+`LegacyTaskHandlers` invokes the checkpointed `WritingPipeline`, and the
+pipeline reaches `StoryRepository.create_story_commit()` followed by
+`accept_story_commit()`. Only that repository boundary creates the accepted
+`StoryFact`, `StoryState`, and `StoryProjection` rows. After the transaction,
+`StoryRepository` captures a rebuildable observed StoryGraph snapshot; the
+next Graph read rebuilds the same projection from authoritative SQLite when
+its catalog fingerprint changes.
+
+The Canvas does not receive a browser-side Canon mutation. Its existing
+read-only `story-graph/changes` poll detects the new snapshot, reloads the
+focused subgraph when safe, and leaves unsaved planning workspace state intact
+when a refresh requires author action. The new integration test and the
+deterministic acceptance harness cover the same Worker/Handler path without
+requiring external credentials. This is provider-independent boundary
+coverage, not a claim that a live configured model has quality-validated
+completion.
+
+## Canon-before-overlay recovery boundary (2026-08-13)
+
+The writing pipeline accepts Canon before attempting the optional planning
+overlay fulfillment. If the revisioned `plot_workspaces` write loses a race,
+the durable `write-next` task result records
+`storyflow_plan_status=ACCEPTED_PENDING_OVERLAY`, `storyflow_plan_node_id`,
+`chapter_id`, and the accepted `story_commit_id`. The task result is a recovery
+pointer, not a second fact source and not a permission to manufacture
+`ACCEPTED` state.
+
+`GET .../story-graph/planning/reconciliation-candidates` lists only completed
+writing tasks whose planning overlay is still pending. It exposes safe ids,
+the chapter number, the accepted commit id, and the recovery boundary; it does
+not expose prompt text or provider data. `POST .../planning/reconcile` reads
+that persisted result and delegates to
+`StoryFlowPlanningService.mark_intent_accepted()`. The service rechecks task
+ownership/type/completion, StoryCommit ownership/status/chapter/number, and the
+PlanningNode lifecycle. Only `PLANNED -> ACCEPTED` with a matching accepted
+StoryCommit is legal; direct client creation of `ACCEPTED` nodes/edges and
+illegal lifecycle transitions are rejected. Reconciliation is idempotent, and
+a successful retry disappears from the candidate list.
+
+The Inspector shows the recovery action only for the selected PlanningNode.
+The Canvas must be in explicit Planning Edit mode before the retry button is
+enabled. The retry writes only the revisioned planning overlay and the
+`PlanningNode -> leads_to -> Chapter` provenance edge; it never repeats the
+canonical StoryCommit transaction.
+
+## Context manifest v3 source boundary (2026-08-13)
+
+Writer `GenerationRun.input_reference.context_manifest` is now schema version
+3 for newly assembled contexts. Project writing style/profile and author
+constraints are included from the authoritative `projects` row when present,
+with section and source provenance. The manifest also records per-source
+availability: style and constraints are either `included` or explicitly
+`not_available`, while the legacy file-backed `MemorySystem` is explicitly
+`not_included` because it is not an input to this SQLite-authoritative writer
+pipeline. Context View renders this availability table from the persisted
+manifest. Older manifests without the field remain truthful and show no
+invented availability claim.
+
+The persisted Context Graph remains a metadata-only projection of that
+manifest. It can explain why a source was included or excluded, but it does not
+retroactively infer missing context from the current graph, prompt prose, or
+the absence of a character-state row.
+
+## Port-aware edge rendering boundary (2026-08-13)
+
+Semantic edge payloads may carry `sourcePort` and `targetPort`. The Canvas
+anchors SVG curves to the corresponding visible Story Port handle when that
+handle is present; legacy edges without port metadata use the existing
+node-side fallback. This keeps the visual connection consistent with the
+server-side port/schema validation without changing authoritative data. The
+backend remains the final validator, so a visually possible drag cannot bypass
+`validate_edge()` or write Context Graph evidence.
+
+## Incremental viewport merge (2026-08-14)
+
+The Full Graph Canvas now treats each successful world-coordinate response as
+an incremental read-model page. New nodes and semantic edges are merged into
+the current client projection instead of replacing the graph. Existing node
+order is preserved, and unsaved workspace coordinates, pin/collapse, and
+hidden state are retained when a fetched page overlaps a locally edited node.
+The toolbar exposes `loaded / total` from the server projection so a bounded
+page is not presented as a complete graph. `loadedGraphNodes` and
+`loadedGraphEdges` are observable Canvas diagnostics; DOM rendering still uses
+viewport culling.
+
+Pointer panning does not issue a projection request for every pointer move.
+The request is scheduled after pointer release, with in-flight and page-key
+deduplication. This is progressive loaded-projection merging, not true graph
+virtualization: a user who traverses the whole coordinate space can still load
+the full graph into the browser, and cross-page edge paging/high-degree
+clustering remain future work.
+
+## Cross-viewport semantic boundary (2026-08-14)
+
+Full Graph viewport pages intentionally draw only edges whose two endpoints
+are loaded in the current read-model page. The authoritative projector now
+also returns `meta.viewport.crossBoundaryEdgeCount`,
+`crossBoundaryEdgeTypeCounts`, and a bounded `crossBoundaryEdges` sample. Each
+sample retains the semantic edge, `loadedEndpointId`, and a read-only
+`remoteEndpoint` summary with the server layout coordinate. This prevents
+“not loaded” from being mistaken for “no relationship exists” without adding
+remote nodes to the page or creating a second client truth.
+
+The Full Graph toolbar exposes the complete boundary count. “Boundary” is
+defined by the current world-coordinate page, not by the client cache, so a
+remote endpoint cached from an earlier page is still shown as off-page evidence.
+When the selected node is represented by the sample, its Inspector lists the
+remote endpoint and can focus a fresh authoritative subgraph query on it. Exact
+high-degree inspection remains available through the existing paged
+`/story-graph/neighbors/{node_id}` API. Boundary samples are capped and are not
+themselves rendered as edges; true cross-page edge paging remains future work.
+
+## Selection projection and working-set boundary (2026-08-14)
+
+The multi-selection Inspector now consumes the same authoritative projection as
+the single-node and viewport surfaces. It does not construct relationship rows
+from the currently rendered DOM: the server resolves all selected ids against
+`StoryGraphProjector`, separates internal semantic flow from external edges,
+and keeps the external list bounded. The selected nodes can therefore be passed
+to the existing Chapter Intent, StoryFlow analysis, and candidate-generation
+actions with an inspectable read boundary before any planning write is confirmed.
+
+Selection order is not a data contract. The browser treats the response as
+matching when the selected id sets are equal, which prevents a late API response
+from replacing a newer selection merely because the server sorted nodes by its
+canonical node order. Remote focus uses the recorded endpoint type to select the
+appropriate StoryFlow view and issue a fresh `focus` query when the endpoint is
+outside the current bounded page. This is progressive disclosure, not a claim
+that a selection response loads the whole graph.
+
+## Spatial viewport continuation (2026-08-14)
+
+The Full Graph read path now has an explicit continuation contract in the same
+`GET /api/v1/books/{book_id}/story-graph` endpoint. A world-coordinate request
+returns `meta.viewport.pageSize`, `pageOffset`, `pageIndex`, `hasMore`, and an
+opaque `nextPageToken`. The token is bound to the normalized query signature,
+the current authoritative SQLite projection fingerprint, and the current
+workspace layout fingerprint for that view. A continuation therefore cannot be
+silently reused after Canon data, filters, or the saved workspace coordinates
+change: the API returns a typed `422 STORY_GRAPH_QUERY` error and the Canvas must
+reload the viewport.
+
+The Canvas keeps the current read model visible, merges a successful continuation
+page by node/semantic-edge identity, and exposes an explicit `Load next viewport
+page` action when the current world-coordinate page is still truncated. Page
+coordinates and boundary-edge evidence remain read-only projection data. The
+cursor does not create a new graph database or move UI coordinates into
+StoryFact/StoryState/StoryCommit.
+
+This is a real page/continuation seam and improves transport and client working
+set bounds. It is not yet complete server-side virtualization: candidate
+catalog construction and view-specific layout still operate over the filtered
+read model before the spatial slice. Full all-scale virtualization and the
+explicit >900-node compatibility fallback remain follow-up boundaries.
+
+## Rebuildable spatial read model and boundary paging (2026-08-14)
+
+The follow-up read path is now implemented as a separate SQLite-derived seam.
+`StoryGraphProjector` materializes `storyflow_spatial_layouts`,
+`storyflow_graph_edge_index`, and `storyflow_spatial_index_meta` keyed by the
+authoritative catalog fingerprint, normalized projection signature, and
+workspace-layout fingerprint. Rectangle reads use indexed `x/y` bounds; node
+selection and cross-boundary evidence use indexed source/target endpoint reads.
+The first cold request builds the index from the existing authoritative-derived
+catalog. Subsequent pans and boundary pages reuse it, and a changed source,
+filter, view, layout, or read-model schema selects a rebuildable cache identity.
+
+`boundary_node_id` plus the opaque `boundary_page_token` now provide an exact,
+paged semantic boundary read. The response includes the complete crossing-edge
+count/type counts and only the current page of remote endpoint summaries. The
+remote endpoint is evidence for the Inspector, not an implicit Canvas node;
+the browser never writes it to Canon. Cursor validation covers query identity
+and the same source/workspace freshness boundary as viewport continuation.
+
+This materially reduces repeated world-coordinate layout and edge rescans, but
+it is still a partial virtualization seam: candidate filtering and the cold
+index build currently begin from the rebuildable JSON catalog. A future deepening
+step can move more predicates into normalized read tables without changing the
+Graph API or StoryFact/StoryState authority boundary.
+
+## Paired semantic-edge read model for Inspector focus (2026-08-14)
+
+The same source-epoch seam now materializes
+`storyflow_graph_semantic_edge_index` beside
+`storyflow_graph_node_index`. It is not the viewport edge cache: its source
+fingerprint is the complete projected catalog identity, so Inspector and
+focused Story/Character/World queries can ask for the incident semantic edge
+frontier independently of the view/layout that was opened first. The node
+index metadata stores the paired schema and edge count; a missing row or count
+mismatch is treated as a cold cache and cannot produce a partial warm result.
+
+`/story-graph/nodes/{id}`, `/story-graph/neighbors/{id}`, and warm focused
+Depth 1/2/3 projections hydrate only the selected node payloads and traverse
+only the requested frontier. The public seam reports
+`sqlite_node_index+semantic_edge_index`; the cold fallback reports
+`json_catalog`. JSON hydration restores the runtime Story Port shape, and all
+semantic edge payloads retain their recorded status/provenance. Triggered
+source invalidation causes the next read to rebuild both derived tables; no
+StoryFact, StoryState, StoryCommit, or layout row is mutated.
+
+This deepens the most common author interaction without pretending that the
+Full Graph is fully GPU-virtualized. DOM culling, bounded viewport transport,
+full all-scale virtualization, and historical replay remain separate
+acceptance boundaries.
+
+## Query-bound Inspector and boundary edge pages (2026-08-14)
+
+Warm Inspector neighbor pages now execute SQLite `COUNT` and ordered
+`LIMIT/OFFSET` queries before hydration. The API returns `nextPageToken` bound
+to the resolved node, direction, type filter, page size, and source fingerprint;
+the legacy offset remains accepted for compatibility. The browser uses the
+opaque token first, so source mutation and changed filters cannot silently
+produce duplicate or missing neighbor rows.
+
+Ordinary Full Graph cross-viewport boundary pages use a selected-endpoint CTE
+to count and group crossing edge types, then hydrate only the requested payload
+page. Very large explicit working sets retain a documented fallback because a
+single SQLite CTE cannot exceed the host's bind-variable ceiling. This is a
+read-amplification reduction and cursor-integrity improvement, not a claim of
+GPU rendering or complete mutable-table history.
+
+## Warm multi-selection projection (2026-08-14)
+
+The selection working set used by Chapter Intent and StoryFlow AI analysis now
+shares the paired SQLite read model with Inspector and focused projections.
+Warm reads resolve selected ids/source ids/titles from
+`storyflow_graph_node_index`, fetch their incident semantic edges from
+`storyflow_graph_semantic_edge_index`, and hydrate only selected nodes plus
+remote endpoint summaries. `projectionReadModel` makes the path observable.
+Source-epoch invalidation returns the read to the authoritative-derived cold
+rebuild; the selection endpoint remains read-only and cannot mutate
+StoryFact, StoryState, or StoryCommit.
+## Selection external-edge pagination (2026-08-14)
+
+High-degree multi-selection no longer requires the warm projector to materialize
+the complete incident frontier. Internal selected-to-selected edges remain a
+bounded working-set projection; selected-to-remote edges use SQLite COUNT,
+type aggregation, and LIMIT/OFFSET under an opaque source/query-bound cursor.
+The API exposes `externalEdgesPage`, while the Canvas Inspector merges pages by
+edge id and never writes StoryFact, StoryState, or StoryCommit.
+
+## Accepted commit snapshot recovery (2026-08-14)
+
+The authoritative acceptance transaction and the derived graph capture remain
+separate. When the post-commit capture fails, the repository records the
+failed capture's source fingerprint/revision in
+`storyflow_graph_snapshot_capture_failures`. Idempotent acceptance and
+`POST /api/v1/books/{book_id}/story-graph/snapshots/retry` can recover only
+when the accepted commit is still the current StoryState boundary and the
+trigger-backed source epoch is unchanged. A changed mutable entity source or
+an old commit without a recorded failure boundary is explicitly ledger-only;
+the current graph is never presented as that commit's historical graph.
+
+## Historical dependency surface for ChapterVersion compare (2026-08-14)
+
+`chapter-version-compare` now keeps two read-only views explicit. The existing
+`dependencySurface` remains the current projection surface; when both selected
+ChapterVersions map to accepted StoryCommit graph snapshots, the response also
+returns `canonicalSurface.historicalDependencySurface`. That surface seeds on
+changed node/edge endpoints and traverses the target snapshot's semantic
+outgoing edges with the requested depth/limit. It exposes snapshot boundaries,
+changed ids, direct/downstream nodes, future chapter candidates, and the
+evidence label `accepted StoryCommit graph snapshots and target semantic edges`.
+
+This is a deep projector seam rather than a second Canon store: it never
+modifies StoryFact, StoryState, StoryCommit, or layout state, and it refuses to
+infer causality from prose. If either accepted snapshot is missing, the API and
+Inspector show an explicit unavailable/ledger-only state. The Version Compare
+Inspector renders the historical surface separately from the current impact
+surface so authors can distinguish “what the current graph records” from “what
+changed and was reachable at the two accepted boundaries.”
+
+## Accepted graph history timeline (2026-08-14)
+
+`GET .../story-graph/history` now includes `canonicalGraphHistory`, an accepted-
+commit-scoped timeline for the graph itself. Each row is sourced from an
+accepted `StoryCommit` boundary and its `reason=story_commit_accept` snapshot,
+including an older accepted boundary whose mutable commit status is now
+`superseded`. The row exposes snapshot provenance, node/edge counts, the
+previous comparable snapshot, bounded changed node/edge ids, and a compact
+semantic diff summary. `nodeId` scopes the changed counts to the selected
+Inspector node and its incident semantic edges.
+
+This is deliberately a history boundary, not a new Canon store. The projector
+does not reconstruct mutable Character/Location/Faction tables at arbitrary
+past times and returns `mutableDomainTablesHistorical=false`. If an accepted
+commit has no valid capture, the timeline records a missing boundary, marks the
+evidence partial/`STALE`, and resets the comparison chain; it never bridges that
+gap with the current catalog. The Inspector renders this separately as “Canon
+Graph history,” with accepted-snapshot evidence and an existing exact snapshot
+diff action. No StoryFact, StoryState, StoryCommit, or layout row is written.
+
+## Context input accounting (2026-08-14)
+
+Context View now exposes `tokenSummary.inputAccounting`, a read-only
+reconciliation of the persisted `GenerationRun.input_reference.promptLayout`
+and the manifest's persisted source/section/component ranges. It reports the
+prompt character length when available, the union of recorded ranges, raw
+attributed characters, overlap caused by source → section → component
+roll-up, untracked prompt/message characters, range-status counts, and the
+number of included sources without a persisted range. Coverage is calculated
+from the union rather than summing provenance rows, so repeated section
+bindings cannot inflate the prompt size.
+
+The status is explicit: `exact_character_accounting` requires the persisted
+prompt layout and at least one persisted range; `ranges_without_prompt_layout`
+or `ranges_without_prompt_length` describes older/incomplete runs; `layout_only`
+means the prompt length exists but no manifest range can be reconciled. The
+Inspector shows this as “Input accounting · character-level” alongside the
+whole-run provider usage. It never converts `/4` character estimates into
+provider tokens and never claims per-source provider offsets. No canonical
+StoryFact, StoryState, StoryCommit, or UI layout row is written.
+
+## Dense semantic-edge renderer (2026-08-14)
+
+The Canvas now has a hybrid presentation boundary for dense viewports. The
+same `renderedEdgeRecords()` produced by the SQLite-authoritative Story Graph
+projection is used in both modes:
+
+- When the viewport contains at least 40 rendered semantic edge records, a
+  single 2D Canvas surface paints the curves, arrows, status line styles, and
+  selected semantic labels. SVG edge DOM is cleared for that frame.
+- Sparse graphs remain SVG DOM so existing edge labels, hover affordances, and
+  semantic edge Inspector behavior stay compatible. The SVG layer is also
+  retained for the temporary port-connection preview.
+- Canvas edge hit testing samples the same cubic paths used for painting, so a
+  dense edge can be hovered and selected without inventing a separate edge
+  store. The selected edge still opens the real semantic/provenance Inspector.
+- `edgeRenderer`, `renderedEdges`, `edgePaintedEdges`, and `viewportCulling` are
+  observable presentation diagnostics. They do not become StoryFact,
+  StoryState, StoryCommit, or layout data.
+
+On the real 500-chapter browser fixture, the bounded Full Graph loaded 1,200
+projected nodes and 3,000 indexed edges, kept 38 nodes in the DOM, and painted
+334 viewport edges in Canvas mode at both 1920x1080 and 1366x768. Switching
+back to Story Flow restored 15 SVG semantic edges and cleared the Canvas paint
+counter. This is a real dense-edge renderer and hit-testing increment; it is
+not a claim of GPU rendering, full graph virtualization, or a production FPS
+SLA.
+
+## Bounded Full Graph transport budget (2026-08-14)
+
+The explicit Full Graph browser entry no longer starts with the old
+`1200`-node/`3000`-edge compatibility payload. `queryString()` now sends
+`limit=240&edge_limit=600` for the first read and for viewport continuation
+reads. The server still reports the complete SQLite candidate totals, so this
+is a transport working-set limit rather than a smaller Story Graph.
+
+In the real 500-chapter fixture the initial expanded response was 240 nodes /
+476 internal edges, with authoritative totals of 1,892 nodes / 7,489 edges.
+The existing world-coordinate cursor then returned additional pages and the
+Canvas merged them to 480 and 720 loaded nodes. The selected Character
+Inspector continued to show SQLite state, knowledge, cross-viewport semantic
+edge counts, and source provenance. The change makes the existing spatial
+read-model seam active on large works without creating a frontend fact store.
+It does not claim full viewport virtualization or GPU rendering; independent
+cross-page semantic-edge paging is documented in the section below.
+
+## Minimap viewport navigation (2026-08-14)
+
+The Canvas Minimap now has two distinct read-only navigation gestures. Clicking
+the map centers the main Canvas on the clicked world point; dragging the visible
+viewport rectangle moves the Canvas viewport continuously while preserving the
+current zoom. The drag uses the same `state.transform` as wheel zoom and Canvas
+pan, so it does not create a second coordinate system and does not write
+`StoryFact`, `StoryState`, `StoryCommit`, or layout rows.
+
+During a drag, viewport continuation is debounced until pointer release. This
+prevents a long Minimap gesture from issuing one Graph API request per pointer
+move while still requesting the final authoritative world-coordinate page for
+an explicit Full Graph. The viewport rectangle is a presentation of the
+current transform only; node positions remain the separate workspace layout
+state.
+
+## Independent viewport semantic-edge pages (2026-08-14)
+
+The Full Graph read now has a second opaque cursor, `edge_page_token`, beside
+the node `page_token`. It pages edges whose two endpoints are in the current
+world-coordinate viewport, ordered by semantic type/source/target/edge id.
+`internalEdgeCount`, `internalEdgePageOffset`, and
+`nextInternalEdgePageToken` make the boundary observable. The cursor is bound
+to the same view/filter/viewport/edge-limit/source/workspace identity as the
+node cursor, so a changed Canon source or saved layout rejects continuation.
+
+The native Canvas merges returned edge records by semantic edge id and exposes
+an explicit “Load more semantic edges” action. Edges may be fetched before one
+or both endpoint node cards are hydrated; they become renderable as the node
+pages arrive. This closes the cross-page read-model gap without adding remote
+nodes to the Canvas or writing any StoryFact/StoryState/StoryCommit row.

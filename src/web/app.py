@@ -16,6 +16,7 @@ from ..core.project import ProjectManager
 from ..core.story_repository import StoryRepository
 from ..core.task_runtime import TaskRuntime, TaskStateError
 from ..creation.continuous_service import ContinuousWritingService
+from ..llm.model_runtime import build_model_runtime
 
 app = FastAPI(title="NovelForge", description="AI小说创作平台")
 
@@ -25,6 +26,10 @@ config = Config(project_path=str(workspace_root))
 story_repository = StoryRepository(Database(str(workspace_root / "projects" / "novelforge.db")))
 project_mgr = ProjectManager(str(workspace_root), repository=story_repository)
 task_runtime = TaskRuntime(story_repository.db)
+try:
+    model_runtime = build_model_runtime(story_repository.db, str(workspace_root))
+except Exception:
+    model_runtime = None
 
 
 def _config_int(section: str, key: str, default: int) -> int:
@@ -140,7 +145,7 @@ async def continuous_mode(project_id: str, req: ContinuousRequest):
     try:
         task = ContinuousWritingService(
             story_repository.db,
-            None,
+            model_runtime,
             story_repository,
             task_runtime,
             score_threshold=_config_int("review", "pass_score", 93),

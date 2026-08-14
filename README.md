@@ -51,6 +51,8 @@ NovelForge 适合希望把“写小说”变成长期、可恢复工程的人：
 StoryFlow 是思维导图、剧情工作流、人物关系、时间线和世界地图收敛到**同一个 Story Graph** 的统一入口。当前已落地一个真实可用的 P0 vertical slice：
 
 - 数据链路为 `SQLite 权威领域 → StoryGraphProjector → Graph API → StoryFlow Canvas`，画布不维护第二套故事事实；
+- Full Graph 的 warm viewport、搜索和 Inspector/聚焦子图共享可重建的 SQLite `storyflow_graph_node_index` + `storyflow_graph_semantic_edge_index`；`storyflow_projection_epochs` 在权威行变更后失效并触发重建，节点/邻居/聚焦接口会明确报告 `projectionReadModel=sqlite_node_index+semantic_edge_index`，但当前仍不宣称完整 GPU virtualization；
+- 高连接节点 Inspector 与普通跨视口边界页在 SQLite 端执行计数、排序和分页后才 hydration payload；邻居接口返回查询绑定的 `nextPageToken`，同时保留旧 `offset` 兼容路径；
 - 默认打开 focused subgraph，支持 depth 1/2/3、类型/状态/章节范围过滤与搜索聚焦；
 - Story / Character / Timeline / World / Foreshadow / Context 六种视图共享同一 Graph API；
 - Inspector 展示来源、状态、章节和可追溯元数据；节点拖拽、框选、自动布局与布局保存只属于 UI workspace，不写入 StoryFact；
@@ -67,10 +69,16 @@ StoryFlow 是思维导图、剧情工作流、人物关系、时间线和世界�
 - 选中任意真实 Flow 后可“保存章节计划”或“生成章节”：后者把结构化 `ChapterIntent` 写入现有规划控制面，并排队标准 `write-next` 任务，由既有 Prompt Registry、模型路由、GenerationRun 和 StoryCommit 完成后续写作；不会覆盖旧章节或绕过 Canon 边界；StoryCommit 接受后计划节点会变为 `ACCEPTED`，并以 `leads_to` 语义边指向实际生成章节；
 - Context View 在存在真实 Writer `GenerationRun` manifest 时展示 included/excluded 语义边、来源字符数、GenerationRun provenance 和未解析的只读 `ContextSource`；现在还记录实际 context sections、Writer prompt components、包含原因和 section/prompt 绑定，点击来源可回到真实图节点；manifest 缺失或不匹配时明确显示 trace unavailable，不伪造 AI 上下文；Writer 输入还保留 `promptLayout`、`promptRange` 与 runtime 生成的 `persistedPromptRange` 字符区间，无法唯一定位时明确标记，不把字符范围冒充 Provider token 偏移；
 - StoryFlow 保存的 `ChapterIntent` 现在可作为真实 Writer Context 来源：`storyflow_plan_node_id` 会把计划目标、前置条件、必需人物/地点、剧情线和伏笔动作写入现有 `GenerationRun` manifest；Context View 以 `PlanningNode`、`selectionRole=chapter_intent`、各选中图节点的角色及已持久化的语义边类型（如 `affects`、`advances`）展示“为什么加入”，缺失计划时记录明确 warning 而不伪造 provenance；
+- Full Graph 在展开证据模式下使用服务端世界坐标视口查询；已加载页面会增量合并到当前 Story Graph，工具栏显示 `loaded / total`，拖拽期间只在 pointerup 后请求，且不会覆盖未保存的工作区坐标/折叠/固定/隐藏状态。它仍是渐进式加载与 DOM culling，不宣称真正虚拟化；
+- Full Graph 的首个浏览器工作集现在固定为 `240` 个节点 / `600` 条语义边上限；展开 `All evidence nodes` 后才按视口向 SQLite 读取后续页，避免在建立 Canvas 视口前序列化 `1200/3000` 的兼容性大包。这个预算是 read-model transport 约束，不是 Canon 限制；
+- 多选真实节点会通过只读 `GET .../story-graph/selection?nodeIds=...` 读取同一 SQLite Story Graph 的选区内语义流和选区外连接；Inspector 将它呈现为可执行的 StoryFlow working set，选区外远端节点可以触发新的权威 focus 查询，不会把未加载节点伪装成当前事实；
+- 多选摘要在 read model warm 后复用同一 node/semantic-edge index，只 hydration 选中节点与远端边界摘要；权威数据变化会触发重建，不写入 Canon；
+- 高连接度多选的选区外语义边在 SQLite 端做总数/类型聚合与分页，Inspector 首页 60 条并通过 query-bound `externalPageToken` 渐进加载；游标失效会显式报错，不混入不同选区或新 Canon；
 - Character Inspector 现在把同一投影中的人物当前状态、位置、情绪、状态来源章节、最近出现、直接人物/势力关系、PlotThread 与 Foreshadow 关联分组呈现；缺失的 `character_states` 字段明确显示为“未记录”，不从 prose 推断，且可直接切入共享 Timeline 或持久化 StoryFlow AI 分析任务；
 - 选中真实 Chapter 后，Inspector 会从同一 SQLite node-detail 邻接证据按人物/势力、地点、事件/场景、剧情线/冲突、伏笔/秘密、时间/设定分组，并分别列出“本章依赖 / 输入”和“本章改变 / 输出”；同时自动读取不可变 StoryCommit/History，展示已记录的事实与状态变化摘要，不把布局或前端推断当成 Canon；
 - Story Bible 现在也进入同一 Story Graph：已发布 25 步快照、最近草稿快照和未发布步骤分别以 `StoryBibleEntry` 的 `CANON`/`DRAFT`/`PLANNED` 投影；Chapter 通过 `depends_on` 显示对当前已发布设定的规划依赖，GenerationRun 的 `story_bible` manifest 会解析到相同快照节点，而不是降级成无来源的图数据；点击设定节点可回到现有 25 步向导，Inspector 明确 Canon 与规划边界；
 - 同一章节存在多个 Writer runs 时，Context View 可从 SQLite availableRuns 选择并通过 generation_run_id 精确读取；未知或越界 run 返回 404。component attribution 显示字符数、绑定/范围状态与 contentChars/4 estimate，整次 provider usage 仍是唯一实际 token 权威。
+- Context View 还显示 `inputAccounting`：从 GenerationRun 的 persisted prompt layout 与 manifest ranges 计算字符级 union、重复覆盖、未追踪 Writer-message 字符和缺失来源范围；旧 run 会显示 `ranges_without_prompt_layout`/`ranges_without_prompt_length`，不把字符估算冒充 provider token。
 - Writer `GenerationRun` 的 `context_manifest` 现在还持久化可校验的 `contextGraphSnapshot`：Context API 会重算节点/语义边 payload 的 SHA-256，Inspector 显示 included/excluded 来源、快照计数与 integrity 状态；旧 run 没有快照时明确显示 unavailable，不从当前图或 prompt 反推 AI 上下文。
 - Forecast 与 StoryFlow Analysis 复用同一 GenerationRun Context Graph seam；Inspector 可按需读取真实 SQLite 快照，查看来源节点、included/excluded 语义边、focus、hash 完整性和 provenance 边界，且不暴露 prompt 正文或凭据。该能力已在 1920×1080 与 1366×768 headed browser fixture 中验收。
 - World View 现在是有真实层级语义的 World Graph：Book 投影出 `World` 根，地点用 `locations.parent_id + type` 表达 `World → Region → City → Location`，控制/驻留/事件叠加分别追溯到 SQLite state/timeline 表；无坐标时明确标记 `spatialMap=false`，不把线性节点排列冒充地图。
@@ -78,7 +86,7 @@ StoryFlow 是思维导图、剧情工作流、人物关系、时间线和世界�
 - Scene、Item、Secret、StoryGoal、Conflict、TimelinePoint 和 Knowledge 等尚无独立权威表的扩展概念，只接受真实 StoryFact/结构化伏笔笔记中的 typed reference；每个节点保留 `referenceType`、`referenceId`、`story_facts` provenance，并从所属 Chapter 建立 `contains` 证据边。显式 `relation` 会继续通过 Story Ports/semantic edge validator 生成 `owns`、`reveals`、`advances`、`causes`、`knows` 等语义边，Inspector 明确标注 read-model evidence 而非新 Canon 表；
 - 对尚无独立权威实体表的扩展类型，显式 typed `PlotThread` 引用会投影为可重建的 read-model 节点，并合并 `StoryFact` / `Foreshadow.notes` 的 SQLite provenance；未标注类型的字符串不会被提升为剧情事实。PlotThread Story Ports 的合法连接由统一 schema 校验。
 - 已用 120 章真实 SQLite fixture 验收 progressive disclosure：默认焦点子图 9 节点，Depth 2 116 节点/307 语义边，浏览器 DOM viewport culling、搜索聚焦和刷新后的布局恢复均有证据；
-- Graph History 支持 exact observed-snapshot pair diff；投影健康会把旧 ChapterVersion pending commit 标成 `STALE`、阻塞 Review 标成 `CONFLICT`，并在侧栏/Inspector 显示只读 diagnostics。History 明确标注 `observed_projection`，不冒充完整 canonical replay；对已接受的 `StoryCommit / StoryFact / StoryState` immutable ledger，另提供 commit-scoped Canon replay/diff，并明确 mutable entity tables 没有被伪造成历史；
+- Graph History 支持 exact observed-snapshot pair diff；投影健康会把旧 ChapterVersion pending commit 标成 `STALE`、阻塞 Review 标成 `CONFLICT`，并在侧栏/Inspector 显示只读 diagnostics。History 明确标注 `observed_projection`，不冒充完整 canonical replay；对已接受的 `StoryCommit / StoryFact / StoryState` immutable ledger，另提供 commit-scoped Canon replay/diff 和 `canonicalGraphHistory` accepted-snapshot 时间线，保留 superseded 的已接受边界并对缺失 snapshot 明确断链，不把 mutable entity tables 伪造成历史；
 - StoryFlow AI 分析任务写入现有 SQLite `tasks.result`，刷新后可从“最近 AI 分析”恢复选择与报告；分析结果仍是模型/任务产物，不自动变成 StoryFact 或 Canon；
 - StoryFlow Chapter Inspector 可直接打开章节、审查、重写、查看版本；章节工作台补充“查看本章关系”并把真实 chapter id 带入 Character View。存在于 authoritative SQLite 但尚无 `chapter_versions` 的章节仍会返回 truthful empty history，而不会被误报成 404；
 - 规划节点、候选分支和 AI 分析以 `PARTIAL` 状态持续迭代，当前不把未完成能力写成完整产品——详细边界见 [`docs/storyflow-canvas/`](docs/storyflow-canvas/) 与 [`docs/architecture/16-storyflow-canvas.md`](docs/architecture/16-storyflow-canvas.md)。
@@ -88,6 +96,12 @@ StoryFlow 是思维导图、剧情工作流、人物关系、时间线和世界�
 StoryFlow 当前还包括真实的卷、故事时间、剧情线过滤；剧情线筛选由投影语义边反向建立稳定 ID/标题索引；Inspector 可读取只读 impact/history/diff 边界，并可对高连接度节点分页加载邻居；Canvas 对当前 bounded graph 做 DOM viewport culling，并保留完整 Minimap。Projector 通过 authoritative 字段内容指纹复用可重建 `storyflow_graph_catalog_cache`，指纹变化时自动重建；章节级事实、Commit、版本和审查阻塞项走批量读取，`chapter_versions` 新增也会失效缓存；Graph history 读取现有 ChapterVersion、StoryCommit、StoryFact、状态和 planning revision，并对已观察的 StoryGraph 投影提供 scoped snapshot diff，同时公开 `projectionHealth`。accepted StoryCommit 还可按章节顺序重放 immutable ledger 并比较 commit boundary；这不是对未版本化 mutable entity tables 的完整历史图重建。当前产品结论仍为 `PARTIAL`。
 
 StoryFlow Canvas 现在还支持 Canvas 焦点快捷键（缩放、适配、重置、Depth、搜索、全选、清空、布局撤销/重做和保存）以及可点击 Minimap 导航；这些动作只改变导航或独立 UI workspace，不写入 Canon。真实浏览器证据见 `docs/storyflow-canvas/evidence/storyflow-20260813-hotkeys-minimap-*`。
+
+Canvas 还会通过只读的 `GET .../story-graph/changes?fromSnapshot=...` 检测
+长时间打开的工作台是否已经落后于 SQLite 中的新 Accepted StoryCommit：没有未保存
+规划或布局操作时自动刷新；存在进行中的作者操作时显示
+`CANON UPDATE · REFRESH REQUIRED`，不覆盖当前画布。该 freshness seam 复用
+不可变 observed graph snapshot，不创建第二套故事事实，产品状态仍为 `PARTIAL`。
 
 - **约 45 个页面**：我的创作、章节工作台、世界观向导、连续创作、StoryFlow、思维导图、时间轴、剧情工作流、世界地图、伏笔、人物关系、数据分析、联合审查、剧情推演、导入中心、任务管理、系统诊断等；
 - **配置管理**：Provider / Model / Agent 九角色路由、Prompt 注册表、Skill 与 MCP 扩展管理；
@@ -659,6 +673,23 @@ progressive-disclosure and density boundary, not full graph virtualization.
 Evidence for the real 120-chapter fixture is recorded under
 `docs/storyflow-canvas/evidence/storyflow-20260813-full-graph-*`.
 
+## StoryFlow bounded Full Graph working-set budget (2026-08-14)
+
+The explicit Full Graph entry now starts with the same bounded working-set
+budget as its world-coordinate viewport pages: `limit=240` and
+`edge_limit=600`. The browser then requests the visible rectangle through the
+existing SQLite spatial/node/semantic-edge read model and merges returned pages
+by id. The authoritative totals remain visible separately (`loaded / total`),
+and boundary edges remain queryable from the selected-node Inspector.
+
+On the real 500-chapter fixture, the first expanded request returned 240 nodes
+and 476 internal semantic edges against 1,892 authoritative nodes and 7,489
+edges. The subsequent viewport pages advanced the Canvas working set to 480
+and then 720 loaded nodes without replacing local workspace state; the browser
+diagnostic log was empty. This is a real transport-budget improvement and
+progressive disclosure seam, not full GPU virtualization or a production FPS
+claim. Evidence: `docs/storyflow-canvas/evidence/storyflow-20260814-bounded-viewport-1280.png`.
+
 ## StoryFlow server-side viewport increment (2026-08-13)
 
 Full Graph remains an explicit bounded view. In All evidence mode, the existing
@@ -668,6 +699,16 @@ layout, while preserving authoritative SQLite totals in `meta.viewport`. The
 browser uses this boundary after Canvas pan/zoom and continues native DOM
 culling. This is an incremental read seam, not a claim of GPU rendering or
 complete virtualization; the current product status remains `PARTIAL`.
+The viewport metadata also reports the exact count/type summary of semantic
+edges crossing the loaded page, plus a bounded remote-endpoint sample. The
+toolbar and selected-node Inspector expose this as recorded SQLite evidence;
+remote endpoints are not silently rendered or persisted in the browser. The
+existing paged neighbors API remains the exact high-degree inspection path.
+
+Boundary semantics are page-relative rather than client-cache-relative: a
+remote endpoint cached from an earlier world-coordinate page is still shown as
+off-page evidence for the current page. Clicking that Inspector row starts a
+new authoritative focus query; it does not invent or write a story fact.
 
 StoryFlow writing actions now open a structured Chapter Intent preview before
 writing a planning overlay or queueing a chapter. The preview is returned by
@@ -682,3 +723,75 @@ Characters from explicit SQLite lifecycle/appearance evidence. Clicking a
 signal focuses the real node in its type-specific view; the panel does not
 infer from prose or write Canon. Product status remains `PARTIAL` while the
 broader Context/Planning/AI roadmap continues.
+
+The Canvas workspace also supports reversible Hide/Delete interactions: hidden
+real nodes appear immediately in a recoverable sidebar list, and Restore keeps
+the change local until the author saves the layout. Opening Character,
+Foreshadow, Location, or Faction sources from an Inspector preserves the node
+focus while switching to the corresponding shared StoryFlow view. Browser
+evidence is recorded under
+`docs/storyflow-canvas/evidence/storyflow-20260813-hidden-restore-*` and
+`storyflow-20260813-node-action-focus-1366.png`.
+
+### StoryFlow writing-to-Canon verification
+
+The production `PersistentTaskWorker -> LegacyTaskHandlers -> WritingPipeline`
+path now has an integration contract that reaches the authoritative
+`StoryRepository` boundary. After an accepted commit, the same SQLite-backed
+projector exposes the new Chapter and extracted StoryFact as `CANON` nodes and
+semantic edges; the open Canvas can discover the change through its read-only
+freshness poll. The deterministic fixture harness is
+[`scripts/run_storyflow_deterministic_write.py`](scripts/run_storyflow_deterministic_write.py)
+and the browser evidence is recorded under
+[`docs/storyflow-canvas/evidence/`](docs/storyflow-canvas/evidence/). This
+validates task-to-projection synchronization without claiming live external
+provider quality; the overall StoryFlow roadmap remains `PARTIAL`.
+
+Accepted Canon commits that lose their post-acceptance StoryFlow snapshot now
+retain the derived source fingerprint/revision failure boundary. History and
+`POST .../story-graph/snapshots/retry` can recover only when that boundary is
+unchanged; a Character/Location/source mutation produces an explicit refusal,
+and the endpoint declares `canonicalMutation=false`.
+
+Chapter Version Compare now also exposes a separate historical dependency
+surface when both accepted StoryCommit graph snapshots exist. It shows changed
+graph seeds and bounded semantic downstream dependencies in the Inspector;
+missing snapshots remain explicitly ledger-only rather than being inferred
+from current mutable tables.
+
+### StoryFlow dense semantic-edge rendering
+
+StoryFlow now uses a hybrid edge presentation for bounded dense viewports. The
+same SQLite-derived semantic edge records are painted on one 2D Canvas surface
+when at least 40 edges are visible after culling; sparse views continue using
+SVG so semantic labels and port previews remain compatible. Canvas hit testing
+opens the same provenance-aware edge Inspector, and switching back to sparse
+mode clears the paint surface. This improves the real 500-chapter fixture's
+large-view usability without claiming GPU virtualization or changing Canon.
+The current product verdict remains `PARTIAL`.
+
+### StoryFlow viewport semantic-edge pagination
+
+Full Graph now keeps node-page and semantic-edge-page cursors separate. The
+SQLite-backed Graph API exposes `edge_page_token` and exact
+`internalEdgeCount`; the Canvas merges returned edges by id and offers
+“Load more semantic edges” without replacing the current node working set.
+This makes relationships between cards arriving on different viewport pages
+observable while preserving the Canon/read-model boundary. It remains a
+bounded read-model increment, not full GPU virtualization; the product
+verdict remains `PARTIAL`.
+
+### StoryFlow visual surface
+
+The authoring workbench now opens on NovelForge's warm paper theme. The
+existing dark theme remains available as an explicit user preference; theme
+changes affect only UI presentation and never mutate SQLite Story Graph,
+Canon, or workspace layout state. StoryFlow also reads the existing creation
+preflight contract and visibly distinguishes model runtime `READY`, `SETUP
+REQUIRED`, `UNAVAILABLE`, and `CHECKING`; saving revisioned planning remains
+available when Provider/model setup is incomplete, while model-backed actions
+are gated with a link to the existing AI configuration page.
+The same readiness contract is enforced for direct StoryFlow API callers:
+forecasting, selection analysis, and Flow-to-chapter generation return
+`LLM_PROVIDER_REQUIRED` before creating a task when the model role routes are
+not ready; planning-only node and Chapter Intent saves remain available.

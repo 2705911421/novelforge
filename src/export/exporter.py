@@ -7,6 +7,11 @@ from typing import Optional
 from ..core.models import StoryProject
 
 
+class ExportError(Exception):
+    """导出错误"""
+    pass
+
+
 class Exporter:
     """统一导出器"""
 
@@ -111,7 +116,7 @@ class Exporter:
             from docx.shared import Pt
             from docx.enum.text import WD_ALIGN_PARAGRAPH
         except ImportError:
-            raise ImportError("需要安装 python-docx: pip install python-docx")
+            raise ExportError("需要安装 python-docx: pip install python-docx")
 
         chapters = self._get_sorted_chapters(project, approved_only)
         doc = Document()
@@ -159,10 +164,11 @@ class Exporter:
         return str(path)
 
     def export_review_report(self, project: StoryProject, format: str = "md") -> str:
-        """导出审查报告"""
+        """导出审查报告（当前仅支持 Markdown 格式）"""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = self.output_dir / f"{project.name}_审查报告_{timestamp}.md"
+        ext = "md"  # 目前仅支持 Markdown
+        path = self.output_dir / f"{project.name}_审查报告_{timestamp}.{ext}"
 
         lines = []
         lines.append(f"# {project.name} - 审查报告\n")

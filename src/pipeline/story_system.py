@@ -1,5 +1,10 @@
 """StorySystem - 合同驱动系统（借鉴webnovel-writer Story System）
 
+.. deprecated::
+    此模块使用文件 I/O（JSON）存储合同和事件，与 SQLite 存储并存。
+    生产代码应使用 StoryRepository（基于 SQLite）替代此模块的持久化功能。
+    此模块保留用于合同检查和合规性验证。
+
 核心理念：
 - 合同种子：项目初始化时生成的约束文件
 - 运行时合同：每章写作前生成的约束
@@ -13,6 +18,7 @@
 """
 
 import json
+import os
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -588,7 +594,8 @@ class StorySystem:
     # ========== 事件审计链 ==========
 
     def log_event(self, event: StoryEvent):
-        """记录事件"""
+        """记录事件（原子写入）"""
+        import tempfile
         events_file = self.events_dir / f"chapter_{event.chapter_number:04d}.events.json"
         events = []
         if events_file.exists():
@@ -600,8 +607,15 @@ class StorySystem:
             "details": event.details,
             "timestamp": event.timestamp,
         })
-        with open(events_file, "w", encoding="utf-8") as f:
-            json.dump(events, f, ensure_ascii=False, indent=2)
+        # Atomic write: write to temp file then rename
+        fd, tmp_path = tempfile.mkstemp(dir=str(self.events_dir), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(events, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, str(events_file))
+        except:
+            os.unlink(tmp_path)
+            raise
 
     def get_chapter_events(self, chapter_number: int) -> list:
         """获取章节事件"""

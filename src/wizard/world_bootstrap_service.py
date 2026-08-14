@@ -177,7 +177,7 @@ class WorldBootstrapService:
 
         except Exception as exc:
             logger.warning("AI generation failed: %s", exc)
-            suggested = {"error": str(exc)}
+            suggested = {"error": "AI generation failed. Please try again or enter manually."}
 
         # Save suggestion.
         self.bible_repo.save_suggestion(project_id, step_key, suggested)

@@ -1,14 +1,71 @@
 # NovelForge Implementation Progress
 
-> **Canonical latest verification (2026-08-13)**: `845 passed in 246.55s`; `ruff check .`, `pyright src tests`, `verify.py`, protected-file verification, frontend syntax checks, and `git diff --check` all pass. `scripts/verify_features.py` and `scripts/generate_progress.py --verify` report 5/5 contracts/features verified. Product verdict remains `PARTIAL`.
+> **Latest implementation increment (2026-08-14)**: The StoryFlow Minimap viewport is now a real navigation control: clicking recenters the Canvas, dragging the viewport rectangle moves the same Canvas transform while preserving zoom, and viewport continuation waits for pointer release instead of fanning out one Graph request per move. This is workspace navigation only; it does not write Canon or layout facts. Headed-browser evidence is recorded in `storyflow-20260814-minimap-drag-1280.png`; the full suite is `898 passed in 434.93s`; product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: StoryFlow View switching now preserves the currently focused/selected real node whenever that node is legal in the target projection. Context View remains chapter-anchored and never treats an unrelated entity as an AI context focus. This keeps Story, Character, Timeline, World, and Foreshadow projections navigationally continuous without changing Canon or Graph facts; the navigation contract test covers the seam. The full suite is now `897 passed in 855.62s`; the final static/browser/API gates are green. Product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: The existing model-readiness contract is now enforced at the StoryFlow API boundary as well as in the Canvas. `/forecast`, `story-graph/actions/analyze`, and `story-graph/planning/generate` return the truthful `LLM_PROVIDER_REQUIRED` response before creating a durable task when Provider/model role routing is unavailable. Revisioned planning-node and Chapter Intent saves remain available without a model. Regression coverage proves both no-enqueue failure and ready-route enqueue behavior; the full suite is `896 passed in 437.96s`, with ruff, pyright, `verify.py`, feature verification, progress verification, and protected-file verification also green. Product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: StoryFlow now reads the existing `/creation/preflight` contract before exposing model-backed actions. The workbench shows `AI RUNTIME · READY`, `SETUP REQUIRED`, `UNAVAILABLE`, or `CHECKING`; missing Provider/model routes disable generation, candidate forecasting, and AI analysis while leaving revisioned planning saves available. `Open AI config` routes to the existing Agent Config page. Headed-browser evidence covers both read-only and explicit Planning Edit states in `storyflow-20260814-ai-runtime-setup-1280.png` and `storyflow-20260814-ai-runtime-planning-1280.png`. This is a truthful runtime gate, not a new configuration source; product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: StoryFlow now opens on the requested warm paper authoring surface instead of forcing the dark graphite treatment. The existing dark theme remains an explicit user preference and was browser-checked after toggling from the paper surface; the Canvas, semantic edges, Story Ports, Inspector, and Minimap remain readable in both modes. Evidence: `storyflow-20260814-paper-default-1280.png`, `storyflow-20260814-paper-character-1280.png`, and `storyflow-20260814-paper-dark-1280.png`. Product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: Full Graph viewport reads now page semantic edges independently from node pages through the same SQLite-backed Graph API. `edge_page_token` is bound to the view/filter/viewport/edge-limit/source/workspace fingerprint; the response exposes `internalEdgeCount`, page offsets, and `nextInternalEdgePageToken`. The Canvas merges edge pages by semantic edge id and shows an explicit “Load more semantic edges” action, so edges between not-yet-hydrated node pages are not silently lost. This is a bounded read-model improvement, not GPU virtualization; product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: Explicit Full Graph now starts with a real `limit=240&edge_limit=600` browser working set instead of serializing the historical `1200/3000` compatibility payload. The existing SQLite world-coordinate cursor then incrementally merged a 500-chapter fixture from 240 to 480 to 720 loaded nodes; the Character Inspector retained recorded state/knowledge, boundary semantic edges, and provenance, and Story/Timeline/World switches returned HTTP 200 with empty browser diagnostics. The full suite is `891 passed in 576.54s`; the synthetic 100/500/1000 read-model rerun is recorded in the performance baseline. This is a transport-budget/progressive-disclosure increment, not full GPU virtualization; product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: Dense StoryFlow semantic edges now use a real hybrid renderer. When the bounded viewport contains at least 40 rendered edges, one 2D Canvas surface paints curves, status styles, arrows, labels, and hover/click hit testing from the same SQLite-derived edge records; sparse Story Flow remains SVG and the connection preview remains SVG. On the real 500-chapter fixture, 1,200 projected nodes / 3,000 indexed edges were bounded to 38 DOM nodes and 334 Canvas-painted edges at both 1920x1080 and 1366x768. Switching back to sparse mode cleared Canvas paint state; browser diagnostics were empty. The full suite is `890 passed in 522.20s`; ruff, pyright (`0 errors, 0 warnings`), `verify.py`, feature verification (`5/5`), progress verification, and protected-file verification also pass. Product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: Context View now exposes a truthful `tokenSummary.inputAccounting` read model. It reconciles the persisted GenerationRun prompt layout with manifest source/section/component character ranges, reports union coverage, provenance overlap, untracked prompt/message characters, missing included-source ranges, and explicit legacy degradation states. The Inspector renders the same character-level accounting beside whole-run provider usage; no per-source provider tokens are invented and no Canon/UI rows are mutated. The canonical full suite is `889 passed in 459.25s`; browser evidence covers 1920x1080 and 1366x768 with zero page/console diagnostics. Product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: Chapter History now exposes a real `canonicalGraphHistory` timeline in the existing `/story-graph/history` response. Rows are accepted StoryCommit graph-snapshot boundaries, retain older accepted boundaries after supersession, report bounded semantic changes and snapshot provenance, and explicitly break when a capture is missing. The Inspector renders `CANON GRAPH` / `STALE GRAPH` evidence without reconstructing mutable entity tables or mutating Canon. The canonical full suite is `888 passed in 537.16s`; headed-browser evidence covers 1920x1080, 1366x768, and 1280x720 with the accepted diff action and refresh recovery. Product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: Chapter Version Compare now exposes a separate `canonicalSurface.historicalDependencySurface` when both ChapterVersions have accepted StoryCommit graph snapshots. The projector seeds on changed graph nodes/edge endpoints and traverses bounded target-snapshot semantic edges; the Inspector renders direct/downstream evidence separately from the current projection impact list. Missing snapshots remain explicitly unavailable, and `mutableDomainTablesHistorical=false` prevents false historical claims. Targeted tests and a headed 120-chapter browser fixture passed with zero console errors/warnings. Product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: Accepted StoryCommit projection-capture failures now persist a source fingerprint/revision boundary and appear in Chapter History as explicit `STALE` operational evidence. Idempotent accept and `POST .../story-graph/snapshots/retry` recover only when the authoritative source boundary is unchanged; mutable-source changes and missing failure boundaries refuse historical backfill. Canonical replay now accepts only `reason=story_commit_accept` snapshots, so an ordinary observed `history_read` snapshot cannot upgrade a ledger-only historical view. The StoryGraph suite is `86 passed in 371.20s`; headed browser evidence verified visible failure → retry → cleared state with zero console errors/warnings. Product verdict remains `PARTIAL`.
+
+> **Previous canonical verification (2026-08-14)**: `887 passed in 654.39s`; a second full-suite run was green after the historical dependency-surface increment. This remains a historical iteration record; the latest canonical result is the `888 passed in 537.16s` run above. Ruff, pyright (`0 errors, 0 warnings`), `verify.py`, protected-file verification, feature verification (`5/5`), and progress verification also passed in that earlier run. One earlier full-suite attempt had a single same-snapshot `snapshot_diff` failure; the test passed in isolation and the complete rerun passed without changing the contract. Product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: High-degree multi-selection external edges now use a SQLite-side count/type aggregate and bounded page query. `externalPageToken` is bound to the selected node ids, page size, and source fingerprint; changed selections and authoritative mutations produce explicit mismatch/expired errors. The Inspector starts with 60 external edges, merges the next page by edge id, and keeps remote endpoints as read-only focus evidence. Targeted unit/API tests and headed browser evidence pass; product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: `storyflow_graph_semantic_edge_index` now pairs with the SQLite node index under the same source fingerprint and schema. Warm `/story-graph/nodes`, `/neighbors`, and focused Depth 1/2/3 projections hydrate selected nodes and incident semantic edges without reopening the full JSON catalog; cold or invalidated indexes fall back and rebuild. The public read-model marker is `sqlite_node_index+semantic_edge_index`. Real browser recheck: Chapter API 200 with 17 neighbors, focused Depth 2 API 200, Character Inspector + Depth 2 rendered, and zero page/console diagnostics. Product verdict remains `PARTIAL` because true GPU virtualization, complete high-degree edge paging, full historical replay, and provider-backed AI execution remain incomplete.
+
+> **Current implementation increment (2026-08-14)**: High-degree Inspector pagination now executes SQLite `COUNT` plus ordered `LIMIT/OFFSET` against the paired node/semantic-edge indexes before hydrating remote nodes. The API also returns a query-bound opaque `nextPageToken` and rejects changed-query or source-stale continuations; the browser prefers this cursor and retains offset compatibility. Full Graph cross-viewport boundary evidence uses a bounded CTE count/type aggregate plus a page payload query for ordinary Canvas working sets. New regression coverage proves page-size bounds, no duplicate continuation rows, cursor mismatch handling, and boundary-page correctness. This reduces read amplification but does not claim GPU virtualization or remove the explicit >900-selected-node compatibility fallback.
+
+> **Latest implementation increment (2026-08-14)**: Multi-selection projection now uses the warmed `sqlite_node_index+semantic_edge_index` seam for the selection working set that feeds Chapter Intent and AI analysis. It resolves selected ids/source ids, reads only their incident semantic edge frontier, and hydrates bounded remote endpoint summaries; source-epoch mutation falls back to a rebuild and exposes the changed authoritative title. New tests prove the warm path works with `_read_catalog` unavailable and that the rebuild does not mutate StoryFact, StoryState, or StoryCommit. Product verdict remains `PARTIAL`.
+
+> **Latest implementation increment (2026-08-14)**: Full Graph world-coordinate responses now expose a query-bound opaque continuation cursor (`pageSize`, `pageOffset`, `pageIndex`, `hasMore`, `nextPageToken`). The API rejects malformed, mismatched, or stale cursors; the Canvas keeps pages incremental and exposes an explicit next-page action. Targeted viewport/API tests: `4 passed`; ruff and frontend syntax pass. This is a transport/working-set seam, not a claim of complete server-side virtualization.
+
+> **Current increment (2026-08-14)**: Full Graph warm viewport reads now reuse a
+> rebuildable SQLite spatial/semantic-edge read model keyed by source,
+> projection, candidate-set, workspace, and read-model schema fingerprints.
+> `boundary_node_id` plus `boundary_page_token` provide exact paged
+> cross-viewport semantic evidence without adding remote nodes to the Canvas.
+> The related StoryFlow navigation/API suite is `92 passed`; a Canon immutability test
+> covers delete-and-rebuild of the derived rows. The cold path still starts
+> from the JSON read catalog, so this remains `PARTIAL` virtualization.
+
+> **Latest increment (2026-08-14)**: Warm Full Graph viewport candidate reads
+> now use a rebuildable SQLite `storyflow_graph_node_index` with scalar filter
+> keys and one derived node payload per row. `storyflow_projection_epochs`
+> triggers invalidate that index on authoritative changes; the next cold read
+> rebuilds it and restores the exact content fingerprint. The public Graph
+> contract is unchanged and reports `projectionReadModel=sqlite_node_index` on
+> the warm path. New seam tests prove the warm viewport succeeds even when the
+> full catalog reader is unavailable and that Chapter mutation invalidates and
+> rebuilds the index without changing StoryFact/StoryState/StoryCommit. Search
+> now uses the same indexed rows after the first build, so a warm search also
+> avoids full-catalog deserialization.
+
+> **Verification correction**: the older `887`/`885`/`884`/`882`/`881`/`878`/`875`/`874`/`871`/`868`/`866`/`864`/`862`/`861`/`853`/`851`/`850` figures retained below are historical iteration records; the current canonical full-suite result is the `888 passed in 537.16s` result at the top of this file.
 
 > 最后审计：2026-08-08 (High-End Audit)。数据经过源码验证、测试验证和静态分析。
 > **注意**: 本文件中的 Phase 状态和历史完成度都是开发方声明，不是验收结论。
 > 当前可执行验证仅覆盖 `spec/features/*.yaml` 中的 5 个合同；详见
 > `docs/high-end-audit/` 目录下的独立运行证据。
-> **最新验证**: 2026-08-13 845 tests passed in 246.55s, ruff clean, pyright 0 errors, 5/5 合同特征 VERIFIED
+> **历史验证**: 2026-08-13 851 tests passed in 269.40s, ruff clean, pyright 0 errors, 5/5 合同特征 VERIFIED
 > **功能矩阵更新**: NOT_STARTED 从 57 降至 37，TESTED 从 21 增至 41
-> **本轮最终回归**: 2026-08-13 `845 passed in 246.55s`, `ruff check .` 通过，`pyright src tests` 为 0 errors/warnings
+> **历史回归**: 2026-08-13 `851 passed in 269.40s`, `ruff check .` 通过，`pyright src tests` 为 0 errors/warnings
 > **本轮产品结论**: `PARTIAL`；StoryFlow P0 vertical slice 已接通，但完整历史重放、真实 Provider 完成态和高级候选编排仍未完成
 
 ## StoryFlow Canvas 迭代（2026-08-11 至 2026-08-12）
@@ -347,8 +404,8 @@ This addendum supersedes older StoryFlow-only counts in this file; the repositor
 
 ## Direct PlanningNode authoring addendum (2026-08-12)
 
-- The StoryFlow toolbar now exposes `新建规划节点` only after the author explicitly enters `规划编辑`. The modal writes a revision-checked author `PlanningNode` through the existing `plot_workspaces` planning service, including title, summary, status, optional anchor metadata, and—when the author leaves the default checkbox enabled—a second revision-checked semantic planning edge. It does not write StoryFact, StoryState, or StoryCommit.
-- The headed browser run submitted the form against a real SQLite fixture (`POST .../story-graph/planning/node` = 200, followed by `POST .../story-graph/planning/edge` = 200), saw the selected node, `originates_from` edge, and `plot_workspaces` provenance in the Inspector, refreshed, and found the linked node in the default Chapter-focused subgraph. Evidence: `storyflow-20260812-planning-anchor-1920.png` and `storyflow-20260812-planning-anchor-1366.png`; console was 0 errors/0 warnings.
+- The StoryFlow toolbar now exposes `新建规划节点` only after the author explicitly enters `规划编辑`. The modal writes a revision-checked author `PlanningNode` through the existing `plot_workspaces` planning service, including title, summary, status, optional anchor metadata, and—when the author leaves the default checkbox enabled—the semantic anchor edge in the same atomic revisioned operation. It does not write StoryFact, StoryState, or StoryCommit. Invalid anchor types are rejected before either object is persisted.
+- The headed browser run submitted the form against a real SQLite fixture (`POST .../story-graph/planning/node` = 200), saw the selected node, `originates_from` edge, and `plot_workspaces` provenance in the Inspector, refreshed, and found the linked node in the default Chapter-focused subgraph. Evidence: `storyflow-20260812-planning-anchor-1920.png` and `storyflow-20260812-planning-anchor-1366.png`; console was 0 errors/0 warnings. The current backend contract additionally covers atomic invalid-anchor rollback.
 - An explicitly unlinked planning node remains supported and can be found through Search/type filter; progressive disclosure still prevents a global Full Graph.
 
 ## StoryFlow World Graph addendum (2026-08-12)
@@ -1082,7 +1139,7 @@ HTTP 200 and browser diagnostics remained empty. Evidence is recorded at
 Targeted and full verification after this increment:
 
 - `python -m pytest -q tests/test_story_graph.py -k "story_graph_health or story_graph_api_uses_real_sqlite" --tb=short`: **3 passed**.
-- `python -m pytest -q --tb=short`: **847 passed in 309.62s (0:05:09)**.
+- `python -m pytest -q --tb=short`: **847 passed in 194.82s (0:03:14)**.
 - `ruff check .`: **All checks passed**.
 - `pyright src tests`: **0 errors, 0 warnings, 0 informations**.
 - `node --check src/web/static/studio-storyflow.js`: **passed**.
@@ -1096,3 +1153,217 @@ This increment improves deterministic author-facing diagnosis but does not
 claim AI diagnosis, automatic health-driven writing, exact high-degree graph
 virtualization, or completion of the remaining P1/P2 roadmap. Product verdict
 remains `PARTIAL`.
+
+## Full Graph cross-viewport semantic boundary (2026-08-14)
+
+The authoritative viewport projection now reports exact
+`crossBoundaryEdgeCount`/type counts and a capped semantic edge sample with
+`loadedEndpointId` and a read-only remote endpoint summary. The Full Graph
+toolbar exposes the count; the selected-node Inspector exposes sampled remote
+relationships as recorded SQLite evidence and can focus a new authoritative
+query. Remote nodes are not silently added to the current page and no Canon
+table is written. The exact `/story-graph/neighbors/{node_id}` page remains the
+high-degree inspection path. Unit/API/navigation contracts pass; headed browser
+evidence for this boundary is still pending in this iteration, so the product
+verdict remains `PARTIAL`.
+
+## Long-lived Canvas freshness increment (2026-08-13)
+
+Added a read-only `story-graph/changes` API over the existing immutable
+`storyflow_graph_snapshots` observed-projection boundary. The projector compares
+the client snapshot with the current SQLite-authoritative projection, reports a
+truthful scoped diff or explicit resync requirement, and exposes the current
+source StoryCommit without creating a second event log. Unit/API coverage now
+checks unchanged polling, Accepted Commit detection, current source commit
+metadata, and missing-snapshot resync behavior.
+
+StoryFlow polls the seam every 12 seconds. A safe read-only session refreshes
+automatically after a relevant Accepted Commit; Planning Edit, an active port
+connection, or an unsaved layout instead keeps the current workspace and shows
+`CANON UPDATE · REFRESH REQUIRED` with an explicit Refresh button. A real
+headed browser run against a 120-chapter SQLite fixture accepted two external
+StoryCommits, verified both paths at 1920x1080 and 1366x768, observed HTTP 200
+for the Graph/changes/node/history/health/layout requests, and reported zero
+console errors/warnings. Evidence is recorded under
+`docs/storyflow-canvas/evidence/storyflow-20260813-freshness-*`.
+
+This closes a live-session freshness gap but does not claim server-push
+delivery, full GPU virtualization, exact per-source provider tokens, or full
+P1/P2 completion. Product verdict remains `PARTIAL`.
+
+Verification for this increment: `python -m pytest -q --tb=short` reported
+**850 passed in 217.89s (0:03:37)**. `ruff check .`, `pyright src tests`,
+`verify.py`, `scripts/verify_features.py`,
+`scripts/generate_progress.py --verify`, `scripts/check_protected_files.py`,
+`node --check src/web/static/studio-storyflow.js`, and `git diff --check` all
+passed. This feature still does not change the overall `PARTIAL` product
+verdict.
+
+## Legacy visualization entry convergence increment (2026-08-13)
+
+The base Studio router now sends the historical Mind Map, Plot Workflow,
+Timeline, World Map, Foreshadowing, and Character Relations entries into the
+single StoryFlow controller with explicit view intent. The mappings are
+`mindmap -> story`, `plot -> story`, `timeline -> timeline`,
+`world-map -> world`, `foreshadowing -> foreshadow`, and
+`characters -> character`. This closes the normal navigation split without
+deleting the old `PAGES.*` renderers or their APIs, which remain compatibility
+fallbacks.
+
+A headed browser run against the real 120-chapter SQLite fixture exercised all
+six mappings, verified HTTP 200 Graph requests and zero console errors or
+warnings, and captured 1920x1080 and 1366x768 evidence under
+`docs/storyflow-canvas/evidence/storyflow-20260813-legacy-*`. The product
+verdict remains `PARTIAL`: legacy fallback internals, true large-graph
+virtualization, and provider-backed completion still require follow-up.
+
+## Writing pipeline → StoryFlow projection increment (2026-08-13)
+
+Added a regression contract that exercises the production
+`PersistentTaskWorker -> LegacyTaskHandlers -> WritingPipeline` path with a
+deterministic provider-shaped test double. A successful task now has explicit
+coverage for the full boundary: the chapter becomes committed, the
+`StoryCommit` is accepted, extracted `StoryFact` rows are linked to that
+commit, and the same `StoryGraphProjector` exposes the new Chapter/Fact as
+`CANON` nodes with semantic edges. The accepted commit also captures the
+observed projection snapshot without bypassing the StoryRepository boundary.
+
+The reusable acceptance harness is
+[`scripts/run_storyflow_deterministic_write.py`](../scripts/run_storyflow_deterministic_write.py);
+it only operates on an explicitly supplied disposable SQLite root and emits a
+safe summary rather than prompt or credential payloads. A headed browser run
+left StoryFlow open while the harness wrote Chapter 121. The existing
+read-only freshness poll discovered the new projection, and selecting the
+chapter showed the newly extracted Canon fact, StoryCommit history, semantic
+edges, and SQLite provenance at 1920x1080 and 1366x768. Evidence:
+[`storyflow-20260813-writing-before-1920.png`](storyflow-canvas/evidence/storyflow-20260813-writing-before-1920.png),
+[`storyflow-20260813-writing-after-1920.png`](storyflow-canvas/evidence/storyflow-20260813-writing-after-1920.png),
+[`storyflow-20260813-writing-after-1366.png`](storyflow-canvas/evidence/storyflow-20260813-writing-after-1366.png).
+
+This closes the provider-independent task-to-Canon projection seam for the
+acceptance fixture. It does not claim a live external provider completion,
+provider quality, full historical mutable-entity replay, or completion of the
+remaining P1/P2 roadmap; the product verdict remains `PARTIAL`.
+
+## Workspace recovery and focused node actions increment (2026-08-13)
+
+The Canvas now refreshes the complete workspace shell after Hide/Delete, so a
+hidden real node immediately appears in a recoverable sidebar section. Restore
+keeps the change local until the author saves the layout, then re-centers the
+real node and reloads its SQLite-backed Inspector. The backend regression now
+covers persisted `collapsed`, `pinned`, and `hidden` flags surviving projection
+refresh without changing `StoryState`; the navigation contract covers the
+shared controller routing for Character, Foreshadow, Location, and Faction
+actions.
+
+The headed browser run verified Hide -> Restore at 1920x1080 and 1366x768, and
+verified that opening a Character source changes to the shared radial Character
+View while preserving the `character:*` focus. The session reported zero
+console errors/warnings. Evidence is recorded under
+`docs/storyflow-canvas/evidence/storyflow-20260813-hidden-restore-*` and
+`storyflow-20260813-node-action-focus-1366.png`.
+
+This is a workspace/navigation increment only. It does not claim full graph
+virtualization, complete mutable-entity history replay, or live external
+provider quality; the product verdict remains `PARTIAL`.
+
+## Canon-before-overlay recovery and Context source boundary (2026-08-13)
+
+The optional planning fulfillment after Writer Canon acceptance now has a
+durable recovery seam. When `StoryRepository.accept_story_commit()` succeeds
+but the revisioned planning overlay loses a race, the production Worker /
+Handler / WritingPipeline path persists `storyflow_plan_status=
+ACCEPTED_PENDING_OVERLAY`, the plan node id, accepted chapter id, and
+`story_commit_id` in `tasks.result`. `StoryFlowPlanningService` exposes safe
+reconciliation candidates and accepts a retry only after rechecking task
+ownership/completion, accepted Commit ownership/status/chapter/number, and the
+strict `PLANNED -> ACCEPTED` lifecycle. The Studio Inspector discovers these
+candidates from SQLite, gates retry behind Planning Edit, and calls the
+revision-checked `/planning/reconcile` endpoint. Reconciliation writes only the
+planning overlay and is idempotent; it never repeats the canonical transaction.
+
+Context assembly now records schema v3 availability in the existing
+`GenerationRun.input_reference.context_manifest`: authoritative project style
+and author constraints are included when present, while the legacy file-backed
+MemorySystem is explicitly marked `not_included` because it is not an input to
+the SQLite-authoritative Writer pipeline. Context View renders the persisted
+availability boundary. The port-aware SVG endpoint rendering and its legacy
+fallback are covered by the navigation contract.
+
+## Full Graph incremental viewport merge (2026-08-14)
+
+Full Graph expanded evidence mode now merges successful server-side
+world-coordinate viewport pages into the current client read model. It no
+longer replaces the bounded graph after a pan, preserves unsaved workspace
+layout/visibility fields on overlap, deduplicates page keys, and schedules the
+expensive projection request after pointerup. The toolbar reports authoritative
+`loaded / total` counts and the Canvas exposes loaded-node/edge diagnostics
+while retaining DOM viewport culling.
+
+Against the real 500-chapter SQLite browser fixture, the initial bounded page
+was `1200` nodes / `3415` edges out of `1891` authoritative nodes. A completed
+pan into a new coordinate region grew the merged read model to `1891` nodes /
+`3963` edges; the viewport requests returned HTTP 200 and the headed browser
+session reported zero console errors/warnings at 1920x1080 and 1366x768.
+Observed local request times were 4.009s and 1.654s, not production SLA
+claims. This is progressive loaded-projection merging with DOM culling, not
+true graph virtualization or complete cross-page edge paging; product verdict
+remains `PARTIAL`.
+
+Unit, integration, API, and navigation-contract coverage for the boundary
+projection passes locally. The Inspector treats the boundary as the current
+world-coordinate page (not the client cache), so a remote node cached from an
+earlier page is still shown as off-page evidence. A fresh headed browser run
+against the real 500-chapter fixture verified the corrected semantics at
+1920x1080 and 1366x768: the Inspector showed the bounded remote sample and a
+click issued a focus query for the remote Character. Evidence is recorded in
+`docs/storyflow-canvas/evidence/storyflow-20260814-boundary-*`. The product
+verdict remains `PARTIAL` because true thousands-node virtualization, complete
+mutable-entity history replay, and live provider completion are not claimed.
+
+## StoryFlow multi-selection working-set increment (2026-08-14)
+
+Added `StoryGraphProjector.selection_projection()` and the book-scoped
+`GET .../story-graph/selection` endpoint. It resolves a selected id set against
+the SQLite-authoritative catalog, returns internal semantic edges separately from
+bounded external edges, preserves missing ids truthfully, and marks the response
+read-only with `canonicalMutation=false`. Remote endpoint summaries remain
+projection evidence; they are not silently appended to the current Canvas page.
+
+The multi-selection Inspector now presents this response as a StoryFlow working
+unit. Its existing Save Intent, Generate Chapter, and AI Analyze actions keep the
+same selected ids, while the semantic summary explains what the actions are
+operating on. External rows can focus a remote endpoint that is not currently
+loaded by issuing a fresh authoritative `focus` query; selection response
+matching is set-based so canonical server ordering cannot let a late response
+overwrite a newer user selection.
+
+Against the real 500-chapter SQLite browser fixture, the Character/Event
+ selection displayed `2 nodes`, `1 inside edge`, `216 outbound edges`, and the
+recorded `participates_in` edge at 1920x1080 and 1366x768. A remote Chapter
+focus returned HTTP 200 and selected `chapter:fixture-chapter-0005`; the headed
+session reported zero console errors/warnings. Evidence is recorded under
+`docs/storyflow-canvas/evidence/storyflow-20260814-selection-*`.
+
+This increment does not claim complete high-degree edge pagination, true graph
+virtualization, AI inference for unrecorded relationships, or a complete
+selection editor. The overall product verdict remains `PARTIAL`.
+
+## Boundary cursor integrity after Full Graph search focus (2026-08-14)
+
+The expanded Full Graph search path now preserves the active bounded
+projection. A searched node is fetched through the viewport read model rather
+than replacing the page with an unbounded type-specific graph. Inspector-only
+boundary pagination stores the exact viewport coordinates that signed its
+cursor; ordinary viewport merges cannot erase an active cursor, and a terminal
+page releases the preservation latch. Search focus no longer recenters the
+Canvas before continuation, avoiding a false `422` caused by mixing a cursor
+with a different coordinate window.
+
+The 500-chapter headed fixture was rechecked at 1920x1080 and 1366x768 with
+no NovelForge page/API errors and the boundary action visible in both views.
+The final screenshot pass also exposed one Browser Use harness-only
+`clipboard bridge is unavailable` diagnostic; it is recorded in the evidence
+README and is not a page error. The result remains `PARTIAL`: this closes
+cursor correctness and interaction continuity, not true GPU virtualization,
+full predicate pushdown, or complete high-degree edge paging.

@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from copy import deepcopy
 from datetime import datetime
+import json
 import uuid
 from typing import Any, Iterable, Optional
 
@@ -29,6 +30,19 @@ from .service import (
 
 
 PLANNING_STATUSES = frozenset({"PLANNED", "CANDIDATE", "ACCEPTED", "DRAFT", "SUPERSEDED", "STALE", "CONFLICT"})
+
+# Planning is an authoring overlay, but its lifecycle still needs a narrow,
+# explicit contract.  In particular, a client must not manufacture ACCEPTED
+# state: only an already-accepted StoryCommit may move an adopted plan there.
+PLANNING_TRANSITIONS: dict[str, frozenset[str]] = {
+    "draft": frozenset({"candidate", "planned", "superseded", "conflict"}),
+    "candidate": frozenset({"planned", "superseded", "stale", "conflict"}),
+    "planned": frozenset({"accepted", "superseded", "stale", "conflict"}),
+    "accepted": frozenset(),
+    "superseded": frozenset(),
+    "stale": frozenset({"planned", "superseded", "conflict"}),
+    "conflict": frozenset({"planned", "superseded", "stale"}),
+}
 
 
 class StoryFlowPlanningError(StoryGraphError):
@@ -48,6 +62,26 @@ def _raw_status(value: Any, default: str = "planned") -> str:
             f"unsupported planning status {value!r}; expected one of {sorted(PLANNING_STATUSES)}"
         )
     return status
+
+
+def validate_planning_transition(current: Any, target: Any) -> tuple[str, str]:
+    """Validate a persisted planning lifecycle transition.
+
+    This is intentionally a pure seam: the workspace repository owns the
+    revisioned write, while this function owns the product lifecycle rules.
+    Keeping the rule independent makes API, pipeline, and unit tests agree on
+    the same Canon/Planning boundary.
+    """
+    current_status = _raw_status(current, "")
+    target_status = _raw_status(target, "")
+    if current_status == target_status:
+        return current_status, target_status
+    allowed = PLANNING_TRANSITIONS.get(current_status, frozenset())
+    if target_status not in allowed:
+        raise StoryFlowPlanningError(
+            f"illegal planning transition: {current_status.upper()} -> {target_status.upper()}"
+        )
+    return current_status, target_status
 
 
 def _workspace_type(node: dict[str, Any]) -> str:
@@ -103,18 +137,28 @@ class StoryFlowPlanningService:
         metadata: Optional[dict[str, Any]] = None,
         source: str = "author",
         expected_revision: Optional[int] = None,
+        anchor_node_id: Optional[str] = None,
+        anchor_edge_type: Optional[str] = None,
+        anchor_label: str = "",
+        anchor_source_port: Optional[str] = None,
+        anchor_target_port: Optional[str] = None,
+        anchor_metadata: Optional[dict[str, Any]] = None,
     ) -> tuple[dict[str, Any], int, dict[str, Any]]:
         self._require_book(book_id)
         # ``apply_delta`` intentionally refuses an uninitialised workspace;
         # initializing through ``load`` keeps the existing revision contract
         # and seeds it from authoritative SQLite facts.
-        self.load(book_id)
+        graph, _ = self.load(book_id)
         normalized_title = _text(title)
         if not normalized_title:
             raise StoryFlowPlanningError("planning node title is required")
         if source not in {"author", "ai"}:
             raise StoryFlowPlanningError("planning node source must be author or ai")
         normalized_status = _raw_status(status)
+        if normalized_status == "accepted":
+            raise StoryFlowPlanningError(
+                "ACCEPTED planning state can only be created by an accepted StoryCommit"
+            )
         node_id = f"planning:{uuid.uuid4().hex}"
         node = {
             "id": node_id,
@@ -140,7 +184,80 @@ class StoryFlowPlanningService:
             "status": normalized_status,
             "customized": True,
         }
-        graph, revision = self._apply(book_id, [{"op": "add_node", "node": node}], expected_revision)
+        operations: list[dict[str, Any]] = [{"op": "add_node", "node": node}]
+        normalized_anchor_id = _text(anchor_node_id)
+        normalized_anchor_type = _text(anchor_edge_type)
+        if normalized_anchor_id and not normalized_anchor_type:
+            raise StoryFlowPlanningError(
+                "anchorEdgeType is required when anchorNodeId is provided"
+            )
+        if normalized_anchor_type and not normalized_anchor_id:
+            raise StoryFlowPlanningError(
+                "anchorNodeId is required when anchorEdgeType is provided"
+            )
+        if normalized_anchor_id:
+            workspace_nodes = {
+                str(item.get("id")): item
+                for item in graph.get("nodes", [])
+                if isinstance(item, dict) and item.get("id")
+            }
+            target_type = self._resolve_node_type(book_id, normalized_anchor_id, workspace_nodes)
+            relation = _edge_type({"type": normalized_anchor_type})
+            if relation not in EDGE_TYPES:
+                raise StoryFlowPlanningError(
+                    f"unknown semantic edge type: {normalized_anchor_type!r}"
+                )
+            if relation in {"included_in_context", "excluded_from_context"} or target_type == "ContextSource":
+                raise StoryFlowPlanningError(
+                    "GenerationRun Context Graph edges are read-only evidence and cannot be planned manually"
+                )
+            try:
+                assert_valid_edge(
+                    "PlanningNode",
+                    relation,
+                    target_type,
+                    anchor_source_port,
+                    anchor_target_port,
+                )
+            except StoryGraphError as exc:
+                raise StoryFlowPlanningError(str(exc)) from exc
+            edge_metadata = deepcopy(anchor_metadata) if isinstance(anchor_metadata, dict) else {}
+            edge_metadata.update({
+                "createdFrom": "storyflow-canvas",
+                "planningNodeId": node_id,
+                "anchorNodeId": normalized_anchor_id,
+                "anchorNodeType": target_type,
+                "provenance": [{
+                    "kind": "plot_workspace",
+                    "bookId": book_id,
+                    "sourceNodeId": node_id,
+                    "targetNodeId": normalized_anchor_id,
+                }],
+            })
+            operations.append({
+                "op": "add_edge",
+                "edge": {
+                    "id": f"planning-edge:{uuid.uuid4().hex}",
+                    "source": node_id,
+                    "target": normalized_anchor_id,
+                    "type": relation,
+                    "kind": relation,
+                    "edgeType": relation,
+                    "label": _text(anchor_label, relation),
+                    "status": normalized_status,
+                    "weight": 1.0,
+                    "confidence": 1.0,
+                    "sourcePort": anchor_source_port,
+                    "targetPort": anchor_target_port,
+                    "sourceRef": "storyflow",
+                    "metadata": edge_metadata,
+                },
+            })
+        graph, revision = self._apply(
+            book_id,
+            operations,
+            expected_revision,
+        )
         return graph, revision, node
 
     def add_edge(
@@ -182,6 +299,11 @@ class StoryFlowPlanningService:
             raise StoryFlowPlanningError("edge weight and confidence must be numeric") from exc
         if not 0 <= normalized_confidence <= 1:
             raise StoryFlowPlanningError("edge confidence must be between 0 and 1")
+        normalized_status = _raw_status(status)
+        if normalized_status == "accepted":
+            raise StoryFlowPlanningError(
+                "ACCEPTED planning edge can only be created by StoryFlow commit fulfillment"
+            )
         edge = {
             "id": f"planning-edge:{uuid.uuid4().hex}",
             "source": source_node_id,
@@ -190,7 +312,7 @@ class StoryFlowPlanningService:
             "kind": relation,
             "edgeType": relation,
             "label": _text(label, relation),
-            "status": _raw_status(status),
+            "status": normalized_status,
             "weight": normalized_weight,
             "confidence": normalized_confidence,
             "sourcePort": source_port,
@@ -1015,26 +1137,72 @@ class StoryFlowPlanningService:
         node = nodes.get(node_id)
         if not node or _workspace_type(node) != "PlanningNode":
             raise StoryFlowPlanningError(f"planning node not found: {node_id}")
-        if _raw_status(node.get("status"), "") == "superseded":
+        current_status = _raw_status(node.get("status"), "")
+        if current_status == "superseded":
             raise StoryFlowPlanningError(f"superseded planning node cannot be accepted: {node_id}")
+
+        commit = self.db.fetchone(
+            """SELECT sc.id, sc.chapter_id, sc.status, c.book_id, c.number
+               FROM story_commits sc
+               JOIN chapters c ON c.id=sc.chapter_id
+               WHERE sc.id=?""",
+            (commit_id,),
+        )
+        if not commit:
+            raise StoryFlowPlanningError(f"accepted StoryCommit not found: {commit_id}")
+        if str(commit.get("book_id")) != str(book_id):
+            raise StoryFlowPlanningError(
+                f"StoryCommit belongs to another book: {commit_id}"
+            )
+        if str(commit.get("chapter_id")) != accepted_chapter_id:
+            raise StoryFlowPlanningError(
+                "accepted StoryCommit chapter does not match the fulfillment chapter"
+            )
+        if _text(commit.get("status")).lower() != "accepted":
+            raise StoryFlowPlanningError(
+                f"StoryCommit is not accepted: {commit_id}"
+            )
 
         chapter_node_id = f"chapter:{accepted_chapter_id}"
         if chapter_node_id not in nodes:
             raise StoryFlowPlanningError(
                 f"accepted chapter is not present in the Story Graph: {chapter_node_id}"
             )
-        accepted_chapter_metadata = nodes[chapter_node_id].get("metadata")
-        if not isinstance(accepted_chapter_metadata, dict):
-            accepted_chapter_metadata = {}
         plan_metadata = node.get("metadata")
         if not isinstance(plan_metadata, dict):
             plan_metadata = {}
-        accepted_chapter_number = (
-            accepted_chapter_metadata.get("number")
-            or accepted_chapter_metadata.get("chapterNumber")
-            or accepted_chapter_metadata.get("narrativeOrder")
-            or plan_metadata.get("chapterNumber")
+        accepted_chapter_number_raw = commit.get("number")
+        if accepted_chapter_number_raw in (None, ""):
+            raise StoryFlowPlanningError(
+                "accepted StoryCommit chapter number is missing"
+            )
+        try:
+            accepted_chapter_number = int(str(accepted_chapter_number_raw))
+        except (TypeError, ValueError) as exc:
+            raise StoryFlowPlanningError(
+                "accepted StoryCommit chapter number is invalid"
+            ) from exc
+        planned_intent = plan_metadata.get("intent")
+        planned_chapter_number = (
+            plan_metadata.get("chapterNumber")
+            or plan_metadata.get("chapter_number")
         )
+        if isinstance(planned_intent, dict):
+            planned_chapter_number = (
+                planned_chapter_number
+                or planned_intent.get("chapterNumber")
+                or planned_intent.get("chapter_number")
+            )
+        if planned_chapter_number not in (None, ""):
+            try:
+                if int(str(planned_chapter_number)) != accepted_chapter_number:
+                    raise StoryFlowPlanningError(
+                        "accepted StoryCommit chapter number does not match the StoryFlow intent"
+                    )
+            except (TypeError, ValueError) as exc:
+                raise StoryFlowPlanningError(
+                    "StoryFlow intent chapter number is invalid"
+                ) from exc
         metadata = deepcopy(node.get("metadata") or {})
         if not isinstance(metadata, dict):
             metadata = {}
@@ -1056,12 +1224,21 @@ class StoryFlowPlanningService:
         )
         current_metadata = plan_metadata
         if (
-            _raw_status(node.get("status"), "") == "accepted"
+            current_status == "accepted"
             and current_metadata.get("acceptedChapterId") == accepted_chapter_id
             and current_metadata.get("storyCommitId") == commit_id
             and already_linked
         ):
             return graph, revision
+        if current_status == "accepted":
+            raise StoryFlowPlanningError(
+                f"planning node is already fulfilled by another StoryCommit: {node_id}"
+            )
+        if current_status != "planned":
+            raise StoryFlowPlanningError(
+                f"only PLANNED StoryFlow intents can be fulfilled; current status is {current_status.upper()}"
+            )
+        validate_planning_transition(current_status, "accepted")
 
         operations: list[dict[str, Any]] = [
             {
@@ -1104,7 +1281,160 @@ class StoryFlowPlanningService:
                     },
                 }
             )
-        return self._apply(book_id, operations, expected_revision)
+        return self._apply(
+            book_id,
+            operations,
+            expected_revision,
+            allow_story_commit_acceptance=True,
+        )
+
+    def reconcile_intent_from_task(
+        self,
+        book_id: str,
+        task_id: str,
+        *,
+        expected_revision: Optional[int] = None,
+    ) -> tuple[dict[str, Any], int]:
+        """Retry a post-commit StoryFlow fulfillment from durable task output.
+
+        The writing worker may finish the canonical commit while the optional
+        planning-overlay update loses a revision race.  Recovery reads the
+        persisted task result, not browser state, and delegates all authority
+        checks to :meth:`mark_intent_accepted`.
+        """
+        normalized_task_id = _text(task_id)
+        if not normalized_task_id:
+            raise StoryFlowPlanningError("reconciliation requires task id")
+        task = self.db.fetchone(
+            "SELECT id, book_id, type, status, data, result FROM tasks WHERE id=?",
+            (normalized_task_id,),
+        )
+        if not task:
+            raise StoryFlowPlanningError(f"writing task not found: {normalized_task_id}")
+        if str(task.get("book_id") or "") != str(book_id):
+            raise StoryFlowPlanningError(
+                f"writing task belongs to another book: {normalized_task_id}"
+            )
+        if str(task.get("type") or "") not in {"write-next", "write"}:
+            raise StoryFlowPlanningError("reconciliation requires a writing task")
+        if str(task.get("status") or "") != "completed":
+            raise StoryFlowPlanningError("writing task must be completed before reconciliation")
+        result = self._json_object(task.get("result"))
+        data = self._json_object(task.get("data"))
+        plan_node_id = _text(result.get("storyflow_plan_node_id") or data.get("storyflow_plan_node_id"))
+        chapter_id = _text(result.get("chapter_id"))
+        chapter_number = result.get("chapter_number") or data.get("chapter_number")
+        if not chapter_id and chapter_number not in (None, ""):
+            chapter = self.db.fetchone(
+                "SELECT id FROM chapters WHERE book_id=? AND number=?",
+                (book_id, chapter_number),
+            )
+            chapter_id = _text(chapter.get("id")) if chapter else ""
+        commit_id = _text(result.get("story_commit_id"))
+        if not plan_node_id or not chapter_id or not commit_id:
+            raise StoryFlowPlanningError(
+                "writing task has no complete StoryFlow fulfillment result"
+            )
+        return self.mark_intent_accepted(
+            book_id,
+            plan_node_id,
+            chapter_id=chapter_id,
+            story_commit_id=commit_id,
+            expected_revision=expected_revision,
+        )
+
+    def reconciliation_candidates(
+        self,
+        book_id: str,
+        *,
+        plan_node_id: Optional[str] = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """List durable Canon-before-overlay recoveries for one plan node.
+
+        The worker stores only safe identifiers and status in ``tasks.result``;
+        this read seam deliberately omits prompt text, prose, and provider
+        details.  It lets a refreshed Canvas discover an overlay race without
+        treating the task result as a second source of canonical facts.
+        """
+        self._require_book(book_id)
+        normalized_plan_node_id = _text(plan_node_id)
+        graph, _ = self.load(book_id)
+        graph_nodes = {
+            _text(node.get("id")): node
+            for node in graph.get("nodes", [])
+            if isinstance(node, dict) and node.get("id")
+        }
+        try:
+            bounded_limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError) as exc:
+            raise StoryFlowPlanningError("reconciliation limit must be an integer") from exc
+        rows = self.db.fetchall(
+            """SELECT id, type, status, data, result, created_at, updated_at
+               FROM tasks
+               WHERE book_id=? AND type IN ('write-next', 'write') AND status='completed'
+               ORDER BY updated_at DESC, id DESC LIMIT ?""",
+            (book_id, bounded_limit),
+        )
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            result = self._json_object(row.get("result"))
+            data = self._json_object(row.get("data"))
+            result_status = _text(result.get("storyflow_plan_status")).upper()
+            candidate_plan_node_id = _text(
+                result.get("storyflow_plan_node_id")
+                or data.get("storyflow_plan_node_id")
+            )
+            if result_status != "ACCEPTED_PENDING_OVERLAY":
+                continue
+            if normalized_plan_node_id and candidate_plan_node_id != normalized_plan_node_id:
+                continue
+            current_plan_node = graph_nodes.get(candidate_plan_node_id)
+            current_plan_metadata: dict[str, Any] = {}
+            if isinstance(current_plan_node, dict):
+                raw_metadata = current_plan_node.get("metadata")
+                if isinstance(raw_metadata, dict):
+                    current_plan_metadata = raw_metadata
+            if (
+                current_plan_node
+                and _raw_status(current_plan_node.get("status"), "").upper() == "ACCEPTED"
+                and _text(current_plan_metadata.get("storyCommitId"))
+                == _text(result.get("story_commit_id"))
+            ):
+                # The durable result still records the original race, but the
+                # overlay is already repaired. Do not show a false recovery
+                # action after a successful reconciliation.
+                continue
+            candidates.append(
+                {
+                    "taskId": _text(row.get("id")),
+                    "taskType": _text(row.get("type")),
+                    "taskStatus": _text(row.get("status")),
+                    "planNodeId": candidate_plan_node_id or None,
+                    "chapterId": _text(result.get("chapter_id")) or None,
+                    "chapterNumber": result.get("chapter_number") or data.get("chapter_number"),
+                    "storyCommitId": _text(result.get("story_commit_id")) or None,
+                    "overlayStatus": result_status,
+                    "error": _text(result.get("storyflow_plan_error")) or None,
+                    "createdAt": row.get("created_at"),
+                    "updatedAt": row.get("updated_at"),
+                    "canonicalMutation": False,
+                    "planningBoundary": "reconciliation_only",
+                }
+            )
+        return candidates
+
+    @staticmethod
+    def _json_object(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
 
     @staticmethod
     def _is_candidate_node(node: dict[str, Any], *, include_inactive: bool = False) -> bool:
@@ -1336,11 +1666,218 @@ class StoryFlowPlanningService:
         book_id: str,
         operations: list[dict[str, Any]],
         expected_revision: Optional[int],
+        *,
+        allow_story_commit_acceptance: bool = False,
     ) -> tuple[dict[str, Any], int]:
+        self._validate_lifecycle_operations(
+            book_id,
+            operations,
+            allow_story_commit_acceptance=allow_story_commit_acceptance,
+        )
         try:
             return self.workspace.apply_delta(book_id, {"operations": operations}, expected_revision)
         except (PlotWorkspaceError, PlotRevisionConflict) as exc:
             raise StoryFlowPlanningError(str(exc)) from exc
+
+    def validate_delta(self, book_id: str, delta: dict[str, Any]) -> None:
+        """Preflight a legacy plot-canvas write at the StoryFlow boundary.
+
+        The old canvas remains a compatibility surface, but it shares the
+        revisioned planning workspace.  It may edit UI/planning properties;
+        it must not manufacture an ACCEPTED node or edge.  Canonical
+        fulfillment is intentionally available only through
+        :meth:`mark_intent_accepted`, which verifies a real StoryCommit.
+        """
+        if not isinstance(delta, dict):
+            raise StoryFlowPlanningError("plot delta must be an object")
+        if isinstance(delta.get("graph"), dict):
+            graph = delta["graph"]
+            for node in graph.get("nodes", []):
+                if not isinstance(node, dict):
+                    continue
+                # Full-graph compatibility writes may contain canonical
+                # statuses from the legacy renderer.  Only an explicit
+                # planning ACCEPTED value is a forbidden fabrication here;
+                # the repository still owns the actual revisioned write.
+                if _text(node.get("status")).lower() == "accepted":
+                    raise StoryFlowPlanningError(
+                        "legacy plot canvas cannot create ACCEPTED planning state"
+                    )
+            for edge in graph.get("edges", []):
+                if not isinstance(edge, dict):
+                    continue
+                if _text(edge.get("status")).lower() == "accepted":
+                    raise StoryFlowPlanningError(
+                        "legacy plot canvas cannot create ACCEPTED planning edge"
+                    )
+            return
+        operations = delta.get("operations", [])
+        if not isinstance(operations, list):
+            raise StoryFlowPlanningError("plot operations must be an array")
+        self._validate_lifecycle_operations(book_id, operations)
+
+    def _validate_lifecycle_operations(
+        self,
+        book_id: str,
+        operations: list[dict[str, Any]],
+        *,
+        allow_story_commit_acceptance: bool = False,
+    ) -> None:
+        """Preflight planning status writes before the revisioned workspace write.
+
+        ``PlotWorkspaceRepository`` remains a generic revisioned canvas store;
+        this service is the typed StoryFlow seam and therefore validates the
+        lifecycle for every mutation it emits.  This catches accidental
+        accepted-state fabrication without moving canonical facts into the
+        planning database.
+        """
+        graph, _ = self.load(book_id)
+        statuses = {
+            str(node.get("id")): _raw_status(node.get("status"), "planned")
+            for node in graph.get("nodes", [])
+            if isinstance(node, dict) and node.get("id")
+        }
+        node_metadata = {
+            str(node.get("id")): deepcopy(node.get("metadata"))
+            if isinstance(node.get("metadata"), dict)
+            else {}
+            for node in graph.get("nodes", [])
+            if isinstance(node, dict) and node.get("id")
+        }
+        edge_statuses = {
+            str(edge.get("id")): _raw_status(edge.get("status"), "planned")
+            for edge in graph.get("edges", [])
+            if isinstance(edge, dict) and edge.get("id")
+        }
+        edges = {
+            str(edge.get("id")): deepcopy(edge)
+            for edge in graph.get("edges", [])
+            if isinstance(edge, dict) and edge.get("id")
+        }
+        for operation in operations:
+            if not isinstance(operation, dict):
+                continue
+            op = operation.get("op") or operation.get("type")
+            if op == "add_node":
+                raw_node = operation.get("node")
+                if not isinstance(raw_node, dict):
+                    continue
+                node_id = _text(raw_node.get("id"))
+                status = _raw_status(raw_node.get("status"), "planned")
+                if status == "accepted":
+                    raise StoryFlowPlanningError(
+                        "ACCEPTED planning state can only be created by an accepted StoryCommit"
+                    )
+                statuses[node_id] = status
+                node_metadata[node_id] = deepcopy(raw_node.get("metadata")) \
+                    if isinstance(raw_node.get("metadata"), dict) else {}
+            elif op == "update_node":
+                node_id = _text(operation.get("id"))
+                patch = operation.get("patch")
+                if not node_id or not isinstance(patch, dict):
+                    continue
+                current = statuses.get(node_id)
+                if current is None:
+                    continue
+                current_metadata: dict[str, Any] = node_metadata.get(node_id) or {}
+                node_metadata[node_id] = current_metadata
+                if isinstance(patch.get("metadata"), dict):
+                    current_metadata.update(deepcopy(patch["metadata"]))
+                if "status" not in patch:
+                    continue
+                target = _raw_status(patch.get("status"), "")
+                validate_planning_transition(current, target)
+                if target == "accepted" and current != "accepted":
+                    if not _text(current_metadata.get("storyCommitId")):
+                        raise StoryFlowPlanningError(
+                            "ACCEPTED planning state requires StoryCommit provenance"
+                        )
+                    if not allow_story_commit_acceptance:
+                        raise StoryFlowPlanningError(
+                            "ACCEPTED planning state can only be written by StoryCommit fulfillment"
+                        )
+                statuses[node_id] = target
+            elif op == "add_edge":
+                raw_edge = operation.get("edge")
+                if not isinstance(raw_edge, dict):
+                    continue
+                status = _raw_status(raw_edge.get("status"), "planned")
+                if status == "accepted" and not (
+                    _text(raw_edge.get("sourceRef")) == "story_commit"
+                    and isinstance(raw_edge.get("metadata"), dict)
+                    and _text(raw_edge["metadata"].get("storyCommitId"))
+                ):
+                    raise StoryFlowPlanningError(
+                        "ACCEPTED planning edge requires StoryCommit provenance"
+                    )
+                if status == "accepted" and not allow_story_commit_acceptance:
+                    raise StoryFlowPlanningError(
+                        "ACCEPTED planning edge can only be written by StoryCommit fulfillment"
+                    )
+                edge_id = _text(raw_edge.get("id"))
+                if edge_id:
+                    edge_statuses[edge_id] = status
+                    edges[edge_id] = deepcopy(raw_edge)
+            elif op == "update_edge":
+                edge_id = _text(operation.get("id"))
+                patch = operation.get("patch")
+                if not edge_id or not isinstance(patch, dict) or "status" not in patch:
+                    if edge_id and isinstance(patch, dict) and edge_id in edges:
+                        current_edge = edges[edge_id]
+                        if isinstance(patch.get("metadata"), dict):
+                            raw_current_metadata = current_edge.get("metadata")
+                            current_metadata: dict[str, Any] = (
+                                raw_current_metadata
+                                if isinstance(raw_current_metadata, dict)
+                                else {}
+                            )
+                            current_edge["metadata"] = {
+                                **current_metadata,
+                                **deepcopy(patch["metadata"]),
+                            }
+                        current_edge.update({
+                            key: deepcopy(value)
+                            for key, value in patch.items()
+                            if key != "metadata"
+                        })
+                    continue
+                current = edge_statuses.get(edge_id)
+                if current is None:
+                    # The workspace repository will report a missing edge;
+                    # do not obscure that lower-level error here.
+                    continue
+                target = _raw_status(patch.get("status"), "")
+                validate_planning_transition(current, target)
+                current_edge = edges.get(edge_id, {})
+                current_source_ref = _text(current_edge.get("sourceRef"))
+                raw_current_metadata = current_edge.get("metadata")
+                current_metadata: dict[str, Any] = (
+                    raw_current_metadata
+                    if isinstance(raw_current_metadata, dict)
+                    else {}
+                )
+                next_metadata: dict[str, Any] = deepcopy(current_metadata)
+                patch_metadata = patch.get("metadata")
+                if isinstance(patch_metadata, dict):
+                    next_metadata.update(deepcopy(patch_metadata))
+                next_source_ref = _text(patch.get("sourceRef"), current_source_ref)
+                if target == "accepted" and not (
+                    next_source_ref == "story_commit" and _text(next_metadata.get("storyCommitId"))
+                ):
+                    raise StoryFlowPlanningError(
+                        "ACCEPTED planning edge requires StoryCommit provenance"
+                    )
+                if target == "accepted" and not allow_story_commit_acceptance:
+                    raise StoryFlowPlanningError(
+                        "ACCEPTED planning edge can only be written by StoryCommit fulfillment"
+                    )
+                edge_statuses[edge_id] = target
+                current_edge.update({
+                    key: deepcopy(value)
+                    for key, value in patch.items()
+                    if key != "metadata"
+                })
+                current_edge["metadata"] = next_metadata
 
     def _resolve_node_type(
         self,

@@ -547,6 +547,8 @@ class WritingPipeline:
             items = []
             manifest["items"] = items
         source_hints = {
+            "style": ("writing style",),
+            "constraints": ("author constraints",),
             "story_bible": ("story bible",),
             "planning_source": ("用户导入", "planning reference"),
             "chapter_summary": ("前文摘要", "previous chapter"),
@@ -842,6 +844,8 @@ class WritingPipeline:
         Story Graph projection has changed.
         """
         source_type_to_node_type = {
+            "style": "ContextSource",
+            "constraints": "ContextSource",
             "story_graph_node": "StoryGraphNode",
             "planning_node": "PlanningNode",
             "chapter_summary": "Chapter",
@@ -1235,6 +1239,57 @@ class WritingPipeline:
         context_parts: list[str] = []
         manifest_items: list[dict[str, Any]] = []
 
+        # Style and author constraints are durable project truth, not an
+        # inferred label in Context View.  Add them only when the current
+        # project row actually contains content so the manifest can explain
+        # precisely why the Writer received them.
+        project = self.db.fetchone(
+            "SELECT author_intent, writing_style, style_profile FROM projects WHERE id=?",
+            (project_id,),
+        )
+        if project:
+            author_intent = str(project.get("author_intent") or "").strip()
+            writing_style = str(project.get("writing_style") or "").strip()
+            style_profile = project.get("style_profile")
+            if isinstance(style_profile, str) and style_profile.strip():
+                try:
+                    style_profile = json.loads(style_profile)
+                except json.JSONDecodeError:
+                    style_profile = {}
+            style_lines: list[str] = []
+            if writing_style:
+                style_lines.append(writing_style[:4_000])
+            if isinstance(style_profile, dict):
+                for key, value in style_profile.items():
+                    if value in (None, "", [], {}):
+                        continue
+                    rendered = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+                    style_lines.append(f"{key}: {rendered[:800]}")
+            if style_lines:
+                style_text = "## Writing Style\n" + "\n".join(style_lines)
+                context_parts.append(style_text)
+                manifest_items.append({
+                    "sourceType": "style",
+                    "sourceId": project_id,
+                    "label": "project writing style",
+                    "included": True,
+                    "contentChars": len(style_text),
+                    "reason": "project writing_style/style_profile persisted in SQLite",
+                    "provenanceKind": "project_style_profile",
+                })
+            if author_intent:
+                constraint_text = f"## Author Constraints\n{author_intent[:4_000]}"
+                context_parts.append(constraint_text)
+                manifest_items.append({
+                    "sourceType": "constraints",
+                    "sourceId": project_id,
+                    "label": "author intent and constraints",
+                    "included": True,
+                    "contentChars": len(constraint_text),
+                    "reason": "project author_intent persisted in SQLite",
+                    "provenanceKind": "project_author_intent",
+                })
+
         storyflow_plan_context = self._build_storyflow_plan_context(
             book_id,
             ctx.get("storyflow_plan_node_id"),
@@ -1363,7 +1418,7 @@ class WritingPipeline:
         ctx["context_parts"] = context_parts
         assembled_context = "\n\n".join(context_parts)
         ctx["context_manifest"] = {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "source": "writing_pipeline.BUILD_CONTEXT",
             "projectId": project_id,
             "bookId": book_id,
@@ -1373,6 +1428,18 @@ class WritingPipeline:
             "contextChars": len(assembled_context),
             "contextSha256": hashlib.sha256(assembled_context.encode("utf-8")).hexdigest(),
             "note": "Source identifiers describe context assembled by the pipeline; GenerationRun stores the exact final prompt.",
+            "availability": {
+                "memory": {
+                    "status": "not_included",
+                    "reason": "legacy file-backed MemorySystem is not an input to this SQLite-authoritative writer pipeline",
+                },
+                "style": {
+                    "status": "included" if any(item.get("sourceType") == "style" for item in manifest_items) else "not_available",
+                },
+                "constraints": {
+                    "status": "included" if any(item.get("sourceType") == "constraints" for item in manifest_items) else "not_available",
+                },
+            },
         }
         self._decorate_context_manifest(ctx["context_manifest"], context_parts)
         return {"next_stage": "RETRIEVE_MEMORY", "context": ctx}
@@ -2196,6 +2263,13 @@ class WritingPipeline:
                 logger.warning("StoryFlow plan fulfillment failed after commit %s: %s", commit_id, exc)
                 ctx["storyflow_plan_status"] = "ACCEPTED_PENDING_OVERLAY"
                 ctx["storyflow_plan_error"] = str(exc)
+
+        # The task result is the durable recovery seam for a rare overlay
+        # failure after Canon acceptance.  Do not bury these identifiers in a
+        # worker-local context: the reconciliation endpoint needs the exact
+        # accepted chapter and commit IDs later.
+        ctx["storyflow_plan_node_id"] = plan_node_id
+        ctx["chapter_id"] = chapter_id
 
         return {"next_stage": "COMPLETE", "context": ctx}
 

@@ -33,3 +33,35 @@
 
 保留 API 语义作为迁移参考，不保留内嵌 HTML 或双应用结构。Phase 14 才建立 React Studio；在此之前，后端能力只能通过版本化 REST/SSE 契约暴露，任何没有真实后端的菜单必须显示为开发中。
 
+## StoryFlow 迁移增量（2026-08-14）
+
+上表是本轮重构前的审计基线；当前 Studio 已将思维导图、剧情工作流、
+故事时间轴、世界地图、伏笔与人物关系的正常入口收敛到同一个
+`StoryGraphProjector → Graph API → StoryFlow Canvas` 控制器，旧渲染器保留为
+兼容 fallback。Story/Character/Timeline/World/Foreshadow/Context 使用同一
+SQLite 派生读模型，不把布局或前端状态当作事实。
+
+Chapter History 现在还读取真实 `/story-graph/history` 的
+`canonicalGraphHistory`：它只展示 accepted StoryCommit 的 graph snapshot
+边界，保留已接受但后来 superseded 的边界，并在缺失 capture 时明确断开历史
+比较链。该历史面板是 `PARTIAL` 的只读证据面，不代表 mutable entity tables
+已经完成任意时间点版本化；详细验收证据见
+`docs/storyflow-canvas/evidence/storyflow-20260814-accepted-graph-history-*`。
+
+Context View 的最新只读增量还将 GenerationRun 的 persisted prompt layout
+与 manifest ranges 汇总为 `tokenSummary.inputAccounting`，以 union/overlap/
+untracked 字符和明确 legacy 状态呈现上下文覆盖度；它仍不声称有
+per-source provider token offsets。真实浏览器证据见
+`docs/storyflow-canvas/evidence/storyflow-20260814-context-accounting-*`。
+## Dense edge renderer audit increment (2026-08-14)
+
+The StoryFlow browser surface now has an explicit hybrid rendering boundary:
+viewport-cropped nodes remain native DOM, sparse semantic edges remain SVG,
+and a dense bounded edge set uses one 2D Canvas surface with sampled hit
+testing. This is still one SQLite-derived Story Graph projection; it is not a
+second frontend graph store. The real 500-chapter fixture was checked at
+1920x1080 and 1366x768 with 1,200 projected nodes, 3,000 indexed edges, 38
+DOM nodes, 334 painted edges, zero SVG edge DOM in dense mode, and no browser
+page/console diagnostics. The explicit audit boundary remains `PARTIAL`:
+full GPU virtualization, production FPS/memory guarantees, and all-scale
+historical mutable-table replay are not implemented.

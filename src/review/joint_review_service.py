@@ -68,7 +68,7 @@ class JointReviewService:
         # falling back to a newer template.
         prompt_key = "joint-review"
         prompt_version = "0"
-        prompt_system = "浣犳槸涓€浣嶄笓涓氱殑灏忚瀹＄缂栬緫"
+        prompt_system = "你是一位专业的审稿编辑"
         prompt_repo = PromptRepository(self.db)
         pinned = (prompt_policy_versions or {}).get("joint-review") if isinstance(prompt_policy_versions, dict) else None
         if pinned is not None:
@@ -153,10 +153,10 @@ class JointReviewService:
         except json.JSONDecodeError as exc:
             logger.warning("Joint review JSON parse failed: %s", exc)
             review_data = {
-                "overall_score": 70,
-                "verdict": "fail",
-                "summary": "联合审查返回格式异常",
-                "issues": [],
+                "overall_score": 0,
+                "verdict": "error",
+                "summary": f"联合审查返回格式异常: {exc}",
+                "issues": [{"type": "error", "description": "LLM返回的JSON格式无法解析"}],
             }
         except Exception as exc:
             logger.error("Joint review failed: %s", exc)
