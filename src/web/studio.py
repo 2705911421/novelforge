@@ -1742,13 +1742,26 @@ async def consolidate_chapters(book_id: str):
     """归并长篇章节摘要"""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
-    project = get_project(book_id)
-    memory = get_memory(book_id)
-
-    summaries = memory.get_all_summaries()
+    get_project(book_id)
+    authoritative_book_id = get_authoritative_book_id(book_id)
+    memory = story_repository.read_narrative_memory(authoritative_book_id, limit=500)
+    summaries = [
+        {
+            "chapter_number": item.get("valid_from_chapter"),
+            "summary": item.get("content") or "",
+            "category": item.get("category"),
+            "source_event_id": item.get("source_event_id"),
+            "source_commit_id": item.get("source_commit_id"),
+            "source_version_id": item.get("source_version_id"),
+            "provenance": item.get("provenance") or {},
+        }
+        for item in memory
+    ]
     return {
         "chapterCount": len(summaries),
         "summaries": summaries,
+        "owner": "story_repository.narrative_memory",
+        "bookId": authoritative_book_id,
     }
 
 @app.post("/api/v1/books/{book_id}/rewrite/{chapter}")

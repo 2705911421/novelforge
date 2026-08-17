@@ -1155,6 +1155,148 @@ def _apply_v20(conn: sqlite3.Connection) -> None:
     )
 
 
+PHASE_21_NARRATIVE_OS_CLOSURE_SQL = """
+-- An accepted StoryCommit is copied into this append-only event ledger.  The
+-- ledger is the replay boundary. Mutable read models never become authority.
+CREATE TABLE IF NOT EXISTS narrative_events (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    commit_id TEXT NOT NULL REFERENCES story_commits(id) ON DELETE RESTRICT,
+    chapter_id TEXT NOT NULL REFERENCES chapters(id) ON DELETE RESTRICT,
+    chapter_version_id TEXT,
+    review_id TEXT,
+    event_type TEXT NOT NULL DEFAULT 'story_commit_accepted',
+    payload JSON NOT NULL,
+    event_hash TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(book_id, sequence),
+    UNIQUE(commit_id),
+    UNIQUE(event_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_narrative_events_book_sequence
+    ON narrative_events(book_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_narrative_events_commit
+    ON narrative_events(commit_id);
+
+-- Every rebuildable projection records the event boundary it observed.  A
+-- failed or stale row is visible to recovery and cannot be mistaken for
+-- successful materialization.
+CREATE TABLE IF NOT EXISTS projection_ledger (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    source_event_id TEXT NOT NULL REFERENCES narrative_events(id) ON DELETE RESTRICT,
+    projection_type TEXT NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    projection_version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error_code TEXT,
+    error_detail TEXT,
+    applied_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(book_id, source_event_id, projection_type),
+    CHECK(status IN ('pending', 'applied', 'failed', 'stale', 'degraded'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_projection_ledger_book_status
+    ON projection_ledger(book_id, projection_type, status);
+
+-- Canonical Memory projection.  Legacy file-backed MemorySystem remains a
+-- compatibility adapter only. New writes land here and carry provenance.
+CREATE TABLE IF NOT EXISTS narrative_memory (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    source_event_id TEXT NOT NULL REFERENCES narrative_events(id) ON DELETE RESTRICT,
+    source_commit_id TEXT NOT NULL REFERENCES story_commits(id) ON DELETE RESTRICT,
+    source_version_id TEXT,
+    category TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'story',
+    content TEXT NOT NULL,
+    entity_refs JSON NOT NULL DEFAULT '[]',
+    importance REAL NOT NULL DEFAULT 0.5,
+    valid_from_chapter INTEGER,
+    valid_to_chapter INTEGER,
+    status TEXT NOT NULL DEFAULT 'active',
+    provenance JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_event_id, category, content),
+    CHECK(status IN ('active', 'invalidated', 'superseded'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_narrative_memory_active
+    ON narrative_memory(book_id, status, category, valid_from_chapter);
+
+-- Durable vector materialization.  The vector is opaque JSON so providers
+-- can choose dimensions without coupling the Canon schema to one SDK.
+CREATE TABLE IF NOT EXISTS embedding_projections (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_checksum TEXT NOT NULL,
+    model_key TEXT NOT NULL,
+    embedding JSON,
+    dimension INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending',
+    projection_version TEXT NOT NULL,
+    provenance JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(book_id, source_type, source_id, source_version, model_key),
+    CHECK(status IN ('pending', 'ready', 'failed', 'stale', 'degraded'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_embedding_projections_lookup
+    ON embedding_projections(book_id, status, model_key);
+"""
+
+
+def _apply_v21(conn: sqlite3.Connection) -> None:
+    """Add the replayable Canon and durable derived-projection boundaries."""
+    for table, definition in (
+        ("story_commits", "review_id TEXT"),
+        ("story_commits", "source_fingerprint TEXT"),
+        ("story_commits", "event_hash TEXT"),
+        ("story_commits", "override_provenance JSON NOT NULL DEFAULT '{}'"),
+    ):
+        _add_column_if_missing(conn, table, definition)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_story_commits_review ON story_commits(review_id, chapter_version_id)"
+    )
+    _execute_sql_script(conn, PHASE_21_NARRATIVE_OS_CLOSURE_SQL)
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS narrative_events_immutable_update
+           BEFORE UPDATE ON narrative_events
+           BEGIN SELECT RAISE(ABORT, 'narrative events are immutable'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER IF NOT EXISTS narrative_events_immutable_delete
+           BEFORE DELETE ON narrative_events
+           BEGIN SELECT RAISE(ABORT, 'narrative events are immutable'); END"""
+    )
+
+
+PHASE_22_COMMIT_REBASE_SQL = """
+-- A historical edit supersedes the old commit for a ChapterVersion.  The
+-- version may then be reviewed and committed again while pending/accepted
+-- idempotency remains enforced by the partial unique index.
+DROP INDEX IF EXISTS idx_story_commits_chapter_version;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_story_commits_chapter_version_live
+    ON story_commits(chapter_id, chapter_version_id)
+    WHERE chapter_version_id IS NOT NULL AND status IN ('pending', 'accepted');
+"""
+
+
+def _apply_v22(conn: sqlite3.Connection) -> None:
+    """Allow a superseded ChapterVersion to be re-reviewed after a rebase."""
+    _execute_sql_script(conn, PHASE_22_COMMIT_REBASE_SQL)
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -1186,6 +1328,8 @@ _MIGRATIONS = (
     _Migration(18, "phase_18_agent_extension_scope", _apply_v18, PHASE_18_AGENT_EXTENSION_SCOPE_SQL),
     _Migration(19, "phase_19_draft_import_analysis", _apply_v19, PHASE_19_DRAFT_IMPORT_ANALYSIS_SQL),
     _Migration(20, "phase_20_continuous_run_governance", _apply_v20, PHASE_20_CONTINUOUS_RUN_GOVERNANCE_SQL),
+    _Migration(21, "phase_21_narrative_os_closure", _apply_v21, PHASE_21_NARRATIVE_OS_CLOSURE_SQL),
+    _Migration(22, "phase_22_commit_rebase", _apply_v22, PHASE_22_COMMIT_REBASE_SQL),
 )
 
 

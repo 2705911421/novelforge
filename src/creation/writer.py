@@ -1,17 +1,24 @@
 """章节写手"""
 
 import json
+from typing import Protocol
 from ..core.models import StoryProject, Chapter, ChapterStatus
-from ..core.memory import MemorySystem
 from ..llm.client import MultiModelManager
 from ..llm.prompts import PromptManager
 from ..pipeline.rules import genre_contract_lines
 
 
+class MemoryContext(Protocol):
+    """Minimal read seam required by the legacy writer adapter."""
+
+    def get_chapter_context(self, chapter_number: int, window: int = 3) -> str:
+        ...
+
+
 class ChapterWriter:
     """章节写手 - 根据计划创作章节正文"""
 
-    def __init__(self, model_manager: MultiModelManager, memory: MemorySystem,
+    def __init__(self, model_manager: MultiModelManager, memory: MemoryContext,
                  chapter_words_min: int = 2000, chapter_words_max: int = 4000):
         self.models = model_manager
         self.memory = memory

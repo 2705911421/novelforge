@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import difflib
+import hashlib
 import logging
 from contextlib import nullcontext
 from datetime import datetime
@@ -26,6 +27,11 @@ def _load(value: Optional[str], default: Any) -> Any:
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):
         return default
+
+
+def _hash_json(value: Any) -> str:
+    """Return a stable hash for an order-preserving canonical JSON value."""
+    return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
 class ChapterVersionConflict(ValueError):
@@ -271,6 +277,22 @@ class StoryRepository:
                    WHERE commit_id = ?""",
                 (commit["id"],),
             )
+            event = conn.execute(
+                "SELECT id FROM narrative_events WHERE commit_id=?",
+                (commit["id"],),
+            ).fetchone()
+            if event is not None:
+                conn.execute(
+                    """UPDATE narrative_memory SET status='superseded', updated_at=?
+                       WHERE source_event_id=? AND status='active'""",
+                    (now, event["id"]),
+                )
+                conn.execute(
+                    """UPDATE projection_ledger SET status='stale', error_code='SOURCE_EDITED',
+                       error_detail=?, applied_at=NULL, updated_at=?
+                       WHERE source_event_id=?""",
+                    (f"chapter {chapter['number']} was edited", now, event["id"]),
+                )
         accepted = conn.execute(
             """SELECT sc.state_changes FROM story_commits sc
                JOIN chapters c ON c.id = sc.chapter_id
@@ -442,6 +464,237 @@ class StoryRepository:
         if target != current and target not in allowed.get(current, set()):
             raise ChapterStateError(f"illegal chapter transition: {current} -> {target}")
 
+    @staticmethod
+    def _chapter_version_fingerprint(conn: Any, chapter_version_id: Optional[str]) -> str:
+        if not chapter_version_id:
+            return ""
+        row = conn.execute(
+            "SELECT content, version FROM chapter_versions WHERE id = ?",
+            (chapter_version_id,),
+        ).fetchone()
+        if row is None:
+            return ""
+        return _hash_json({"version": row["version"], "content": row["content"]})
+
+    @staticmethod
+    def _canonical_event_payload(commit: Any, chapter: Any, source_fingerprint: str) -> dict[str, Any]:
+        facts = _load(commit["facts_extracted"], [])
+        if not isinstance(facts, list):
+            raise ValueError("story commit facts_extracted must be a JSON array")
+        state_changes = _load(commit["state_changes"], {})
+        if not isinstance(state_changes, dict):
+            raise ValueError("story commit state_changes must be a JSON object")
+        normalized_facts: list[dict[str, Any]] = []
+        for index, fact in enumerate(facts):
+            if not isinstance(fact, dict) or not str(fact.get("content") or "").strip():
+                raise ValueError(f"story commit fact[{index}] is malformed")
+            normalized_facts.append({
+                "fact_type": str(fact.get("fact_type") or fact.get("type") or "event"),
+                "content": str(fact["content"]),
+                "entities": fact.get("entities") if isinstance(fact.get("entities"), list) else [],
+                "confidence": fact.get("confidence", 1.0),
+            })
+        return {
+            "schema": "narrative-event/v1",
+            "eventType": "story_commit_accepted",
+            "chapterId": commit["chapter_id"],
+            "chapterNumber": chapter["number"],
+            "chapterVersionId": commit["chapter_version_id"],
+            "reviewId": commit["review_id"],
+            "sourceFingerprint": source_fingerprint,
+            "facts": normalized_facts,
+            "stateChanges": state_changes,
+            "reviewScore": commit["review_score"],
+            "blockingIssues": int(commit["blocking_issues"] or 0),
+            "authorOverride": bool(commit["author_override"]),
+            "overrideReason": commit["override_reason"] or "",
+        }
+
+    @staticmethod
+    def _set_projection_status(
+        conn: Any,
+        book_id: str,
+        event_id: str,
+        projection_type: str,
+        status: str,
+        *,
+        error_code: Optional[str] = None,
+        error_detail: Optional[str] = None,
+    ) -> None:
+        now = datetime.now().isoformat()
+        applied_at = now if status in {"applied", "degraded"} else None
+        conn.execute(
+            """UPDATE projection_ledger
+               SET status=?, error_code=?, error_detail=?, applied_at=?, updated_at=?
+               WHERE book_id=? AND source_event_id=? AND projection_type=?""",
+            (status, error_code, error_detail, applied_at, now, book_id, event_id, projection_type),
+        )
+
+    @classmethod
+    def _ensure_narrative_event(cls, conn: Any, commit: Any, book_id: str) -> dict[str, Any]:
+        """Materialize one accepted commit in the immutable event ledger."""
+        existing = conn.execute(
+            "SELECT * FROM narrative_events WHERE commit_id = ?",
+            (commit["id"],),
+        ).fetchone()
+        if existing is not None:
+            return dict(existing)
+
+        chapter = conn.execute(
+            "SELECT id, number FROM chapters WHERE id = ? AND book_id = ?",
+            (commit["chapter_id"], book_id),
+        ).fetchone()
+        if chapter is None:
+            raise ValueError("accepted StoryCommit chapter is not owned by the book")
+        source_fingerprint = commit["source_fingerprint"] or cls._chapter_version_fingerprint(
+            conn, commit["chapter_version_id"]
+        )
+        payload = cls._canonical_event_payload(commit, chapter, source_fingerprint)
+        event_hash = _hash_json({"commitId": commit["id"], "payload": payload})
+        sequence = conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM narrative_events WHERE book_id = ?",
+            (book_id,),
+        ).fetchone()["next_sequence"]
+        event_id = generate_id()
+        now = datetime.now().isoformat()
+        conn.execute(
+            """INSERT INTO narrative_events(
+                   id, book_id, sequence, commit_id, chapter_id, chapter_version_id,
+                   review_id, event_type, payload, event_hash, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, 'story_commit_accepted', ?, ?, ?)""",
+            (event_id, book_id, sequence, commit["id"], commit["chapter_id"],
+             commit["chapter_version_id"], commit["review_id"], _json(payload), event_hash, now),
+        )
+        conn.execute(
+            "UPDATE story_commits SET source_fingerprint=?, event_hash=? WHERE id=?",
+            (source_fingerprint, event_hash, commit["id"]),
+        )
+        for projection_type in ("story_facts", "story_state", "narrative_memory", "rag", "story_graph"):
+            status = "degraded" if projection_type == "rag" else "pending"
+            error_code = "EMBEDDING_PROVIDER_UNCONFIGURED" if projection_type == "rag" else None
+            error_detail = "BM25 remains available; no embedding provider is configured" if projection_type == "rag" else None
+            conn.execute(
+                """INSERT INTO projection_ledger(
+                       id, book_id, source_event_id, projection_type, source_fingerprint,
+                       projection_version, status, error_code, error_detail, applied_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, 'narrative-os-v1', ?, ?, ?, ?, ?)""",
+                (generate_id(), book_id, event_id, projection_type, source_fingerprint,
+                 status, error_code, error_detail, now if status == "degraded" else None, now),
+            )
+        return {
+            "id": event_id,
+            "book_id": book_id,
+            "sequence": sequence,
+            "commit_id": commit["id"],
+            "chapter_id": commit["chapter_id"],
+            "chapter_version_id": commit["chapter_version_id"],
+            "review_id": commit["review_id"],
+            "event_type": "story_commit_accepted",
+            "payload": _json(payload),
+            "event_hash": event_hash,
+            "created_at": now,
+        }
+
+    @staticmethod
+    def _materialize_memory(conn: Any, event: dict[str, Any], commit: Any, chapter_number: int) -> int:
+        payload = _load(event["payload"], {})
+        facts = payload.get("facts", [])
+        count = 0
+        for index, fact in enumerate(facts):
+            content = str(fact.get("content") or "").strip()
+            if not content:
+                continue
+            memory_id = hashlib.sha256(
+                f"narrative-memory:{event['id']}:{index}:{content}".encode("utf-8")
+            ).hexdigest()[:32]
+            now = datetime.now().isoformat()
+            conn.execute(
+                """INSERT OR IGNORE INTO narrative_memory(
+                       id, book_id, source_event_id, source_commit_id, source_version_id,
+                       category, scope, content, entity_refs, importance, valid_from_chapter,
+                       status, provenance, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, 'episodic', 'story', ?, ?, ?, ?, 'active', ?, ?, ?)""",
+                (
+                    memory_id, event["book_id"], event["id"], commit["id"],
+                    commit["chapter_version_id"], content, _json(fact.get("entities", [])),
+                    float(fact.get("confidence", 1.0) or 1.0), chapter_number,
+                    _json({
+                        "source": "narrative_event",
+                        "eventId": event["id"],
+                        "commitId": commit["id"],
+                        "chapterVersionId": commit["chapter_version_id"],
+                        "projectionVersion": "narrative-os-v1",
+                    }), now, now,
+                ),
+            )
+            count += 1
+        return count
+
+    @staticmethod
+    def _canonical_event_rows(conn: Any, book_id: str) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """SELECT e.*, sc.status AS commit_status, sc.accepted_at, sc.created_at,
+                      c.number AS chapter_number
+               FROM narrative_events e
+               JOIN story_commits sc ON sc.id=e.commit_id
+               JOIN chapters c ON c.id=e.chapter_id
+               WHERE e.book_id=? AND sc.status='accepted'
+               ORDER BY c.number, COALESCE(sc.accepted_at, sc.created_at),
+                        sc.created_at, e.sequence, e.id""",
+            (book_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @classmethod
+    def _canon_hash(cls, rows: list[dict[str, Any]]) -> str:
+        records = [
+            {
+                "commitId": row["commit_id"],
+                "chapterNumber": row["chapter_number"],
+                "chapterVersionId": row["chapter_version_id"],
+                "eventHash": row["event_hash"],
+                "payload": _load(row["payload"], {}),
+            }
+            for row in rows
+        ]
+        return _hash_json(records)
+
+    @staticmethod
+    def _derived_hash(conn: Any, book_id: str) -> str:
+        state = conn.execute(
+            "SELECT state, state_version, last_commit_id, stale FROM story_states WHERE book_id=?",
+            (book_id,),
+        ).fetchone()
+        facts = conn.execute(
+            """SELECT commit_id, chapter_id, fact_type, content, entities, confidence,
+                      source, verification_status
+               FROM story_facts WHERE book_id=? AND commit_id IS NOT NULL
+               ORDER BY commit_id, id""",
+            (book_id,),
+        ).fetchall()
+        memory = conn.execute(
+            """SELECT source_event_id, source_commit_id, category, scope, content,
+                      entity_refs, importance, valid_from_chapter, valid_to_chapter,
+                      status, provenance
+               FROM narrative_memory WHERE book_id=? ORDER BY source_event_id, id""",
+            (book_id,),
+        ).fetchall()
+        projections = conn.execute(
+            """SELECT commit_id, projection_type, payload
+               FROM story_projections WHERE book_id=? ORDER BY commit_id, projection_type, id""",
+            (book_id,),
+        ).fetchall()
+        return _hash_json({
+            "state": ({
+                key: state[key]
+                for key in ("state", "state_version", "last_commit_id", "stale")
+                if key in state
+            } if state else None),
+            "facts": [dict(row) for row in facts],
+            "memory": [dict(row) for row in memory],
+            "projections": [dict(row) for row in projections],
+        })
+
     def create_story_commit(
         self,
         chapter_id: str,
@@ -451,6 +704,7 @@ class StoryRepository:
         review_score: Optional[float] = None,
         blocking_issues: int = 0,
         chapter_version_id: Optional[str] = None,
+        review_id: Optional[str] = None,
         author_override: bool = False,
         override_reason: str = "",
     ) -> str:
@@ -463,27 +717,54 @@ class StoryRepository:
                 ).fetchone()
                 chapter_version_id = version["id"] if version else None
 
+            if review_id is not None:
+                review = conn.execute(
+                    "SELECT chapter_id, chapter_version_id FROM reviews WHERE id = ?",
+                    (review_id,),
+                ).fetchone()
+                if review is None:
+                    raise ValueError(f"review not found: {review_id}")
+                if review["chapter_id"] != chapter_id:
+                    raise ValueError("review does not belong to the StoryCommit chapter")
+                if review["chapter_version_id"] != chapter_version_id:
+                    raise ValueError("review does not inspect the StoryCommit chapter version")
+
             # Prevent duplicate commits for the same chapter version.
             if chapter_version_id is not None:
                 existing = conn.execute(
-                    "SELECT id FROM story_commits WHERE chapter_id = ? AND chapter_version_id = ?",
+                    "SELECT id, review_id, status FROM story_commits WHERE chapter_id = ? AND chapter_version_id = ? "
+                    "AND status IN ('pending', 'accepted')",
                     (chapter_id, chapter_version_id),
                 ).fetchone()
                 if existing is not None:
+                    if review_id is not None and existing["review_id"] not in (None, review_id):
+                        raise ValueError("chapter version already has a different bound review")
                     return existing["id"]
+
+            source_fingerprint = self._chapter_version_fingerprint(conn, chapter_version_id)
+            normalized_state_changes: Any = state_changes
+            if normalized_state_changes is None or normalized_state_changes == []:
+                normalized_state_changes = {}
+            if not isinstance(normalized_state_changes, dict):
+                raise ValueError("state_changes must be a JSON object")
 
             conn.execute(
                 """INSERT INTO story_commits(id, chapter_id, status, facts_extracted, state_changes,
-                   review_score, blocking_issues, chapter_version_id, author_override, override_reason)
-                   VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
-                (commit_id, chapter_id, _json(list(facts)), _json(state_changes), review_score,
-                 blocking_issues, chapter_version_id, bool(author_override), (override_reason or "")[:2000]),
+                   review_score, blocking_issues, chapter_version_id, review_id, source_fingerprint,
+                   author_override, override_reason, override_provenance)
+                   VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (commit_id, chapter_id, _json(list(facts)), _json(normalized_state_changes), review_score,
+                 blocking_issues, chapter_version_id, review_id, source_fingerprint, bool(author_override),
+                 (override_reason or "")[:2000], _json({
+                     "source": "author_override" if author_override else "none",
+                     "reason": (override_reason or "")[:2000],
+                 })),
             )
         return commit_id
 
     def accept_story_commit(self, commit_id: str, *, author_override: bool = False,
                             override_reason: str = "") -> dict[str, Any]:
-        """Accept a pending commit and atomically advance the book projection."""
+        """Accept a pending commit and atomically advance Canon projections."""
         result: dict[str, Any]
         backup_target: tuple[str, str] | None = None
         idempotent_accept = False
@@ -493,12 +774,17 @@ class StoryRepository:
                 raise KeyError(f"story commit not found: {commit_id}")
             if commit["status"] == "accepted":
                 chapter = conn.execute(
-                    """SELECT c.book_id, b.project_id FROM chapters c
+                    """SELECT c.book_id, c.number AS chapter_number, b.project_id FROM chapters c
                        JOIN books b ON b.id = c.book_id WHERE c.id = ?""",
                     (commit["chapter_id"],),
                 ).fetchone()
                 if chapter is None:
                     raise ValueError("commit chapter no longer exists")
+                event = self._ensure_narrative_event(conn, commit, chapter["book_id"])
+                self._materialize_memory(conn, event, commit, chapter["chapter_number"])
+                self._set_projection_status(conn, chapter["book_id"], event["id"], "story_facts", "applied")
+                self._set_projection_status(conn, chapter["book_id"], event["id"], "story_state", "applied")
+                self._set_projection_status(conn, chapter["book_id"], event["id"], "narrative_memory", "applied")
                 # An earlier post-acceptance StoryFlow projection may have
                 # failed after Canon was already committed.  Keep the public
                 # acceptance operation idempotent, but let the derived read
@@ -507,6 +793,8 @@ class StoryRepository:
                 result = {
                     "commit_id": commit_id,
                     "book_id": chapter["book_id"],
+                    "event_id": event["id"],
+                    "event_hash": event["event_hash"],
                     "accepted": True,
                     "idempotent": True,
                 }
@@ -522,11 +810,17 @@ class StoryRepository:
                 if author_override and not commit["author_override"]:
                     reason = (override_reason or "author override")[:2000]
                     conn.execute(
-                        "UPDATE story_commits SET author_override=TRUE, override_reason=? WHERE id=? AND status='pending'",
-                        (reason, commit_id),
+                        """UPDATE story_commits
+                           SET author_override=TRUE, override_reason=?, override_provenance=?
+                           WHERE id=? AND status='pending'""",
+                        (reason, _json({
+                            "source": "author",
+                            "reason": reason,
+                            "recordedAt": datetime.now().isoformat(),
+                        }), commit_id),
                     )
                 chapter = conn.execute(
-                    """SELECT c.book_id, b.project_id FROM chapters c
+                    """SELECT c.book_id, c.number AS chapter_number, b.project_id FROM chapters c
                        JOIN books b ON b.id = c.book_id WHERE c.id = ?""",
                     (commit["chapter_id"],),
                 ).fetchone()
@@ -544,6 +838,33 @@ class StoryRepository:
                             f"story commit version {commit_version_id} is stale; "
                             f"chapter has been edited to {current_version['id']}"
                         )
+
+                # New pipeline commits carry a durable review binding.  Check
+                # the exact ChapterVersion and all unresolved actionable
+                # issues before Canon can advance.  Legacy callers without a
+                # review remain a visible compatibility path for old imports.
+                review_id = commit["review_id"]
+                if review_id:
+                    review = conn.execute(
+                        "SELECT chapter_id, chapter_version_id, passed, verdict FROM reviews WHERE id=?",
+                        (review_id,),
+                    ).fetchone()
+                    if review is None:
+                        raise ValueError(f"bound review not found: {review_id}")
+                    if review["chapter_id"] != commit["chapter_id"] or review["chapter_version_id"] != commit_version_id:
+                        raise ValueError("bound review is not for the exact committed ChapterVersion")
+                    issues = conn.execute(
+                        "SELECT severity, blocking, status FROM review_issues WHERE review_id=?",
+                        (review_id,),
+                    ).fetchall()
+                    actionable = any(
+                        (issue["status"] or "open") not in {"resolved", "fixed", "ignored"}
+                        and (issue["blocking"] or issue["severity"] in {"major", "critical", "blocking"})
+                        for issue in issues
+                    )
+                    if (not bool(review["passed"]) or review["verdict"] != "pass" or actionable) and not effective_override:
+                        raise ValueError("bound review has not passed the blocking quality gate")
+
                 book_id = chapter["book_id"]
                 now = datetime.now().isoformat()
                 if conn.execute(
@@ -551,18 +872,26 @@ class StoryRepository:
                     (now, commit_id),
                 ).rowcount != 1:
                     raise ValueError("story commit was changed concurrently")
-                facts = _load(commit["facts_extracted"], [])
+                canonical_commit = conn.execute("SELECT * FROM story_commits WHERE id=?", (commit_id,)).fetchone()
+                facts = _load(canonical_commit["facts_extracted"], [])
+                if not isinstance(facts, list):
+                    raise ValueError("story commit facts_extracted must be a JSON array")
                 for fact in facts:
+                    if not isinstance(fact, dict) or not str(fact.get("content") or "").strip():
+                        raise ValueError("story commit contains a malformed fact")
                     conn.execute(
                         """INSERT INTO story_facts(id, book_id, chapter_id, fact_type, content, entities,
                            confidence, commit_id, source, verification_status)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'native', 'verified')""",
-                        (generate_id(), book_id, commit["chapter_id"], fact.get("fact_type", "event"),
+                        (generate_id(), book_id, canonical_commit["chapter_id"], fact.get("fact_type", "event"),
                          fact["content"], _json(fact.get("entities", [])), fact.get("confidence", 1.0), commit_id),
                     )
+                state_changes = _load(canonical_commit["state_changes"], {})
+                if not isinstance(state_changes, dict):
+                    raise ValueError("story commit state_changes must be a JSON object")
                 old = conn.execute("SELECT * FROM story_states WHERE book_id = ?", (book_id,)).fetchone()
                 state = _load(old["state"], {}) if old else {}
-                state.update(_load(commit["state_changes"], {}))
+                state.update(state_changes)
                 version = int(old["state_version"]) + 1 if old else 1
                 payload = {"state": state, "state_version": version}
                 conn.execute(
@@ -579,8 +908,21 @@ class StoryRepository:
                     (book_id, _json(state), commit_id, version, now),
                 )
 
-                result = {"commit_id": commit_id, "book_id": book_id, "accepted": True, "state": state}
-                backup_target = (chapter["project_id"], commit["chapter_id"])
+                event = self._ensure_narrative_event(conn, canonical_commit, book_id)
+                self._materialize_memory(conn, event, canonical_commit, chapter["chapter_number"])
+                self._set_projection_status(conn, book_id, event["id"], "story_facts", "applied")
+                self._set_projection_status(conn, book_id, event["id"], "story_state", "applied")
+                self._set_projection_status(conn, book_id, event["id"], "narrative_memory", "applied")
+                result = {
+                    "commit_id": commit_id,
+                    "book_id": book_id,
+                    "event_id": event["id"],
+                    "event_hash": event["event_hash"],
+                    "review_id": canonical_commit["review_id"],
+                    "accepted": True,
+                    "state": state,
+                }
+                backup_target = (chapter["project_id"], canonical_commit["chapter_id"])
 
         # Run the backup after the accepting transaction commits.  A second
         # SQLite connection opened inside the transaction can otherwise see a
@@ -605,6 +947,14 @@ class StoryRepository:
                 result["graph_snapshot"] = projector.capture_accepted_commit_snapshot(
                     result["book_id"], commit_id
                 )
+            graph_captured = bool(result["graph_snapshot"].get("captured", True))
+            with self.db.transaction() as conn:
+                self._set_projection_status(
+                    conn, result["book_id"], result["event_id"], "story_graph",
+                    "applied" if graph_captured else "failed",
+                    error_code=None if graph_captured else "GRAPH_SNAPSHOT_NOT_CAPTURED",
+                    error_detail=None if graph_captured else _json(result["graph_snapshot"]),
+                )
         except Exception as exc:
             logger.exception("Story Graph snapshot capture failed after StoryCommit %s", commit_id)
             if projector is not None and not idempotent_accept:
@@ -625,6 +975,14 @@ class StoryRepository:
                 "canonicalSource": "sqlite",
                 "error": str(exc),
             }
+            try:
+                with self.db.transaction() as conn:
+                    self._set_projection_status(
+                        conn, result["book_id"], result["event_id"], "story_graph", "failed",
+                        error_code="GRAPH_SNAPSHOT_FAILED", error_detail=str(exc),
+                    )
+            except Exception:
+                logger.exception("Could not record graph projection failure for StoryCommit %s", commit_id)
         if idempotent_accept:
             return result
         try:
@@ -657,6 +1015,25 @@ class StoryRepository:
         row["stale"] = bool(row["stale"])
         return row
 
+    def read_narrative_memory(self, book_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Read active canonical Memory with its event/version provenance."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValueError("memory limit must be between 1 and 500")
+        rows = self.db.fetchall(
+            """SELECT id, source_event_id, source_commit_id, source_version_id,
+                      category, scope, content, entity_refs, importance,
+                      valid_from_chapter, valid_to_chapter, status, provenance
+               FROM narrative_memory
+               WHERE book_id=? AND status='active'
+               ORDER BY valid_from_chapter DESC, created_at DESC, id
+               LIMIT ?""",
+            (book_id, limit),
+        )
+        for row in rows:
+            row["entity_refs"] = _load(row.get("entity_refs"), [])
+            row["provenance"] = _load(row.get("provenance"), {})
+        return rows
+
     def replay_story_state(self, book_id: str) -> dict[str, Any]:
         """Rebuild the projection solely from accepted immutable commits.
 
@@ -684,6 +1061,194 @@ class StoryRepository:
                 (book_id, _json(state), last_commit_id, len(commits), datetime.now().isoformat()),
             )
         return self.read_story_state(book_id)
+
+    def rebuild_all(self, book_id: str) -> dict[str, Any]:
+        """Rebuild every Narrative OS projection from accepted Canon events.
+
+        This is the recovery seam shared by restart, backup restore, repair
+        and endurance campaigns.  It never promotes a mutable table into
+        authority: accepted ``StoryCommit`` rows are first copied to the
+        immutable event ledger, then all derived rows are replaced from that
+        ledger in deterministic chapter order.
+        """
+        if self.db.fetchone("SELECT id FROM books WHERE id=?", (book_id,)) is None:
+            raise KeyError(f"book not found: {book_id}")
+
+        with self.db.transaction() as conn:
+            accepted_commits = conn.execute(
+                """SELECT sc.* FROM story_commits sc
+                   JOIN chapters c ON c.id=sc.chapter_id
+                   WHERE c.book_id=? AND sc.status='accepted'
+                   ORDER BY c.number, COALESCE(sc.accepted_at, sc.created_at), sc.created_at, sc.id""",
+                (book_id,),
+            ).fetchall()
+            # Old accepted rows created before migration 21 are upgraded to an
+            # event boundary without changing their historical payload.
+            for commit in accepted_commits:
+                self._ensure_narrative_event(conn, commit, book_id)
+
+            rows = self._canonical_event_rows(conn, book_id)
+            conn.execute("DELETE FROM narrative_memory WHERE book_id=? AND status='active'", (book_id,))
+            conn.execute(
+                """DELETE FROM story_facts
+                   WHERE book_id=? AND commit_id IN (
+                       SELECT id FROM story_commits WHERE book_id=? AND status='accepted'
+                   )""",
+                (book_id, book_id),
+            )
+            conn.execute(
+                """DELETE FROM story_projections
+                   WHERE book_id=? AND commit_id IN (
+                       SELECT id FROM story_commits WHERE chapter_id IN (
+                           SELECT id FROM chapters WHERE book_id=?
+                       ) AND status='accepted'
+                   )""",
+                (book_id, book_id),
+            )
+            conn.execute("DELETE FROM story_states WHERE book_id=?", (book_id,))
+            conn.execute(
+                "DELETE FROM embedding_projections WHERE book_id=? AND source_type='narrative_memory'",
+                (book_id,),
+            )
+            conn.execute(
+                "UPDATE projection_ledger SET status='stale', error_code=NULL, error_detail=NULL, applied_at=NULL, updated_at=? WHERE book_id=?",
+                (datetime.now().isoformat(), book_id),
+            )
+
+            state: dict[str, Any] = {}
+            last_commit_id: Optional[str] = None
+            fact_count = 0
+            memory_count = 0
+            for state_version, row in enumerate(rows, start=1):
+                commit = conn.execute(
+                    "SELECT * FROM story_commits WHERE id=? AND status='accepted'",
+                    (row["commit_id"],),
+                ).fetchone()
+                if commit is None:
+                    continue
+                payload = _load(row["payload"], {})
+                facts = payload.get("facts", [])
+                state_changes = payload.get("stateChanges", {})
+                if not isinstance(facts, list) or not isinstance(state_changes, dict):
+                    raise ValueError(f"malformed canonical event: {row['id']}")
+                for index, fact in enumerate(facts):
+                    content = str(fact.get("content") or "").strip() if isinstance(fact, dict) else ""
+                    if not content:
+                        raise ValueError(f"malformed fact in canonical event: {row['id']}")
+                    fact_id = hashlib.sha256(
+                        f"story-fact:{row['id']}:{index}:{content}".encode("utf-8")
+                    ).hexdigest()[:32]
+                    conn.execute(
+                        """INSERT INTO story_facts(
+                               id, book_id, chapter_id, fact_type, content, entities,
+                               confidence, commit_id, source, verification_status
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'native', 'verified')""",
+                        (
+                            fact_id, book_id, commit["chapter_id"],
+                            fact.get("fact_type", "event"), content,
+                            _json(fact.get("entities", [])), fact.get("confidence", 1.0),
+                            commit["id"],
+                        ),
+                    )
+                    fact_count += 1
+                state.update(state_changes)
+                projection_id = hashlib.sha256(
+                    f"story-state:{row['id']}".encode("utf-8")
+                ).hexdigest()[:32]
+                conn.execute(
+                    """INSERT INTO story_projections(id, book_id, commit_id, projection_type, payload, applied_at)
+                       VALUES (?, ?, ?, 'story_state', ?, ?)""",
+                    (projection_id, book_id, commit["id"], _json({"state": state, "state_version": state_version}), datetime.now().isoformat()),
+                )
+                memory_count += self._materialize_memory(conn, row, commit, row["chapter_number"])
+                last_commit_id = commit["id"]
+                for projection_type in ("story_facts", "story_state", "narrative_memory"):
+                    self._set_projection_status(conn, book_id, row["id"], projection_type, "applied")
+                self._set_projection_status(
+                    conn, book_id, row["id"], "rag", "degraded",
+                    error_code="EMBEDDING_PROVIDER_UNCONFIGURED",
+                    error_detail="BM25 remains available; no embedding provider is configured",
+                )
+
+            conn.execute(
+                """INSERT INTO story_states(book_id, state, last_commit_id, state_version, stale, updated_at)
+                   VALUES (?, ?, ?, ?, FALSE, ?)
+                   ON CONFLICT(book_id) DO UPDATE SET state=excluded.state,
+                     last_commit_id=excluded.last_commit_id, state_version=excluded.state_version,
+                     stale=FALSE, updated_at=excluded.updated_at""",
+                (book_id, _json(state), last_commit_id, len(rows), datetime.now().isoformat()),
+            )
+
+        graph_error: Optional[str] = None
+        graph_payload: dict[str, Any] = {}
+        try:
+            from src.story_graph.service import StoryGraphProjector
+
+            graph_payload = StoryGraphProjector(self.db).project(
+                book_id, view="all", limit=2000, edge_limit=6000
+            )
+            with self.db.transaction() as conn:
+                for row in self._canonical_event_rows(conn, book_id):
+                    self._set_projection_status(conn, book_id, row["id"], "story_graph", "applied")
+        except Exception as exc:
+            graph_error = str(exc)
+            logger.exception("Narrative OS projection rebuild graph stage failed for %s", book_id)
+            with self.db.transaction() as conn:
+                for row in self._canonical_event_rows(conn, book_id):
+                    self._set_projection_status(
+                        conn, book_id, row["id"], "story_graph", "failed",
+                        error_code="GRAPH_REBUILD_FAILED", error_detail=graph_error,
+                    )
+
+        with self.db.connect() as conn:
+            derived = {
+                "story_facts": conn.execute(
+                    "SELECT COUNT(*) AS count FROM story_facts WHERE book_id=? AND commit_id IS NOT NULL", (book_id,)
+                ).fetchone()["count"],
+                "story_projections": conn.execute(
+                    "SELECT COUNT(*) AS count FROM story_projections WHERE book_id=?", (book_id,)
+                ).fetchone()["count"],
+                "narrative_memory": conn.execute(
+                    "SELECT COUNT(*) AS count FROM narrative_memory WHERE book_id=? AND status='active'", (book_id,)
+                ).fetchone()["count"],
+                "story_state": conn.execute(
+                    "SELECT COUNT(*) AS count FROM story_states WHERE book_id=?", (book_id,)
+                ).fetchone()["count"],
+            }
+            status_rows = conn.execute(
+                "SELECT projection_type, status, COUNT(*) AS count FROM projection_ledger WHERE book_id=? GROUP BY projection_type, status",
+                (book_id,),
+            ).fetchall()
+        rows = self.db.fetchall(
+            """SELECT e.*, c.number AS chapter_number FROM narrative_events e
+               JOIN story_commits sc ON sc.id=e.commit_id JOIN chapters c ON c.id=e.chapter_id
+               WHERE e.book_id=? AND sc.status='accepted'
+               ORDER BY c.number, COALESCE(sc.accepted_at, sc.created_at), sc.created_at, e.sequence, e.id""",
+            (book_id,),
+        )
+        with self.db.connect() as conn:
+            derived_hash = self._derived_hash(conn, book_id)
+        return {
+            "status": "failed" if graph_error else "rebuilt",
+            "book_id": book_id,
+            "accepted_commits": len(rows),
+            "accepted_commit_ids": [row["commit_id"] for row in rows],
+            "canon_hash": self._canon_hash(rows),
+            "derived_hash": derived_hash,
+            "derived": derived,
+            "materialized": {"story_facts": fact_count, "narrative_memory": memory_count},
+            "projection_status": [dict(row) for row in status_rows],
+            "graph_hash": _hash_json(graph_payload) if graph_payload else None,
+            "error": graph_error,
+        }
+
+    def replay_all(self, book_id: str) -> dict[str, Any]:
+        """Rebuild and return the deterministic accepted-event replay result."""
+        report = self.rebuild_all(book_id)
+        result = dict(report)
+        result["accepted_commits"] = list(report["accepted_commit_ids"])
+        result["replay"] = True
+        return result
 
     def save_review(self, project_id: str, review: dict[str, Any]) -> Optional[str]:
         book = self.book_for_project(project_id)
@@ -1239,6 +1804,14 @@ class StoryRepository:
             ).fetchone()
             if chapter is None:
                 return False
+            # An accepted event is immutable and references its chapter. Keep
+            # the chapter as a deleted tombstone in that case; physical
+            # deletion would either destroy author history or violate the
+            # event ledger's foreign-key boundary.
+            has_immutable_event = conn.execute(
+                "SELECT 1 FROM narrative_events WHERE chapter_id=? LIMIT 1",
+                (chapter["id"],),
+            ).fetchone() is not None
             self._mark_story_state_stale_for_chapter(
                 conn, book["id"], chapter["id"], datetime.now().isoformat()
             )
@@ -1264,6 +1837,21 @@ class StoryRepository:
                    source = 'superseded' WHERE chapter_id = ?""",
                 (chapter["id"],),
             )
+            if has_immutable_event:
+                conn.execute(
+                    "UPDATE chapters SET status='deleted', updated_at=? WHERE id=?",
+                    (datetime.now().isoformat(), chapter["id"]),
+                )
+                conn.execute(
+                    """UPDATE books SET total_chapters = (
+                           SELECT COUNT(*) FROM chapters WHERE book_id=? AND status != 'deleted'
+                       ), total_words = (
+                           SELECT COALESCE(SUM(word_count), 0) FROM chapters
+                           WHERE book_id=? AND status != 'deleted'
+                       ), updated_at=? WHERE id=?""",
+                    (book["id"], book["id"], datetime.now().isoformat(), book["id"]),
+                )
+                return True
             # Delete review data for this chapter.
             review_ids = [
                 r["id"] for r in conn.execute(

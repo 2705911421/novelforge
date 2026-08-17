@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Any, Callable, Optional
 
 from src.core.config import Config
-from src.core.memory import MemorySystem
+from src.core.canonical_memory import CanonicalMemoryReader
 from src.core.project import ProjectManager
 from src.core.task_runtime import TaskRuntime
 from src.creation.planner import ChapterPlanner
@@ -240,7 +240,7 @@ class LegacyTaskHandlers:
             project, chapter_number, self._text(data.get("context"))
         )
         self.runtime.checkpoint(task["id"], "draft", {"chapter_number": chapter_number})
-        chapter = ChapterWriter(self.model_manager, MemorySystem(self.project_manager.get_project_dir(project.id))).write_chapter(
+        chapter = ChapterWriter(self.model_manager, self._canonical_memory(project.id)).write_chapter(
             project, chapter_number, plan, self._text(data.get("context"))
         )
         project.chapters[chapter_number] = chapter
@@ -278,7 +278,7 @@ class LegacyTaskHandlers:
             raise KeyError(f"chapter not found: {chapter_number}")
         if chapter.review is None:
             raise ValueError("chapter has not been reviewed")
-        memory = MemorySystem(self.project_manager.get_project_dir(project.id))
+        memory = self._canonical_memory(project.id)
         writer = ChapterWriter(self.model_manager, memory)
         reviewer = ChapterReviewer(self.model_manager, pass_score=self._config_int("review", "pass_score", 93))
         self.runtime.checkpoint(task["id"], "revise", {"chapter_number": chapter_number})
@@ -308,7 +308,7 @@ class LegacyTaskHandlers:
             project, chapter_number, self._text(data.get("context"))
         )
         self.runtime.checkpoint(task["id"], "rewrite", {"chapter_number": chapter_number})
-        revised = ChapterWriter(self.model_manager, MemorySystem(self.project_manager.get_project_dir(project.id))).write_chapter(
+        revised = ChapterWriter(self.model_manager, self._canonical_memory(project.id)).write_chapter(
             project, chapter_number, plan, self._text(data.get("context"))
         )
         project.chapters[chapter_number] = revised
@@ -2057,6 +2057,12 @@ class LegacyTaskHandlers:
         if project is None:
             raise KeyError(f"project not found: {project_id}")
         return project
+
+    def _canonical_memory(self, project_id: str) -> CanonicalMemoryReader:
+        book = self.project_manager.story_repository.book_for_project(project_id)
+        if not book:
+            raise KeyError(f"authoritative book not found for project: {project_id}")
+        return CanonicalMemoryReader(self.project_manager.story_repository, book["id"])
 
     def _composer(self, project_id: str) -> Composer:
         return Composer(self.model_manager, ControlSurface(self.project_manager.get_project_dir(project_id)))

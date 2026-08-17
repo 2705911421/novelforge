@@ -1408,6 +1408,29 @@ class WritingPipeline:
                 "reason": "verified, non-invalidated StoryFact",
             } for fact in facts)
 
+        # Canonical Narrative Memory is a SQLite projection of accepted event
+        # rows.  It is the writer-facing Memory owner; legacy file-backed
+        # MemorySystem data is never silently merged into this context.
+        narrative_memory = self.story_repo.read_narrative_memory(book_id, limit=20)
+        if narrative_memory:
+            memory_lines = [
+                f"- [{item.get('category') or 'memory'}] {str(item.get('content') or '')[:240]}"
+                for item in narrative_memory
+            ]
+            context_parts.append("## Canonical Narrative Memory\n" + "\n".join(memory_lines))
+            manifest_items.extend({
+                "sourceType": "narrative_memory",
+                "sourceId": item.get("id"),
+                "sourceEventId": item.get("source_event_id"),
+                "sourceCommitId": item.get("source_commit_id"),
+                "sourceVersionId": item.get("source_version_id"),
+                "label": str(item.get("category") or "memory"),
+                "included": True,
+                "contentChars": min(len(str(item.get("content") or "")), 240),
+                "reason": "active canonical Memory projection with event provenance",
+                "provenance": item.get("provenance") or {},
+            } for item in narrative_memory)
+
         graph_context = self._build_story_graph_context(book_id, chapter_number)
         if graph_context.get("text"):
             context_parts.append(str(graph_context["text"]))
@@ -1430,8 +1453,9 @@ class WritingPipeline:
             "note": "Source identifiers describe context assembled by the pipeline; GenerationRun stores the exact final prompt.",
             "availability": {
                 "memory": {
-                    "status": "not_included",
-                    "reason": "legacy file-backed MemorySystem is not an input to this SQLite-authoritative writer pipeline",
+                    "status": "included" if narrative_memory else "not_available",
+                    "owner": "story_repository.narrative_memory",
+                    "reason": "legacy file-backed MemorySystem is not an input; active canonical Memory projection is derived from accepted Narrative Events",
                 },
                 "style": {
                     "status": "included" if any(item.get("sourceType") == "style" for item in manifest_items) else "not_available",
@@ -1461,24 +1485,36 @@ class WritingPipeline:
         query = " ".join(query_parts) if query_parts else f"第{ctx['chapter_number']}章"
 
         try:
-            from src.rag.retriever import PersistentRAGRetriever
+            from src.rag.retriever import DurableHybridRetriever, PersistentRAGRetriever
+            memory_retriever = DurableHybridRetriever(
+                self.db, model_key="narrative-memory-v1", embedder=None
+            )
+            memory_book_id = ctx.get("book_id", project_id)
+            memory_retriever.rebuild_from_memory(memory_book_id)
+            memory_results = memory_retriever.query(memory_book_id, query, top_k=5)
+            memory_chunks = [
+                {**item, "document_name": "Canonical Narrative Memory", "document_id": item.get("source_id")}
+                for item in memory_results.get("results", [])
+            ]
             retriever = PersistentRAGRetriever(self.db)
-            results = retriever.query(project_id, query, top_k=5)
-            chunks = results.get("results", [])
+            document_results = retriever.query(project_id, query, top_k=5)
+            chunks = memory_chunks + document_results.get("results", [])
             if chunks:
-                chunk_lines = [f"- [{r.get('document_name', '?')}] {r.get('content', '')[:200]}" for r in chunks]
+                chunk_lines = [f"- [{r.get('document_name') or r.get('source_type') or '?'}] {r.get('content', '')[:200]}" for r in chunks]
                 ctx.setdefault("context_parts", []).append(
                     "## 参考资料\n" + "\n".join(chunk_lines)
                 )
                 ctx["rag_results"] = len(chunks)
+                ctx["memory_rag_results"] = len(memory_chunks)
                 ctx.setdefault("context_manifest", {}).setdefault("items", []).extend({
-                    "sourceType": "rag_chunk",
+                    "sourceType": "narrative_memory" if result.get("source_type") == "narrative_memory" else "rag_chunk",
                     "sourceId": result.get("chunk_id") or result.get("id"),
-                    "documentId": result.get("document_id"),
-                    "label": result.get("document_name") or "RAG result",
+                    "documentId": result.get("document_id") or result.get("source_id"),
+                    "label": result.get("document_name") or result.get("source_type") or "RAG result",
                     "included": True,
                     "contentChars": min(len(str(result.get("content") or "")), 200),
-                    "reason": "retriever result selected for chapter planning",
+                    "reason": "canonical memory or durable RAG result selected for chapter planning",
+                    "provenance": result.get("provenance") or result.get("metadata", {}).get("provenance", {}),
                 } for result in chunks)
                 assembled_context = "\n\n".join(ctx.get("context_parts", []))
                 ctx["context_manifest"]["contextChars"] = len(assembled_context)
@@ -1951,7 +1987,7 @@ class WritingPipeline:
         except Exception as exc:
             logger.warning("Failed to save review to repository: %s", exc)
             # Fallback to story_repo for backward compatibility.
-            self.story_repo.save_review(project_id, {
+            fallback_review_id = self.story_repo.save_review(project_id, {
                 "chapter_number": chapter_number,
                 "chapter_version_id": ctx["draft_version_id"],
                 "overall_score": ctx["review_score"],
@@ -1959,6 +1995,7 @@ class WritingPipeline:
                 "dimensions": dimensions_list,
                 "specific_issues": [i.get("description", "") for i in ctx["review_issues"]],
             })
+            ctx["review_id"] = fallback_review_id
 
         return {"next_stage": "QUALITY_GATE", "context": ctx}
 
@@ -2228,6 +2265,7 @@ class WritingPipeline:
                 review_score=ctx.get("review_score"),
                 blocking_issues=len(ctx.get("blocking_issues", [])),
                 chapter_version_id=draft_version_id,
+                review_id=ctx.get("review_id"),
                 author_override=bool(ctx.get("author_override")),
                 override_reason=str(ctx.get("author_decision_reason") or "")[:2000],
             )
