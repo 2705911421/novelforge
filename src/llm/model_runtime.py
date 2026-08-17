@@ -17,6 +17,12 @@ from typing import Any, ContextManager, Iterator, Optional
 import httpx
 
 from src.core.database import Database, generate_id
+from src.core.generation_attempts import (
+    GenerationAttemptStore,
+    RESPONSE_STATUSES,
+    response_from_artifact,
+    stable_hash,
+)
 
 from .gateway import ImageResponse, LLMConfig, LLMResponse, ModelGateway, ProviderType
 from .agent_prompts import (
@@ -790,7 +796,7 @@ class PersistentModelRuntime:
             }
             value["persistedPromptRangeStatus"] = "exact"
 
-        for collection_name in ("items", "contextSections"):
+        for collection_name in ("items", "compiledItems", "contextSections"):
             collection = manifest.get(collection_name)
             if isinstance(collection, list):
                 for item in collection:
@@ -816,7 +822,7 @@ class PersistentModelRuntime:
             binding["messageIndex"] = 0
             binding["persistedAvailable"] = any(
                 isinstance(item, dict) and item.get("persistedPromptRangeStatus") == "exact"
-                for collection_name in ("items", "contextSections")
+                for collection_name in ("items", "compiledItems", "contextSections")
                 for item in (manifest.get(collection_name) or [])
             )
 
@@ -834,6 +840,7 @@ class PersistentModelRuntime:
             effective_system = route_system_prompt or caller_system or DEFAULT_AGENT_SYSTEM_PROMPTS.get(role, "")
         prompt_key = kwargs.pop("prompt_key", None) or f"agent-route:{role}:system"
         prompt_version = kwargs.pop("prompt_version", None)
+        task_stage = str(kwargs.pop("task_stage", "") or role)
         context_manifest = kwargs.pop("context_manifest", None)
         if not prompt_version:
             configured_version = int(resolved.get("route_system_prompt_version") or 0)
@@ -843,30 +850,98 @@ class PersistentModelRuntime:
         runtime_context_manifest = deepcopy(context_manifest) if isinstance(context_manifest, dict) else None
         if runtime_context_manifest is not None:
             self._bind_context_manifest_to_prompt_layout(runtime_context_manifest, prompt_layout)
+        input_reference = {
+            # Keep the complete prompt alongside its audit metadata. The
+            # Studio task detail view must show the exact model input.
+            "system_prompt": effective_system,
+            "messages": messages,
+            "prompt": persisted_prompt,
+            "promptLayout": prompt_layout,
+            "message_count": len(messages),
+            "system_chars": len(effective_system),
+            "message_chars": sum(len(str(message.get("content", ""))) for message in messages),
+            "prompt_sha256": prompt_sha256,
+            "persisted_prompt_sha256": hashlib.sha256(persisted_prompt.encode("utf-8")).hexdigest(),
+            "prompt_source": "agent-contract+route-override",
+            "context_manifest": runtime_context_manifest,
+        }
+        context_hash = stable_hash(runtime_context_manifest or {})
+        request_hash = stable_hash({
+            "taskStage": task_stage,
+            "role": role,
+            "providerId": resolved.get("provider_id"),
+            "modelId": resolved.get("id"),
+            "externalModelId": resolved.get("model_id"),
+            "promptKey": prompt_key,
+            "promptVersion": prompt_version,
+            "promptHash": prompt_sha256,
+            "persistedPromptHash": input_reference["persisted_prompt_sha256"],
+            "contextHash": context_hash,
+            "messages": messages,
+            "jsonMode": bool(json_mode),
+            "options": kwargs,
+        })
+        base_idempotency_key = f"{task_id}:{task_stage}:{request_hash}"
+        attempts = GenerationAttemptStore(self.repository.db)
+
+        def recover(existing: dict[str, Any]) -> LLMResponse:
+            response = response_from_artifact(existing.get("response_artifact"))
+            run = self.repository.db.fetchone(
+                "SELECT status FROM generation_runs WHERE id=?",
+                (existing.get("generation_run_id"),),
+            )
+            if run is not None and run["status"] != "succeeded":
+                self.repository.finish_run(existing["generation_run_id"], response)
+            attempts.consume(existing["id"])
+            return response
+
+        existing = attempts.by_idempotency(base_idempotency_key)
+        if existing and existing.get("status") in RESPONSE_STATUSES and existing.get("response_artifact"):
+            return recover(existing)
+        existing_attempts = [
+            item for item in attempts.for_task(task_id)
+            if item.get("request_hash") == request_hash and item.get("task_stage") == task_stage
+        ]
+        if existing_attempts:
+            latest = max(existing_attempts, key=lambda item: int(item.get("attempt_number") or 0))
+            if latest.get("status") in {"prepared", "requesting"}:
+                attempts.abandon(latest["id"])
+                self.repository.fail_run(latest["generation_run_id"], "GENERATION_ATTEMPT_RETRY")
+            attempt_number = int(latest.get("attempt_number") or 0) + 1
+            idempotency_key = f"{base_idempotency_key}:retry:{attempt_number}"
+            retry_existing = attempts.by_idempotency(idempotency_key)
+            if retry_existing and retry_existing.get("status") in RESPONSE_STATUSES and retry_existing.get("response_artifact"):
+                return recover(retry_existing)
+        else:
+            attempt_number = 1
+            idempotency_key = base_idempotency_key
         run_id = self.repository.create_run(
             task_id=task_id, role=role, resolved=resolved,
             prompt_key=prompt_key, prompt_version=prompt_version,
-            input_reference={
-                # Keep the complete prompt alongside its audit metadata. The
-                # Studio task detail view must show the exact model input.
-                "system_prompt": effective_system,
-                "messages": messages,
-                "prompt": persisted_prompt,
-                "promptLayout": prompt_layout,
-                "message_count": len(messages),
-                "system_chars": len(effective_system),
-                "message_chars": sum(len(str(message.get("content", ""))) for message in messages),
-                "prompt_sha256": prompt_sha256,
-                "persisted_prompt_sha256": hashlib.sha256(persisted_prompt.encode("utf-8")).hexdigest(),
-                "prompt_source": "agent-contract+route-override",
-                "context_manifest": runtime_context_manifest,
-            },
+            input_reference=input_reference,
         )
+        attempt = attempts.prepare(
+            generation_run_id=run_id,
+            task_id=task_id,
+            task_stage=task_stage,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            provider_id=str(resolved.get("provider_id") or ""),
+            model_id=str(resolved.get("id") or ""),
+            prompt_key=str(prompt_key),
+            prompt_version=str(prompt_version),
+            prompt_hash=prompt_sha256,
+            context_hash=context_hash,
+        )
+        if attempt.get("status") in RESPONSE_STATUSES and attempt.get("response_artifact"):
+            self.repository.fail_run(run_id, "GENERATION_ATTEMPT_REUSED")
+            return recover(attempt)
         if runtime_context_manifest is not None:
             self.repository.attach_context_manifest(run_id, runtime_context_manifest)
         try:
             secret = self.repository.credentials.resolve(resolved.get("credential_ref"))
         except CredentialError as exc:
+            attempts.fail(attempt["id"], exc.code, str(exc))
             self.repository.fail_run(run_id, exc.code)
             raise
         try:
@@ -882,15 +957,20 @@ class PersistentModelRuntime:
             provider_name = f"run-{resolved['provider_id']}"
             self.gateway.register_provider(provider_name, config)
         except Exception as exc:
+            attempts.fail(attempt["id"], "MODEL_CONFIGURATION", str(exc))
             self.repository.fail_run(run_id, "MODEL_CONFIGURATION")
             raise ModelConfigurationError("MODEL_CONFIGURATION", "model configuration error") from exc
         try:
+            attempts.mark_requesting(attempt["id"])
             response = self.gateway.chat(provider_name, messages, effective_system, json_mode=json_mode, **kwargs)
         except Exception as exc:
             code = self._error_code(exc)
+            attempts.fail(attempt["id"], code, str(exc))
             self.repository.fail_run(run_id, code)
             raise ModelConfigurationError(code, "model provider invocation failed") from exc
+        attempts.persist_response(attempt["id"], response)
         self.repository.finish_run(run_id, response)
+        attempts.consume(attempt["id"])
         return response
 
     def test_provider(self, provider_id: str) -> LLMResponse:
@@ -1097,12 +1177,14 @@ class PersistentMultiModelManager:
              **kwargs: Any) -> LLMResponse:
         """Route the pipeline's legacy ``chat`` call through a durable agent role."""
         role = self._task_roles.get(task_type or "", "writer")
+        kwargs.setdefault("task_stage", task_type or role)
         return self.get_client(role).chat(messages, system, **kwargs)
 
     def chat_json(self, messages: list[dict[str, Any]], system: str = "", *, task_type: Optional[str] = None,
                   **kwargs: Any) -> dict[str, Any]:
         """Provide the same durable routing for JSON-constrained pipeline stages."""
         role = self._task_roles.get(task_type or "", "writer")
+        kwargs.setdefault("task_stage", task_type or role)
         return self.get_client(role).chat_json(messages, system, **kwargs)
 
     def test_provider(self, provider_id: str) -> LLMResponse:

@@ -20,6 +20,7 @@ class ReviewRepository:
         chapter_number: int,
         review_data: dict[str, Any],
         chapter_version_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> str:
         """Save a complete review with dimensions and issues.
         
@@ -57,14 +58,22 @@ class ReviewRepository:
             chapter_version_id = version["id"] if version else None
 
         review_id = generate_id()
+        idempotency_key = idempotency_key or review_data.get("idempotency_key")
         from datetime import timezone
         now = datetime.now(timezone.utc).isoformat()
 
         with self.db.transaction() as conn:
+            if idempotency_key:
+                existing = conn.execute(
+                    "SELECT id FROM reviews WHERE idempotency_key=?", (idempotency_key,)
+                ).fetchone()
+                if existing:
+                    return existing["id"]
             # Insert the main review record with chapter_version_id for provenance.
             conn.execute(
-                """INSERT INTO reviews(id, chapter_id, chapter_version_id, overall_score, passed, verdict, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO reviews(id, chapter_id, chapter_version_id, overall_score, passed, verdict,
+                   idempotency_key, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     review_id,
                     chapter_id,
@@ -72,6 +81,7 @@ class ReviewRepository:
                     review_data.get("overall_score", 0),
                     review_data.get("passed", False),
                     review_data.get("verdict", "needs_revision"),
+                    idempotency_key,
                     now,
                 ),
             )

@@ -158,8 +158,16 @@ class OpenAIProvider(BaseProvider):
                 latency = int((time.time() - start_time) * 1000)
                 usage = data.get("usage", {})
                 
+                message = data["choices"][0].get("message") or {}
+                content = message.get("content")
+                if content in (None, ""):
+                    # Some OpenAI-compatible reasoning providers return a
+                    # reasoning-only delta when the output budget is too
+                    # small. Preserve the durable provider artifact instead
+                    # of falsely recording an empty successful generation.
+                    content = message.get("reasoning_content") or data["choices"][0].get("text") or ""
                 return LLMResponse(
-                    content=data["choices"][0]["message"]["content"],
+                    content=content,
                     model=data.get("model", self.config.model),
                     tokens_used=usage.get("total_tokens", 0),
                     prompt_tokens=usage.get("prompt_tokens", 0),

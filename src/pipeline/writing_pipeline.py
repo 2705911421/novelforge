@@ -20,6 +20,7 @@ from src.core.task_runtime import TaskRuntime
 from src.prompts.prompt_repository import PromptRepository
 from src.review.review_repository import ReviewRepository
 from src.pipeline.rules import genre_contract_lines, get_genre_profile
+from src.pipeline.context_compiler import ContextBudgetExceeded, ContextCompiler, ContextSection
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,17 @@ class WritingPipeline:
                     "UNKNOWN_STAGE", f"unknown pipeline stage: {stage}"
                 )
             handler = stage_map[stage]
-            result = handler(task, ctx)
+            try:
+                result = handler(task, ctx)
+            except ContextBudgetExceeded as exc:
+                ctx["completed"] = False
+                ctx["needs_author_decision"] = True
+                ctx["reason"] = exc.code
+                self._transition(task, "needs_author_decision", detail={
+                    "reason": exc.code,
+                    **(exc.details if isinstance(exc.details, dict) else {}),
+                })
+                return ctx
             stage = result["next_stage"]
             ctx = result.get("context", ctx)
             # Checkpoint after every stage transition while the task remains active.
@@ -1438,16 +1449,73 @@ class WritingPipeline:
         if graph_context.get("warning"):
             ctx.setdefault("context_warnings", []).append(graph_context["warning"])
 
-        ctx["context_parts"] = context_parts
-        assembled_context = "\n\n".join(context_parts)
+        # Compile the assembled sections through one deterministic budget seam.
+        # The existing source manifest remains for compatibility; compiledItems
+        # records the exact selection and ranges used by this run.
+        sections: list[ContextSection] = []
+        for index, content in enumerate(context_parts):
+            header = content.splitlines()[0] if content.splitlines() else ""
+            inferred_type = "assembled_context"
+            if "Writing Style" in header:
+                inferred_type = "style"
+            elif "Author Constraints" in header:
+                inferred_type = "constraints"
+            elif "StoryFlow Chapter Intent" in header:
+                inferred_type = "planning_node"
+            elif "Story Bible" in header:
+                inferred_type = "story_bible"
+            elif "用户导入" in header:
+                inferred_type = "planning_source"
+            elif "前文摘要" in header:
+                inferred_type = "chapter_summary"
+            elif "已确立的事实" in header:
+                inferred_type = "story_fact"
+            elif "Canonical Narrative Memory" in header:
+                inferred_type = "narrative_memory"
+            elif "Story Graph" in header:
+                inferred_type = "story_graph"
+            source_item = next(
+                (item for item in manifest_items if item.get("sourceType") == inferred_type),
+                {},
+            )
+            sections.append(ContextCompiler.from_manifest(content, {
+                **source_item,
+                "sourceType": inferred_type,
+                "sourceId": source_item.get("sourceId") or f"context-section:{index}",
+            }))
+        raw_budget = (task.get("data") or {}).get("context_budget_tokens") if isinstance(task.get("data"), dict) else None
+        try:
+            budget_tokens = int(raw_budget) if raw_budget is not None else ContextCompiler.DEFAULT_BUDGET_TOKENS
+        except (TypeError, ValueError):
+            budget_tokens = ContextCompiler.DEFAULT_BUDGET_TOKENS
+        bundle = ContextCompiler.compile(sections, budget_tokens=budget_tokens)
+        compiled_items: list[dict[str, Any]] = []
+        context_parts_from_bundle: list[str] = []
+        for section in bundle.sections:
+            section_copy = dict(section)
+            context_parts_from_bundle.append(str(section_copy.pop("_content", "")))
+            compiled_items.append(section_copy)
+        ctx["context_parts"] = context_parts_from_bundle
+        for item in manifest_items:
+            ContextCompiler.decorate_manifest_item(item)
+        assembled_context = bundle.text
         ctx["context_manifest"] = {
             "schemaVersion": 3,
+            "contextCompilerVersion": "context-compiler-v1",
             "source": "writing_pipeline.BUILD_CONTEXT",
             "projectId": project_id,
             "bookId": book_id,
             "chapterNumber": chapter_number,
             "chapterId": ctx.get("chapter_id") or self._get_chapter_id(book_id, chapter_number),
             "items": manifest_items,
+            "compiledItems": compiled_items,
+            "excludedItems": bundle.excluded,
+            "budget": {
+                "budgetTokens": bundle.budget_tokens,
+                "estimatedTokens": bundle.estimated_tokens,
+                "selection": "priority_then_source_order",
+                "hardConstraintsFailClosed": True,
+            },
             "contextChars": len(assembled_context),
             "contextSha256": hashlib.sha256(assembled_context.encode("utf-8")).hexdigest(),
             "note": "Source identifiers describe context assembled by the pipeline; GenerationRun stores the exact final prompt.",
@@ -1486,12 +1554,25 @@ class WritingPipeline:
 
         try:
             from src.rag.retriever import DurableHybridRetriever, PersistentRAGRetriever
+            from src.rag.embedding_provider import RoutedEmbeddingProvider
+            embedder = None
+            model_key = "narrative-memory-v1"
+            runtime = getattr(self.model_manager, "runtime", None)
+            if runtime is not None:
+                try:
+                    embedder = RoutedEmbeddingProvider(runtime.repository)
+                    model_key = f"narrative-memory:{embedder.model_key}"
+                except Exception:
+                    # No embedding route is a supported degraded mode.  The
+                    # durable projection remains queryable through BM25.
+                    embedder = None
             memory_retriever = DurableHybridRetriever(
-                self.db, model_key="narrative-memory-v1", embedder=None
+                self.db, model_key=model_key, embedder=embedder
             )
             memory_book_id = ctx.get("book_id", project_id)
-            memory_retriever.rebuild_from_memory(memory_book_id)
+            sync_report = memory_retriever.sync_incremental(memory_book_id)
             memory_results = memory_retriever.query(memory_book_id, query, top_k=5)
+            ctx["memory_projection_sync"] = sync_report
             memory_chunks = [
                 {**item, "document_name": "Canonical Narrative Memory", "document_id": item.get("source_id")}
                 for item in memory_results.get("results", [])

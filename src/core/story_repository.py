@@ -12,6 +12,18 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .database import Database, generate_id, get_db
+from .narrative_events import (
+    AUTHOR_OVERRIDE_GRANTED,
+    CHAPTER_RESTORED,
+    CHAPTER_TOMBSTONED,
+    CHAPTER_VERSION_SUPERSEDED,
+    STORY_COMMIT_ACCEPTED,
+    STORY_COMMIT_REJECTED,
+    STORY_COMMIT_SUPERSEDED,
+    active_events,
+    append_event,
+)
+from .memory_compiler import MemoryCompiler
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +74,36 @@ class StoryRepository:
         return self.db.fetchone(
             "SELECT * FROM books WHERE project_id = ? ORDER BY created_at LIMIT 1", (project_id,)
         )
+
+    def append_narrative_audit_event(
+        self,
+        book_id: str,
+        event_type: str,
+        payload: Optional[dict[str, Any]] = None,
+        *,
+        aggregate_type: str = "book",
+        aggregate_id: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        source_commit_id: Optional[str] = None,
+        reason: str = "",
+        actor_type: str = "system",
+        actor_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Expose one idempotent seam for audit-only lifecycle events."""
+        with self.db.transaction() as conn:
+            return append_event(
+                conn,
+                book_id=book_id,
+                event_type=event_type,
+                payload=payload or {},
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+                source_event_id=source_event_id,
+                source_commit_id=source_commit_id,
+                reason=reason,
+                actor_type=actor_type,
+                actor_id=actor_id,
+            )
 
     def create_native_project(
         self,
@@ -245,71 +287,106 @@ class StoryRepository:
 
     @staticmethod
     def _mark_story_state_stale_for_chapter(conn, book_id: str, chapter_id: str, now: str) -> bool:
-        """Invalidate accepted evidence at and after an edited chapter.
+        """Append edit invalidations and mark derived rows stale.
 
-        An edit changes the evidence for that chapter and every later projection
-        derived from it.  Those commits remain in append-only history but are
-        marked ``superseded`` and their facts are excluded from future replay.
+        ``story_commits.status`` is updated as a compatibility read model only.
+        The immutable supersession events below are the source of truth used by
+        replay and recovery.
         """
         chapter = conn.execute(
             "SELECT book_id, number FROM chapters WHERE id = ?", (chapter_id,)
         ).fetchone()
         if chapter is None:
             return False
-        commits = conn.execute(
-            """SELECT sc.id FROM story_commits sc
-               JOIN chapters c ON c.id = sc.chapter_id
-               WHERE c.book_id = ? AND c.number >= ? AND sc.status = 'accepted'""",
-            (book_id, chapter["number"]),
-        ).fetchall()
-        if not commits:
+        targets = [
+            row for row in active_events(conn, book_id)
+            if int(row.get("chapter_number") or 0) >= int(chapter["number"])
+        ]
+        if not targets:
             return False
-        for commit in commits:
+        latest = conn.execute(
+            "SELECT id FROM chapter_versions WHERE chapter_id=? ORDER BY version DESC LIMIT 1",
+            (chapter_id,),
+        ).fetchone()
+        for event in targets:
+            commit_id = event.get("commit_id") or event.get("source_commit_id")
+            append_event(
+                conn,
+                book_id=book_id,
+                event_type=CHAPTER_VERSION_SUPERSEDED,
+                payload={
+                    "chapterId": event.get("chapter_id"),
+                    "chapterNumber": chapter["number"],
+                    "supersededVersionId": event.get("chapter_version_id"),
+                    "replacementVersionId": latest["id"] if latest else None,
+                    "targetEventId": event["id"],
+                    "targetCommitId": commit_id,
+                    "reason": f"chapter {chapter['number']} was edited",
+                },
+                aggregate_id=event.get("chapter_id"),
+                chapter_id=event.get("chapter_id"),
+                chapter_version_id=event.get("chapter_version_id"),
+                source_event_id=event["id"],
+                source_commit_id=commit_id,
+                reason=f"chapter {chapter['number']} was edited",
+            )
+            append_event(
+                conn,
+                book_id=book_id,
+                event_type=STORY_COMMIT_SUPERSEDED,
+                payload={
+                    "chapterId": event.get("chapter_id"),
+                    "chapterNumber": chapter["number"],
+                    "targetEventId": event["id"],
+                    "targetCommitId": commit_id,
+                    "reason": f"chapter {chapter['number']} was edited",
+                },
+                aggregate_id=commit_id or event.get("chapter_id"),
+                chapter_id=event.get("chapter_id"),
+                chapter_version_id=event.get("chapter_version_id"),
+                source_event_id=event["id"],
+                source_commit_id=commit_id,
+                reason=f"chapter {chapter['number']} was edited",
+            )
+            if not commit_id:
+                continue
             conn.execute(
                 """UPDATE story_commits
                    SET status = 'superseded', rejection_reason = ?
-                   WHERE id = ? AND status = 'accepted'""",
-                (f"chapter {chapter['number']} was edited", commit["id"]),
+                   WHERE id = ? AND status IN ('accepted', 'pending')""",
+                (f"chapter {chapter['number']} was edited", commit_id),
             )
             conn.execute(
                 """UPDATE story_facts
                    SET verification_status = 'invalidated', source = 'superseded'
                    WHERE commit_id = ?""",
-                (commit["id"],),
+                (commit_id,),
             )
-            event = conn.execute(
-                "SELECT id FROM narrative_events WHERE commit_id=?",
-                (commit["id"],),
-            ).fetchone()
-            if event is not None:
-                conn.execute(
-                    """UPDATE narrative_memory SET status='superseded', updated_at=?
-                       WHERE source_event_id=? AND status='active'""",
-                    (now, event["id"]),
-                )
-                conn.execute(
-                    """UPDATE projection_ledger SET status='stale', error_code='SOURCE_EDITED',
-                       error_detail=?, applied_at=NULL, updated_at=?
-                       WHERE source_event_id=?""",
-                    (f"chapter {chapter['number']} was edited", now, event["id"]),
-                )
-        accepted = conn.execute(
-            """SELECT sc.state_changes FROM story_commits sc
-               JOIN chapters c ON c.id = sc.chapter_id
-               WHERE c.book_id = ? AND sc.status = 'accepted'
-               ORDER BY c.number, sc.accepted_at, sc.created_at""",
-            (book_id,),
-        ).fetchall()
+            conn.execute(
+                """UPDATE narrative_memory SET status='superseded', stale_reason=?, updated_at=?
+                   WHERE source_event_id=? AND status='active'""",
+                (f"chapter {chapter['number']} was edited", now, event["id"]),
+            )
+            conn.execute(
+                """UPDATE projection_ledger SET status='stale', error_code='SOURCE_EDITED',
+                   error_detail=?, applied_at=NULL, updated_at=?
+                   WHERE source_event_id=?""",
+                (f"chapter {chapter['number']} was edited", now, event["id"]),
+            )
+        current = active_events(conn, book_id)
         state: dict[str, Any] = {}
-        for row in accepted:
-            state.update(_load(row["state_changes"], {}))
+        for row in current:
+            payload = _load(row.get("payload"), {})
+            state_changes = payload.get("stateChanges", {})
+            if isinstance(state_changes, dict):
+                state.update(state_changes)
         conn.execute(
             """INSERT INTO story_states(book_id, state, last_commit_id, state_version, stale, updated_at)
                VALUES (?, ?, NULL, ?, TRUE, ?)
                ON CONFLICT(book_id) DO UPDATE SET state=excluded.state,
                  last_commit_id=NULL, state_version=excluded.state_version,
                  stale=TRUE, updated_at=excluded.updated_at""",
-            (book_id, _json(state), len(accepted), now),
+            (book_id, _json(state), len(current), now),
         )
         return True
 
@@ -416,6 +493,23 @@ class StoryRepository:
             story_state_stale = self._mark_story_state_stale_for_chapter(
                 conn, book["id"], chapter["id"], now
             )
+            append_event(
+                conn,
+                book_id=book["id"],
+                event_type=CHAPTER_RESTORED,
+                payload={
+                    "chapterId": chapter["id"],
+                    "chapterNumber": number,
+                    "sourceVersionId": source["id"],
+                    "restoredVersionId": version_id,
+                    "restoresEventIds": [],
+                },
+                aggregate_id=chapter["id"],
+                chapter_id=chapter["id"],
+                chapter_version_id=version_id,
+                reason=f"restored from version {source_version}",
+                actor_type="author",
+            )
             conn.execute(
                 """UPDATE books SET total_words = (SELECT COALESCE(SUM(word_count), 0) FROM chapters
                    WHERE book_id = ?), updated_at = ? WHERE id = ?""",
@@ -493,10 +587,11 @@ class StoryRepository:
                 "content": str(fact["content"]),
                 "entities": fact.get("entities") if isinstance(fact.get("entities"), list) else [],
                 "confidence": fact.get("confidence", 1.0),
+                "provenance": fact.get("provenance") if isinstance(fact.get("provenance"), dict) else {},
             })
         return {
-            "schema": "narrative-event/v1",
-            "eventType": "story_commit_accepted",
+            "schema": "narrative-event/v2",
+            "eventType": STORY_COMMIT_ACCEPTED,
             "chapterId": commit["chapter_id"],
             "chapterNumber": chapter["number"],
             "chapterVersionId": commit["chapter_version_id"],
@@ -550,80 +645,58 @@ class StoryRepository:
             conn, commit["chapter_version_id"]
         )
         payload = cls._canonical_event_payload(commit, chapter, source_fingerprint)
-        event_hash = _hash_json({"commitId": commit["id"], "payload": payload})
-        sequence = conn.execute(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM narrative_events WHERE book_id = ?",
-            (book_id,),
-        ).fetchone()["next_sequence"]
-        event_id = generate_id()
-        now = datetime.now().isoformat()
-        conn.execute(
-            """INSERT INTO narrative_events(
-                   id, book_id, sequence, commit_id, chapter_id, chapter_version_id,
-                   review_id, event_type, payload, event_hash, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, 'story_commit_accepted', ?, ?, ?)""",
-            (event_id, book_id, sequence, commit["id"], commit["chapter_id"],
-             commit["chapter_version_id"], commit["review_id"], _json(payload), event_hash, now),
+        event = append_event(
+            conn,
+            book_id=book_id,
+            event_type=STORY_COMMIT_ACCEPTED,
+            payload=payload,
+            aggregate_id=commit["chapter_id"],
+            chapter_id=commit["chapter_id"],
+            chapter_version_id=commit["chapter_version_id"],
+            review_id=commit["review_id"],
+            commit_id=commit["id"],
+            source_commit_id=commit["id"],
+            source_fingerprint=source_fingerprint,
+            reason="story commit accepted",
         )
         conn.execute(
             "UPDATE story_commits SET source_fingerprint=?, event_hash=? WHERE id=?",
-            (source_fingerprint, event_hash, commit["id"]),
+            (source_fingerprint, event["event_hash"], commit["id"]),
         )
-        for projection_type in ("story_facts", "story_state", "narrative_memory", "rag", "story_graph"):
-            status = "degraded" if projection_type == "rag" else "pending"
-            error_code = "EMBEDDING_PROVIDER_UNCONFIGURED" if projection_type == "rag" else None
-            error_detail = "BM25 remains available; no embedding provider is configured" if projection_type == "rag" else None
-            conn.execute(
-                """INSERT INTO projection_ledger(
-                       id, book_id, source_event_id, projection_type, source_fingerprint,
-                       projection_version, status, error_code, error_detail, applied_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, 'narrative-os-v1', ?, ?, ?, ?, ?)""",
-                (generate_id(), book_id, event_id, projection_type, source_fingerprint,
-                 status, error_code, error_detail, now if status == "degraded" else None, now),
-            )
-        return {
-            "id": event_id,
-            "book_id": book_id,
-            "sequence": sequence,
-            "commit_id": commit["id"],
-            "chapter_id": commit["chapter_id"],
-            "chapter_version_id": commit["chapter_version_id"],
-            "review_id": commit["review_id"],
-            "event_type": "story_commit_accepted",
-            "payload": _json(payload),
-            "event_hash": event_hash,
-            "created_at": now,
-        }
+        return event
 
     @staticmethod
     def _materialize_memory(conn: Any, event: dict[str, Any], commit: Any, chapter_number: int) -> int:
         payload = _load(event["payload"], {})
-        facts = payload.get("facts", [])
+        candidates = MemoryCompiler().compile(payload if isinstance(payload, dict) else {})
         count = 0
-        for index, fact in enumerate(facts):
-            content = str(fact.get("content") or "").strip()
-            if not content:
-                continue
+        for index, candidate in enumerate(candidates):
+            content = candidate.content
             memory_id = hashlib.sha256(
-                f"narrative-memory:{event['id']}:{index}:{content}".encode("utf-8")
+                f"narrative-memory:{event['id']}:{candidate.category}:{index}:{content}".encode("utf-8")
             ).hexdigest()[:32]
             now = datetime.now().isoformat()
             conn.execute(
                 """INSERT OR IGNORE INTO narrative_memory(
                        id, book_id, source_event_id, source_commit_id, source_version_id,
-                       category, scope, content, entity_refs, importance, valid_from_chapter,
-                       status, provenance, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, 'episodic', 'story', ?, ?, ?, ?, 'active', ?, ?, ?)""",
+                       category, memory_type, compression_version, compiler_version,
+                       generation_run_id, scope, content, entity_refs, importance,
+                       valid_from_chapter, valid_to_chapter, status, provenance, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, 'active', ?, ?, ?)""",
                 (
                     memory_id, event["book_id"], event["id"], commit["id"],
-                    commit["chapter_version_id"], content, _json(fact.get("entities", [])),
-                    float(fact.get("confidence", 1.0) or 1.0), chapter_number,
+                    commit["chapter_version_id"], candidate.category, candidate.memory_type,
+                    candidate.compression_version, candidate.compiler_version,
+                    candidate.scope, content, _json(candidate.entity_refs), candidate.importance,
+                    chapter_number,
                     _json({
                         "source": "narrative_event",
                         "eventId": event["id"],
                         "commitId": commit["id"],
                         "chapterVersionId": commit["chapter_version_id"],
-                        "projectionVersion": "narrative-os-v1",
+                        "projectionVersion": "narrative-os-v2",
+                        "memoryType": candidate.memory_type,
+                        "compilerVersion": candidate.compiler_version,
                     }), now, now,
                 ),
             )
@@ -632,18 +705,15 @@ class StoryRepository:
 
     @staticmethod
     def _canonical_event_rows(conn: Any, book_id: str) -> list[dict[str, Any]]:
-        rows = conn.execute(
-            """SELECT e.*, sc.status AS commit_status, sc.accepted_at, sc.created_at,
-                      c.number AS chapter_number
-               FROM narrative_events e
-               JOIN story_commits sc ON sc.id=e.commit_id
-               JOIN chapters c ON c.id=e.chapter_id
-               WHERE e.book_id=? AND sc.status='accepted'
-               ORDER BY c.number, COALESCE(sc.accepted_at, sc.created_at),
-                        sc.created_at, e.sequence, e.id""",
-            (book_id,),
-        ).fetchall()
-        return [dict(row) for row in rows]
+        rows = active_events(conn, book_id)
+        for row in rows:
+            commit_id = row.get("commit_id") or row.get("source_commit_id")
+            commit = conn.execute(
+                "SELECT status AS commit_status, accepted_at, created_at "
+                "FROM story_commits WHERE id=?", (commit_id,)
+            ).fetchone() if commit_id else None
+            row.update(dict(commit) if commit else {})
+        return rows
 
     @classmethod
     def _canon_hash(cls, rows: list[dict[str, Any]]) -> str:
@@ -694,6 +764,145 @@ class StoryRepository:
             "memory": [dict(row) for row in memory],
             "projections": [dict(row) for row in projections],
         })
+
+    @staticmethod
+    def _world_projection_hash(conn: Any, book_id: str) -> str:
+        tables = {
+            "character_states": "SELECT cs.* FROM character_states cs JOIN chapters c ON c.id=cs.chapter_id WHERE c.book_id=? AND cs.source_event_id IS NOT NULL ORDER BY cs.source_event_id, cs.id",
+            "faction_states": "SELECT fs.* FROM faction_states fs JOIN factions f ON f.id=fs.faction_id WHERE f.book_id=? AND fs.source_event_id IS NOT NULL ORDER BY fs.source_event_id, fs.id",
+            "location_states": "SELECT ls.* FROM location_states ls JOIN locations l ON l.id=ls.location_id WHERE l.book_id=? AND ls.source_event_id IS NOT NULL ORDER BY ls.source_event_id, ls.id",
+            "relationships": "SELECT * FROM relationships WHERE book_id=? AND source_event_id IS NOT NULL ORDER BY source_event_id, id",
+            "timeline_events": "SELECT * FROM timeline_events WHERE book_id=? AND source_event_id IS NOT NULL ORDER BY source_event_id, id",
+            "foreshadows": "SELECT * FROM foreshadows WHERE book_id=? AND source_event_id IS NOT NULL ORDER BY source_event_id, id",
+            "hooks": "SELECT * FROM hooks WHERE book_id=? AND source_event_id IS NOT NULL ORDER BY source_event_id, id",
+        }
+        stable: dict[str, list[dict[str, Any]]] = {}
+        for name, query in tables.items():
+            entries: list[dict[str, Any]] = []
+            for row in conn.execute(query, (book_id,)).fetchall():
+                value = dict(row)
+                value.pop("created_at", None)
+                value.pop("updated_at", None)
+                entries.append(value)
+            stable[name] = entries
+        return _hash_json(stable)
+
+    @staticmethod
+    def _rebuild_world_projections(conn: Any, book_id: str, rows: list[dict[str, Any]]) -> dict[str, int]:
+        """Replay structured stateChanges into owned world read models.
+
+        Legacy rows without ``source_event_id`` are compatibility records and
+        remain untouched.  Only projections emitted by Canon events are
+        deleted and rebuilt here.
+        """
+        conn.execute(
+            """DELETE FROM character_states WHERE source_event_id IS NOT NULL
+               AND chapter_id IN (SELECT id FROM chapters WHERE book_id=?)""", (book_id,)
+        )
+        conn.execute(
+            """DELETE FROM faction_states WHERE source_event_id IS NOT NULL
+               AND faction_id IN (SELECT id FROM factions WHERE book_id=?)""", (book_id,)
+        )
+        conn.execute(
+            """DELETE FROM location_states WHERE source_event_id IS NOT NULL
+               AND location_id IN (SELECT id FROM locations WHERE book_id=?)""", (book_id,)
+        )
+        for table in ("relationships", "timeline_events", "foreshadows", "hooks"):
+            conn.execute(f"DELETE FROM {table} WHERE book_id=? AND source_event_id IS NOT NULL", (book_id,))
+        counts = {table: 0 for table in ("character_states", "faction_states", "location_states", "relationships", "timeline_events", "foreshadows", "hooks")}
+
+        def records(value: Any) -> list[dict[str, Any]]:
+            if isinstance(value, dict):
+                return [value]
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            return []
+
+        for event in rows:
+            payload = _load(event.get("payload"), {})
+            changes = payload.get("stateChanges", {})
+            if not isinstance(changes, dict):
+                continue
+            event_id = event["id"]
+            commit_id = event.get("commit_id") or event.get("source_commit_id")
+            chapter_id = event.get("chapter_id")
+            for index, record in enumerate(records(changes.get("character_states", changes.get("characterStates")))):
+                character_id = str(record.get("character_id") or record.get("characterId") or "")
+                if not character_id and record.get("name"):
+                    found = conn.execute("SELECT id FROM characters WHERE book_id=? AND name=?", (book_id, record["name"])).fetchone()
+                    character_id = found["id"] if found else ""
+                if not character_id or not chapter_id:
+                    continue
+                state_id = hashlib.sha256(f"world:{event_id}:character:{index}".encode()).hexdigest()[:32]
+                conn.execute(
+                    """INSERT INTO character_states(id, character_id, chapter_id, location, status, relationships, knowledge, emotional_state, source_event_id, source_commit_id, projection_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'narrative-replay-v1')""",
+                    (state_id, character_id, chapter_id, record.get("location"), record.get("status"), _json(record.get("relationships", {})), _json(record.get("knowledge", [])), record.get("emotional_state", record.get("emotionalState")), event_id, commit_id),
+                )
+                counts["character_states"] += 1
+            for index, record in enumerate(records(changes.get("faction_states", changes.get("factionStates")))):
+                faction_id = str(record.get("faction_id") or record.get("factionId") or "")
+                if not faction_id and record.get("name"):
+                    found = conn.execute("SELECT id FROM factions WHERE book_id=? AND name=?", (book_id, record["name"])).fetchone()
+                    faction_id = found["id"] if found else ""
+                if not faction_id or not chapter_id:
+                    continue
+                state_id = hashlib.sha256(f"world:{event_id}:faction:{index}".encode()).hexdigest()[:32]
+                conn.execute(
+                    """INSERT INTO faction_states(id, faction_id, chapter_id, territory, power_level, allies, enemies, source_event_id, source_commit_id, projection_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'narrative-replay-v1')""",
+                    (state_id, faction_id, chapter_id, _json(record.get("territory", {})), record.get("power_level", record.get("powerLevel")), _json(record.get("allies", [])), _json(record.get("enemies", [])), event_id, commit_id),
+                )
+                counts["faction_states"] += 1
+            for index, record in enumerate(records(changes.get("location_states", changes.get("locationStates")))):
+                location_id = str(record.get("location_id") or record.get("locationId") or "")
+                if not location_id and record.get("name"):
+                    found = conn.execute("SELECT id FROM locations WHERE book_id=? AND name=?", (book_id, record["name"])).fetchone()
+                    location_id = found["id"] if found else ""
+                if not location_id or not chapter_id:
+                    continue
+                state_id = hashlib.sha256(f"world:{event_id}:location:{index}".encode()).hexdigest()[:32]
+                conn.execute(
+                    """INSERT INTO location_states(id, location_id, chapter_id, controlling_faction, events, condition, source_event_id, source_commit_id, projection_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'narrative-replay-v1')""",
+                    (state_id, location_id, chapter_id, record.get("controlling_faction", record.get("controllingFaction")), _json(record.get("events", [])), record.get("condition"), event_id, commit_id),
+                )
+                counts["location_states"] += 1
+            for index, record in enumerate(records(changes.get("relationships", changes.get("relationshipChanges")))):
+                if not record.get("source_id") and not record.get("sourceId"):
+                    continue
+                relation_id = hashlib.sha256(f"world:{event_id}:relationship:{index}".encode()).hexdigest()[:32]
+                conn.execute(
+                    """INSERT INTO relationships(id, book_id, source_type, source_id, target_type, target_id, relationship_type, description, strength, source_event_id, source_commit_id, projection_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'narrative-replay-v1')""",
+                    (relation_id, book_id, record.get("source_type", record.get("sourceType", "character")), record.get("source_id", record.get("sourceId")), record.get("target_type", record.get("targetType", "character")), record.get("target_id", record.get("targetId")), record.get("relationship_type", record.get("relationshipType", "")), record.get("description", ""), record.get("strength", 5), event_id, commit_id),
+                )
+                counts["relationships"] += 1
+            for index, record in enumerate(records(changes.get("timeline_events", changes.get("events")))):
+                event_record_id = hashlib.sha256(f"world:{event_id}:timeline:{index}".encode()).hexdigest()[:32]
+                conn.execute(
+                    """INSERT INTO timeline_events(id, book_id, chapter_id, event_time, event_type, title, description, characters_involved, location, significance, source_event_id, source_commit_id, projection_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'narrative-replay-v1')""",
+                    (event_record_id, book_id, record.get("chapter_id", record.get("chapterId", chapter_id)), record.get("event_time", record.get("eventTime", "")), record.get("event_type", record.get("eventType", "event")), record.get("title", ""), record.get("description", ""), _json(record.get("characters_involved", record.get("charactersInvolved", []))), record.get("location", ""), record.get("significance", ""), event_id, commit_id),
+                )
+                counts["timeline_events"] += 1
+            for index, record in enumerate(records(changes.get("foreshadows", changes.get("foreshadowing")))):
+                foreshadow_id = hashlib.sha256(f"world:{event_id}:foreshadow:{index}".encode()).hexdigest()[:32]
+                conn.execute(
+                    """INSERT INTO foreshadows(id, book_id, created_chapter, resolved_chapter, title, description, status, priority, notes, source_event_id, source_commit_id, projection_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'narrative-replay-v1')""",
+                    (foreshadow_id, book_id, int(record.get("created_chapter", record.get("createdChapter", event.get("chapter_number") or 0)) or 0), record.get("resolved_chapter", record.get("resolvedChapter")), record.get("title", ""), record.get("description", ""), record.get("status", "open"), record.get("priority", "medium"), record.get("notes", ""), event_id, commit_id),
+                )
+                counts["foreshadows"] += 1
+            for index, record in enumerate(records(changes.get("hooks"))):
+                hook_id = hashlib.sha256(f"world:{event_id}:hook:{index}".encode()).hexdigest()[:32]
+                conn.execute(
+                    """INSERT INTO hooks(id, book_id, chapter_id, hook_type, description, status, source_event_id, source_commit_id, projection_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'narrative-replay-v1')""",
+                    (hook_id, book_id, record.get("chapter_id", record.get("chapterId", chapter_id)), record.get("hook_type", record.get("hookType", "")), record.get("description", ""), record.get("status", "active"), event_id, commit_id),
+                )
+                counts["hooks"] += 1
+        return counts
 
     def create_story_commit(
         self,
@@ -866,6 +1075,23 @@ class StoryRepository:
                         raise ValueError("bound review has not passed the blocking quality gate")
 
                 book_id = chapter["book_id"]
+                if author_override and not commit["author_override"]:
+                    append_event(
+                        conn,
+                        book_id=book_id,
+                        event_type=AUTHOR_OVERRIDE_GRANTED,
+                        payload={
+                            "commitId": commit_id,
+                            "reason": (override_reason or "author override")[:2000],
+                            "reviewId": commit["review_id"],
+                        },
+                        aggregate_type="story_commit",
+                        aggregate_id=commit_id,
+                        chapter_id=commit["chapter_id"],
+                        source_commit_id=commit_id,
+                        reason=(override_reason or "author override")[:2000],
+                        actor_type="author",
+                    )
                 now = datetime.now().isoformat()
                 if conn.execute(
                     "UPDATE story_commits SET status = 'accepted', accepted_at = ? WHERE id = ? AND status = 'pending'",
@@ -1000,11 +1226,30 @@ class StoryRepository:
 
     def reject_story_commit(self, commit_id: str, reason: str) -> None:
         with self.db.transaction() as conn:
+            commit = conn.execute(
+                """SELECT sc.*, c.book_id FROM story_commits sc
+                   JOIN chapters c ON c.id=sc.chapter_id WHERE sc.id=?""", (commit_id,)
+            ).fetchone()
+            if commit is None:
+                raise KeyError(f"story commit not found: {commit_id}")
             if conn.execute(
                 "UPDATE story_commits SET status='rejected', rejection_reason=? WHERE id=? AND status='pending'",
                 (reason, commit_id),
             ).rowcount != 1:
                 raise ValueError("only a pending story commit can be rejected")
+            append_event(
+                conn,
+                book_id=commit["book_id"],
+                event_type=STORY_COMMIT_REJECTED,
+                payload={"commitId": commit_id, "reason": reason[:4000]},
+                aggregate_type="story_commit",
+                aggregate_id=commit_id,
+                chapter_id=commit["chapter_id"],
+                chapter_version_id=commit["chapter_version_id"],
+                source_commit_id=commit_id,
+                reason=reason,
+                actor_type="author",
+            )
 
     def read_story_state(self, book_id: str) -> dict[str, Any]:
         row = self.db.fetchone("SELECT * FROM story_states WHERE book_id = ?", (book_id,))
@@ -1021,7 +1266,8 @@ class StoryRepository:
             raise ValueError("memory limit must be between 1 and 500")
         rows = self.db.fetchall(
             """SELECT id, source_event_id, source_commit_id, source_version_id,
-                      category, scope, content, entity_refs, importance,
+                      category, memory_type, compression_version, compiler_version,
+                      scope, content, entity_refs, importance,
                       valid_from_chapter, valid_to_chapter, status, provenance
                FROM narrative_memory
                WHERE book_id=? AND status='active'
@@ -1035,22 +1281,31 @@ class StoryRepository:
         return rows
 
     def replay_story_state(self, book_id: str) -> dict[str, Any]:
-        """Rebuild the projection solely from accepted immutable commits.
-
-        Order by chapter number to ensure deterministic replay regardless of
-        acceptance time (a later chapter could be accepted before an earlier one).
-        """
-        commits = self.db.fetchall(
-            """SELECT sc.* FROM story_commits sc JOIN chapters c ON c.id = sc.chapter_id
-               WHERE c.book_id = ? AND sc.status = 'accepted'
-               ORDER BY c.number, sc.accepted_at, sc.created_at""",
-            (book_id,),
-        )
+        """Rebuild StoryState from the active immutable event ledger."""
+        with self.db.transaction() as conn:
+            # Compatibility bootstrap for databases created before the ledger
+            # existed.  Once an event exists, mutable commit status is ignored.
+            legacy = conn.execute(
+                """SELECT sc.* FROM story_commits sc
+                   JOIN chapters c ON c.id=sc.chapter_id
+                   WHERE c.book_id=? AND sc.status='accepted'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM narrative_events e
+                         WHERE e.commit_id=sc.id OR e.source_commit_id=sc.id
+                     )""",
+                (book_id,),
+            ).fetchall()
+            for commit in legacy:
+                self._ensure_narrative_event(conn, commit, book_id)
+            events = self._canonical_event_rows(conn, book_id)
         state: dict[str, Any] = {}
         last_commit_id = None
-        for commit in commits:
-            state.update(_load(commit["state_changes"], {}))
-            last_commit_id = commit["id"]
+        for event in events:
+            payload = _load(event.get("payload"), {})
+            state_changes = payload.get("stateChanges", {})
+            if isinstance(state_changes, dict):
+                state.update(state_changes)
+            last_commit_id = event.get("commit_id") or event.get("source_commit_id")
         with self.db.transaction() as conn:
             conn.execute(
                 """INSERT INTO story_states(book_id, state, last_commit_id, state_version, stale, updated_at)
@@ -1058,27 +1313,30 @@ class StoryRepository:
                    ON CONFLICT(book_id) DO UPDATE SET state=excluded.state,
                      last_commit_id=excluded.last_commit_id, state_version=excluded.state_version,
                      stale=FALSE, updated_at=excluded.updated_at""",
-                (book_id, _json(state), last_commit_id, len(commits), datetime.now().isoformat()),
+                (book_id, _json(state), last_commit_id, len(events), datetime.now().isoformat()),
             )
         return self.read_story_state(book_id)
 
     def rebuild_all(self, book_id: str) -> dict[str, Any]:
-        """Rebuild every Narrative OS projection from accepted Canon events.
+        """Rebuild every Narrative OS projection from the event ledger.
 
-        This is the recovery seam shared by restart, backup restore, repair
-        and endurance campaigns.  It never promotes a mutable table into
-        authority: accepted ``StoryCommit`` rows are first copied to the
-        immutable event ledger, then all derived rows are replaced from that
-        ledger in deterministic chapter order.
+        ``story_commits`` is consulted only to bootstrap pre-v2 rows that have
+        no event boundary yet.  After that compatibility step, active Canon is
+        computed exclusively by replaying immutable lifecycle events.
         """
         if self.db.fetchone("SELECT id FROM books WHERE id=?", (book_id,)) is None:
             raise KeyError(f"book not found: {book_id}")
 
+        world_counts: dict[str, int] = {}
         with self.db.transaction() as conn:
             accepted_commits = conn.execute(
                 """SELECT sc.* FROM story_commits sc
                    JOIN chapters c ON c.id=sc.chapter_id
                    WHERE c.book_id=? AND sc.status='accepted'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM narrative_events e
+                         WHERE e.commit_id=sc.id OR e.source_commit_id=sc.id
+                     )
                    ORDER BY c.number, COALESCE(sc.accepted_at, sc.created_at), sc.created_at, sc.id""",
                 (book_id,),
             ).fetchall()
@@ -1088,23 +1346,12 @@ class StoryRepository:
                 self._ensure_narrative_event(conn, commit, book_id)
 
             rows = self._canonical_event_rows(conn, book_id)
-            conn.execute("DELETE FROM narrative_memory WHERE book_id=? AND status='active'", (book_id,))
+            conn.execute("DELETE FROM narrative_memory WHERE book_id=?", (book_id,))
             conn.execute(
-                """DELETE FROM story_facts
-                   WHERE book_id=? AND commit_id IN (
-                       SELECT id FROM story_commits WHERE book_id=? AND status='accepted'
-                   )""",
-                (book_id, book_id),
+                "DELETE FROM story_facts WHERE book_id=? AND commit_id IS NOT NULL",
+                (book_id,),
             )
-            conn.execute(
-                """DELETE FROM story_projections
-                   WHERE book_id=? AND commit_id IN (
-                       SELECT id FROM story_commits WHERE chapter_id IN (
-                           SELECT id FROM chapters WHERE book_id=?
-                       ) AND status='accepted'
-                   )""",
-                (book_id, book_id),
-            )
+            conn.execute("DELETE FROM story_projections WHERE book_id=?", (book_id,))
             conn.execute("DELETE FROM story_states WHERE book_id=?", (book_id,))
             conn.execute(
                 "DELETE FROM embedding_projections WHERE book_id=? AND source_type='narrative_memory'",
@@ -1121,8 +1368,8 @@ class StoryRepository:
             memory_count = 0
             for state_version, row in enumerate(rows, start=1):
                 commit = conn.execute(
-                    "SELECT * FROM story_commits WHERE id=? AND status='accepted'",
-                    (row["commit_id"],),
+                    "SELECT * FROM story_commits WHERE id=?",
+                    (row.get("commit_id") or row.get("source_commit_id"),),
                 ).fetchone()
                 if commit is None:
                     continue
@@ -1160,7 +1407,7 @@ class StoryRepository:
                        VALUES (?, ?, ?, 'story_state', ?, ?)""",
                     (projection_id, book_id, commit["id"], _json({"state": state, "state_version": state_version}), datetime.now().isoformat()),
                 )
-                memory_count += self._materialize_memory(conn, row, commit, row["chapter_number"])
+                memory_count += self._materialize_memory(conn, row, commit, row.get("chapter_number") or 0)
                 last_commit_id = commit["id"]
                 for projection_type in ("story_facts", "story_state", "narrative_memory"):
                     self._set_projection_status(conn, book_id, row["id"], projection_type, "applied")
@@ -1169,6 +1416,14 @@ class StoryRepository:
                     error_code="EMBEDDING_PROVIDER_UNCONFIGURED",
                     error_detail="BM25 remains available; no embedding provider is configured",
                 )
+
+            world_counts = self._rebuild_world_projections(conn, book_id, rows)
+            for row in rows:
+                for projection_type in (
+                    "character_states", "faction_states", "location_states", "relationships",
+                    "timeline_events", "foreshadows", "hooks",
+                ):
+                    self._set_projection_status(conn, book_id, row["id"], projection_type, "applied")
 
             conn.execute(
                 """INSERT INTO story_states(book_id, state, last_commit_id, state_version, stale, updated_at)
@@ -1219,24 +1474,22 @@ class StoryRepository:
                 "SELECT projection_type, status, COUNT(*) AS count FROM projection_ledger WHERE book_id=? GROUP BY projection_type, status",
                 (book_id,),
             ).fetchall()
-        rows = self.db.fetchall(
-            """SELECT e.*, c.number AS chapter_number FROM narrative_events e
-               JOIN story_commits sc ON sc.id=e.commit_id JOIN chapters c ON c.id=e.chapter_id
-               WHERE e.book_id=? AND sc.status='accepted'
-               ORDER BY c.number, COALESCE(sc.accepted_at, sc.created_at), sc.created_at, e.sequence, e.id""",
-            (book_id,),
-        )
+            world_projection_hash = self._world_projection_hash(conn, book_id)
+        with self.db.connect() as conn:
+            rows = self._canonical_event_rows(conn, book_id)
         with self.db.connect() as conn:
             derived_hash = self._derived_hash(conn, book_id)
         return {
             "status": "failed" if graph_error else "rebuilt",
             "book_id": book_id,
             "accepted_commits": len(rows),
-            "accepted_commit_ids": [row["commit_id"] for row in rows],
+            "accepted_commit_ids": [row.get("commit_id") or row.get("source_commit_id") for row in rows],
             "canon_hash": self._canon_hash(rows),
             "derived_hash": derived_hash,
             "derived": derived,
             "materialized": {"story_facts": fact_count, "narrative_memory": memory_count},
+            "world_projection": world_counts,
+            "world_projection_hash": world_projection_hash,
             "projection_status": [dict(row) for row in status_rows],
             "graph_hash": _hash_json(graph_payload) if graph_payload else None,
             "error": graph_error,
@@ -1261,12 +1514,20 @@ class StoryRepository:
             return None
         review_id = generate_id()
         issues = review.get("issues", review.get("specific_issues", []))
+        idempotency_key = review.get("idempotency_key")
         with self.db.transaction() as conn:
+            if idempotency_key:
+                existing = conn.execute(
+                    "SELECT id FROM reviews WHERE idempotency_key=?", (idempotency_key,)
+                ).fetchone()
+                if existing:
+                    return existing["id"]
             conn.execute(
-                """INSERT INTO reviews(id, chapter_id, chapter_version_id, overall_score, passed, verdict)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO reviews(id, chapter_id, chapter_version_id, overall_score, passed, verdict,
+                   idempotency_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (review_id, chapter["id"], self._latest_version_id(conn, chapter["id"]), review.get("overall_score", 0),
-                 not bool(issues), review.get("verdict", "")),
+                 not bool(issues), review.get("verdict", ""), idempotency_key),
             )
             for dimension in review.get("dimensions", []):
                 conn.execute(
@@ -1815,6 +2076,21 @@ class StoryRepository:
             self._mark_story_state_stale_for_chapter(
                 conn, book["id"], chapter["id"], datetime.now().isoformat()
             )
+            if has_immutable_event:
+                append_event(
+                    conn,
+                    book_id=book["id"],
+                    event_type=CHAPTER_TOMBSTONED,
+                    payload={
+                        "chapterId": chapter["id"],
+                        "chapterNumber": number,
+                        "reason": f"chapter {number} was deleted",
+                    },
+                    aggregate_id=chapter["id"],
+                    chapter_id=chapter["id"],
+                    reason=f"chapter {number} was deleted",
+                    actor_type="author",
+                )
             # Reconcile dependent references before physical deletion.
             # Nullify FK pointers in timeline events and hooks rather than
             # cascading deletes, so author intent is preserved as stale markers.
