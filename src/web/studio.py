@@ -40,6 +40,7 @@ from src.core.config import Config
 from src.core.project import ProjectManager
 from src.core.database import Database
 from src.core.story_repository import ChapterStateError, ChapterVersionConflict, StoryRepository
+from src.core.narrative_health import NarrativeHealthService
 from src.core.task_runtime import TaskRuntime, TaskStateError
 from src.core.task_worker import PersistentTaskWorker
 from src.creation.task_handlers import LegacyTaskHandlers
@@ -49,6 +50,7 @@ from src.core.models import StoryProject, Chapter
 from src.llm.model_runtime import CredentialStore, ModelConfigurationError, ModelRepository, build_model_runtime
 from src.ingestion.service import DocumentIngestionError, DocumentRepository, DEFAULT_MAX_BYTES, SUPPORTED_SUFFIXES
 from src.ingestion.draft_import import DraftImportError, DraftImportRepository
+from src.ingestion.canonical_import import CanonicalImportError, CanonicalImportService
 from src.rag.retriever import PersistentRAGRetriever, RAGQueryError
 from src.planning.story_bible import StoryBibleError, StoryBibleRepository, STORY_BIBLE_STEPS
 from src.planning.readiness import evaluate_planning_readiness
@@ -109,6 +111,7 @@ skill_repository = SkillRepository(story_repository.db)
 skill_repository.seed_builtins()
 mcp_server_repository = MCPServerRepository(story_repository.db)
 draft_import_repository = DraftImportRepository(story_repository.db)
+canonical_import_service = CanonicalImportService(story_repository.db, story_repository)
 studio_daemon_state: dict[str, Any] = {"task": None, "stop_event": None, "worker_id": None}
 
 # ========== FastAPI应用 ==========
@@ -549,6 +552,17 @@ def get_draft_import_repository() -> DraftImportRepository:
     if getattr(draft_import_repository, "db", None) is story_repository.db:
         return draft_import_repository
     return DraftImportRepository(story_repository.db)
+
+
+def get_canonical_import_service() -> CanonicalImportService:
+    """Bind canonical import proposals to the active authoritative database."""
+    if getattr(canonical_import_service, "db", None) is story_repository.db:
+        return canonical_import_service
+    return CanonicalImportService(story_repository.db, story_repository)
+
+
+def get_narrative_health_service() -> NarrativeHealthService:
+    return NarrativeHealthService(story_repository.db)
 
 
 def get_mcp_server_repository() -> MCPServerRepository:
@@ -3381,6 +3395,96 @@ async def get_story_graph_health(
     result["bookId"] = book_id
     result["authoritativeBookId"] = story_graph_authoritative_id(book)
     return result
+
+
+@app.get("/api/v1/books/{book_id}/health/narrative")
+async def get_narrative_health(book_id: str):
+    """Return the read-only SQL-backed Narrative Health contract."""
+    book = resolve_story_graph_book(book_id)
+    try:
+        result = get_narrative_health_service().health(str(book["id"]))
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = story_graph_authoritative_id(book)
+    return result
+
+
+@app.post("/api/v1/books/{book_id}/canonical-imports")
+async def propose_canonical_import(book_id: str, request: Request):
+    """Persist an import manifest as proposals; no Canon mutation occurs here."""
+    book = resolve_story_graph_book(book_id)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "JSON object is required")
+    manifest = body.get("manifest", body.get("items", []))
+    try:
+        result = get_canonical_import_service().propose(
+            str(book["project_id"]), manifest if isinstance(manifest, list) else [],
+            source_document_ids=body.get("sourceDocumentIds", []),
+            source_fingerprint=body.get("sourceFingerprint"),
+            idempotency_key=body.get("idempotencyKey"),
+            task_id=body.get("taskId"),
+        )
+    except CanonicalImportError as exc:
+        raise HTTPException(422, detail={"code": exc.code, "message": str(exc)}) from exc
+    result["bookId"] = book_id
+    result["authoritativeBookId"] = str(book["id"])
+    return result
+
+
+@app.get("/api/v1/books/{book_id}/canonical-imports")
+async def list_canonical_imports(book_id: str, limit: int = Query(50, ge=1, le=200)):
+    book = resolve_story_graph_book(book_id)
+    return {
+        "bookId": book_id,
+        "imports": get_canonical_import_service().list(str(book["project_id"]), limit=limit),
+    }
+
+
+@app.get("/api/v1/books/{book_id}/canonical-imports/{import_id}")
+async def get_canonical_import(book_id: str, import_id: str):
+    book = resolve_story_graph_book(book_id)
+    result = get_canonical_import_service().get(import_id)
+    if result is None or result.get("project_id") != book["project_id"]:
+        raise HTTPException(404, "canonical import not found")
+    return {"bookId": book_id, "canonicalImport": result}
+
+
+@app.post("/api/v1/books/{book_id}/canonical-imports/{import_id}/items/{item_id}/edit")
+async def edit_canonical_import_item(book_id: str, import_id: str, item_id: str, request: Request):
+    book = resolve_story_graph_book(book_id)
+    record = get_canonical_import_service().get(import_id)
+    if record is None or record.get("project_id") != book["project_id"]:
+        raise HTTPException(404, "canonical import not found")
+    body = await request.json()
+    raw_value = body.get("value") if isinstance(body, dict) and "value" in body else body
+    if not isinstance(raw_value, dict):
+        raise HTTPException(422, "canonical import item value must be an object")
+    value: dict[str, Any] = {str(key): item for key, item in raw_value.items()}
+    try:
+        return {"bookId": book_id, "canonicalImport": get_canonical_import_service().edit_item(import_id, item_id, value)}
+    except CanonicalImportError as exc:
+        raise HTTPException(422, detail={"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.post("/api/v1/books/{book_id}/canonical-imports/{import_id}/accept")
+async def accept_canonical_import(book_id: str, import_id: str, request: Request):
+    book = resolve_story_graph_book(book_id)
+    record = get_canonical_import_service().get(import_id)
+    if record is None or record.get("project_id") != book["project_id"]:
+        raise HTTPException(404, "canonical import not found")
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    try:
+        result = get_canonical_import_service().accept(
+            import_id,
+            item_ids=body.get("itemIds"),
+            actor_id=str(body.get("actorId") or "author"),
+        )
+    except CanonicalImportError as exc:
+        raise HTTPException(422, detail={"code": exc.code, "message": str(exc)}) from exc
+    return {"bookId": book_id, "canonicalImport": result}
 
 
 @app.get("/api/v1/books/{book_id}/story-graph/context/{chapter_id}")

@@ -1297,6 +1297,275 @@ def _apply_v22(conn: sqlite3.Connection) -> None:
     _execute_sql_script(conn, PHASE_22_COMMIT_REBASE_SQL)
 
 
+PHASE_23_NARRATIVE_RUNTIME_V2_SQL = """
+-- Durable GenerationAttempt records make provider calls recoverable at the
+-- boundary between the provider response and the following projection.
+CREATE TABLE IF NOT EXISTS generation_attempts (
+    id TEXT PRIMARY KEY,
+    generation_run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE RESTRICT,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    task_stage TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL,
+    provider_id TEXT,
+    model_id TEXT,
+    prompt_key TEXT,
+    prompt_version TEXT,
+    prompt_hash TEXT,
+    context_hash TEXT,
+    request_started_at TIMESTAMP,
+    provider_response_received_at TIMESTAMP,
+    response_hash TEXT,
+    response_artifact JSON,
+    usage JSON NOT NULL DEFAULT '{}',
+    latency_ms INTEGER,
+    status TEXT NOT NULL DEFAULT 'prepared',
+    error_code TEXT,
+    error_detail TEXT,
+    consumed_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK(status IN ('prepared', 'requesting', 'response_received', 'persisted',
+                     'consumed', 'failed', 'abandoned'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_generation_attempts_task
+    ON generation_attempts(task_id, task_stage, created_at);
+CREATE INDEX IF NOT EXISTS idx_generation_attempts_request_hash
+    ON generation_attempts(request_hash, status);
+
+CREATE TABLE IF NOT EXISTS canonical_imports (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    source_document_ids JSON NOT NULL DEFAULT '[]',
+    source_fingerprint TEXT NOT NULL,
+    manifest JSON NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'proposed',
+    version INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    accepted_event_id TEXT,
+    task_id TEXT,
+    report JSON NOT NULL DEFAULT '{}',
+    error_code TEXT,
+    error_detail TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK(status IN ('proposed', 'partially_accepted', 'accepted', 'rejected', 'failed'))
+);
+
+CREATE TABLE IF NOT EXISTS canonical_import_items (
+    id TEXT PRIMARY KEY,
+    import_id TEXT NOT NULL REFERENCES canonical_imports(id) ON DELETE CASCADE,
+    item_type TEXT NOT NULL,
+    source_document_id TEXT,
+    source_start INTEGER NOT NULL DEFAULT 0,
+    source_end INTEGER NOT NULL DEFAULT 0,
+    chapter_number INTEGER,
+    proposed_value JSON NOT NULL DEFAULT '{}',
+    edited_value JSON,
+    confidence REAL NOT NULL DEFAULT 0.0,
+    conflict JSON NOT NULL DEFAULT '{}',
+    provenance JSON NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'proposed',
+    accepted_event_id TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK(status IN ('proposed', 'accepted', 'edited', 'rejected'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_canonical_import_items_import
+    ON canonical_import_items(import_id, status, source_start, id);
+CREATE INDEX IF NOT EXISTS idx_canonical_imports_project
+    ON canonical_imports(project_id, created_at DESC);
+"""
+
+
+def _apply_v23(conn: sqlite3.Connection) -> None:
+    """Upgrade the closure ledger and add durable runtime/import boundaries.
+
+    SQLite cannot drop a UNIQUE constraint in place.  The event and its two
+    event-owned projections are therefore rebuilt in one migration transaction;
+    all rows and their identifiers are copied before the v2 shape is exposed.
+    """
+    conn.execute("DROP TRIGGER IF EXISTS narrative_events_immutable_update")
+    conn.execute("DROP TRIGGER IF EXISTS narrative_events_immutable_delete")
+    conn.execute("CREATE TEMP TABLE _v23_events AS SELECT * FROM narrative_events")
+    conn.execute("CREATE TEMP TABLE _v23_projection_ledger AS SELECT * FROM projection_ledger")
+    conn.execute("CREATE TEMP TABLE _v23_narrative_memory AS SELECT * FROM narrative_memory")
+    conn.execute("DROP TABLE projection_ledger")
+    conn.execute("DROP TABLE narrative_memory")
+    conn.execute("DROP TABLE narrative_events")
+
+    _execute_sql_script(conn,
+        """
+        CREATE TABLE narrative_events (
+            id TEXT PRIMARY KEY,
+            book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL,
+            -- commit_id is retained for compatibility with the first closure
+            -- release, because lifecycle events may legitimately leave it NULL.
+            commit_id TEXT REFERENCES story_commits(id) ON DELETE RESTRICT,
+            chapter_id TEXT REFERENCES chapters(id) ON DELETE RESTRICT,
+            chapter_version_id TEXT,
+            review_id TEXT,
+            event_type TEXT NOT NULL,
+            payload JSON NOT NULL,
+            event_hash TEXT NOT NULL,
+            source_event_id TEXT,
+            source_commit_id TEXT REFERENCES story_commits(id) ON DELETE RESTRICT,
+            aggregate_type TEXT NOT NULL DEFAULT 'chapter',
+            aggregate_id TEXT,
+            reason TEXT NOT NULL DEFAULT '',
+            actor_type TEXT NOT NULL DEFAULT 'system',
+            actor_id TEXT,
+            actor_scope TEXT NOT NULL DEFAULT 'book',
+            source_fingerprint TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(book_id, sequence),
+            UNIQUE(event_hash)
+        );
+
+        CREATE INDEX idx_narrative_events_book_sequence
+            ON narrative_events(book_id, sequence);
+        CREATE INDEX idx_narrative_events_commit
+            ON narrative_events(commit_id);
+        CREATE INDEX idx_narrative_events_source_commit
+            ON narrative_events(book_id, source_commit_id, sequence);
+        CREATE INDEX idx_narrative_events_aggregate
+            ON narrative_events(book_id, aggregate_type, aggregate_id, sequence);
+
+        CREATE TABLE projection_ledger (
+            id TEXT PRIMARY KEY,
+            book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            source_event_id TEXT NOT NULL REFERENCES narrative_events(id) ON DELETE RESTRICT,
+            projection_type TEXT NOT NULL,
+            source_fingerprint TEXT NOT NULL,
+            projection_version TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            error_code TEXT,
+            error_detail TEXT,
+            applied_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(book_id, source_event_id, projection_type),
+            CHECK(status IN ('pending', 'applied', 'failed', 'stale', 'degraded'))
+        );
+
+        CREATE INDEX idx_projection_ledger_book_status
+            ON projection_ledger(book_id, projection_type, status);
+
+        CREATE TABLE narrative_memory (
+            id TEXT PRIMARY KEY,
+            book_id TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            source_event_id TEXT NOT NULL REFERENCES narrative_events(id) ON DELETE RESTRICT,
+            source_commit_id TEXT NOT NULL REFERENCES story_commits(id) ON DELETE RESTRICT,
+            source_version_id TEXT,
+            category TEXT NOT NULL,
+            memory_type TEXT NOT NULL DEFAULT 'episodic',
+            compression_version TEXT NOT NULL DEFAULT 'none',
+            compiler_version TEXT NOT NULL DEFAULT 'memory-compiler-v1',
+            generation_run_id TEXT,
+            scope TEXT NOT NULL DEFAULT 'story',
+            content TEXT NOT NULL,
+            entity_refs JSON NOT NULL DEFAULT '[]',
+            importance REAL NOT NULL DEFAULT 0.5,
+            valid_from_chapter INTEGER,
+            valid_to_chapter INTEGER,
+            status TEXT NOT NULL DEFAULT 'active',
+            stale_reason TEXT,
+            provenance JSON NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(source_event_id, category, content),
+            CHECK(status IN ('active', 'invalidated', 'superseded'))
+        );
+
+        CREATE INDEX idx_narrative_memory_active
+            ON narrative_memory(book_id, status, category, valid_from_chapter);
+        CREATE INDEX idx_narrative_memory_compiler
+            ON narrative_memory(book_id, compiler_version, status);
+
+        """
+    )
+    conn.execute(
+        """CREATE TRIGGER narrative_events_immutable_update
+           BEFORE UPDATE ON narrative_events
+           BEGIN SELECT RAISE(ABORT, 'narrative events are immutable'); END"""
+    )
+    conn.execute(
+        """CREATE TRIGGER narrative_events_immutable_delete
+           BEFORE DELETE ON narrative_events
+           BEGIN SELECT RAISE(ABORT, 'narrative events are immutable'); END"""
+    )
+    conn.execute(
+        """INSERT INTO narrative_events(
+               id, book_id, sequence, commit_id, chapter_id, chapter_version_id,
+               review_id, event_type, payload, event_hash, source_commit_id,
+               aggregate_type, aggregate_id, source_fingerprint, created_at
+           )
+           SELECT e.id, e.book_id, e.sequence, e.commit_id, e.chapter_id,
+                  e.chapter_version_id, e.review_id, e.event_type, e.payload,
+                  e.event_hash, e.commit_id, 'chapter', e.chapter_id,
+                  COALESCE(sc.source_fingerprint, ''), e.created_at
+           FROM _v23_events e LEFT JOIN story_commits sc ON sc.id=e.commit_id"""
+    )
+    conn.execute(
+        """INSERT INTO projection_ledger(
+               id, book_id, source_event_id, projection_type, source_fingerprint,
+               projection_version, status, error_code, error_detail, applied_at,
+               created_at, updated_at
+           ) SELECT id, book_id, source_event_id, projection_type,
+                    source_fingerprint, projection_version, status, error_code,
+                    error_detail, applied_at, created_at, updated_at
+             FROM _v23_projection_ledger"""
+    )
+    conn.execute(
+        """INSERT INTO narrative_memory(
+               id, book_id, source_event_id, source_commit_id, source_version_id,
+               category, scope, content, entity_refs, importance, valid_from_chapter,
+               valid_to_chapter, status, provenance, created_at, updated_at
+           ) SELECT id, book_id, source_event_id, source_commit_id, source_version_id,
+                    category, scope, content, entity_refs, importance, valid_from_chapter,
+                    valid_to_chapter, status, provenance, created_at, updated_at
+             FROM _v23_narrative_memory"""
+    )
+    conn.execute("DROP TABLE _v23_events")
+    conn.execute("DROP TABLE _v23_projection_ledger")
+    conn.execute("DROP TABLE _v23_narrative_memory")
+
+    _add_column_if_missing(conn, "reviews", "idempotency_key TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_idempotency_key "
+        "ON reviews(idempotency_key) WHERE idempotency_key IS NOT NULL"
+    )
+    for table, definition in (
+        ("character_states", "source_event_id TEXT"),
+        ("character_states", "source_commit_id TEXT"),
+        ("character_states", "projection_version TEXT"),
+        ("faction_states", "source_event_id TEXT"),
+        ("faction_states", "source_commit_id TEXT"),
+        ("faction_states", "projection_version TEXT"),
+        ("location_states", "source_event_id TEXT"),
+        ("location_states", "source_commit_id TEXT"),
+        ("location_states", "projection_version TEXT"),
+        ("relationships", "source_event_id TEXT"),
+        ("relationships", "source_commit_id TEXT"),
+        ("relationships", "projection_version TEXT"),
+        ("timeline_events", "source_event_id TEXT"),
+        ("timeline_events", "source_commit_id TEXT"),
+        ("timeline_events", "projection_version TEXT"),
+        ("foreshadows", "source_event_id TEXT"),
+        ("foreshadows", "source_commit_id TEXT"),
+        ("foreshadows", "projection_version TEXT"),
+        ("hooks", "source_event_id TEXT"),
+        ("hooks", "source_commit_id TEXT"),
+        ("hooks", "projection_version TEXT"),
+    ):
+        _add_column_if_missing(conn, table, definition)
+    _execute_sql_script(conn, PHASE_23_NARRATIVE_RUNTIME_V2_SQL)
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -1331,6 +1600,11 @@ _MIGRATIONS = (
     _Migration(21, "phase_21_narrative_os_closure", _apply_v21, PHASE_21_NARRATIVE_OS_CLOSURE_SQL),
     _Migration(22, "phase_22_commit_rebase", _apply_v22, PHASE_22_COMMIT_REBASE_SQL),
 )
+
+_RUNTIME_EXTENSION_NAME = "narrative_runtime_v2"
+_RUNTIME_EXTENSION_CHECKSUM = hashlib.sha256(
+    f"23:{_RUNTIME_EXTENSION_NAME}:{PHASE_23_NARRATIVE_RUNTIME_V2_SQL}".encode("utf-8")
+).hexdigest()
 
 
 def generate_id() -> str:
@@ -1376,6 +1650,14 @@ class Database:
                     applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )"""
             )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS schema_extensions (
+                       name TEXT PRIMARY KEY,
+                       version INTEGER NOT NULL,
+                       checksum TEXT NOT NULL,
+                       applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                   )"""
+            )
             self._bootstrap_legacy_migration(conn)
             for migration in _MIGRATIONS:
                 applied = conn.execute(
@@ -1395,6 +1677,33 @@ class Database:
                     conn.execute(
                         "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                         (migration.version, migration.checksum),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            extension = conn.execute(
+                "SELECT checksum FROM schema_extensions WHERE name=?",
+                (_RUNTIME_EXTENSION_NAME,),
+            ).fetchone()
+            if extension and extension["checksum"] != _RUNTIME_EXTENSION_CHECKSUM:
+                raise MigrationError("narrative runtime extension checksum mismatch")
+            if extension is None:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    # A database upgraded by the previous development build
+                    # may already contain v23 tables but not the extension
+                    # marker.  Do not rebuild its immutable event table twice.
+                    existing_tables = {
+                        row["name"] for row in conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ).fetchall()
+                    }
+                    if not {"generation_attempts", "canonical_imports", "canonical_import_items"}.issubset(existing_tables):
+                        _apply_v23(conn)
+                    conn.execute(
+                        "INSERT INTO schema_extensions(name, version, checksum) VALUES (?, 23, ?)",
+                        (_RUNTIME_EXTENSION_NAME, _RUNTIME_EXTENSION_CHECKSUM),
                     )
                     conn.commit()
                 except Exception:
@@ -1427,7 +1736,13 @@ class Database:
                 applied = {
                     int(row[0]) for row in source.execute("SELECT version FROM schema_migrations")
                 }
-            if all(migration.version in applied for migration in _MIGRATIONS):
+            extension_ready = False
+            if "schema_extensions" in tables:
+                extension_ready = source.execute(
+                    "SELECT 1 FROM schema_extensions WHERE name=? AND checksum=?",
+                    (_RUNTIME_EXTENSION_NAME, _RUNTIME_EXTENSION_CHECKSUM),
+                ).fetchone() is not None
+            if all(migration.version in applied for migration in _MIGRATIONS) and extension_ready:
                 return
             source_integrity = source.execute("PRAGMA integrity_check").fetchone()[0]
             if source_integrity != "ok":

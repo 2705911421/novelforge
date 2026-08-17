@@ -223,6 +223,7 @@ class DurableHybridRetriever:
     """
 
     MAX_TOP_K = 50
+    PROJECTION_VERSION = "durable-rag-v2"
 
     def __init__(
         self,
@@ -285,7 +286,7 @@ class DurableHybridRetriever:
             "sourceVersion": version,
             "contentChecksum": checksum,
             "modelKey": self.model_key,
-            "projectionVersion": "durable-rag-v1",
+            "projectionVersion": self.PROJECTION_VERSION,
         })
         now = __import__("datetime").datetime.now().isoformat()
         with self.database.transaction() as conn:
@@ -294,7 +295,7 @@ class DurableHybridRetriever:
                        id, book_id, source_type, source_id, source_version, content,
                        content_checksum, model_key, embedding, dimension, status,
                        projection_version, provenance, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'durable-rag-v1', ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(book_id, source_type, source_id, source_version, model_key)
                    DO UPDATE SET content=excluded.content,
                        content_checksum=excluded.content_checksum, embedding=excluded.embedding,
@@ -305,6 +306,7 @@ class DurableHybridRetriever:
                     record_id, book_id, source_type, source_id, version, content, checksum,
                     self.model_key, json.dumps(embedding) if embedding is not None else None,
                     len(embedding) if embedding is not None else None, status,
+                    self.PROJECTION_VERSION,
                     json.dumps(metadata, ensure_ascii=False, sort_keys=True), now, now,
                 ),
             )
@@ -319,6 +321,7 @@ class DurableHybridRetriever:
             "content_checksum": checksum,
             "model_key": self.model_key,
             "provenance": metadata,
+            "projection_version": self.PROJECTION_VERSION,
         }
         if error_code:
             result["error_code"] = error_code
@@ -346,6 +349,74 @@ class DurableHybridRetriever:
             else:
                 failed += 1
         return {"book_id": book_id, "source_count": len(rows), "ready": ready, "failed": failed}
+
+    def sync_incremental(self, book_id: str) -> dict[str, Any]:
+        """Synchronize only new or changed active memory rows.
+
+        Full rebuild remains an explicit repair operation.  Normal writing
+        queries use this seam so the growing novel does not re-embed history on
+        every chapter.
+        """
+        rows = self.database.fetchall(
+            """SELECT id, source_version_id, content, provenance
+               FROM narrative_memory WHERE book_id=? AND status='active' ORDER BY id""",
+            (book_id,),
+        )
+        changed = 0
+        ready = 0
+        degraded = 0
+        active_keys: set[tuple[str, str, str]] = set()
+        for row in rows:
+            provenance = self._json_object(row.get("provenance"))
+            version = str(row.get("source_version_id") or provenance.get("eventId") or "unknown")
+            checksum = hashlib.sha256(row["content"].encode("utf-8")).hexdigest()
+            active_keys.add(("narrative_memory", row["id"], version))
+            existing = self.database.fetchone(
+                """SELECT content_checksum, status FROM embedding_projections
+                   WHERE book_id=? AND source_type='narrative_memory' AND source_id=?
+                     AND source_version=? AND model_key=?""",
+                (book_id, row["id"], version, self.model_key),
+            )
+            if existing and existing["content_checksum"] == checksum and existing["status"] in {"ready", "degraded"}:
+                if existing["status"] == "ready":
+                    ready += 1
+                else:
+                    degraded += 1
+                continue
+            changed += 1
+            result = self.upsert(
+                book_id, "narrative_memory", row["id"], version, row["content"], provenance
+            )
+            if result["status"] == "ready":
+                ready += 1
+            else:
+                degraded += 1
+        with self.database.transaction() as conn:
+            stale_rows = conn.execute(
+                """SELECT source_id, source_version FROM embedding_projections
+                   WHERE book_id=? AND source_type='narrative_memory' AND model_key=?
+                     AND status IN ('ready', 'degraded')""",
+                (book_id, self.model_key),
+            ).fetchall()
+            for stale in stale_rows:
+                if ("narrative_memory", stale["source_id"], stale["source_version"]) not in active_keys:
+                    conn.execute(
+                        """UPDATE embedding_projections SET status='stale',
+                           provenance=json_set(COALESCE(provenance, '{}'), '$.staleReason', 'memory_not_active'),
+                           updated_at=CURRENT_TIMESTAMP
+                           WHERE book_id=? AND source_type='narrative_memory' AND source_id=?
+                             AND source_version=? AND model_key=?""",
+                        (book_id, stale["source_id"], stale["source_version"], self.model_key),
+                    )
+        return {
+            "book_id": book_id,
+            "source_count": len(rows),
+            "changed": changed,
+            "ready": ready,
+            "degraded": degraded,
+            "strategy": "incremental",
+            "projection_version": self.PROJECTION_VERSION,
+        }
 
     def delete(
         self,
@@ -377,7 +448,7 @@ class DurableHybridRetriever:
             raise RAGQueryError("TOP_K_INVALID", f"top_k must be between 1 and {self.MAX_TOP_K}")
         rows = self.database.fetchall(
             """SELECT id, source_type, source_id, source_version, content, content_checksum,
-                      embedding, dimension, status, provenance
+                      embedding, dimension, status, projection_version, provenance
                FROM embedding_projections
                WHERE book_id=? AND model_key=? AND status IN ('ready', 'degraded')
                ORDER BY id""",
@@ -401,6 +472,16 @@ class DurableHybridRetriever:
                     if not row.get("embedding"):
                         continue
                     vector = json.loads(row["embedding"])
+                    if row.get("dimension") and int(row["dimension"]) != len(query_vector):
+                        with self.database.transaction() as conn:
+                            conn.execute(
+                                """UPDATE embedding_projections SET status='stale',
+                                   provenance=json_set(COALESCE(provenance, '{}'), '$.staleReason', 'dimension_mismatch'),
+                                   updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                                (row["id"],),
+                            )
+                        row["status"] = "stale"
+                        continue
                     score = self._cosine(query_vector, [float(value) for value in vector])
                     if score <= 0:
                         continue
@@ -427,6 +508,8 @@ class DurableHybridRetriever:
             "error_detail": vector_error,
             "resultCount": len(ordered),
             "results": [self._result_dict(item, by_id[item.id]) for item in ordered],
+            "projection_version": self.PROJECTION_VERSION,
+            "retrieval_strategy": "hybrid" if vector_used else "bm25_fallback",
         }
 
     @staticmethod
@@ -459,6 +542,8 @@ class DurableHybridRetriever:
             "source_version": row["source_version"],
             "content_checksum": row["content_checksum"],
             "status": row["status"],
+            "projection_version": row.get("projection_version") or cls.PROJECTION_VERSION,
+            "retrieval_strategy": "hybrid" if row.get("embedding") else "bm25_fallback",
             "provenance": cls._json_object(row.get("provenance")),
         }
 
@@ -474,6 +559,8 @@ class DurableHybridRetriever:
             "score": round(float(result.score), 8),
             "content_checksum": row["content_checksum"],
             "status": row["status"],
+            "projection_version": row.get("projection_version") or DurableHybridRetriever.PROJECTION_VERSION,
+            "retrieval_strategy": metadata.get("retrieval_strategy", "bm25_fallback"),
             "provenance": metadata.get("provenance", {}),
             "metadata": metadata,
         }
