@@ -331,7 +331,8 @@ def test_context_manifest_records_style_constraints_and_memory_boundary(pipeline
     assert "Author Constraints" in "\n".join(built["context_parts"])
     assert manifest["availability"]["style"]["status"] == "included"
     assert manifest["availability"]["constraints"]["status"] == "included"
-    assert manifest["availability"]["memory"]["status"] == "not_included"
+    assert manifest["availability"]["memory"]["status"] == "not_available"
+    assert manifest["availability"]["memory"]["owner"] == "story_repository.narrative_memory"
     assert "legacy file-backed MemorySystem" in manifest["availability"]["memory"]["reason"]
 
 

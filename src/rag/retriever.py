@@ -7,6 +7,7 @@ import math
 import re
 import logging
 import json
+import hashlib
 from typing import Any
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
@@ -210,6 +211,272 @@ class PersistentRAGRetriever:
             raise RAGQueryError("TOP_K_INVALID", f"top_k must be between 1 and {self.MAX_TOP_K}")
         if doc_type is not None and doc_type not in self.VALID_TYPES:
             raise RAGQueryError("DOCUMENT_TYPE_INVALID", "unsupported document type")
+
+
+class DurableHybridRetriever:
+    """SQLite-backed BM25/vector Adapter for rebuildable narrative sources.
+
+    ``VectorIndex`` remains useful for isolated legacy callers, but it is an
+    in-process implementation.  This seam persists the embedding payload and
+    its provenance, then reconstructs BM25/vector search from SQLite on every
+    new instance.  The Canon never depends on this read model being available.
+    """
+
+    MAX_TOP_K = 50
+
+    def __init__(
+        self,
+        database: Any,
+        *,
+        model_key: str,
+        embedder: Any = None,
+        bm25_weight: float = 0.5,
+        vector_weight: float = 0.5,
+    ) -> None:
+        if not isinstance(model_key, str) or not model_key.strip():
+            raise ValueError("model_key is required")
+        if bm25_weight < 0 or vector_weight < 0 or bm25_weight + vector_weight <= 0:
+            raise ValueError("retrieval weights must be non-negative and not both zero")
+        self.database = database
+        self.model_key = model_key.strip()
+        self.embedder = embedder
+        total = bm25_weight + vector_weight
+        self.bm25_weight = bm25_weight / total
+        self.vector_weight = vector_weight / total
+
+    def upsert(
+        self,
+        book_id: str,
+        source_type: str,
+        source_id: str,
+        source_version: str,
+        content: str,
+        provenance: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        if not all(isinstance(value, str) and value.strip() for value in (book_id, source_type, source_id, content)):
+            raise ValueError("book_id, source_type, source_id and content are required")
+        version = str(source_version)
+        checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        embedding: Optional[list[float]] = None
+        status = "degraded"
+        error_code: Optional[str] = None
+        error_detail: Optional[str] = None
+        if self.embedder is not None:
+            try:
+                candidate = self.embedder(content)
+                if isinstance(candidate, (str, bytes)):
+                    raise ValueError("embedding must be a numeric sequence")
+                embedding = [float(value) for value in candidate]
+                if not embedding or any(not math.isfinite(value) for value in embedding):
+                    raise ValueError("embedding must contain finite values")
+                status = "ready"
+            except Exception as exc:
+                status = "failed"
+                error_code = "EMBEDDING_FAILED"
+                error_detail = str(exc)
+
+        record_id = hashlib.sha256(
+            f"embedding:{book_id}:{source_type}:{source_id}:{version}:{self.model_key}".encode("utf-8")
+        ).hexdigest()[:32]
+        metadata = dict(provenance or {})
+        metadata.update({
+            "sourceType": source_type,
+            "sourceId": source_id,
+            "sourceVersion": version,
+            "contentChecksum": checksum,
+            "modelKey": self.model_key,
+            "projectionVersion": "durable-rag-v1",
+        })
+        now = __import__("datetime").datetime.now().isoformat()
+        with self.database.transaction() as conn:
+            conn.execute(
+                """INSERT INTO embedding_projections(
+                       id, book_id, source_type, source_id, source_version, content,
+                       content_checksum, model_key, embedding, dimension, status,
+                       projection_version, provenance, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'durable-rag-v1', ?, ?, ?)
+                   ON CONFLICT(book_id, source_type, source_id, source_version, model_key)
+                   DO UPDATE SET content=excluded.content,
+                       content_checksum=excluded.content_checksum, embedding=excluded.embedding,
+                       dimension=excluded.dimension, status=excluded.status,
+                       projection_version=excluded.projection_version, provenance=excluded.provenance,
+                       updated_at=excluded.updated_at""",
+                (
+                    record_id, book_id, source_type, source_id, version, content, checksum,
+                    self.model_key, json.dumps(embedding) if embedding is not None else None,
+                    len(embedding) if embedding is not None else None, status,
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True), now, now,
+                ),
+            )
+        result = {
+            "id": record_id,
+            "book_id": book_id,
+            "source_type": source_type,
+            "source_id": source_id,
+            "source_version": version,
+            "status": status,
+            "embedding_available": status == "ready",
+            "content_checksum": checksum,
+            "model_key": self.model_key,
+            "provenance": metadata,
+        }
+        if error_code:
+            result["error_code"] = error_code
+            result["error_detail"] = error_detail
+        return result
+
+    def rebuild_from_memory(self, book_id: str) -> dict[str, Any]:
+        """Materialize active canonical Narrative Memory into durable vectors."""
+        rows = self.database.fetchall(
+            """SELECT id, source_version_id, content, provenance
+               FROM narrative_memory WHERE book_id=? AND status='active' ORDER BY id""",
+            (book_id,),
+        )
+        ready = 0
+        failed = 0
+        for row in rows:
+            provenance = self._json_object(row.get("provenance"))
+            result = self.upsert(
+                book_id, "narrative_memory", row["id"],
+                str(row.get("source_version_id") or provenance.get("eventId") or "unknown"),
+                row["content"], provenance,
+            )
+            if result["status"] == "ready":
+                ready += 1
+            else:
+                failed += 1
+        return {"book_id": book_id, "source_count": len(rows), "ready": ready, "failed": failed}
+
+    def delete(
+        self,
+        book_id: str,
+        source_type: str,
+        source_id: str,
+        source_version: Optional[str] = None,
+    ) -> int:
+        with self.database.transaction() as conn:
+            if source_version is None:
+                cursor = conn.execute(
+                    "DELETE FROM embedding_projections WHERE book_id=? AND source_type=? AND source_id=? AND model_key=?",
+                    (book_id, source_type, source_id, self.model_key),
+                )
+            else:
+                cursor = conn.execute(
+                    """DELETE FROM embedding_projections
+                       WHERE book_id=? AND source_type=? AND source_id=? AND source_version=? AND model_key=?""",
+                    (book_id, source_type, source_id, str(source_version), self.model_key),
+                )
+        return cursor.rowcount
+
+    def query(self, book_id: str, query: str, *, top_k: int = 5) -> dict[str, Any]:
+        if not isinstance(book_id, str) or not book_id.strip():
+            raise RAGQueryError("BOOK_INVALID", "book_id is required")
+        if not isinstance(query, str) or not query.strip():
+            raise RAGQueryError("QUERY_EMPTY", "query must not be blank")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= self.MAX_TOP_K:
+            raise RAGQueryError("TOP_K_INVALID", f"top_k must be between 1 and {self.MAX_TOP_K}")
+        rows = self.database.fetchall(
+            """SELECT id, source_type, source_id, source_version, content, content_checksum,
+                      embedding, dimension, status, provenance
+               FROM embedding_projections
+               WHERE book_id=? AND model_key=? AND status IN ('ready', 'degraded')
+               ORDER BY id""",
+            (book_id, self.model_key),
+        )
+        bm25 = BM25Index()
+        by_id = {row["id"]: row for row in rows}
+        for row in rows:
+            bm25.add_document(row["id"], row["content"], self._metadata(row))
+        results: dict[str, SearchResult] = {}
+        for result in bm25.search(query.strip(), top_k * 2):
+            result.score *= self.bm25_weight
+            results[result.id] = result
+
+        vector_used = False
+        vector_error: Optional[str] = None
+        if self.embedder is not None and any(row.get("embedding") for row in rows):
+            try:
+                query_vector = [float(value) for value in self.embedder(query)]
+                for row in rows:
+                    if not row.get("embedding"):
+                        continue
+                    vector = json.loads(row["embedding"])
+                    score = self._cosine(query_vector, [float(value) for value in vector])
+                    if score <= 0:
+                        continue
+                    vector_used = True
+                    candidate = SearchResult(
+                        id=row["id"], content=row["content"], score=score * self.vector_weight,
+                        source=row["source_type"], metadata=self._metadata(row),
+                    )
+                    if row["id"] in results:
+                        results[row["id"]].score += candidate.score
+                    else:
+                        results[row["id"]] = candidate
+            except Exception as exc:
+                vector_error = str(exc)
+
+        ordered = sorted(results.values(), key=lambda item: (-item.score, item.id))[:top_k]
+        return {
+            "book_id": book_id,
+            "query": query.strip(),
+            "strategy": "hybrid" if vector_used else "bm25_fallback",
+            "degraded": not vector_used,
+            "embedding_available": vector_used,
+            "error_code": "EMBEDDING_QUERY_FAILED" if vector_error else None,
+            "error_detail": vector_error,
+            "resultCount": len(ordered),
+            "results": [self._result_dict(item, by_id[item.id]) for item in ordered],
+        }
+
+    @staticmethod
+    def _cosine(left: list[float], right: list[float]) -> float:
+        if len(left) != len(right):
+            raise ValueError("embedding dimensions do not match")
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        if left_norm == 0 or right_norm == 0:
+            return 0.0
+        return sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
+
+    @staticmethod
+    def _json_object(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value:
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    @classmethod
+    def _metadata(cls, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "source_type": row["source_type"],
+            "source_id": row["source_id"],
+            "source_version": row["source_version"],
+            "content_checksum": row["content_checksum"],
+            "status": row["status"],
+            "provenance": cls._json_object(row.get("provenance")),
+        }
+
+    @staticmethod
+    def _result_dict(result: SearchResult, row: dict[str, Any]) -> dict[str, Any]:
+        metadata = result.metadata or {}
+        return {
+            "id": result.id,
+            "source_type": row["source_type"],
+            "source_id": row["source_id"],
+            "source_version": row["source_version"],
+            "content": result.content,
+            "score": round(float(result.score), 8),
+            "content_checksum": row["content_checksum"],
+            "status": row["status"],
+            "provenance": metadata.get("provenance", {}),
+            "metadata": metadata,
+        }
 
 
 class BM25Index:

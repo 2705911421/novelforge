@@ -12,7 +12,9 @@ from __future__ import annotations
 import logging
 import shutil
 import sqlite3
+import hashlib
 import threading as _threading
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -37,6 +39,47 @@ class BackupManager:
         self.workspace_root = workspace_root or Path.cwd()
         self.backup_dir = self.workspace_root / ".novelforge-backups"
         self.backup_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _hash_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _checkpoint_or_raise(db_path: Path) -> None:
+        """Quiesce SQLite WAL state and fail closed when it cannot be done."""
+        try:
+            with closing(sqlite3.connect(str(db_path), timeout=5)) as connection:
+                connection.execute("PRAGMA busy_timeout=5000")
+                result = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if result and int(result[0]) != 0:
+                    raise RuntimeError(f"WAL checkpoint returned busy state: {tuple(result)}")
+        except Exception as exc:
+            raise RuntimeError(f"WAL checkpoint failed: {exc}") from exc
+
+    @staticmethod
+    def _remove_sidecar_or_raise(path: Path, *, allow_locked_shm: bool = False) -> None:
+        if not path.exists():
+            return
+        try:
+            path.unlink()
+        except Exception as exc:
+            # A separate SQLite reader may keep an already-truncated WAL file
+            # open on Windows. An empty sidecar contains no frames that can
+            # override the restored main file, so retain it only with this
+            # direct size proof; any non-empty or unverifiable sidecar fails.
+            if isinstance(exc, PermissionError) and path.exists() and path.stat().st_size == 0:
+                return
+            if isinstance(exc, PermissionError) and allow_locked_shm and path.name.endswith("-shm"):
+                wal_path = Path(str(path)[:-4] + "-wal")
+                if not wal_path.exists() or wal_path.stat().st_size == 0:
+                    return
+            raise RuntimeError(f"cannot remove SQLite sidecar {path}: {exc}") from exc
+        if path.exists():
+            raise RuntimeError(f"SQLite sidecar remains after removal: {path}")
 
     def create_backup(
         self,
@@ -69,8 +112,8 @@ class BackupManager:
         try:
             # 使用 SQLite backup API 获取一致性快照
             # 注意：需要先关闭连接，否则文件可能被锁定
-            with sqlite3.connect(str(self.db.db_path)) as source:
-                with sqlite3.connect(str(backup_path)) as dest:
+            with closing(sqlite3.connect(str(self.db.db_path))) as source:
+                with closing(sqlite3.connect(str(backup_path))) as dest:
                     source.backup(dest)
 
             # 验证备份完整性
@@ -267,39 +310,33 @@ class BackupManager:
             # If WAL/SHM sidecars survive the copy, SQLite will replay
             # committed WAL frames over the restored snapshot, silently
             # reverting the restore.
-            try:
-                with sqlite3.connect(str(db_path), timeout=5) as tmp_conn:
-                    tmp_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception:
-                pass
+            self._checkpoint_or_raise(db_path)
 
             # Remove WAL/SHM sidecars so the restored snapshot starts clean.
             wal_path = db_path.with_suffix(db_path.suffix + "-wal")
             shm_path = db_path.with_suffix(db_path.suffix + "-shm")
-            for sidecar in (wal_path, shm_path):
-                try:
-                    sidecar.unlink(missing_ok=True)
-                except PermissionError:
-                    pass
+            self._remove_sidecar_or_raise(wal_path)
+            self._remove_sidecar_or_raise(shm_path, allow_locked_shm=True)
 
             shutil.copy2(str(backup_path), str(db_path))
+            if self._hash_file(db_path) != self._hash_file(backup_path):
+                raise RuntimeError("restored database hash does not match the selected backup")
 
             # Remove any WAL/SHM that came with the backup or lingered.
-            for sidecar in (wal_path, shm_path):
-                try:
-                    sidecar.unlink(missing_ok=True)
-                except PermissionError:
-                    pass
+            self._remove_sidecar_or_raise(wal_path)
+            self._remove_sidecar_or_raise(shm_path, allow_locked_shm=True)
 
             # 重新初始化数据库连接
             from .database import init_db
             self.db = init_db(str(db_path))
 
-            # Force DELETE journal mode to prevent WAL false-success on next open.
-            try:
-                self.db.execute("PRAGMA journal_mode=DELETE")
-            except Exception:
-                pass
+            # Confirm the rebound connection exposes a valid journal mode
+            # without swallowing an error. Database connections may switch
+            # back to WAL after this check; the boundary is a clean rebind.
+            with closing(sqlite3.connect(str(db_path), timeout=5)) as rebound:
+                journal_mode = str(rebound.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                if journal_mode not in {"wal", "delete", "truncate", "persist", "memory", "off"}:
+                    raise RuntimeError(f"unexpected rebound journal mode: {journal_mode}")
 
             # Verify post-restore integrity.
             integrity = self._check_integrity(db_path)
@@ -311,18 +348,38 @@ class BackupManager:
                 "id", "project_id", "backup_type", "file_path",
                 "size_bytes", "description", "created_at",
             ]
-            for row in catalog_rows:
-                try:
+            placeholders = ", ".join(["?"] * len(catalog_cols))
+            col_names = ", ".join(catalog_cols)
+            with self.db.transaction() as conn:
+                for row in catalog_rows:
                     vals = [row.get(c) for c in catalog_cols]
-                    placeholders = ", ".join(["?"] * len(catalog_cols))
-                    col_names = ", ".join(catalog_cols)
-                    self.db.execute(
+                    conn.execute(
                         f"INSERT OR IGNORE INTO backups({col_names}) VALUES ({placeholders})",
                         tuple(vals),
                     )
-                except Exception:
-                    # Non-fatal: catalog entry may already exist or schema mismatch.
-                    pass
+
+            # Rebind the authoritative repository and rebuild every derived
+            # projection. A restore is not successful if Canon is readable
+            # but Memory/Graph/StoryState remains missing or stale.
+            from .story_repository import StoryRepository
+            restored_book = self.db.fetchone(
+                "SELECT id FROM books WHERE project_id=? ORDER BY created_at LIMIT 1",
+                (backup["project_id"],),
+            )
+            projection_rebuild = {"status": "not_applicable", "project_id": backup["project_id"]}
+            canon_hash = None
+            if restored_book is not None:
+                projection_rebuild = StoryRepository(
+                    self.db, workspace_root=self.workspace_root
+                ).rebuild_all(restored_book["id"])
+                if projection_rebuild.get("status") != "rebuilt":
+                    raise RuntimeError(
+                        f"projection rebuild did not complete: {projection_rebuild.get('error')}"
+                    )
+                canon_hash = projection_rebuild.get("canon_hash")
+
+            self._checkpoint_or_raise(db_path)
+            rebound_hash = self._hash_file(db_path)
 
             return {
                 "success": True,
@@ -331,6 +388,10 @@ class BackupManager:
                 "pre_restore_backup_id": pre_restore_backup_id,
                 "restored_from": backup["created_at"],
                 "catalog_preserved": len(catalog_rows),
+                "projection_rebuild": projection_rebuild,
+                "canon_hash": canon_hash,
+                "restored_backup_sha256": self._hash_file(backup_path),
+                "rebound_database_sha256": rebound_hash,
                 "message": f"成功从备份 {backup_id} 恢复",
             }
 
@@ -447,7 +508,7 @@ class BackupManager:
             完整性检查结果 ("ok" 或错误信息)
         """
         try:
-            with sqlite3.connect(str(db_path)) as conn:
+            with closing(sqlite3.connect(str(db_path))) as conn:
                 result = conn.execute("PRAGMA integrity_check").fetchone()
                 status = result[0] if result else "unknown"
                 if status != "ok":

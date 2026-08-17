@@ -877,9 +877,6 @@ function renderBookBranch(book){
       '<button type="button" class="nav-extension-toggle '+(extensionsAreOpen?'is-open':'')+'" onclick="toggleBookExtensions(\''+escAttr(book.id)+'\')" aria-expanded="'+(extensionsAreOpen?'true':'false')+'"><span class="nav-extension-glyph" aria-hidden="true">+</span><span>规划与结构 / 创作与审查</span><span class="nav-extension-count">'+extensionItems.length+'</span><span class="nav-chevron '+(extensionsAreOpen?'is-open':'')+'" aria-hidden="true">›</span></button>'+
       (extensionsAreOpen?'<div class="nav-extension-list">'+groupHtml+'</div>':'')+'</div>':'')+
     '</div>';
-  // Dead code below removed (duplicate renderBookBranch implementation)
-    </div>`:''}
-  </div>`;
 }
 
 function renderNav(){
