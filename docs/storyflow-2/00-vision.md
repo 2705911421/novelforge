@@ -32,6 +32,8 @@ interventions are counterfactual evidence. They never alter Canon directly.
 - `src/storyflow/planning/`: author-gated adoption into PlanningNode.
 - `src/web/studio.py`: book-scoped snapshot/run/read/compare API.
 
-The product remains `PARTIAL`: provider-driven agents, task-worker execution,
-analyst/reporting, interaction, complete UI workspaces, and browser E2E are
-not yet evidence-backed.
+The product remains `PARTIAL`: real external-provider authorization, the full
+23-step browser gate, and production-scale provider scheduling are not yet
+evidence-backed. Durable task-worker Analyst/Chat/Survey paths, repeat-run
+Outcome Clusters, History archive actions, and the automated
+Simulation-to-StoryCommit proof are implemented and covered by focused tests.

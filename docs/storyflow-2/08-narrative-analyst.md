@@ -16,5 +16,7 @@ named tool, returns a grounded evidence chain, and the Studio
 relationships, interventions, world rules, and GenerationRun provenance. The
 causal API and `query_causal_trace` tool expose only that Sandbox evidence with
 `canonicalMutation=false`; missing evidence is reported as missing rather than
-invented. Provider-backed prose synthesis and richer causal graph inference
-remain `PARTIAL`.
+invented. Provider-backed Analyst/Character Chat/Survey requests run through
+durable capability tasks when an enabled route is available; richer prose
+synthesis, causal graph inference, and real external-provider acceptance remain
+`PARTIAL`.

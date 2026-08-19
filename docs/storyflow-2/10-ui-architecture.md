@@ -24,10 +24,9 @@ book-scoped API.
 
 Provider choices are run-scoped configuration, not browser-only settings. A
 queued round task carries the normalized `providerAssignment` and hashes it in
-the idempotency fingerprint. Agent Decision currently honors the selected
-provider through the existing Model Router; memory, analyst, and embedding
-provider capabilities are persisted as explicit partial metadata until their
-invocation seams are implemented.
+the idempotency fingerprint. Agent Decision, Memory, Embedding, Analyst, Chat,
+and Survey use the selected route through the existing Model Router or its
+durable capability task; unavailable external providers fail closed.
 
 The timeline also subscribes to the book-scoped `events/stream` endpoint. It
 replays from the highest rendered sequence, accepts only events for the active

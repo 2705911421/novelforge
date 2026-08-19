@@ -16,7 +16,8 @@ from src.core.project import ProjectManager
 from src.core.story_repository import StoryRepository
 from src.storyflow.planning import SimulationAdoptionService, SimulationChapterIntentService
 from src.storyflow.analysis import (BranchComparisonService, NarrativeAnalyst, SimulationAnalyst,
-                                    SimulationAnalystTools, SimulationCausalityService, SimulationGraphProjector)
+                                    SimulationAnalystTools, SimulationCausalityService, SimulationGraphProjector,
+                                    SimulationOutcomeClusterService)
 from src.storyflow.interaction import CharacterChatService, SimulationSurveyService
 from src.storyflow.agents import AgentProfileBuilder
 from src.storyflow.simulation import (
@@ -665,6 +666,105 @@ def test_analyst_and_character_chat_capabilities_route_with_local_evidence(tmp_p
     assert all(item["kwargs"]["context_manifest"]["canonicalMutation"] is False for item in manager.calls)
 
 
+def test_simulation_capability_tasks_persist_and_retry_without_duplicate_provider_calls(tmp_path):
+    database = Database(str(tmp_path / "simulation.db"))
+    database.execute("INSERT INTO projects(id, name) VALUES (?, ?)", ("project-1", "Test"))
+    database.execute("INSERT INTO books(id, project_id, title) VALUES (?, ?, ?)", ("book-1", "project-1", "Test"))
+    snapshot = WorldSnapshotRepository(database).create(SimulationWorldSnapshot(
+        book_id="book-1", project_id="project-1", base_canon_event_id="event-7", canon_hash="hash-a",
+        story_state_version=3,
+        world={"characters": {"a": {"name": "A", "alive": True, "location": "room"},
+                               "b": {"name": "B", "alive": True, "location": "tower"}}},
+    ))
+    simulations = SimulationRepository(database)
+    simulations.create_run(SimulationRun(
+        "capability-task-run", "book-1", snapshot.snapshot_id, "Capability tasks",
+        configuration={"providerAssignment": {
+            "analystProviderId": "analyst-provider",
+            "agentDecisionProviderId": "chat-provider",
+        }},
+    ))
+    runtime = TaskRuntime(database)
+    manager = _CapabilityManager()
+    handlers = SimulationTaskHandlers(database, model_manager=manager)
+    worker = PersistentTaskWorker(runtime, handlers.mapping(), retry_delay_seconds=0)
+
+    analyst_data = {
+        "runId": "capability-task-run", "question": "What events were recorded?",
+        "tool": "query_simulation_events", "arguments": {},
+    }
+    analyst_task = runtime.enqueue(
+        "simulation-analyst-query", project_id="project-1", book_id="book-1",
+        data=analyst_data, idempotency_key="capability-analyst-key",
+    )
+    first_analyst = __import__("asyncio").run(worker.execute_once("capability-worker"))
+    assert first_analyst["status"] == "completed"
+    assert first_analyst["result"]["report"]["kind"] == "analyst-query"
+    analyst_calls = len([item for item in manager.calls if item["kwargs"].get("prompt_key") == "simulation-analyst-answer"])
+    assert analyst_calls == 1
+    duplicate_analyst = runtime.enqueue(
+        "simulation-analyst-query", project_id="project-1", book_id="book-1",
+        data=analyst_data, idempotency_key="capability-analyst-key",
+    )
+    assert duplicate_analyst["id"] == analyst_task["id"]
+    assert duplicate_analyst["status"] == "completed"
+    assert __import__("asyncio").run(worker.execute_once("capability-worker")) is None
+    retried_analyst = handlers.execute_analyst_query(analyst_task)
+    assert retried_analyst["analysis"] == first_analyst["result"]["analysis"]
+    assert len([item for item in manager.calls if item["kwargs"].get("prompt_key") == "simulation-analyst-answer"]) == analyst_calls
+
+    chat_data = {"runId": "capability-task-run", "agentId": "a", "prompt": "where are you?"}
+    chat_task = runtime.enqueue(
+        "simulation-character-chat", project_id="project-1", book_id="book-1",
+        data=chat_data, idempotency_key="capability-chat-key",
+    )
+    first_chat = __import__("asyncio").run(worker.execute_once("capability-worker"))
+    assert first_chat["status"] == "completed"
+    chat_calls = len([item for item in manager.calls if item["kwargs"].get("prompt_key") == "simulation-character-chat"])
+    assert chat_calls == 1
+    retried_chat = handlers.execute_character_chat(chat_task)
+    assert retried_chat["interaction"] == first_chat["result"]["interaction"]
+    assert len([item for item in manager.calls if item["kwargs"].get("prompt_key") == "simulation-character-chat"]) == chat_calls
+
+    survey_data = {
+        "runId": "capability-task-run", "question": "Where are you?", "agentIds": ["a", "b"],
+    }
+    survey_task = runtime.enqueue(
+        "simulation-survey", project_id="project-1", book_id="book-1",
+        data=survey_data, idempotency_key="capability-survey-key",
+    )
+    first_survey = __import__("asyncio").run(worker.execute_once("capability-worker"))
+    assert first_survey["status"] == "completed"
+    assert first_survey["result"]["survey"]["status"] == "COMPLETED"
+    survey_calls = len([item for item in manager.calls if item["kwargs"].get("prompt_key") == "simulation-character-chat"])
+    assert survey_calls == chat_calls + 2
+    retried_survey = handlers.execute_survey(survey_task)
+    assert json.loads(json.dumps(retried_survey["survey"])) == first_survey["result"]["survey"]
+    assert len([item for item in manager.calls if item["kwargs"].get("prompt_key") == "simulation-character-chat"]) == survey_calls
+
+
+def test_simulation_capability_task_fails_closed_without_provider_manager(tmp_path):
+    database = Database(str(tmp_path / "simulation.db"))
+    database.execute("INSERT INTO projects(id, name) VALUES (?, ?)", ("project-1", "Test"))
+    database.execute("INSERT INTO books(id, project_id, title) VALUES (?, ?, ?)", ("book-1", "project-1", "Test"))
+    snapshot = WorldSnapshotRepository(database).create(make_snapshot())
+    simulations = SimulationRepository(database)
+    simulations.create_run(SimulationRun(
+        "capability-fail-run", "book-1", snapshot.snapshot_id, "Capability fail",
+        configuration={"providerAssignment": {"analystProviderId": "analyst-provider"}},
+    ))
+    runtime = TaskRuntime(database)
+    runtime.enqueue("simulation-analyst-query", project_id="project-1", book_id="book-1", data={
+        "runId": "capability-fail-run", "question": "What happened?",
+    })
+    failed = __import__("asyncio").run(PersistentTaskWorker(
+        runtime, SimulationTaskHandlers(database).mapping(), retry_delay_seconds=0,
+    ).execute_once("capability-fail-worker"))
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "SIMULATION_ANALYST_PROVIDER_UNAVAILABLE"
+    assert SimulationAnalyst(database).reports.list_for_run("capability-fail-run") == []
+
+
 def test_agent_scheduler_persists_tiers_and_explains_passive_activation(tmp_path):
     snapshot = SimulationWorldSnapshot(
         book_id="book-1", project_id="project-1", base_canon_event_id="event-7", canon_hash="hash-a",
@@ -791,6 +891,12 @@ def test_provider_simulation_round_persists_generation_runs_attempts_and_context
         def chat(self, _name, messages, _system, **_kwargs):
             payload = json.loads(messages[0]["content"])
             agent_id = payload["agentId"]
+            if "agentLocalMemories" in payload:
+                return LLMResponse(
+                    content=json.dumps({"embedding": [0.25, 0.5, 0.75]}),
+                    model="simulation-test", provider="fake", tokens_used=9, prompt_tokens=6,
+                    completion_tokens=3, latency_ms=1,
+                )
             if "episodicMemories" in payload:
                 return LLMResponse(
                     content=json.dumps({"summary": "persisted provider memory", "facts": ["local event"], "confidence": 0.9}),
@@ -809,7 +915,9 @@ def test_provider_simulation_round_persists_generation_runs_attempts_and_context
     simulations = SimulationRepository(database)
     simulations.create_run(SimulationRun(
         "provider-persist", "book-1", snapshot.snapshot_id, "Provider persist",
-        configuration={"providerAssignment": {"memoryProviderId": "provider-a"}},
+        configuration={"providerAssignment": {
+            "memoryProviderId": "provider-a", "embeddingProviderId": "provider-a",
+        }},
     ))
     simulations.transition_run("provider-persist", SimulationRunStatus.READY)
     simulations.transition_run("provider-persist", SimulationRunStatus.RUNNING)
@@ -832,12 +940,13 @@ def test_provider_simulation_round_persists_generation_runs_attempts_and_context
     assert attempt is not None and attempt["status"] == "consumed"
     assert json.loads(attempt["response_artifact"])["content"]
     ledger = simulations.cost_ledger("provider-persist")
-    assert len(ledger) == 2
+    assert len(ledger) == 3
     assert ledger[0]["generationRunId"] == event.source_generation_run_id
     assert ledger[0]["totalTokens"] == 9
-    assert {item["modelRole"] for item in ledger} == {"planner", "fact_extraction"}
+    assert {item["modelRole"] for item in ledger} == {"planner", "fact_extraction", "embedding"}
     semantic = simulations.memories.list_for_agent("provider-persist", "a", memory_type=AgentMemoryType.SEMANTIC)
     assert semantic[0].content["providerSummary"]["summary"] == "persisted provider memory"
+    assert semantic[0].content["providerEmbedding"] == [0.25, 0.5, 0.75]
 
 
 def test_simulation_branch_clock_starts_at_fork_and_advances_independently(tmp_path):
@@ -1118,6 +1227,50 @@ def test_branch_compare_uses_persisted_ledger_and_state_evidence(tmp_path):
     assert comparison.evidence["canonicalMutation"] is False
 
 
+def test_repeated_simulation_runs_form_exact_outcome_clusters_without_probability_claims(tmp_path):
+    database = Database(str(tmp_path / "simulation.db"))
+    database.execute("INSERT INTO projects(id, name) VALUES (?, ?)", ("project-1", "Test"))
+    database.execute("INSERT INTO books(id, project_id, title) VALUES (?, ?, ?)", ("book-1", "project-1", "Test"))
+    snapshot = WorldSnapshotRepository(database).create(make_snapshot())
+    repository = SimulationRepository(database)
+    for run_id in ("repeat-a", "repeat-b", "repeat-c"):
+        repository.create_run(SimulationRun(
+            run_id, "book-1", snapshot.snapshot_id, run_id,
+            configuration={"simulationCohortId": "storm-cohort"},
+        ))
+    repository.append_event(SimulationEvent("repeat-a", 1, 1, "SET", {"outcome": "storm"}))
+    repository.append_event(SimulationEvent("repeat-b", 1, 1, "SET", {"outcome": "storm"}))
+    repository.append_event(SimulationEvent("repeat-c", 1, 1, "SET", {"outcome": "clear"}))
+    result = SimulationOutcomeClusterService(repository).cluster_runs(
+        repository.list_runs("book-1"), cohort_id="storm-cohort",
+    )
+    assert result["runCount"] == 3
+    assert result["clusterCount"] == 2
+    assert [item["runCount"] for item in result["clusters"]] == [2, 1]
+    assert result["clusters"][0]["label"] == "dominant outcome"
+    assert all(item["evidence"]["probabilityClaim"] is False for item in result["clusters"])
+    assert result["evidence"]["canonicalMutation"] is False
+
+
+def test_simulation_history_archive_is_append_only_and_does_not_delete_run(tmp_path):
+    database = Database(str(tmp_path / "simulation.db"))
+    database.execute("INSERT INTO projects(id, name) VALUES (?, ?)", ("project-1", "Test"))
+    database.execute("INSERT INTO books(id, project_id, title) VALUES (?, ?, ?)", ("book-1", "project-1", "Test"))
+    snapshot = WorldSnapshotRepository(database).create(make_snapshot())
+    repository = SimulationRepository(database)
+    repository.create_run(SimulationRun("history-run", "book-1", snapshot.snapshot_id, "History"))
+    archived = repository.archive_run("history-run", reason="keep the result out of the active list")
+    assert archived["archived"] is True
+    assert repository.list_runs("book-1") == []
+    assert repository.list_runs("book-1", include_archived=True)[0].id == "history-run"
+    assert repository.history_events("history-run")[0]["action"] == "ARCHIVE"
+    restored = repository.unarchive_run("history-run", reason="re-open for comparison")
+    assert restored["archived"] is False
+    assert repository.list_runs("book-1")[0].id == "history-run"
+    with pytest.raises(sqlite3.DatabaseError):
+        database.execute("DELETE FROM simulation_run_history WHERE simulation_run_id=?", ("history-run",))
+
+
 def test_studio_simulation_snapshot_and_run_api_are_book_scoped(tmp_path, monkeypatch):
     database = Database(str(tmp_path / "projects" / "novelforge.db"))
     repository = StoryRepository(database)
@@ -1292,6 +1445,59 @@ def test_studio_simulation_lifecycle_branch_intervention_and_adoption_api(tmp_pa
         task = task_required(TaskRuntime(database), writing.json()["taskId"])
         assert task["type"] == "write-next"
         assert task["data"]["simulation_adoption_id"] == proposal.json()["proposalId"]
+
+
+def test_studio_simulation_repeat_outcomes_and_history_api_are_book_scoped(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    repository = StoryRepository(database)
+    manager = ProjectManager(str(tmp_path), repository=repository)
+    project = manager.create_project("Simulation outcomes API", "fantasy")
+    book_id = fetch_required(database, "SELECT id FROM books WHERE project_id=?", (project.id,))["id"]
+    from src.web import studio
+    monkeypatch.setenv("NOVELFORGE_DISABLE_STUDIO_WORKER", "1")
+    monkeypatch.setattr(studio, "workspace_root", tmp_path)
+    monkeypatch.setattr(studio, "story_repository", repository)
+    monkeypatch.setattr(studio, "project_mgr", manager)
+    studio.studio_daemon_state.update(task=None, stop_event=None, worker_id=None)
+    with TestClient(studio.app) as client:
+        snapshot = client.post(f"/api/v1/books/{book_id}/simulation/snapshots").json()["snapshotId"]
+        source = client.post(
+            f"/api/v1/books/{book_id}/simulation/runs",
+            json={"snapshotId": snapshot, "name": "Storm source", "cohortId": "storm-cohort"},
+        ).json()["runId"]
+        replicated = client.post(
+            f"/api/v1/books/{book_id}/simulation/runs/{source}/replicate",
+            json={"count": 2, "seedStart": 11},
+        )
+        assert replicated.status_code == 200
+        repeat_ids = replicated.json()["runIds"]
+        assert replicated.json()["cohortId"] == "storm-cohort"
+        assert len(repeat_ids) == 2
+        simulations = SimulationRepository(database)
+        simulations.append_event(SimulationEvent(source, 1, 1, "SET", {"outcome": "storm"}))
+        simulations.append_event(SimulationEvent(repeat_ids[0], 1, 1, "SET", {"outcome": "storm"}))
+        simulations.append_event(SimulationEvent(repeat_ids[1], 1, 1, "SET", {"outcome": "clear"}))
+        outcomes = client.get(f"/api/v1/books/{book_id}/simulation/outcomes?cohortId=storm-cohort")
+        assert outcomes.status_code == 200
+        assert outcomes.json()["clusterCount"] == 2
+        assert outcomes.json()["evidence"]["probabilityClaim"] is False
+        run_outcomes = client.get(f"/api/v1/books/{book_id}/simulation/runs/{source}/outcomes")
+        assert run_outcomes.status_code == 200
+        assert run_outcomes.json()["cohortId"] == "storm-cohort"
+        archived = client.post(
+            f"/api/v1/books/{book_id}/simulation/runs/{repeat_ids[1]}/archive",
+            json={"reason": "archive the alternate outcome"},
+        )
+        assert archived.status_code == 200
+        active = client.get(f"/api/v1/books/{book_id}/simulation/runs")
+        assert repeat_ids[1] not in [item["id"] for item in active.json()["runs"]]
+        all_runs = client.get(f"/api/v1/books/{book_id}/simulation/runs?includeArchived=true")
+        archived_row = next(item for item in all_runs.json()["runs"] if item["id"] == repeat_ids[1])
+        assert archived_row["archived"] is True
+        history = client.get(f"/api/v1/books/{book_id}/simulation/runs/{repeat_ids[1]}/history")
+        assert history.status_code == 200
+        assert history.json()["history"][0]["action"] == "ARCHIVE"
+        assert history.json()["canonicalMutation"] is False
 
 
 def test_simulation_chapter_intent_requires_explicit_adoption(tmp_path):
@@ -1776,6 +1982,77 @@ def test_studio_survey_api_persists_agent_scoped_responses(tmp_path, monkeypatch
         assert listed.json()["surveys"][0]["id"] == survey["id"]
 
 
+def test_studio_capability_routes_persist_task_ownership_and_provider_evidence(tmp_path, monkeypatch):
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    repository = StoryRepository(database)
+    manager = ProjectManager(str(tmp_path), repository=repository)
+    project = manager.create_project("Capability task API", "fantasy")
+    book_id = fetch_required(database, "SELECT id FROM books WHERE project_id=?", (project.id,))["id"]
+    database.execute("INSERT INTO characters(id, book_id, name, description) VALUES (?, ?, ?, ?)", ("a", book_id, "A", "agent"))
+    database.execute("INSERT INTO characters(id, book_id, name, description) VALUES (?, ?, ?, ?)", ("b", book_id, "B", "agent"))
+    from src.web import studio
+    monkeypatch.setenv("NOVELFORGE_DISABLE_STUDIO_WORKER", "1")
+    monkeypatch.setattr(studio, "workspace_root", tmp_path)
+    monkeypatch.setattr(studio, "story_repository", repository)
+    monkeypatch.setattr(studio, "project_mgr", manager)
+    monkeypatch.setattr(studio, "task_runtime", TaskRuntime(database))
+    provider_manager = _CapabilityManager()
+    monkeypatch.setattr(studio, "model_mgr", provider_manager)
+    studio.studio_daemon_state.update(task=None, stop_event=None, worker_id=None)
+    snapshot = WorldSnapshotRepository(database).create(WorldSnapshotBuilder(database).build(book_id))
+    simulations = SimulationRepository(database)
+    simulations.create_run(SimulationRun(
+        "api-capability-run", book_id, snapshot.snapshot_id, "API capability",
+        configuration={"providerAssignment": {
+            "analystProviderId": "analyst-provider", "agentDecisionProviderId": "chat-provider",
+        }},
+    ))
+    with TestClient(studio.app) as client:
+        analyst_url = f"/api/v1/books/{book_id}/simulation/runs/api-capability-run/analysis/query"
+        analyst = client.post(analyst_url, json={
+            "question": "Which events were recorded?", "tool": "query_simulation_events",
+        })
+        assert analyst.status_code == 200
+        analyst_payload = analyst.json()
+        assert analyst_payload["taskStatus"] == "completed"
+        assert analyst_payload["analysis"]["provider"]["providerId"] == "analyst-provider"
+        analyst_task = task_required(TaskRuntime(database), analyst_payload["taskId"])
+        assert analyst_task["type"] == "simulation-analyst-query"
+        assert analyst_task["status"] == "completed"
+        duplicate = client.post(analyst_url, json={
+            "question": "Which events were recorded?", "tool": "query_simulation_events",
+        })
+        assert duplicate.status_code == 200
+        assert duplicate.json()["taskId"] == analyst_payload["taskId"]
+        assert len([item for item in provider_manager.calls if item["kwargs"].get("prompt_key") == "simulation-analyst-answer"]) == 1
+
+        chat = client.post(
+            f"/api/v1/books/{book_id}/simulation/runs/api-capability-run/agents/a/chat",
+            json={"prompt": "where are you?"},
+        )
+        assert chat.status_code == 200
+        chat_payload = chat.json()
+        assert chat_payload["taskStatus"] == "completed"
+        assert chat_payload["interaction"]["evidence"]["provider"]["providerId"] == "chat-provider"
+        chat_task = task_required(TaskRuntime(database), chat_payload["taskId"])
+        assert chat_task["type"] == "simulation-character-chat"
+        assert chat_task["status"] == "completed"
+
+        survey = client.post(
+            f"/api/v1/books/{book_id}/simulation/runs/api-capability-run/survey",
+            json={"question": "Where are you?", "agentIds": ["a", "b"]},
+        )
+        assert survey.status_code == 200
+        survey_payload = survey.json()
+        assert survey_payload["taskStatus"] == "completed"
+        assert survey_payload["survey"]["status"] == "COMPLETED"
+        survey_task = task_required(TaskRuntime(database), survey_payload["taskId"])
+        assert survey_task["type"] == "simulation-survey"
+        assert survey_task["status"] == "completed"
+        assert survey_payload["canonicalMutation"] is False
+        assert all(item["evidence"]["canonicalMutation"] is False for item in survey_payload["survey"]["responses"])
+
+
 def test_multi_agent_survey_persists_scoped_responses(tmp_path):
     database = Database(str(tmp_path / "simulation.db"))
     database.execute("INSERT INTO projects(id, name) VALUES (?, ?)", ("project-1", "Test"))
@@ -1795,6 +2072,37 @@ def test_multi_agent_survey_persists_scoped_responses(tmp_path):
     assert restored == survey
     with pytest.raises(ValueError, match="not found"):
         SimulationSurveyService(database).conduct("survey-run", "where are you?", ["missing"])
+
+
+def test_survey_can_include_faction_agents_without_crossing_knowledge_boundaries(tmp_path):
+    database = Database(str(tmp_path / "simulation.db"))
+    database.execute("INSERT INTO projects(id, name) VALUES (?, ?)", ("project-1", "Test"))
+    database.execute("INSERT INTO books(id, project_id, title) VALUES (?, ?, ?)", ("book-1", "project-1", "Test"))
+    snapshot = WorldSnapshotRepository(database).create(SimulationWorldSnapshot(
+        book_id="book-1", project_id="project-1", base_canon_event_id="event-7", canon_hash="hash-a",
+        story_state_version=3,
+        world={
+            "characters": {"a": {"name": "A", "location": "room", "known_facts": ["local-a"]}},
+            "factions": {"f": {"name": "Faction", "territory": "harbor", "known_information": {"rumor": "local-f"}}},
+            "knowledge": {"a": {"local-a": "character fact"}, "f": {"rumor": "faction rumor"}},
+            "secrets": {"other-secret": {"owner": "other"}},
+        },
+    ))
+    simulations = SimulationRepository(database)
+    simulations.create_run(SimulationRun("faction-survey-run", "book-1", snapshot.snapshot_id, "Faction survey"))
+    chat = CharacterChatService(database)
+    faction_chat = chat.interact("faction-survey-run", "f", "where are you?")
+    assert faction_chat.status == "ANSWERED"
+    assert "harbor" in faction_chat.response
+    assert faction_chat.evidence["agentType"] == "faction"
+    survey = SimulationSurveyService(database).conduct(
+        "faction-survey-run", "where are you?", ["a", "f"], survey_id="faction-survey",
+    )
+    assert survey.status == "COMPLETED"
+    assert {item.agent_id for item in survey.responses} == {"a", "f"}
+    faction_response = next(item for item in survey.responses if item.agent_id == "f")
+    assert faction_response.evidence["agentType"] == "faction"
+    assert "other-secret" not in json.dumps(faction_response.evidence, ensure_ascii=True)
 
 
 def test_agent_profiles_preserve_character_and_faction_knowledge_boundaries():

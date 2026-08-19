@@ -18,6 +18,8 @@ increase the persisted budget and resume. Migration 40 adds an append-only
 causal trace ledger. Each event can reference persisted prior events, Agent
 memory, goals, relationships, interventions, world rules, and GenerationRun
 provenance; the read model is rebuildable and remains strictly Sandbox-scoped.
+Migration 41 adds append-only run archive/unarchive history without deleting
+Sandbox evidence.
 Provider authorization, provider-rate discovery, and large-run
 scheduling/performance remain outside this partial slice.
 
@@ -26,5 +28,8 @@ Run configuration may now persist a normalized `providerAssignment` record. Its
 included in the idempotency fingerprint, and passed to the Model Router as a
 provider override; the router still resolves the enabled model, credentials,
 GenerationRun, and usage ledger. `memoryProviderId`, `analystProviderId`, and
-`embeddingProviderId` are accepted as durable capability metadata but are not
-yet wired to independent invocation paths, so provider routing remains partial.
+`embeddingProviderId` are durable capability assignments. Memory consolidation
+and sandbox embedding use their selected route; Analyst, Character Chat, and
+Survey use persisted capability tasks with the selected analyst/chat route.
+Missing assignments or providers fail closed, and external-provider
+authorization remains a separate gate.

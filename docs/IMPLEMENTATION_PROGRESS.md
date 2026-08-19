@@ -5,11 +5,40 @@
 > (`agentDecisionProviderId`, `memoryProviderId`, `analystProviderId`, and
 > `embeddingProviderId`). Durable `simulation-round` tasks persist the
 > normalized record and include it in their idempotency fingerprint. Agent
-> Decision passes the selected provider ID through the existing Model Router,
-> preserving GenerationRun/Attempt and usage-ledger provenance; invalid
-> assignments fail closed before any Sandbox event. Memory, Analyst, and
-> Embedding provider invocation seams remain explicitly **PARTIAL**, so the
-> overall StoryFlow status remains **PARTIAL**.
+> Decision, Agent Memory consolidation, and sandbox-local Embedding now pass
+> the selected provider through the existing Model Router, preserving
+> GenerationRun/Attempt, context provenance, usage and cost-ledger evidence;
+> invalid or unavailable assignments fail closed before Sandbox events. Analyst,
+> Character Chat, and Survey now run through persisted capability tasks with a
+> targeted lease-fenced worker, deterministic idempotency keys, retry-safe
+> interaction/report records, and task status/result provenance exposed to the
+> existing HTTP/UI surface. Real external-provider E2E is not claimed. Overall
+> StoryFlow remains **PARTIAL**.
+
+> **StoryFlow 2.0 durable capability-task increment (2026-08-19)**: Added
+> `simulation-analyst-query`, `simulation-character-chat`, and
+> `simulation-survey` handlers to the persistent task worker. HTTP requests
+> enqueue a book-scoped task before invoking the handler; a restart or competing
+> worker can recover the row, while stable report/interaction/survey IDs prevent
+> duplicate provider work on retry. Provider evidence retains the existing
+> GenerationRun/Attempt and context-manifest boundary, and failure paths remain
+> fail-closed without Canon mutation.
+
+> **StoryFlow 2.0 repeat-run/history increment (2026-08-19)**: Added explicit
+> repeat-run cohorts and deterministic Outcome Clusters derived from exact
+> replayed Sandbox state hashes; the service reports structural
+> `dominant outcome`/`plausible outcome` labels and never invents probabilities.
+> Migration 41 adds an append-only Simulation archive/unarchive history ledger,
+> book-scoped History APIs, and Studio controls. Archived runs retain snapshots,
+> events, reports, and branch evidence; Canon remains untouched.
+
+> **StoryFlow 2.0 Canon-boundary proof increment (2026-08-19)**: Added a
+> 100-round integration proof covering a sandbox intervention, branch fork and
+> branch-only state, Character Chat, Survey, Analyst, persisted Report,
+> Adoption, and ChapterIntent. A digest over `story_facts`, `story_states`,
+> `narrative_events`, and `story_commits` remains byte-for-byte unchanged;
+> this is a focused automated boundary proof, not a claim that the complete
+> browser or real-provider acceptance gate is complete.
 
 > **StoryFlow 2.0 adoption handoff browser check (2026-08-19)**: A fresh
 > current-code read-only Studio pass loaded the real `ADOPTED` proposal,
@@ -42,17 +71,26 @@
 > full 23-step browser acceptance or complete Provider/StoryCommit E2E;
 > StoryFlow remains **PARTIAL**.
 
-> **Final verification addendum for the 2026-08-19 StoryFlow increment**:
+> **Prior verification addendum for the 2026-08-19 StoryFlow increment**:
 > Current-code browser verification on `http://127.0.0.1:8002/` loaded the
 > persisted simulation adoption list, displayed the Sandbox causal trace, and
 > returned HTTP 200 for `causal-trace`, adoption listing, and ChapterIntent
 > creation. The fresh browser session recorded 0 console errors/warnings;
 > causal evidence and the ChapterIntent response retained
 > `canonicalMutation=false`. The focused StoryFlow/Phase 1/performance suite
-> is now `89 passed`; `scripts/verify_features.py` reports CW-001, MEMORY-001,
+> is now `102 passed`; `scripts/verify_features.py` reports CW-001, MEMORY-001,
 > REVIEW-001, STORY-001, and WRITE-001 as `VERIFIED`. Ruff, JavaScript syntax,
-> compileall, protected-file, and diff checks pass; the live database is schema
-> 40 with `PRAGMA integrity_check=ok`. Overall StoryFlow remains **PARTIAL**.
+> compileall, protected-file, and diff checks pass; that verification snapshot
+> was schema 40 with `PRAGMA integrity_check=ok`. Overall StoryFlow remains
+> **PARTIAL**.
+
+> **Current-turn browser control note (2026-08-19)**: The current-code Studio
+> server loaded in the in-app browser and exposed the real Dashboard DOM with
+> zero fresh console messages, but book navigation clicks exceeded the browser
+> control layer's CDP deadline before dispatch. Therefore the full 23-step
+> browser acceptance is not claimed; API, TestClient, and static checks remain
+> the authoritative evidence for this increment. The current live database is
+> schema 41 with `PRAGMA integrity_check=ok` after the History migration.
 
 > **StoryFlow 2.0 causal trace and runtime benchmark increment (2026-08-19)**:
 > Added migration 40 with append-only `simulation_causal_traces` rows. Event

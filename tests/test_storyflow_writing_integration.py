@@ -23,6 +23,9 @@ from src.core.task_worker import PersistentTaskWorker
 from src.creation.task_handlers import LegacyTaskHandlers
 from src.story_graph import StoryGraphProjector
 from src.story_graph import StoryFlowPlanningService
+from src.storyflow.planning import SimulationAdoptionService, SimulationChapterIntentService
+from src.storyflow.simulation import SimulationRepository, SimulationRun
+from src.storyflow.world import WorldSnapshotBuilder, WorldSnapshotRepository
 
 
 class DeterministicStoryFlowModel:
@@ -237,3 +240,70 @@ def test_storyflow_worker_result_can_reconcile_planning_overlay_after_canon_acce
     assert fulfilled_revision == revision + 1
     projected = next(node for node in graph["nodes"] if node["id"] == plan_node["id"])
     assert projected["status"] == "accepted"
+
+
+def test_simulation_adoption_chapter_intent_reaches_story_commit_through_worker(tmp_path: Path) -> None:
+    """The explicit Simulation handoff is consumed by the existing write pipeline."""
+    database = Database(str(tmp_path / "simulation-to-canon.db"))
+    repository = StoryRepository(database)
+    runtime = TaskRuntime(database)
+    manager = ProjectManager(str(tmp_path), repository=repository)
+    project = manager.create_project("Simulation to Canon", "fantasy")
+    book = database.fetchone("SELECT id FROM books WHERE project_id=?", (project.id,))
+    assert book is not None
+    book_id = str(book["id"])
+
+    snapshot = WorldSnapshotRepository(database).create(WorldSnapshotBuilder(database).build(book_id))
+    simulations = SimulationRepository(database)
+    simulations.create_run(SimulationRun(
+        "simulation-to-canon-run", book_id, snapshot.snapshot_id, "Simulation handoff",
+    ))
+    adoption = SimulationAdoptionService(database).propose(
+        "simulation-to-canon-run", title="Carry the sandbox outcome",
+        summary="Use the adopted future as the next chapter premise.",
+        payload={"goals": ["carry the adopted future"], "requiredCharacters": []},
+    )
+    adopted = SimulationAdoptionService(database).adopt(adoption.id)
+    intent = SimulationChapterIntentService(
+        database, manager.get_project_dir(project.id),
+    ).create(adopted.id, chapter_number=1)
+    before = {
+        table: int((database.fetchone(f"SELECT COUNT(*) AS count FROM {table}") or {"count": 0})["count"])
+        for table in ("story_facts", "story_states", "narrative_events", "story_commits")
+    }
+
+    task = runtime.enqueue(
+        "write-next", project_id=project.id, book_id=book_id,
+        data={
+            "chapter_number": 1,
+            "context": "Use the adopted Simulation outcome as the chapter premise.",
+            "plan": intent.to_dict(),
+            "simulation_adoption_id": adopted.id,
+        },
+        idempotency_key=f"simulation-to-canon:{adopted.id}:1",
+    )
+    model = DeterministicStoryFlowModel()
+    handlers = LegacyTaskHandlers(
+        manager, model, Config(project_path=str(tmp_path)), runtime,
+    ).mapping()
+    outcome = asyncio.run(
+        PersistentTaskWorker(runtime, handlers, retry_delay_seconds=0).execute_once(
+            "simulation-to-canon-worker"
+        )
+    )
+    assert outcome is not None and outcome["status"] == "completed"
+    assert outcome["result"]["completed"] is True
+    assert outcome["result"]["story_commit_id"]
+    assert {"review", "fact-extraction"} <= set(model.task_types)
+
+    after = {
+        table: int((database.fetchone(f"SELECT COUNT(*) AS count FROM {table}") or {"count": 0})["count"])
+        for table in before
+    }
+    assert after["story_commits"] == before["story_commits"] + 1
+    assert after["story_facts"] > before["story_facts"]
+    commit = database.fetchone("SELECT status FROM story_commits WHERE id=?", (outcome["result"]["story_commit_id"],))
+    assert commit is not None and commit["status"] == "accepted"
+    completed_task = runtime.get(task["id"])
+    assert completed_task is not None
+    assert completed_task["result"]["story_commit_id"] == outcome["result"]["story_commit_id"]
