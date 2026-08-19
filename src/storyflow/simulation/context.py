@@ -1,0 +1,148 @@
+"""Bounded, agent-local context compilation for simulation decisions."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+from typing import Any, Mapping
+
+from .perception import AgentPerception
+
+
+def _copy(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=True, sort_keys=True, default=str))
+
+
+def _stable_hash(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class SimulationAgentContextBundle:
+    """The only context a simulation decision model is allowed to receive."""
+
+    agent_id: str
+    actor_type: str
+    identity: Mapping[str, Any]
+    current_state: Mapping[str, Any]
+    local_world: Mapping[str, Any]
+    knowledge: Mapping[str, Any]
+    beliefs: Mapping[str, Any]
+    goals: tuple[Any, ...]
+    relationships: Mapping[str, Any]
+    recent_memory: tuple[Mapping[str, Any], ...]
+    relevant_memory: tuple[Mapping[str, Any], ...]
+    observations: tuple[Mapping[str, Any], ...]
+    available_actions: tuple[str, ...]
+    world_rules: tuple[Any, ...]
+    truncation: Mapping[str, Any]
+
+    @property
+    def context_hash(self) -> str:
+        return _stable_hash(self.to_record(include_hash=False))
+
+    def to_record(self, *, include_hash: bool = True) -> dict[str, Any]:
+        record = {
+            "agentId": self.agent_id,
+            "actorType": self.actor_type,
+            "identity": _copy(self.identity),
+            "currentState": _copy(self.current_state),
+            "localWorld": _copy(self.local_world),
+            "knowledge": _copy(self.knowledge),
+            "beliefs": _copy(self.beliefs),
+            "goals": _copy(self.goals),
+            "relationships": _copy(self.relationships),
+            "recentMemory": _copy(self.recent_memory),
+            "relevantMemory": _copy(self.relevant_memory),
+            "observations": _copy(self.observations),
+            "availableActions": _copy(self.available_actions),
+            "worldRules": _copy(self.world_rules),
+            "truncation": _copy(self.truncation),
+        }
+        if include_hash:
+            record["contextHash"] = self.context_hash
+        return record
+
+
+class SimulationContextCompiler:
+    """Compile perception into a bounded JSON bundle without global leakage.
+
+    ``max_chars`` is deliberately an explicit character budget. We do not
+    pretend to know a provider's tokenizer; callers can record the estimate
+    and let the routed provider own actual token accounting.
+    """
+
+    _SECTIONS = (
+        "identity", "current_state", "local_world", "knowledge", "beliefs",
+        "goals", "relationships", "recent_memory", "relevant_memory",
+        "observations", "available_actions", "world_rules",
+    )
+
+    def compile(self, perception: AgentPerception, *, max_chars: int | None = None) -> SimulationAgentContextBundle:
+        if max_chars is not None and max_chars < 256:
+            raise ValueError("simulation context max_chars must be at least 256")
+        recent = tuple(_copy(item) for item in perception.recent_memory)
+        relevant = tuple(
+            item for item in recent
+            if float(item.get("importance", 0.0) or 0.0) >= 0.5
+        )
+        values: dict[str, Any] = {
+            "identity": _copy(perception.identity),
+            "current_state": _copy(perception.current_state),
+            "local_world": _copy(perception.local_world),
+            "knowledge": _copy(perception.knowledge),
+            "beliefs": _copy(perception.beliefs),
+            "goals": _copy(perception.goals),
+            "relationships": _copy(perception.relationships),
+            "recent_memory": recent,
+            "relevant_memory": relevant,
+            "observations": _copy(perception.observations),
+            "available_actions": _copy(perception.available_actions),
+            "world_rules": _copy(perception.world_rules),
+        }
+        truncation: dict[str, Any] = {
+            "applied": False,
+            "budgetKind": "character-approximation",
+            "maxChars": max_chars,
+            "omittedSections": [],
+        }
+        if max_chars is not None:
+            values, omitted = self._bound(values, max_chars)
+            truncation["applied"] = bool(omitted)
+            truncation["omittedSections"] = omitted
+        return SimulationAgentContextBundle(
+            agent_id=perception.agent_id,
+            actor_type=perception.actor_type,
+            identity=values["identity"],
+            current_state=values["current_state"],
+            local_world=values["local_world"],
+            knowledge=values["knowledge"],
+            beliefs=values["beliefs"],
+            goals=tuple(values["goals"]),
+            relationships=values["relationships"],
+            recent_memory=tuple(values["recent_memory"]),
+            relevant_memory=tuple(values["relevant_memory"]),
+            observations=tuple(values["observations"]),
+            available_actions=tuple(values["available_actions"]),
+            world_rules=tuple(values["world_rules"]),
+            truncation=truncation,
+        )
+
+    @classmethod
+    def _bound(cls, values: dict[str, Any], max_chars: int) -> tuple[dict[str, Any], list[str]]:
+        if len(json.dumps(values, ensure_ascii=True, sort_keys=True, default=str)) <= max_chars:
+            return values, []
+        omitted: list[str] = []
+        # Preserve identity/state/knowledge first; trim lower-priority context
+        # whole-section-at-a-time so the model never receives a malformed slice.
+        for section in reversed(cls._SECTIONS):
+            candidate = dict(values)
+            candidate[section] = [] if isinstance(values[section], (list, tuple)) else {}
+            if len(json.dumps(candidate, ensure_ascii=True, sort_keys=True, default=str)) <= max_chars:
+                omitted.append(section)
+                values = candidate
+                if len(json.dumps(values, ensure_ascii=True, sort_keys=True, default=str)) <= max_chars:
+                    return values, list(reversed(omitted))
+        return values, list(reversed(omitted))

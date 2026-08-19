@@ -692,6 +692,7 @@ class PersistentModelRuntime:
         self.repository = repository
         self.gateway = gateway or ModelGateway()
         self._task_id: ContextVar[Optional[str]] = ContextVar("novelforge_model_task_id", default=None)
+        self._last_run_id: ContextVar[Optional[str]] = ContextVar("novelforge_model_last_run_id", default=None)
 
     @contextmanager
     def task_scope(self, task_id: str) -> Iterator[None]:
@@ -700,6 +701,10 @@ class PersistentModelRuntime:
             yield
         finally:
             self._task_id.reset(token)
+
+    def last_generation_run_id(self) -> str | None:
+        """Return the latest GenerationRun created/recovered in this task context."""
+        return self._last_run_id.get()
 
     @staticmethod
     def _build_prompt_layout(
@@ -885,6 +890,7 @@ class PersistentModelRuntime:
         attempts = GenerationAttemptStore(self.repository.db)
 
         def recover(existing: dict[str, Any]) -> LLMResponse:
+            self._last_run_id.set(str(existing.get("generation_run_id") or "") or None)
             response = response_from_artifact(existing.get("response_artifact"))
             run = self.repository.db.fetchone(
                 "SELECT status FROM generation_runs WHERE id=?",
@@ -920,6 +926,7 @@ class PersistentModelRuntime:
             prompt_key=prompt_key, prompt_version=prompt_version,
             input_reference=input_reference,
         )
+        self._last_run_id.set(run_id)
         attempt = attempts.prepare(
             generation_run_id=run_id,
             task_id=task_id,
@@ -1155,6 +1162,9 @@ class PersistentMultiModelManager:
 
     def task_scope(self, task_id: str) -> ContextManager[None]:
         return self.runtime.task_scope(task_id)
+
+    def last_generation_run_id(self) -> str | None:
+        return self.runtime.last_generation_run_id()
 
     def get_client(self, role: str = "primary") -> PersistentModelClient:
         resolved_role = self._legacy_roles.get(role, role)

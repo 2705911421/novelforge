@@ -493,13 +493,18 @@ def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
     """Execute the repository's migration SQL inside the caller's transaction.
 
     ``sqlite3.Connection.executescript`` commits an open transaction before it
-    runs.  These schema scripts deliberately contain no procedural SQL, so
-    executing their semicolon-delimited statements preserves atomic migration
-    semantics.
+    runs. ``sqlite3.complete_statement`` preserves the caller's transaction
+    while also correctly handling trigger bodies containing semicolons.
     """
-    for statement in script.split(";"):
-        if statement.strip():
-            conn.execute(statement)
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        conn.execute(statement)
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, definition: str) -> None:
@@ -1566,6 +1571,546 @@ def _apply_v23(conn: sqlite3.Connection) -> None:
     _execute_sql_script(conn, PHASE_23_NARRATIVE_RUNTIME_V2_SQL)
 
 
+PHASE_24_STORYFLOW_SIMULATION_FOUNDATION_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_world_snapshots (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
+    base_canon_event_id TEXT NOT NULL,
+    canon_hash TEXT NOT NULL,
+    story_state_version INTEGER NOT NULL,
+    planning_snapshot_id TEXT,
+    planning_snapshot_hash TEXT,
+    snapshot_version INTEGER NOT NULL,
+    world_payload JSON NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    UNIQUE(book_id, base_canon_event_id, canon_hash, planning_snapshot_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_world_snapshots_book_created
+    ON simulation_world_snapshots(book_id, created_at DESC);
+"""
+
+
+def _apply_v24(conn: sqlite3.Connection) -> None:
+    """Add the immutable Canon-to-simulation world snapshot boundary."""
+    _execute_sql_script(conn, PHASE_24_STORYFLOW_SIMULATION_FOUNDATION_SQL)
+
+
+PHASE_25_STORYFLOW_SIMULATION_LEDGER_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_runs (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
+    snapshot_id TEXT NOT NULL REFERENCES simulation_world_snapshots(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    current_round INTEGER NOT NULL DEFAULT 0,
+    max_rounds INTEGER NOT NULL,
+    seed INTEGER NOT NULL,
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS simulation_events (
+    id TEXT PRIMARY KEY,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    sequence INTEGER NOT NULL,
+    round_number INTEGER NOT NULL,
+    simulation_time TEXT,
+    event_type TEXT NOT NULL,
+    actor_type TEXT,
+    actor_id TEXT,
+    target_ids JSON NOT NULL DEFAULT '[]',
+    action_id TEXT,
+    payload JSON NOT NULL DEFAULT '{}',
+    state_delta JSON NOT NULL DEFAULT '{}',
+    visibility_scope TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    UNIQUE(simulation_run_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_runs_book_created
+    ON simulation_runs(book_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_simulation_events_run_sequence
+    ON simulation_events(simulation_run_id, sequence);
+"""
+
+
+def _apply_v25(conn: sqlite3.Connection) -> None:
+    """Add durable runs and the append-only counterfactual event ledger."""
+    _execute_sql_script(conn, PHASE_25_STORYFLOW_SIMULATION_LEDGER_SQL)
+
+
+PHASE_26_STORYFLOW_SIMULATION_INTEGRITY_SQL = """
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_snapshot_update
+BEFORE UPDATE ON simulation_world_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'simulation world snapshots are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_snapshot_delete
+BEFORE DELETE ON simulation_world_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'simulation world snapshots are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_event_update
+BEFORE UPDATE ON simulation_events
+BEGIN
+    SELECT RAISE(ABORT, 'simulation events are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_event_delete
+BEFORE DELETE ON simulation_events
+BEGIN
+    SELECT RAISE(ABORT, 'simulation events are append-only');
+END;
+"""
+
+
+def _apply_v26(conn: sqlite3.Connection) -> None:
+    """Enforce immutable snapshot and event-ledger rows in SQLite itself."""
+    _execute_sql_script(conn, PHASE_26_STORYFLOW_SIMULATION_INTEGRITY_SQL)
+
+
+PHASE_27_STORYFLOW_SIMULATION_CHECKPOINT_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_checkpoints (
+    id TEXT PRIMARY KEY,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    event_sequence INTEGER NOT NULL,
+    state_hash TEXT NOT NULL,
+    state_values JSON NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    UNIQUE(simulation_run_id, event_sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_checkpoints_run_created
+    ON simulation_checkpoints(simulation_run_id, created_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_checkpoint_update
+BEFORE UPDATE ON simulation_checkpoints
+BEGIN
+    SELECT RAISE(ABORT, 'simulation checkpoints are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_checkpoint_delete
+BEFORE DELETE ON simulation_checkpoints
+BEGIN
+    SELECT RAISE(ABORT, 'simulation checkpoints are immutable');
+END;
+"""
+
+
+def _apply_v27(conn: sqlite3.Connection) -> None:
+    _execute_sql_script(conn, PHASE_27_STORYFLOW_SIMULATION_CHECKPOINT_SQL)
+
+
+PHASE_28_STORYFLOW_AGENT_MEMORY_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_agent_memories (
+    id TEXT PRIMARY KEY,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    agent_id TEXT NOT NULL,
+    memory_type TEXT NOT NULL,
+    content JSON NOT NULL,
+    source_simulation_event_ids JSON NOT NULL DEFAULT '[]',
+    importance REAL NOT NULL DEFAULT 0.5,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    validity TEXT NOT NULL DEFAULT 'active',
+    created_round INTEGER NOT NULL DEFAULT 0,
+    last_accessed_round INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_agent_memory_scope
+    ON simulation_agent_memories(simulation_run_id, agent_id, memory_type, importance DESC);
+"""
+
+
+def _apply_v28(conn: sqlite3.Connection) -> None:
+    _execute_sql_script(conn, PHASE_28_STORYFLOW_AGENT_MEMORY_SQL)
+
+
+PHASE_29_STORYFLOW_SIMULATION_BRANCHES_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_branches (
+    id TEXT PRIMARY KEY,
+    parent_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    branch_run_id TEXT NOT NULL UNIQUE REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    fork_sequence INTEGER NOT NULL,
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_branches_parent
+    ON simulation_branches(parent_run_id, fork_sequence);
+"""
+
+
+def _apply_v29(conn: sqlite3.Connection) -> None:
+    _execute_sql_script(conn, PHASE_29_STORYFLOW_SIMULATION_BRANCHES_SQL)
+
+
+PHASE_30_STORYFLOW_SIMULATION_INTERVENTIONS_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_interventions (
+    id TEXT PRIMARY KEY,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL,
+    state_delta JSON NOT NULL,
+    rationale TEXT NOT NULL,
+    event_id TEXT NOT NULL UNIQUE REFERENCES simulation_events(id) ON DELETE RESTRICT,
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_interventions_run
+    ON simulation_interventions(simulation_run_id, created_at DESC);
+"""
+
+
+def _apply_v30(conn: sqlite3.Connection) -> None:
+    _execute_sql_script(conn, PHASE_30_STORYFLOW_SIMULATION_INTERVENTIONS_SQL)
+
+
+PHASE_31_STORYFLOW_SIMULATION_ADOPTIONS_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_adoptions (
+    id TEXT PRIMARY KEY,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    payload JSON NOT NULL,
+    status TEXT NOT NULL,
+    planning_node_id TEXT,
+    planning_revision INTEGER,
+    created_at TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_simulation_adoptions_run ON simulation_adoptions(simulation_run_id, created_at DESC);
+"""
+
+
+def _apply_v31(conn: sqlite3.Connection) -> None:
+    _execute_sql_script(conn, PHASE_31_STORYFLOW_SIMULATION_ADOPTIONS_SQL)
+
+
+PHASE_32_STORYFLOW_SIMULATION_ANALYSIS_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_analysis_reports (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    evidence JSON NOT NULL,
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_analysis_reports_run_created
+    ON simulation_analysis_reports(simulation_run_id, created_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_analysis_report_update
+BEFORE UPDATE ON simulation_analysis_reports
+BEGIN
+    SELECT RAISE(ABORT, 'simulation analysis reports are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_analysis_report_delete
+BEFORE DELETE ON simulation_analysis_reports
+BEGIN
+    SELECT RAISE(ABORT, 'simulation analysis reports are immutable');
+END;
+"""
+
+
+def _apply_v32(conn: sqlite3.Connection) -> None:
+    _execute_sql_script(conn, PHASE_32_STORYFLOW_SIMULATION_ANALYSIS_SQL)
+
+
+PHASE_33_STORYFLOW_CHARACTER_INTERACTIONS_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_character_interactions (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    agent_id TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    response TEXT NOT NULL,
+    status TEXT NOT NULL,
+    evidence JSON NOT NULL,
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_character_interactions_agent
+    ON simulation_character_interactions(simulation_run_id, agent_id, created_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_character_interaction_update
+BEFORE UPDATE ON simulation_character_interactions
+BEGIN
+    SELECT RAISE(ABORT, 'simulation character interactions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_character_interaction_delete
+BEFORE DELETE ON simulation_character_interactions
+BEGIN
+    SELECT RAISE(ABORT, 'simulation character interactions are immutable');
+END;
+"""
+
+
+def _apply_v33(conn: sqlite3.Connection) -> None:
+    _execute_sql_script(conn, PHASE_33_STORYFLOW_CHARACTER_INTERACTIONS_SQL)
+
+
+PHASE_34_STORYFLOW_SURVEYS_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_surveys (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    question TEXT NOT NULL,
+    agent_ids JSON NOT NULL,
+    status TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS simulation_survey_responses (
+    id TEXT PRIMARY KEY,
+    survey_id TEXT NOT NULL REFERENCES simulation_surveys(id) ON DELETE RESTRICT,
+    agent_id TEXT NOT NULL,
+    interaction_id TEXT NOT NULL UNIQUE REFERENCES simulation_character_interactions(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL,
+    response TEXT NOT NULL,
+    evidence JSON NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_surveys_run_created
+    ON simulation_surveys(simulation_run_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_simulation_survey_responses_survey
+    ON simulation_survey_responses(survey_id, agent_id);
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_survey_response_update
+BEFORE UPDATE ON simulation_survey_responses
+BEGIN
+    SELECT RAISE(ABORT, 'simulation survey responses are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_survey_response_delete
+BEFORE DELETE ON simulation_survey_responses
+BEGIN
+    SELECT RAISE(ABORT, 'simulation survey responses are immutable');
+END;
+"""
+
+
+def _apply_v34(conn: sqlite3.Connection) -> None:
+    _execute_sql_script(conn, PHASE_34_STORYFLOW_SURVEYS_SQL)
+
+
+PHASE_35_STORYFLOW_RUN_METADATA_SQL = """
+ALTER TABLE simulation_runs ADD COLUMN description TEXT NOT NULL DEFAULT '';
+ALTER TABLE simulation_runs ADD COLUMN purpose TEXT NOT NULL DEFAULT '';
+ALTER TABLE simulation_runs ADD COLUMN created_by TEXT;
+ALTER TABLE simulation_runs ADD COLUMN configuration JSON NOT NULL DEFAULT '{}';
+ALTER TABLE simulation_runs ADD COLUMN task_id TEXT;
+ALTER TABLE simulation_runs ADD COLUMN started_at TIMESTAMP;
+ALTER TABLE simulation_runs ADD COLUMN paused_at TIMESTAMP;
+ALTER TABLE simulation_runs ADD COLUMN completed_at TIMESTAMP;
+"""
+
+
+def _apply_v35(conn: sqlite3.Connection) -> None:
+    _execute_sql_script(conn, PHASE_35_STORYFLOW_RUN_METADATA_SQL)
+
+
+PHASE_36_STORYFLOW_EVENT_PROVENANCE_SQL = """
+ALTER TABLE simulation_events ADD COLUMN source_generation_run_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_simulation_events_source_generation_run
+    ON simulation_events(source_generation_run_id)
+    WHERE source_generation_run_id IS NOT NULL;
+"""
+
+
+def _apply_v36(conn: sqlite3.Connection) -> None:
+    """Persist generation provenance as a first-class simulation event field."""
+    _execute_sql_script(conn, PHASE_36_STORYFLOW_EVENT_PROVENANCE_SQL)
+
+
+PHASE_37_STORYFLOW_SIMULATION_CLOCK_SQL = """
+ALTER TABLE simulation_runs ADD COLUMN simulation_time TEXT;
+"""
+
+
+def _apply_v37(conn: sqlite3.Connection) -> None:
+    """Persist the deterministic simulation clock at the durable run boundary."""
+    _execute_sql_script(conn, PHASE_37_STORYFLOW_SIMULATION_CLOCK_SQL)
+
+
+PHASE_38_STORYFLOW_SIMULATION_GRAPH_SQL = """
+CREATE TABLE IF NOT EXISTS simulation_graph_projection_nodes (
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    simulation_id TEXT,
+    label TEXT NOT NULL,
+    payload JSON NOT NULL DEFAULT '{}',
+    event_sequence INTEGER NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    PRIMARY KEY(simulation_run_id, node_id)
+);
+
+CREATE TABLE IF NOT EXISTS simulation_graph_projection_edges (
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    edge_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    target TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    payload JSON NOT NULL DEFAULT '{}',
+    event_sequence INTEGER NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    PRIMARY KEY(simulation_run_id, edge_id)
+);
+
+CREATE TABLE IF NOT EXISTS simulation_graph_projection_meta (
+    simulation_run_id TEXT PRIMARY KEY REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    state_hash TEXT NOT NULL,
+    event_sequence INTEGER NOT NULL,
+    event_limit INTEGER NOT NULL,
+    projection_version INTEGER NOT NULL DEFAULT 1,
+    updated_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_graph_nodes_run_sequence
+    ON simulation_graph_projection_nodes(simulation_run_id, event_sequence);
+CREATE INDEX IF NOT EXISTS idx_simulation_graph_edges_run_sequence
+    ON simulation_graph_projection_edges(simulation_run_id, event_sequence);
+"""
+
+
+def _apply_v38(conn: sqlite3.Connection) -> None:
+    """Add a rebuildable, run-scoped dynamic graph read model."""
+    _execute_sql_script(conn, PHASE_38_STORYFLOW_SIMULATION_GRAPH_SQL)
+
+
+PHASE_39_STORYFLOW_SCHEDULER_COST_SQL = """
+-- Agent activation is an append-only, run-scoped explanation of why an Agent
+-- did (or did not) receive a decision slot.  The run configuration remains
+-- the durable policy source; these rows are the deterministic per-round
+-- read model and audit trail.
+CREATE TABLE IF NOT EXISTS simulation_agent_activations (
+    id TEXT PRIMARY KEY,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    round_number INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    actor_type TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    active INTEGER NOT NULL,
+    score REAL NOT NULL DEFAULT 0,
+    reasons JSON NOT NULL DEFAULT '[]',
+    policy JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL,
+    UNIQUE(simulation_run_id, round_number, agent_id),
+    CHECK(tier IN ('A', 'B', 'C')),
+    CHECK(active IN (0, 1)),
+    CHECK(round_number >= 1)
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_agent_activations_run_round
+    ON simulation_agent_activations(simulation_run_id, round_number, active, score DESC);
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_agent_activation_update
+BEFORE UPDATE ON simulation_agent_activations
+BEGIN
+    SELECT RAISE(ABORT, 'simulation agent activations are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_agent_activation_delete
+BEFORE DELETE ON simulation_agent_activations
+BEGIN
+    SELECT RAISE(ABORT, 'simulation agent activations are append-only');
+END;
+
+-- A cost row is keyed by the provider GenerationRun.  It lets a retry recover
+-- usage from the existing model-runtime ledger without charging the same
+-- generation twice, even when the worker died after the provider returned.
+CREATE TABLE IF NOT EXISTS simulation_cost_ledger (
+    id TEXT PRIMARY KEY,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    round_number INTEGER NOT NULL,
+    agent_id TEXT,
+    generation_run_id TEXT NOT NULL UNIQUE REFERENCES generation_runs(id) ON DELETE RESTRICT,
+    model_role TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_rate_per_1k REAL NOT NULL DEFAULT 0,
+    estimated_cost REAL NOT NULL DEFAULT 0,
+    actual_cost REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'recorded',
+    created_at TIMESTAMP NOT NULL,
+    CHECK(round_number >= 1),
+    CHECK(prompt_tokens >= 0 AND completion_tokens >= 0 AND total_tokens >= 0),
+    CHECK(cost_rate_per_1k >= 0 AND estimated_cost >= 0 AND actual_cost >= 0),
+    CHECK(status IN ('recorded', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_cost_ledger_run_round
+    ON simulation_cost_ledger(simulation_run_id, round_number, created_at);
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_cost_ledger_update
+BEFORE UPDATE ON simulation_cost_ledger
+BEGIN
+    SELECT RAISE(ABORT, 'simulation cost ledger is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_cost_ledger_delete
+BEFORE DELETE ON simulation_cost_ledger
+BEGIN
+    SELECT RAISE(ABORT, 'simulation cost ledger is append-only');
+END;
+"""
+
+
+def _apply_v39(conn: sqlite3.Connection) -> None:
+    """Persist explainable Agent scheduling and provider usage accounting."""
+    _execute_sql_script(conn, PHASE_39_STORYFLOW_SCHEDULER_COST_SQL)
+
+
+PHASE_40_STORYFLOW_CAUSAL_TRACE_SQL = """
+-- Causal traces are an append-only, rebuildable Sandbox ledger.  They point
+-- at persisted simulation evidence and never become Canon facts.
+CREATE TABLE IF NOT EXISTS simulation_causal_traces (
+    id TEXT PRIMARY KEY,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    event_id TEXT NOT NULL REFERENCES simulation_events(id) ON DELETE RESTRICT,
+    cause_type TEXT NOT NULL,
+    cause_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    evidence JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL,
+    UNIQUE(event_id, cause_type, cause_id, relation),
+    CHECK(cause_type IN ('prior_event', 'goal', 'memory', 'intervention',
+                         'relationship', 'world_rule', 'generation'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_causal_traces_run_event
+    ON simulation_causal_traces(simulation_run_id, event_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_simulation_causal_traces_cause
+    ON simulation_causal_traces(cause_type, cause_id);
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_causal_trace_update
+BEFORE UPDATE ON simulation_causal_traces
+BEGIN
+    SELECT RAISE(ABORT, 'simulation causal traces are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_causal_trace_delete
+BEFORE DELETE ON simulation_causal_traces
+BEGIN
+    SELECT RAISE(ABORT, 'simulation causal traces are append-only');
+END;
+"""
+
+
+def _apply_v40(conn: sqlite3.Connection) -> None:
+    """Persist explainable, Sandbox-only causal evidence for simulation events."""
+    _execute_sql_script(conn, PHASE_40_STORYFLOW_CAUSAL_TRACE_SQL)
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -1599,6 +2144,25 @@ _MIGRATIONS = (
     _Migration(20, "phase_20_continuous_run_governance", _apply_v20, PHASE_20_CONTINUOUS_RUN_GOVERNANCE_SQL),
     _Migration(21, "phase_21_narrative_os_closure", _apply_v21, PHASE_21_NARRATIVE_OS_CLOSURE_SQL),
     _Migration(22, "phase_22_commit_rebase", _apply_v22, PHASE_22_COMMIT_REBASE_SQL),
+    # Version 23 is already present in existing user databases from an earlier
+    # shipped build, but its source is not in this checkout. Never reuse it.
+    _Migration(24, "storyflow_simulation_foundation", _apply_v24, PHASE_24_STORYFLOW_SIMULATION_FOUNDATION_SQL),
+    _Migration(25, "storyflow_simulation_ledger", _apply_v25, PHASE_25_STORYFLOW_SIMULATION_LEDGER_SQL),
+    _Migration(26, "storyflow_simulation_integrity", _apply_v26, PHASE_26_STORYFLOW_SIMULATION_INTEGRITY_SQL),
+    _Migration(27, "storyflow_simulation_checkpoints", _apply_v27, PHASE_27_STORYFLOW_SIMULATION_CHECKPOINT_SQL),
+    _Migration(28, "storyflow_agent_memory", _apply_v28, PHASE_28_STORYFLOW_AGENT_MEMORY_SQL),
+    _Migration(29, "storyflow_simulation_branches", _apply_v29, PHASE_29_STORYFLOW_SIMULATION_BRANCHES_SQL),
+    _Migration(30, "storyflow_simulation_interventions", _apply_v30, PHASE_30_STORYFLOW_SIMULATION_INTERVENTIONS_SQL),
+    _Migration(31, "storyflow_simulation_adoptions", _apply_v31, PHASE_31_STORYFLOW_SIMULATION_ADOPTIONS_SQL),
+    _Migration(32, "storyflow_simulation_analysis", _apply_v32, PHASE_32_STORYFLOW_SIMULATION_ANALYSIS_SQL),
+    _Migration(33, "storyflow_character_interactions", _apply_v33, PHASE_33_STORYFLOW_CHARACTER_INTERACTIONS_SQL),
+    _Migration(34, "storyflow_surveys", _apply_v34, PHASE_34_STORYFLOW_SURVEYS_SQL),
+    _Migration(35, "storyflow_run_metadata", _apply_v35, PHASE_35_STORYFLOW_RUN_METADATA_SQL),
+    _Migration(36, "storyflow_event_provenance", _apply_v36, PHASE_36_STORYFLOW_EVENT_PROVENANCE_SQL),
+    _Migration(37, "storyflow_simulation_clock", _apply_v37, PHASE_37_STORYFLOW_SIMULATION_CLOCK_SQL),
+    _Migration(38, "storyflow_simulation_graph_projection", _apply_v38, PHASE_38_STORYFLOW_SIMULATION_GRAPH_SQL),
+    _Migration(39, "storyflow_scheduler_cost_control", _apply_v39, PHASE_39_STORYFLOW_SCHEDULER_COST_SQL),
+    _Migration(40, "storyflow_simulation_causal_trace", _apply_v40, PHASE_40_STORYFLOW_CAUSAL_TRACE_SQL),
 )
 
 _RUNTIME_EXTENSION_NAME = "narrative_runtime_v2"
