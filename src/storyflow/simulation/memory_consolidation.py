@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections import Counter
 from typing import Any, Callable
 
@@ -53,6 +54,10 @@ class AgentMemoryConsolidator:
         }
         if self._assignment.provider_for("memory"):
             content["providerSummary"], content["providerEvidence"] = self._provider_summary(
+                run_id, agent_id, round_number, episodic, event_ids,
+            )
+        if self._assignment.provider_for("embedding"):
+            content["providerEmbedding"], content["providerEmbeddingEvidence"] = self._provider_embedding(
                 run_id, agent_id, round_number, episodic, event_ids,
             )
         memory = AgentMemory(
@@ -113,6 +118,58 @@ class AgentMemoryConsolidator:
             "summary": summary[:4000], "facts": normalized_facts,
             "confidence": confidence,
         }, evidence
+
+    def _provider_embedding(self, run_id: str, agent_id: str, round_number: int,
+                            episodic: list[AgentMemory], event_ids: tuple[str, ...]) -> tuple[list[float], dict[str, Any]]:
+        """Persist a bounded Agent-local vector returned by the assigned model.
+
+        Simulation embeddings are stored inside the sandbox memory record. They
+        never enter the canonical ``embedding_projections`` table, whose model
+        is a Canon/RAG projection owned by the writing system.
+        """
+        if self._model_manager is None:
+            raise ValueError("SIMULATION_EMBEDDING_PROVIDER_UNAVAILABLE: no model manager is configured")
+        if not self._task_id:
+            raise ValueError("SIMULATION_EMBEDDING_PROVIDER_TASK_REQUIRED: durable task id is required")
+        if self._before_provider_call is not None:
+            self._before_provider_call(1)
+        router = SimulationCapabilityRouter(
+            self._model_manager, self._assignment, run_id=run_id, task_id=self._task_id,
+        )
+        payload = {
+            "simulationRunId": run_id,
+            "agentId": agent_id,
+            "roundNumber": round_number,
+            "sourceEventIds": list(event_ids),
+            "agentLocalMemories": [
+                {"id": item.id, "content": item.content, "importance": item.importance,
+                 "confidence": item.confidence, "createdRound": item.created_round}
+                for item in episodic[-100:]
+            ],
+        }
+        raw, evidence = router.call_json(
+            "embedding", payload=payload,
+            system=("You are the NovelForge Simulation embedding model. Return only a bounded JSON "
+                    "vector for the supplied Agent-local memories: {\"embedding\": [number, ...]}. "
+                    "Do not use Canon or another Agent's private knowledge."),
+            stage=f"simulation-embedding:{run_id}:{round_number}:{agent_id}",
+            prompt_key="simulation-agent-embedding",
+            context_manifest={"kind": "simulation_agent_embedding", "simulationRunId": run_id,
+                              "roundNumber": round_number, "agentId": agent_id,
+                              "sourceEventIds": list(event_ids), "canonicalMutation": False},
+        )
+        values = raw.get("embedding", raw.get("vector"))
+        if not isinstance(values, list) or not values:
+            raise ValueError("SIMULATION_EMBEDDING_PROVIDER_INVALID: embedding vector is required")
+        if len(values) > 1536:
+            raise ValueError("SIMULATION_EMBEDDING_PROVIDER_INVALID: embedding vector is too large")
+        try:
+            vector = [float(value) for value in values]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SIMULATION_EMBEDDING_PROVIDER_INVALID: embedding values must be numeric") from exc
+        if any(not math.isfinite(value) or not (-1_000_000 <= value <= 1_000_000) for value in vector):
+            raise ValueError("SIMULATION_EMBEDDING_PROVIDER_INVALID: embedding value is out of bounds")
+        return vector, evidence
 
     def _social_and_rumor(self, run_id: str, agent_id: str, episodic: list[AgentMemory], round_number: int) -> None:
         targets: dict[str, list[str]] = {}

@@ -54,8 +54,10 @@ class SimulationTaskHandlers:
                                if queued_assignment is not None
                                else SimulationProviderAssignment.from_configuration(run.configuration))
         memory_provider_id = provider_assignment.provider_for("memory")
-        if memory_provider_id and self._model_manager is None:
-            raise ValueError("SIMULATION_MEMORY_PROVIDER_UNAVAILABLE: no durable model manager is configured")
+        embedding_provider_id = provider_assignment.provider_for("embedding")
+        if (memory_provider_id or embedding_provider_id) and self._model_manager is None:
+            capability = "memory" if memory_provider_id else "embedding"
+            raise ValueError(f"SIMULATION_{capability.upper()}_PROVIDER_UNAVAILABLE: no durable model manager is configured")
         action_map: dict[str, NarrativeAction] = {}
         for item in actions:
             if not isinstance(item, dict):
@@ -103,7 +105,7 @@ class SimulationTaskHandlers:
         scope: AbstractContextManager[Any] = nullcontext()
         budget: SimulationBudgetController | None = None
         scheduled_agent_ids = [item.agent_id for item in activations if item.active]
-        if decision_mode == "provider" or memory_provider_id:
+        if decision_mode == "provider" or memory_provider_id or embedding_provider_id:
             budget = SimulationBudgetController(self._repository, run, round_number=round_number, task_id=task["id"])
         if decision_mode == "provider":
             if self._model_manager is None:
@@ -152,10 +154,10 @@ class SimulationTaskHandlers:
                 scope = nullcontext()
         consolidator = AgentMemoryConsolidator(
             self._repository.memories,
-            model_manager=self._model_manager if memory_provider_id else None,
+            model_manager=self._model_manager if (memory_provider_id or embedding_provider_id) else None,
             provider_assignment=provider_assignment,
-            task_id=task["id"] if memory_provider_id else None,
-            before_provider_call=budget.ensure_can_schedule if budget and memory_provider_id else None,
+            task_id=task["id"] if (memory_provider_id or embedding_provider_id) else None,
+            before_provider_call=budget.ensure_can_schedule if budget and (memory_provider_id or embedding_provider_id) else None,
         )
         try:
             with scope:
@@ -241,13 +243,17 @@ class SimulationTaskHandlers:
         SimulationGraphProjector(self._repository).project(run_id, event_limit=5000)
         run = self._repository.get_run(run_id)
         memory_provider_id = provider_assignment.provider_for("memory")
+        embedding_provider_id = provider_assignment.provider_for("embedding")
+        if (memory_provider_id or embedding_provider_id) and self._model_manager is None:
+            capability = "memory" if memory_provider_id else "embedding"
+            raise ValueError(f"SIMULATION_{capability.upper()}_PROVIDER_UNAVAILABLE: no durable model manager is configured")
         budget = (SimulationBudgetController(self._repository, run, round_number=round_number, task_id=task["id"])
-                  if memory_provider_id else None)
+                  if memory_provider_id or embedding_provider_id else None)
         consolidator = AgentMemoryConsolidator(
             self._repository.memories,
-            model_manager=self._model_manager if memory_provider_id else None,
+            model_manager=self._model_manager if (memory_provider_id or embedding_provider_id) else None,
             provider_assignment=provider_assignment,
-            task_id=task["id"] if memory_provider_id else None,
+            task_id=task["id"] if (memory_provider_id or embedding_provider_id) else None,
             before_provider_call=budget.ensure_can_schedule if budget else None,
         )
         actors = sorted({event.actor_id for event in events if event.actor_id})
@@ -269,5 +275,7 @@ class SimulationTaskHandlers:
             "eventIds": [event.id for event in events],
             "checkpointId": checkpoint.id,
             "simulationTime": current.simulation_time,
+            "providerAssignment": provider_assignment.to_record(),
+            "budget": budget.snapshot(estimated_calls=len(actors)) if budget else None,
             "idempotent": True,
         }

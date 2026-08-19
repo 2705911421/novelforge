@@ -140,6 +140,8 @@ class _CapabilityManager:
                 manager.last_run = f"generation-{prompt_key}"
                 if prompt_key == "simulation-agent-memory":
                     return {"summary": "Provider memory summary", "facts": ["A local event"], "confidence": 0.9}
+                if prompt_key == "simulation-agent-embedding":
+                    return {"embedding": [0.1, 0.2, 0.3]}
                 if prompt_key == "simulation-analyst-answer":
                     return {"answer": "Provider analyst answer grounded in the supplied ledger."}
                 if prompt_key == "simulation-character-chat":
@@ -509,6 +511,34 @@ def test_simulation_provider_assignment_fails_closed_before_events(tmp_path, inv
     assert simulations.events("provider-invalid") == []
 
 
+@pytest.mark.parametrize("provider_key, expected_code", [
+    ("memoryProviderId", "SIMULATION_MEMORY_PROVIDER_UNAVAILABLE"),
+    ("embeddingProviderId", "SIMULATION_EMBEDDING_PROVIDER_UNAVAILABLE"),
+])
+def test_simulation_memory_and_embedding_routes_fail_closed_without_manager(tmp_path, provider_key, expected_code):
+    database = Database(str(tmp_path / "simulation.db"))
+    database.execute("INSERT INTO projects(id, name) VALUES (?, ?)", ("project-1", "Test"))
+    database.execute("INSERT INTO books(id, project_id, title) VALUES (?, ?, ?)", ("book-1", "project-1", "Test"))
+    snapshot = WorldSnapshotRepository(database).create(SimulationWorldSnapshot(
+        book_id="book-1", project_id="project-1", base_canon_event_id="event-7", canon_hash="hash-a",
+        story_state_version=3, world={"characters": {"a": {"alive": True}}},
+    ))
+    simulations = SimulationRepository(database)
+    simulations.create_run(SimulationRun(
+        f"{provider_key}-run", "book-1", snapshot.snapshot_id, "Provider unavailable",
+        configuration={"providerAssignment": {provider_key: "provider-a"}},
+    ))
+    simulations.transition_run(f"{provider_key}-run", SimulationRunStatus.READY)
+    simulations.transition_run(f"{provider_key}-run", SimulationRunStatus.RUNNING)
+    with pytest.raises(ValueError, match=expected_code):
+        SimulationTaskHandlers(database).execute_round({
+            "id": f"{provider_key}-task",
+            "data": {"runId": f"{provider_key}-run", "roundNumber": 1, "decisionMode": "explicit",
+                     "actions": [{"actionType": "WAIT", "actorId": "a"}]},
+        })
+    assert simulations.events(f"{provider_key}-run") == []
+
+
 def test_simulation_provider_assignment_normalizes_capability_aliases():
     assignment = SimulationProviderAssignment.from_value({
         "agent_decision_provider_id": " provider-a ",
@@ -563,6 +593,45 @@ def test_memory_capability_provider_is_agent_local_and_durable(tmp_path):
     assert semantic and semantic[0].content["providerSummary"]["summary"] == "Provider memory summary"
     assert semantic[0].content["providerEvidence"]["canonicalMutation"] is False
     assert calls[0]["kwargs"]["context_manifest"]["simulationRunId"] == "memory-provider-run"
+
+
+def test_embedding_capability_provider_is_agent_local_and_sandbox_scoped(tmp_path):
+    database = Database(str(tmp_path / "simulation.db"))
+    database.execute("INSERT INTO projects(id, name) VALUES (?, ?)", ("project-1", "Test"))
+    database.execute("INSERT INTO books(id, project_id, title) VALUES (?, ?, ?)", ("book-1", "project-1", "Test"))
+    snapshot = WorldSnapshotRepository(database).create(SimulationWorldSnapshot(
+        book_id="book-1", project_id="project-1", base_canon_event_id="event-7", canon_hash="hash-a",
+        story_state_version=3,
+        world={"characters": {"a": {"alive": True}, "b": {"alive": True}},
+               "knowledge": {"a": {"secret-a": "local"}, "b": {"secret-b": "private"}}},
+    ))
+    simulations = SimulationRepository(database)
+    simulations.create_run(SimulationRun(
+        "embedding-provider-run", "book-1", snapshot.snapshot_id, "Embedding provider", max_rounds=1,
+        configuration={"providerAssignment": {"embeddingProviderId": "embedding-provider"}},
+    ))
+    simulations.transition_run("embedding-provider-run", SimulationRunStatus.READY)
+    simulations.transition_run("embedding-provider-run", SimulationRunStatus.RUNNING)
+    runtime = TaskRuntime(database)
+    runtime.enqueue("simulation-round", project_id="project-1", book_id="book-1", data={
+        "runId": "embedding-provider-run", "roundNumber": 1, "decisionMode": "explicit",
+        "actions": [{"actionType": "WAIT", "actorId": "a"}],
+    })
+    manager = _CapabilityManager()
+    result = __import__("asyncio").run(PersistentTaskWorker(
+        runtime, SimulationTaskHandlers(database, model_manager=manager).mapping(), retry_delay_seconds=0,
+    ).execute_once("embedding-provider-worker"))
+    assert result["status"] == "completed"
+    calls = [item for item in manager.calls if item["kwargs"].get("prompt_key") == "simulation-agent-embedding"]
+    assert len(calls) == 1
+    assert calls[0]["kwargs"]["provider_id"] == "embedding-provider"
+    assert calls[0]["payload"]["agentId"] == "a"
+    assert "secret-b" not in json.dumps(calls[0]["payload"], ensure_ascii=True)
+    semantic = simulations.memories.list_for_agent(
+        "embedding-provider-run", "a", memory_type=AgentMemoryType.SEMANTIC,
+    )
+    assert semantic and semantic[0].content["providerEmbedding"] == [0.1, 0.2, 0.3]
+    assert semantic[0].content["providerEmbeddingEvidence"]["canonicalMutation"] is False
 
 
 def test_analyst_and_character_chat_capabilities_route_with_local_evidence(tmp_path):
