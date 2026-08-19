@@ -123,13 +123,18 @@ class SimulationSurveyService:
     def surveys(self) -> SimulationSurveyRepository:
         return self._surveys
 
-    def conduct(self, run_id: str, question: str, agent_ids: list[str] | None = None) -> SimulationSurvey:
+    def conduct(self, run_id: str, question: str, agent_ids: list[str] | None = None, *,
+                survey_id: str | None = None) -> SimulationSurvey:
         if not question or not question.strip():
             raise ValueError("survey question is required")
         run = self._simulations.get_run(run_id)
         state = self._simulations.recover(run_id)
         characters = state.values.get("characters", {})
-        available = sorted(characters) if isinstance(characters, Mapping) else []
+        factions = state.values.get("factions", {})
+        available_ids = set(characters) if isinstance(characters, Mapping) else set()
+        if isinstance(factions, Mapping):
+            available_ids.update(factions)
+        available = sorted(available_ids)
         selected = tuple(agent_ids or available)
         if not selected:
             raise ValueError("survey requires at least one character agent")
@@ -138,17 +143,39 @@ class SimulationSurveyService:
             raise ValueError(f"survey agents not found: {', '.join(missing)}")
         if len(set(selected)) != len(selected):
             raise ValueError("survey agent ids must be unique")
-        survey = self._surveys.create_survey(
-            SimulationSurvey(uuid.uuid4().hex, run.book_id, run_id, question, selected, "RUNNING")
-        )
-        responses: list[SurveyResponse] = []
+        existing = self._surveys.get(survey_id) if survey_id else None
+        if existing is not None:
+            if existing.book_id != run.book_id or existing.simulation_run_id != run_id:
+                raise ValueError("survey id is bound to another Simulation run")
+            if existing.question != question or existing.agent_ids != selected:
+                raise ValueError("survey id does not match the requested inquiry")
+            if existing.status != "RUNNING":
+                return existing
+            if len(existing.responses) == len(selected):
+                status = "COMPLETED" if all(item.status == "ANSWERED" for item in existing.responses) else "PARTIAL"
+                self._database_update_status(existing.id, status)
+                return self._surveys.get(existing.id) or existing
+            survey = existing
+        else:
+            survey = self._surveys.create_survey(
+                SimulationSurvey(survey_id or uuid.uuid4().hex, run.book_id, run_id, question, selected, "RUNNING")
+            )
+        responses_by_agent = {item.agent_id: item for item in survey.responses}
+        responses: list[SurveyResponse] = list(survey.responses)
         for agent_id in selected:
-            interaction = self._chat.interact(run_id, agent_id, question)
-            responses.append(self._surveys.add_response(SurveyResponse(
-                id=uuid.uuid4().hex, survey_id=survey.id, agent_id=agent_id,
+            if agent_id in responses_by_agent:
+                continue
+            interaction = self._chat.interact(
+                run_id, agent_id, question,
+                interaction_id=f"{survey.id}:interaction:{agent_id}",
+            )
+            response = self._surveys.add_response(SurveyResponse(
+                id=f"{survey.id}:response:{agent_id}", survey_id=survey.id, agent_id=agent_id,
                 interaction_id=interaction.id, status=interaction.status,
                 response=interaction.response, evidence=interaction.evidence,
-            )))
+            ))
+            responses_by_agent[agent_id] = response
+            responses.append(response)
         status = "COMPLETED" if all(item.status == "ANSWERED" for item in responses) else "PARTIAL"
         self._database_update_status(survey.id, status)
         return self._surveys.get(survey.id) or SimulationSurvey(

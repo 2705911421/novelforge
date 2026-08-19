@@ -5,8 +5,10 @@ from .report import SimulationAnalysisReport, SimulationAnalysisRepository, Simu
 from .graph import SimulationGraphProjection, SimulationGraphProjector
 from .tools import NarrativeAnalyst, SimulationAnalystTools
 from .causality import CausalTrace, SimulationCausalityService
+from .outcomes import OutcomeCluster, SimulationOutcomeClusterService
 
 __all__ = ["BranchComparison", "BranchComparisonService", "SimulationAnalysisReport",
            "SimulationAnalysisRepository", "SimulationAnalyst", "SimulationGraphProjection",
            "SimulationGraphProjector", "SimulationAnalystTools", "NarrativeAnalyst",
-           "CausalTrace", "SimulationCausalityService"]
+           "CausalTrace", "SimulationCausalityService", "OutcomeCluster",
+           "SimulationOutcomeClusterService"]

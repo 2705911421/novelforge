@@ -14,9 +14,6 @@ from .causality import SimulationCausalityService
 from src.storyflow.world.repository import WorldSnapshotRepository
 from src.storyflow.world.snapshot import compare_snapshot_with_canon
 
-from .branch_compare import BranchComparisonService
-
-
 def _event_record(event: Any) -> dict[str, Any]:
     return {
         "id": event.id,
@@ -236,6 +233,11 @@ class SimulationAnalystTools:
         }, {"source": "simulation_branches", "runId": run.id, "canonicalMutation": False})
 
     def compare_branches(self, left_run_id: str, right_run_id: str) -> dict[str, Any]:
+        # Import lazily: ``branch_compare`` depends on ``simulation.repository``.
+        # Eagerly importing it here makes the package-level simulation exports
+        # load ``task_handler`` while ``branch_compare`` is still initializing.
+        from .branch_compare import BranchComparisonService
+
         left_run = self._simulations.get_run(left_run_id)
         right_run = self._simulations.get_run(right_run_id)
         if left_run.book_id != right_run.book_id:

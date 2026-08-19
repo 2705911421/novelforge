@@ -33,6 +33,25 @@ class PersistentTaskWorker:
         task = self.runtime.claim(worker_id, lease_seconds=self.lease_seconds)
         if task is None:
             return None
+        return await self.execute_claimed(task, worker_id)
+
+    async def execute_task(self, task_id: str, worker_id: str = "studio") -> Optional[dict]:
+        """Claim and execute one specific durable task.
+
+        HTTP integrations use this targeted seam when an author expects an
+        immediate response but the provider work must still have a persisted
+        Task/GenerationRun owner.  A concurrent worker can win the claim; in
+        that case the caller receives ``None`` and can read the task record.
+        """
+        task = self.runtime.claim_by_id(task_id, worker_id, lease_seconds=self.lease_seconds)
+        if task is None:
+            return None
+        return await self.execute_claimed(task, worker_id)
+
+    async def execute_claimed(self, task: dict[str, Any], worker_id: str = "studio") -> Optional[dict]:
+        """Run a task that the caller has already claimed with this owner."""
+        if not isinstance(task, dict) or not task.get("id"):
+            raise ValueError("a claimed durable task is required")
         handler = self.handlers.get(task["type"])
         if handler is None:
             return self.runtime.transition(task["id"], "needs_author_decision", detail={
@@ -134,6 +153,9 @@ class PersistentTaskWorker:
         if isinstance(explicit_code, str) and explicit_code:
             return explicit_code, explicit_code in {"RATE_LIMIT", "NETWORK", "PROVIDER_TRANSIENT"}
         message = str(exc).lower()
+        code_token = re.match(r"^\s*([A-Z][A-Z0-9_]+)\s*:", str(exc))
+        if code_token and code_token.group(1).startswith(("SIMULATION_", "MODEL_", "PROVIDER_")):
+            return code_token.group(1), False
         status = re.search(r"\b([1-5]\d\d)\b", message)
         status_code = int(status.group(1)) if status else None
         if status_code in {401, 403} or "unauthorized" in message or "forbidden" in message:

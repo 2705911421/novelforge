@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import uuid
 from datetime import datetime
 from typing import Any, Iterable, Mapping
 
@@ -115,7 +116,8 @@ class SimulationRepository:
         self._record_causal_trace(event)
         return event
 
-    def create_branch(self, parent_run_id: str, branch: SimulationBranch, *, name: str) -> SimulationRun:
+    def create_branch(self, parent_run_id: str, branch: SimulationBranch, *, name: str,
+                      seed: int | None = None) -> SimulationRun:
         parent = self.get_run(parent_run_id)
         if branch.parent_run_id != parent_run_id:
             raise ValueError("branch parent mismatch")
@@ -130,7 +132,8 @@ class SimulationRepository:
         fork_time = (fork_event.simulation_time if fork_event and fork_event.simulation_time
                      else SimulationClock.time_from_start(parent, fork_round))
         child = SimulationRun(branch.branch_run_id, parent.book_id, parent.snapshot_id, name,
-                              SimulationRunStatus.READY, fork_round, parent.max_rounds, parent.seed,
+                              SimulationRunStatus.READY, fork_round, parent.max_rounds,
+                              parent.seed if seed is None else seed,
                               description=parent.description, purpose=parent.purpose,
                               created_by=parent.created_by, configuration=parent.configuration,
                               simulation_time=fork_time)
@@ -373,14 +376,86 @@ class SimulationRepository:
             simulation_time=row["simulation_time"],
         )
 
-    def list_runs(self, book_id: str, *, limit: int = 100) -> list[SimulationRun]:
+    def _history_row(self, run_id: str):
+        return self._database.fetchone(
+            """SELECT action, reason, created_at, id
+               FROM simulation_run_history
+               WHERE simulation_run_id=?
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (run_id,),
+        )
+
+    def history_state(self, run_id: str) -> dict[str, Any]:
+        """Return the latest archive state for a run."""
+        row = self._history_row(run_id)
+        archived = bool(row and row["action"] == "ARCHIVE")
+        return {
+            "archived": archived,
+            "action": row["action"] if row else None,
+            "reason": row["reason"] if row else "",
+            "changedAt": row["created_at"] if row else None,
+            "historyId": row["id"] if row else None,
+        }
+
+    def history_events(self, run_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("history limit must be between 1 and 1000")
+        rows = self._database.fetchall(
+            """SELECT id, simulation_run_id, book_id, action, reason, created_at
+               FROM simulation_run_history
+               WHERE simulation_run_id=?
+               ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (run_id, limit),
+        )
+        return [{
+            "id": row["id"], "runId": row["simulation_run_id"], "bookId": row["book_id"],
+            "action": row["action"], "reason": row["reason"], "createdAt": row["created_at"],
+        } for row in rows]
+
+    def _append_history_action(self, run_id: str, action: str, reason: str = "") -> dict[str, Any]:
+        run = self.get_run(run_id)
+        if action not in {"ARCHIVE", "UNARCHIVE"}:
+            raise ValueError("unsupported simulation history action")
+        current = self.history_state(run_id)
+        if (action == "ARCHIVE" and current["archived"]) or (action == "UNARCHIVE" and not current["archived"]):
+            return current
+        history_id = uuid.uuid4().hex
+        created_at = datetime.now().isoformat()
+        self._database.execute(
+            """INSERT INTO simulation_run_history(
+                   id, simulation_run_id, book_id, action, reason, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (history_id, run_id, run.book_id, action, reason.strip(), created_at),
+        )
+        return self.history_state(run_id)
+
+    def archive_run(self, run_id: str, *, reason: str = "") -> dict[str, Any]:
+        """Hide a run from default History listings without deleting evidence."""
+        run = self.get_run(run_id)
+        if run.status is SimulationRunStatus.RUNNING:
+            raise ValueError("running simulation runs must be paused or stopped before archive")
+        return self._append_history_action(run_id, "ARCHIVE", reason)
+
+    def unarchive_run(self, run_id: str, *, reason: str = "") -> dict[str, Any]:
+        """Restore an archived run to the default History listing."""
+        return self._append_history_action(run_id, "UNARCHIVE", reason)
+
+    def list_runs(self, book_id: str, *, limit: int = 100, include_archived: bool = False) -> list[SimulationRun]:
         if not book_id:
             raise ValueError("book_id is required")
         if limit < 1 or limit > 1000:
             raise ValueError("simulation run limit must be between 1 and 1000")
         rows = self._database.fetchall(
-            "SELECT id FROM simulation_runs WHERE book_id=? ORDER BY created_at DESC, id DESC LIMIT ?",
-            (book_id, limit),
+            """SELECT r.id
+               FROM simulation_runs r
+               WHERE r.book_id=?
+                 AND (? OR COALESCE((
+                     SELECT h.action FROM simulation_run_history h
+                     WHERE h.simulation_run_id=r.id
+                     ORDER BY h.created_at DESC, h.id DESC LIMIT 1
+                 ), 'UNARCHIVE') <> 'ARCHIVE')
+               ORDER BY r.created_at DESC, r.id DESC LIMIT ?""",
+            (book_id, int(include_archived), limit),
         )
         return [self.get_run(row["id"]) for row in rows]
 

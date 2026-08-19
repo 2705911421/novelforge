@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
+import hashlib
 from typing import Any, Callable, cast
 
 from src.core.database import Database
@@ -14,6 +15,10 @@ from .round_engine import FailureInjector, SimulationRoundEngine
 from .memory_consolidation import AgentMemoryConsolidator
 from .decision import SimulationDecisionEngine
 from src.storyflow.analysis.graph import SimulationGraphProjector
+from src.storyflow.analysis.report import SimulationAnalysisReport, SimulationAnalyst
+from src.storyflow.analysis.tools import NarrativeAnalyst
+from src.storyflow.interaction.character_chat import CharacterChatService
+from src.storyflow.interaction.survey import SimulationSurveyService
 from .scheduler import AgentScheduler
 from .budget import SimulationBudgetController, SimulationBudgetExceeded
 from .provider_routing import SimulationProviderAssignment
@@ -29,7 +34,132 @@ class SimulationTaskHandlers:
         self._failure_injector = failure_injector
 
     def mapping(self) -> dict[str, Callable[[dict[str, Any]], dict[str, Any]]]:
-        return {"simulation-round": self.execute_round}
+        return {
+            "simulation-round": self.execute_round,
+            "simulation-analyst-query": self.execute_analyst_query,
+            "simulation-character-chat": self.execute_character_chat,
+            "simulation-survey": self.execute_survey,
+        }
+
+    def execute_analyst_query(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Answer one grounded Analyst query under a durable task owner."""
+        data = task.get("data") or {}
+        run_id = data.get("runId")
+        question = data.get("question")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("simulation analyst task runId is required")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("simulation analyst task question is required")
+        run = self._repository.get_run(run_id)
+        arguments = data.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            raise ValueError("simulation analyst task arguments must be an object")
+        for key in ("left_run_id", "right_run_id"):
+            candidate = arguments.get(key)
+            if candidate:
+                candidate_run = self._repository.get_run(str(candidate))
+                if candidate_run.book_id != run.book_id:
+                    raise ValueError("analyst comparison run does not belong to book")
+        report_id = hashlib.sha256(
+            f"simulation-analyst-report:{task['id']}".encode("utf-8")
+        ).hexdigest()[:32]
+        reports = SimulationAnalyst(self._repository.database).reports
+        existing_report = reports.get(report_id)
+        if existing_report is not None:
+            persisted_analysis = existing_report.evidence.get("analysis")
+            if isinstance(persisted_analysis, dict):
+                return {
+                    "runId": run_id, "analysis": persisted_analysis,
+                    "report": existing_report.to_record(),
+                    "providerAssignment": SimulationProviderAssignment.from_configuration(run.configuration).to_record(),
+                    "canonicalMutation": False,
+                }
+        assignment = SimulationProviderAssignment.from_configuration(run.configuration)
+        analyst = NarrativeAnalyst(
+            self._repository.database,
+            model_manager=self._model_manager,
+            provider_assignment=assignment,
+            task_id=task["id"],
+        )
+        analysis = analyst.ask(
+            run_id, question, tool=data.get("tool"), arguments=arguments,
+        )
+        report = reports.get(report_id)
+        if report is None:
+            report = reports.create(SimulationAnalysisReport(
+                id=report_id, book_id=run.book_id, simulation_run_id=run.id,
+                kind="analyst-query", title=str(data.get("title") or question)[:200],
+                summary=analysis["answer"], evidence={
+                    "source": "simulation_analyst_tools",
+                    "canonicalMutation": False,
+                    "question": question,
+                    "evidenceChain": analysis.get("evidenceChain", []),
+                    "toolCalls": analysis.get("toolCalls", []),
+                    "analysis": analysis,
+                },
+            ))
+        return {
+            "runId": run_id, "analysis": analysis, "report": report.to_record(),
+            "providerAssignment": assignment.to_record(), "canonicalMutation": False,
+        }
+
+    def execute_character_chat(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Answer one Agent-local chat request under a durable task owner."""
+        data = task.get("data") or {}
+        run_id = data.get("runId")
+        agent_id = data.get("agentId")
+        prompt = data.get("prompt")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("simulation character chat task runId is required")
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("simulation character chat task agentId is required")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("simulation character chat task prompt is required")
+        run = self._repository.get_run(run_id)
+        assignment = SimulationProviderAssignment.from_configuration(run.configuration)
+        interaction = CharacterChatService(
+            self._repository.database,
+            model_manager=self._model_manager,
+            provider_assignment=assignment,
+            task_id=task["id"],
+        ).interact(
+            run_id, agent_id, prompt,
+            interaction_id=str(data.get("interactionId") or f"simulation-chat:{task['id']}"),
+        )
+        return {
+            "runId": run_id, "interaction": interaction.to_record(),
+            "providerAssignment": assignment.to_record(), "canonicalMutation": False,
+        }
+
+    def execute_survey(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Run a resumable multi-Agent inquiry under one durable task owner."""
+        data = task.get("data") or {}
+        run_id = data.get("runId")
+        question = data.get("question")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("simulation survey task runId is required")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("simulation survey task question is required")
+        agent_ids = data.get("agentIds")
+        if agent_ids is not None and (not isinstance(agent_ids, list) or
+                                      any(not isinstance(item, str) or not item for item in agent_ids)):
+            raise ValueError("simulation survey task agentIds must be a list of non-empty strings")
+        run = self._repository.get_run(run_id)
+        assignment = SimulationProviderAssignment.from_configuration(run.configuration)
+        chat = CharacterChatService(
+            self._repository.database,
+            model_manager=self._model_manager,
+            provider_assignment=assignment,
+            task_id=task["id"],
+        )
+        survey = SimulationSurveyService(self._repository.database, chat=chat).conduct(
+            run_id, question, agent_ids,
+            survey_id=str(data.get("surveyId") or f"simulation-survey:{task['id']}"),
+        )
+        return {
+            "runId": run_id, "survey": survey.to_record(),
+            "providerAssignment": assignment.to_record(), "canonicalMutation": False,
+        }
 
     def execute_round(self, task: dict[str, Any]) -> dict[str, Any]:
         data = task.get("data") or {}

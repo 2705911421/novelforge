@@ -54,6 +54,12 @@ class CharacterInteractionRepository:
             )
         return interaction
 
+    def get(self, interaction_id: str) -> CharacterInteraction | None:
+        row = self._database.fetchone(
+            "SELECT * FROM simulation_character_interactions WHERE id=?", (interaction_id,)
+        )
+        return self._row(row) if row is not None else None
+
     @staticmethod
     def _row(row) -> CharacterInteraction:
         return CharacterInteraction(
@@ -95,13 +101,23 @@ class CharacterChatService:
     def interactions(self) -> CharacterInteractionRepository:
         return self._interactions
 
-    def interact(self, run_id: str, agent_id: str, prompt: str) -> CharacterInteraction:
+    def interact(self, run_id: str, agent_id: str, prompt: str, *,
+                 interaction_id: str | None = None) -> CharacterInteraction:
         if not prompt or not prompt.strip():
             raise ValueError("interaction prompt is required")
+        if interaction_id:
+            existing = self._interactions.get(interaction_id)
+            if existing is not None:
+                if existing.simulation_run_id != run_id or existing.agent_id != agent_id:
+                    raise ValueError("interaction id is bound to another Agent or Simulation run")
+                return existing
         run = self._simulations.get_run(run_id)
         state = self._simulations.recover(run_id)
         characters = state.values.get("characters", {})
-        if not isinstance(characters, Mapping) or agent_id not in characters:
+        factions = state.values.get("factions", {})
+        is_character = isinstance(characters, Mapping) and agent_id in characters
+        is_faction = isinstance(factions, Mapping) and agent_id in factions
+        if not (is_character or is_faction):
             raise ValueError(f"agent not found: {agent_id}")
         memories = self._simulations.memories.retrieve_for_agent(run_id, agent_id, query=prompt, limit=20)
         perception = self._perception.build(
@@ -122,8 +138,8 @@ class CharacterChatService:
             ).call_json(
                 "agent_decision",
                 payload={"mode": "character_chat", "runId": run_id, "agentId": agent_id,
-                         "prompt": prompt, "context": context.to_record()},
-                system=("You are a NovelForge character inside a Simulation Sandbox. Answer only "
+                         "agentType": perception.actor_type, "prompt": prompt, "context": context.to_record()},
+                system=("You are a NovelForge agent inside a Simulation Sandbox. Answer only "
                         "from the supplied agent-local context. Return {\"answer\": string}; "
                         "never reveal hidden Canon facts or other agents' private knowledge."),
                 stage=f"simulation-character-chat:{run_id}:{agent_id}",
@@ -141,6 +157,7 @@ class CharacterChatService:
         evidence = {
             "context": "agent_perception_and_simulation_memory",
             "agentId": agent_id,
+            "agentType": perception.actor_type,
             "stateHash": state.state_hash,
             "eventSequence": state.event_sequence,
             "visibleEventIds": [event["id"] for event in perception.recent_events],
@@ -149,7 +166,7 @@ class CharacterChatService:
             "canonicalMutation": False,
         }
         interaction = CharacterInteraction(
-            id=uuid.uuid4().hex, book_id=run.book_id, simulation_run_id=run_id,
+            id=interaction_id or uuid.uuid4().hex, book_id=run.book_id, simulation_run_id=run_id,
             agent_id=agent_id, prompt=prompt, response=response, status=status, evidence=evidence,
         )
         return self._interactions.create(interaction)
@@ -158,7 +175,9 @@ class CharacterChatService:
     def _bounded_response(prompt: str, perception: AgentPerception) -> tuple[str, str]:
         normalized = prompt.strip().lower()
         if normalized in {"where are you", "where are you?", "location"}:
-            location = perception.current_state.get("location") or "unknown"
+            location = (perception.current_state.get("location")
+                        or perception.current_state.get("territory")
+                        or "unknown")
             return "ANSWERED", f"My current location is {location}."
         if normalized in {"what do you know", "what do you know?", "knowledge"}:
             return "ANSWERED", json.dumps(perception.knowledge, ensure_ascii=False, sort_keys=True)

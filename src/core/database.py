@@ -2111,6 +2111,44 @@ def _apply_v40(conn: sqlite3.Connection) -> None:
     _execute_sql_script(conn, PHASE_40_STORYFLOW_CAUSAL_TRACE_SQL)
 
 
+PHASE_41_STORYFLOW_HISTORY_SQL = """
+-- Simulation history is an append-only lifecycle ledger.  Archive and
+-- unarchive actions hide/show a run in the default History read model without
+-- deleting its snapshot, event ledger, reports, or any Canon row.
+CREATE TABLE IF NOT EXISTS simulation_run_history (
+    id TEXT PRIMARY KEY,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL,
+    CHECK(action IN ('ARCHIVE', 'UNARCHIVE'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_simulation_run_history_run_created
+    ON simulation_run_history(simulation_run_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_simulation_run_history_book_created
+    ON simulation_run_history(book_id, created_at DESC, id DESC);
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_run_history_update
+BEFORE UPDATE ON simulation_run_history
+BEGIN
+    SELECT RAISE(ABORT, 'simulation run history is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS prevent_simulation_run_history_delete
+BEFORE DELETE ON simulation_run_history
+BEGIN
+    SELECT RAISE(ABORT, 'simulation run history is append-only');
+END;
+"""
+
+
+def _apply_v41(conn: sqlite3.Connection) -> None:
+    """Persist archive/unarchive history without deleting Sandbox evidence."""
+    _execute_sql_script(conn, PHASE_41_STORYFLOW_HISTORY_SQL)
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -2163,6 +2201,7 @@ _MIGRATIONS = (
     _Migration(38, "storyflow_simulation_graph_projection", _apply_v38, PHASE_38_STORYFLOW_SIMULATION_GRAPH_SQL),
     _Migration(39, "storyflow_scheduler_cost_control", _apply_v39, PHASE_39_STORYFLOW_SCHEDULER_COST_SQL),
     _Migration(40, "storyflow_simulation_causal_trace", _apply_v40, PHASE_40_STORYFLOW_CAUSAL_TRACE_SQL),
+    _Migration(41, "storyflow_simulation_history", _apply_v41, PHASE_41_STORYFLOW_HISTORY_SQL),
 )
 
 _RUNTIME_EXTENSION_NAME = "narrative_runtime_v2"
