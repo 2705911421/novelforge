@@ -12,13 +12,14 @@ reference source, prompt, CSS, component, or algorithm is copied.
 | Agent personas | Character/Faction agent profiles | Character/Faction tables | Profile builder and cognition | Knowledge-scoped agents | P0 | Unknown facts excluded from context |
 | Environment setup | Simulation configuration | Snapshot, world rules | Config persistence/UI | Sandbox-only configuration | P1 | Config creates no Canon rows |
 | Multi-agent simulation | SimulationRoundEngine | Event ledger, validator | Task worker/provider routing | Injected decisions, typed actions | P0 | Durable round/recovery test |
+| Multiple simulation runs | Simulation cohort + Outcome Clusters | snapshots/runs/replay | author repeat-run controls | Exact state-hash clusters with no inferred probability | P1 | Repeated runs produce structural clusters |
 | Action timeline | SimulationEvent ledger | SQLite append-only events | Timeline UI | Event evidence with visibility | P0 | Replay hash matches checkpoint |
 | Dynamic memory | AgentMemory | run/agent memory store | consolidation/retrieval | No Canonical Memory writes | P0 | Agent A cannot read B memory |
 | Dynamic graph updates | Simulation projection | StoryGraph read model | projection/UI | Separate sandbox graph | P1 | Projection rebuild is read-only |
 | Report/Report Agent | Analyst report | branch comparison evidence | Analyst, persistence, UI | Evidence citations required | P1 | Every claim references events/state |
 | Agent interaction | Character chat | KnowledgeScope/Perception | chat task/runtime/UI | Character-local context only | P1 | Secret isolation test |
 | Survey/inquiry | Multi-agent survey | Agent profiles | orchestration/results/UI | Aggregated sandbox responses | P1 | No global Canon prompt |
-| History database | Simulation run history | snapshots/runs/events/checkpoints | history API/UI | Immutable run provenance | P1 | Run reload/recovery test |
+| History database | Simulation run history | snapshots/runs/events/checkpoints | history API/UI | Immutable run provenance plus append-only archive lifecycle | P1 | Run reload/recovery/archive test |
 | Variable injection | Intervention | intervention event table | UI | Author intervention is event-ledgered | P0 | Parent/sibling isolation test |
 | Simulation branching | SimulationBranch | prefix replay + child ledger | branch memory/checkpoint UI | Fork at immutable event sequence | P0 | A/B isolation test |
 | Future comparison | BranchComparisonService | persisted state/event comparison | nested/causal compare UI | Deterministic evidence first | P1 | Divergent event ids and state hashes |

@@ -102,6 +102,30 @@ class SimulationAnalyst:
         event_types = Counter(event.event_type for event in events)
         actors = Counter(event.actor_id for event in events if event.actor_id)
         rounds = sorted({event.round_number for event in events})
+        key_event_types = {
+            "INTERVENTION", "ATTACK", "BETRAY", "DISCLOSE_SECRET", "CHANGE_RELATIONSHIP",
+            "FORM_ALLIANCE", "BREAK_ALLIANCE", "MAKE_DECISION", "DECEIVE",
+        }
+        key_events = [
+            {
+                "eventId": event.id, "sequence": event.sequence, "round": event.round_number,
+                "type": event.event_type, "actorId": event.actor_id,
+                "targetIds": list(event.target_ids), "payload": dict(event.payload),
+                "stateDelta": dict(event.state_delta),
+            }
+            for event in events if event.event_type in key_event_types
+        ]
+        turning_points = key_events[:50]
+        relationship_changes = [
+            item for item in key_events
+            if any("relationship" in str(key).lower() for key in item["stateDelta"])
+        ]
+        snapshot_world = snapshot.to_record().get("world", {})
+        novel_state_keys = sorted(set(state.values) - set(snapshot_world))
+        narrative_opportunities = [
+            {"eventId": item["eventId"], "sequence": item["sequence"], "reason": "persisted key event"}
+            for item in key_events[:20]
+        ]
         evidence = {
             "source": "persisted_simulation_event_ledger",
             "canonicalMutation": False,
@@ -113,6 +137,23 @@ class SimulationAnalyst:
             "eventTypes": dict(sorted(event_types.items())),
             "actorEventCounts": dict(sorted(actors.items())), "stateHash": state.state_hash,
             "eventIds": [event.id for event in events],
+            "keyEvents": key_events[:100],
+            "characterOutcomes": state.values.get("characters", {}),
+            "factionOutcomes": state.values.get("factions", {}),
+            "relationshipChanges": relationship_changes[:100],
+            "criticalTurningPoints": turning_points,
+            "foreshadowImpact": state.values.get("foreshadows", state.values.get("foreshadowImpact", {})),
+            "plotThreadImpact": state.values.get("plotThreads", state.values.get("plotThreadImpact", {})),
+            "narrativeRisks": [],
+            "narrativeOpportunities": narrative_opportunities,
+            "unexpectedEmergence": [{"stateKey": key, "source": "sandbox_event_ledger"} for key in novel_state_keys],
+            "canonConflictWarnings": [],
+            "potentialChapterPlans": [],
+            "fieldEvidence": {
+                "keyEvents": [item["eventId"] for item in key_events],
+                "relationshipChanges": [item["eventId"] for item in relationship_changes],
+                "unexpectedEmergence": novel_state_keys,
+            },
         }
         report = SimulationAnalysisReport(
             id=uuid.uuid4().hex, book_id=run.book_id, simulation_run_id=run.id, kind=kind,

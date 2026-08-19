@@ -8,4 +8,6 @@ Current repository evidence supports a partial P0/P1/P2 vertical slice, not
 full product completion. Causal trace evidence is now persisted and queryable;
 the Studio now has real WORLD/AGENTS/SIMULATE/ANALYZE/INTERACT/HISTORY
 workspace navigation and refresh recovery, while the full browser workflow and
-production/provider gates remain `PARTIAL`.
+production/provider gates remain `PARTIAL`. Repeat-run cohorts expose exact
+replay-state Outcome Clusters without probability claims, and History
+archive/unarchive is an append-only Sandbox lifecycle operation.
