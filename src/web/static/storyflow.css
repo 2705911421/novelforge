@@ -136,6 +136,13 @@
 .simulation-graph-list article b,.simulation-change-list article b,.simulation-report-item b { color: var(--text, #e6edf3); }
 .simulation-report-item p { margin: 3px 0; line-height: 1.45; }
 .simulation-report-item > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.simulation-outcome-clusters { display: grid; gap: 6px; max-height: 240px; overflow: auto; }
+.simulation-outcome-cluster { display: grid; gap: 3px; padding: 8px; border-left: 2px solid var(--warning, #d29922); background: rgba(210,153,34,.06); color: var(--text-muted, #8b949e); font-size: 11px; }
+.simulation-outcome-cluster > div { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.simulation-outcome-cluster b { color: var(--text, #e6edf3); }
+.simulation-outcome-cluster p { margin: 2px 0; }
+.simulation-outcome-cluster small { color: var(--text-dim, #484f58); font-size: 10px; overflow-wrap: anywhere; }
+.simulation-query-evidence { max-height: 180px; overflow: auto; margin: 6px 0 0; padding: 8px; background: var(--bg, #0d1117); color: var(--text-muted, #8b949e); font-size: 10px; white-space: pre-wrap; }
 .simulation-evidence-note { display: block; margin-top: 10px; color: var(--text-dim, #484f58); font-size: 10px; }
 .simulation-task-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 9px 0; }
 .simulation-task-metrics span { display: grid; gap: 2px; color: var(--text-muted, #8b949e); font-size: 10px; }

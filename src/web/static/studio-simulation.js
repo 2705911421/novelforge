@@ -112,6 +112,9 @@
       const reportResponse = await api('GET', `${runPath}/analysis?limit=20`);
       state.reports = reportResponse.reports || [];
     } catch (error) { state.analysisError = state.analysisError || error.message; }
+    try {
+      state.outcomes = await api('GET', `${runPath}/outcomes`);
+    } catch (error) { state.analysisError = state.analysisError || `Outcome clusters unavailable: ${error.message}`; }
     const characters = state.agents.filter((agent) => agent.type === 'character');
     state.chatAgentId = characters.some((agent) => agent.id === state.chatAgentId)
       ? state.chatAgentId : (characters[0]?.id || '');
@@ -270,6 +273,17 @@
     return state.reports.map((report) => `<article class="simulation-report-item"><div><b>${text(report.title)}</b><small>${text(report.kind)}</small></div><p>${text(report.summary)}</p><small>State ${text(report.evidence?.stateHash || 'recorded')} · ${text(report.createdAt)}</small></article>`).join('');
   }
 
+  function renderOutcomes() {
+    const outcomes = state.outcomes || {};
+    const clusters = outcomes.clusters || [];
+    if (!clusters.length) {
+      return '<p class="dim-note">No repeat-run outcomes yet. Duplicate this run, execute the repeats, then refresh.</p>';
+    }
+    return `<div class="simulation-compare-metrics"><span>Runs analyzed <b>${text(outcomes.analyzedRunIds?.length || 0)}</b></span><span>Clusters <b>${text(outcomes.clusterCount || clusters.length)}</b></span><span>Probability claims <b>none</b></span></div>
+      <div class="simulation-outcome-clusters">${clusters.map((cluster) => `<article class="simulation-outcome-cluster"><div><b>${text(cluster.label)}</b><span>${text(cluster.runCount)} run${cluster.runCount === 1 ? '' : 's'}</span></div><p>Outcome <code>${text(cluster.outcomeHash)}</code></p><small>Representative ${text(cluster.representativeRunId)} · ${text(cluster.eventCount)} ledger events</small><small>Statuses: ${text(compactValue(cluster.statusCounts))}</small></article>`).join('')}</div>
+      <small class="simulation-evidence-note">Exact replay-state clusters only; no probability is inferred from run counts · canonicalMutation=false</small>`;
+  }
+
   function renderComparison() {
     const comparison = state.comparison;
     if (!comparison) return '<p class="dim-note">Choose two runs to compare persisted sandbox outcomes.</p>';
@@ -377,6 +391,8 @@
           <span class="${statusClass(run.status)}">${text(run.status)}</span>
           ${transition ? `<button class="btn btn-primary" data-sim-transition="${transition.status}">${transition.label}</button>` : ''}
           <button class="btn btn-secondary" data-sim-branch>Fork branch</button>
+          <button class="btn btn-ghost" data-sim-replicate>Duplicate repeat</button>
+          ${detail.history?.archived ? '<button class="btn btn-ghost" data-sim-unarchive>Unarchive</button>' : '<button class="btn btn-ghost" data-sim-archive>Archive</button>'}
         </div>
       </div>
       <div class="simulation-metrics" aria-label="Simulation evidence">
@@ -416,7 +432,11 @@
         </section>
         <section class="simulation-panel" data-sim-workspaces="analyze history"><div class="simulation-panel-heading"><h4>Evidence analysis</h4><small>Deterministic ledger report</small></div>
           <form data-sim-analysis class="simulation-form simulation-inline-form"><label>Report title<input class="input" name="title" placeholder="Run summary"></label><button class="btn btn-secondary" type="submit">Create report</button></form>
-          <div id="simulation-analysis-result" class="simulation-analysis-result"></div><div class="simulation-report-history">${renderReports()}</div>
+          <form data-sim-analyst-query class="simulation-form"><label>Ask Analyst<textarea class="ta" name="question" required placeholder="Which persisted events changed the relationship?"></textarea></label><label>Tool (optional)<input class="input" name="tool" placeholder="query_simulation_events"></label><button class="btn btn-secondary" type="submit">Ask grounded Analyst</button></form>
+          <div id="simulation-analysis-result" class="simulation-analysis-result"></div><div id="simulation-analyst-query-result" class="simulation-analysis-result"></div><div class="simulation-report-history">${renderReports()}</div>
+        </section>
+        <section class="simulation-panel" data-sim-workspaces="analyze history"><div class="simulation-panel-heading"><h4>Outcome clusters</h4><small>Repeated runs · exact persisted state only</small><button class="btn btn-ghost btn-sm" data-sim-outcomes-refresh>Refresh</button></div>
+          <div data-sim-outcomes>${renderOutcomes()}</div>
         </section>
         <section class="simulation-panel" data-sim-workspaces="world analyze"><div class="simulation-panel-heading"><h4>Simulation graph</h4><button class="btn btn-ghost btn-sm" data-sim-graph-refresh>Refresh</button></div><small>Read-only projection from state and ledger</small>
           <div class="simulation-graph-result">${renderGraph()}</div>
@@ -430,9 +450,9 @@
             <label>Question<textarea class="ta" name="prompt" required placeholder="Ask what this character knows or remembers"></textarea></label><button class="btn btn-secondary" type="submit">Ask character</button></form>
           <div class="simulation-chat-history" data-sim-chat-history>${state.interactionError ? `<p class="dim-note">History unavailable: ${text(state.interactionError)}</p>` : renderChatHistory()}</div>
         </section>
-        <section class="simulation-panel" data-sim-workspaces="interact history"><div class="simulation-panel-heading"><h4>Multi-agent survey</h4><small>Each response stays scoped to its selected character</small></div>
+        <section class="simulation-panel" data-sim-workspaces="interact history"><div class="simulation-panel-heading"><h4>Multi-agent survey</h4><small>Each response stays scoped to its selected Character or Faction Agent</small></div>
           <form data-sim-survey class="simulation-form"><label>Question<textarea class="ta" name="question" required placeholder="Ask the same question to selected characters"></textarea></label>
-            <div class="simulation-agent-checks">${characterAgents().map((agent) => `<label class="simulation-agent-check"><input type="checkbox" name="agentIds" value="${text(agent.id)}" checked><span>${text(agent.name)}</span></label>`).join('')}</div>
+            <div class="simulation-agent-checks">${(state.agents || []).map((agent) => `<label class="simulation-agent-check"><input type="checkbox" name="agentIds" value="${text(agent.id)}" checked><span>${text(agent.name)} · ${text(agent.type)}</span></label>`).join('')}</div>
             <button class="btn btn-secondary" type="submit">Run survey</button></form>
           <div class="simulation-survey-history" data-sim-survey-history>${state.interactionError ? `<p class="dim-note">History unavailable: ${text(state.interactionError)}</p>` : renderSurveys()}</div>
         </section>
@@ -476,7 +496,12 @@
     document.querySelector('[data-sim-branch]')?.addEventListener('click', branchRun);
     document.querySelector('[data-sim-intervention]')?.addEventListener('submit', intervene);
     document.querySelector('[data-sim-analysis]')?.addEventListener('submit', analyze);
+    document.querySelector('[data-sim-analyst-query]')?.addEventListener('submit', askAnalyst);
     document.querySelector('[data-sim-compare]')?.addEventListener('submit', compareRuns);
+    document.querySelector('[data-sim-outcomes-refresh]')?.addEventListener('click', refreshOutcomes);
+    document.querySelector('[data-sim-replicate]')?.addEventListener('click', replicateRun);
+    document.querySelector('[data-sim-archive]')?.addEventListener('click', () => changeArchiveState('archive'));
+    document.querySelector('[data-sim-unarchive]')?.addEventListener('click', () => changeArchiveState('unarchive'));
     document.querySelector('[data-sim-graph-refresh]')?.addEventListener('click', refreshGraph);
     document.querySelector('[data-sim-chat]')?.addEventListener('submit', chat);
     document.querySelector('[data-sim-chat] select[name="agentId"]')?.addEventListener('change', switchChatAgent);
@@ -656,6 +681,23 @@
     } catch (error) { toast(error.message, 'error'); }
   }
 
+  async function askAnalyst(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const question = form.question.value.trim();
+    if (!question) { toast('Enter a question for the Analyst.', 'warning'); return; }
+    const output = document.getElementById('simulation-analyst-query-result');
+    try {
+      const body = { question };
+      if (form.tool.value.trim()) body.tool = form.tool.value.trim();
+      const result = await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/analysis/query`, body);
+      const analysis = result.analysis || {};
+      output.innerHTML = `<p><b>${text(analysis.answer || analysis.summary || 'Grounded analysis recorded.')}</b></p><small>Grounded: ${text(analysis.grounded)} · task ${text(result.taskId || 'recorded')}</small><pre class="simulation-query-evidence">${text(JSON.stringify(analysis.evidenceChain || [], null, 2))}</pre>`;
+      form.question.value = '';
+      toast(`Analyst answer persisted (task ${result.taskId || 'recorded'}).`, 'success');
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
   async function compareRuns(event) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -666,6 +708,41 @@
       state.comparison = await api('GET', `${bookPath()}/compare?left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}`);
       const output = document.querySelector('[data-sim-comparison-result]');
       if (output) output.innerHTML = renderComparison();
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
+  async function refreshOutcomes() {
+    if (!state.runId) return;
+    try {
+      state.outcomes = await api('GET', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/outcomes`);
+      const output = document.querySelector('[data-sim-outcomes]');
+      if (output) output.innerHTML = renderOutcomes();
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
+  async function replicateRun() {
+    if (!state.runId) return;
+    const raw = window.prompt('How many repeat runs should be created? (1-20)', '2');
+    if (raw == null) return;
+    const count = Number(raw);
+    if (!Number.isInteger(count) || count < 1 || count > 20) {
+      toast('Repeat count must be an integer between 1 and 20.', 'warning');
+      return;
+    }
+    try {
+      const result = await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/replicate`, { count });
+      toast(`Created ${result.runIds.length} repeat run(s) in cohort ${result.cohortId}.`, 'success');
+      await refresh();
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
+  async function changeArchiveState(action) {
+    if (!state.runId) return;
+    const reason = window.prompt(action === 'archive' ? 'Reason for archiving this Sandbox run (optional)' : 'Reason for restoring this run (optional)', '') ?? '';
+    try {
+      await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/${action}`, { reason });
+      toast(action === 'archive' ? 'Simulation archived without deleting Sandbox evidence.' : 'Simulation restored to History.', 'success');
+      await refresh();
     } catch (error) { toast(error.message, 'error'); }
   }
 
@@ -701,11 +778,11 @@
     const prompt = form.prompt.value.trim();
     if (!agentId || !prompt) { toast('Select a character and enter a question.', 'warning'); return; }
     try {
-      await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/agents/${encodeURIComponent(agentId)}/chat`, { prompt });
+      const result = await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/agents/${encodeURIComponent(agentId)}/chat`, { prompt });
       form.prompt.value = '';
       state.chatAgentId = agentId;
       await refresh();
-      toast('Character interaction persisted with local evidence.', 'success');
+      toast(`Character interaction persisted (task ${result.taskId || 'recorded'}).`, 'success');
     } catch (error) { toast(error.message, 'error'); }
   }
 
@@ -716,10 +793,10 @@
     const agentIds = Array.from(form.querySelectorAll('input[name="agentIds"]:checked')).map((input) => input.value);
     if (!question || !agentIds.length) { toast('Enter a question and select at least one character.', 'warning'); return; }
     try {
-      await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/survey`, { question, agentIds });
+      const result = await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/survey`, { question, agentIds });
       form.question.value = '';
       await refresh();
-      toast('Survey responses persisted with per-agent evidence.', 'success');
+      toast(`Survey responses persisted (task ${result.taskId || 'recorded'}).`, 'success');
     } catch (error) { toast(error.message, 'error'); }
   }
 
@@ -766,7 +843,7 @@
 
   PAGES.simulation = async function simulationPage() {
     if (state?.eventSource) state.eventSource.close();
-    state = { runs: [], branchTree: { nodes: [], edges: [] }, workspace: initialWorkspace(), runId: '', detail: null, events: [], agents: [], proposals: [], surveys: [], chatInteractions: [], chatAgentId: '', interactionError: '', graph: null, scheduler: null, budget: null, causality: null, reports: [], comparison: null, analysisError: '', loading: true, error: '' };
+    state = { runs: [], branchTree: { nodes: [], edges: [] }, workspace: initialWorkspace(), runId: '', detail: null, events: [], agents: [], proposals: [], surveys: [], chatInteractions: [], chatAgentId: '', interactionError: '', graph: null, scheduler: null, budget: null, causality: null, reports: [], outcomes: null, comparison: null, analysisError: '', loading: true, error: '' };
     render();
     await refresh();
   };

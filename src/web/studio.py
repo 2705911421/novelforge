@@ -67,8 +67,9 @@ from src.story_graph import (
     StoryGraphProjector,
     semantic_edge_options,
 )
-from src.storyflow.analysis import (BranchComparisonService, NarrativeAnalyst, SimulationAnalysisReport,
-                                    SimulationAnalyst, SimulationCausalityService, SimulationGraphProjector)
+from src.storyflow.analysis import (BranchComparisonService, SimulationAnalyst,
+                                    SimulationCausalityService, SimulationGraphProjector,
+                                    SimulationOutcomeClusterService)
 from src.storyflow.interaction import CharacterChatService, SimulationSurveyService
 from src.storyflow.planning import SimulationAdoptionService, SimulationChapterIntentService
 from src.storyflow.simulation import (ActionType, NarrativeAction, PerceptionBuilder, SimulationBranch,
@@ -461,7 +462,18 @@ class SimulationRunCreateRequest(BaseModel):
     seed: int = 0
     description: str = ""
     purpose: str = ""
+    cohortId: Optional[str] = None
     configuration: dict[str, Any] = Field(default_factory=dict)
+
+
+class SimulationReplicateRequest(BaseModel):
+    count: int = Field(1, ge=1, le=20)
+    namePrefix: Optional[str] = None
+    seedStart: Optional[int] = None
+
+
+class SimulationHistoryRequest(BaseModel):
+    reason: str = ""
 
 
 class SimulationStatusRequest(BaseModel):
@@ -610,6 +622,73 @@ def get_storyflow_planning_service() -> StoryFlowPlanningService:
 
 def get_simulation_repository() -> SimulationRepository:
     return SimulationRepository(story_repository.db)
+
+
+def _simulation_capability_idempotency_key(task_type: str, book_id: str, data: dict[str, Any]) -> str:
+    """Build a bounded, deterministic key for one Simulation capability request."""
+    payload = json.dumps(
+        {"taskType": task_type, "bookId": book_id, "data": data},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return f"{task_type}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+async def _execute_simulation_capability_task(
+    book: dict[str, Any], task_type: str, data: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist and execute one Analyst/Chat/Survey operation.
+
+    The HTTP layer deliberately does not call a provider-facing service
+    directly.  A fresh worker is used only for the targeted task, while the
+    same row remains recoverable by the normal Studio daemon after a process
+    interruption or lease expiry.
+    """
+    task = task_runtime.enqueue(
+        task_type,
+        project_id=str(book.get("project_id") or book["id"]),
+        book_id=str(book["id"]),
+        data=data,
+        idempotency_key=_simulation_capability_idempotency_key(task_type, str(book["id"]), data),
+    )
+    if task.get("status") not in {"completed", "failed", "cancelled", "needs_author_decision"}:
+        worker = PersistentTaskWorker(
+            task_runtime,
+            SimulationTaskHandlers(story_repository.db, model_manager=model_mgr).mapping(),
+            retry_delay_seconds=0,
+        )
+        worker_id = f"studio-simulation-capability-{uuid.uuid4().hex}"
+        executed = await worker.execute_task(task["id"], worker_id)
+        if executed is not None:
+            task = executed
+        else:
+            # Another process may have won the lease.  Read the durable row
+            # for a short bounded window before reporting an in-flight task.
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                current = task_runtime.get(task["id"])
+                if current is None:
+                    break
+                task = current
+                if task.get("status") in {"completed", "failed", "cancelled", "needs_author_decision"}:
+                    break
+    return task
+
+
+def _simulation_capability_response(task: dict[str, Any]) -> dict[str, Any]:
+    """Return the completed handler payload or an observable task failure."""
+    status = task.get("status")
+    if status != "completed":
+        code = task.get("error_code") or "SIMULATION_CAPABILITY_IN_PROGRESS"
+        message = task.get("error") or "simulation capability task is still in progress"
+        status_code = 422 if status in {"failed", "needs_author_decision"} else 409
+        raise HTTPException(status_code=status_code, detail={
+            "code": code, "message": message, "taskId": task.get("id"), "taskStatus": status,
+        })
+    result = task.get("result")
+    payload = dict(result) if isinstance(result, dict) else {}
+    payload.setdefault("taskId", task.get("id"))
+    payload.setdefault("taskStatus", status)
+    return payload
 
 
 def resolve_story_graph_book(value: str) -> dict[str, Any]:
@@ -3474,6 +3553,8 @@ async def create_simulation_run(book_id: str, request: SimulationRunCreateReques
     if "providerAssignment" in configuration or "provider_assignment" in configuration:
         configuration.pop("provider_assignment", None)
         configuration["providerAssignment"] = provider_assignment.to_record()
+    if request.cohortId:
+        configuration["simulationCohortId"] = request.cohortId.strip()
     run = SimulationRun(uuid.uuid4().hex, str(book["id"]), snapshot.snapshot_id, request.name,
                         max_rounds=request.maxRounds, seed=request.seed, description=request.description,
                         purpose=request.purpose, configuration=configuration)
@@ -3483,21 +3564,172 @@ async def create_simulation_run(book_id: str, request: SimulationRunCreateReques
 
 
 @app.get("/api/v1/books/{book_id}/simulation/runs")
-async def list_simulation_runs(book_id: str, limit: int = Query(100, ge=1, le=1000)):
+async def list_simulation_runs(book_id: str, limit: int = Query(100, ge=1, le=1000),
+                               includeArchived: bool = Query(False)):
     book = resolve_story_graph_book(book_id)
-    runs = get_simulation_repository().list_runs(str(book["id"]), limit=limit)
+    repository = get_simulation_repository()
+    runs = repository.list_runs(str(book["id"]), limit=limit, include_archived=includeArchived)
     return {"runs": [
         {"id": run.id, "snapshotId": run.snapshot_id, "name": run.name, "status": run.status.value,
          "currentRound": run.current_round, "maxRounds": run.max_rounds, "seed": run.seed,
          "simulationTime": run.simulation_time,
          "description": run.description, "purpose": run.purpose,
          "taskId": run.task_id,
+         "cohortId": SimulationOutcomeClusterService(repository).cohort_id(run),
+         "archived": repository.history_state(run.id)["archived"],
          "taskStatus": (task_runtime.get(run.task_id) or {}).get("status") if run.task_id else None,
          "createdAt": run.created_at.isoformat(), "startedAt": run.started_at.isoformat() if run.started_at else None,
          "pausedAt": run.paused_at.isoformat() if run.paused_at else None,
          "completedAt": run.completed_at.isoformat() if run.completed_at else None}
         for run in runs
     ], "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/replicate")
+async def replicate_simulation_runs(book_id: str, run_id: str, request: SimulationReplicateRequest):
+    """Create author-requested repeat runs in one explicit outcome cohort."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        source = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    if source.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    if repository.history_state(run_id)["archived"]:
+        raise HTTPException(409, detail={"code": "SIMULATION_RUN_ARCHIVED", "message": "archived runs cannot be replicated"})
+    cluster_service = SimulationOutcomeClusterService(repository)
+    cohort_id = cluster_service.cohort_id(source)
+    prefix = (request.namePrefix or f"{source.name} repeat").strip() or f"{source.name} repeat"
+    seed_start = request.seedStart if request.seedStart is not None else source.seed + 1
+    created: list[SimulationRun] = []
+    source_events = repository.events(run_id)
+    for offset in range(request.count):
+        child_id = uuid.uuid4().hex
+        name = f"{prefix} {offset + 1}" if request.count > 1 else prefix
+        configuration = json.loads(json.dumps(dict(source.configuration), ensure_ascii=True, sort_keys=True))
+        configuration["simulationCohortId"] = cohort_id
+        if source_events:
+            child = repository.create_branch(
+                run_id,
+                SimulationBranch(
+                    uuid.uuid4().hex, run_id, child_id, source_events[-1].sequence,
+                ),
+                name=name,
+                seed=seed_start + offset,
+            )
+            child = repository.update_configuration(child.id, configuration, replace=True)
+        else:
+            child = SimulationRun(
+                child_id, source.book_id, source.snapshot_id, name,
+                max_rounds=source.max_rounds, seed=seed_start + offset,
+                description=source.description, purpose=source.purpose,
+                created_by=source.created_by, configuration=configuration,
+            )
+            repository.create_run(child)
+        created.append(child)
+    return {
+        "sourceRunId": run_id,
+        "cohortId": cohort_id,
+        "runIds": [run.id for run in created],
+        "runs": [{"id": run.id, "name": run.name, "status": run.status.value,
+                  "snapshotId": run.snapshot_id, "seed": run.seed,
+                  "cohortId": cohort_id} for run in created],
+        "canonicalMutation": False,
+    }
+
+
+@app.get("/api/v1/books/{book_id}/simulation/outcomes")
+async def list_simulation_outcomes(book_id: str, cohortId: Optional[str] = Query(None),
+                                   includeArchived: bool = Query(False),
+                                   limit: int = Query(1000, ge=1, le=1000)):
+    """Return deterministic outcome clusters for one or all repeat cohorts."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    service = SimulationOutcomeClusterService(repository)
+    runs = repository.list_runs(str(book["id"]), limit=limit, include_archived=includeArchived)
+    if cohortId:
+        result = service.cluster_runs(runs, cohort_id=cohortId)
+    else:
+        cohort_ids = sorted({service.cohort_id(run) for run in runs})
+        summaries = [service.cluster_runs(runs, cohort_id=cohort) for cohort in cohort_ids]
+        result = {
+            "cohortId": None,
+            "cohorts": cohort_ids,
+            "clusters": [cluster for summary in summaries for cluster in summary["clusters"]],
+            "summaries": summaries,
+            "analyzedRunIds": [run_id for summary in summaries for run_id in summary["analyzedRunIds"]],
+            "skippedRunIds": [run_id for summary in summaries for run_id in summary["skippedRunIds"]],
+            "runCount": len(runs),
+            "clusterCount": sum(summary["clusterCount"] for summary in summaries),
+            "evidence": {
+                "source": "simulation_world_snapshot_plus_event_ledger",
+                "canonicalMutation": False,
+                "probabilityClaim": False,
+            },
+        }
+    return {**result, "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/outcomes")
+async def get_simulation_run_outcomes(book_id: str, run_id: str,
+                                      includeArchived: bool = Query(True)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    if run.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    result = SimulationOutcomeClusterService(repository).for_run(run_id, include_archived=includeArchived)
+    return {**result, "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/archive")
+async def archive_simulation_run(book_id: str, run_id: str, request: SimulationHistoryRequest):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        history = repository.archive_run(run_id, reason=request.reason)
+    except ValueError as exc:
+        code = "SIMULATION_RUN_ARCHIVE"
+        if "running" in str(exc):
+            code = "SIMULATION_RUN_MUST_STOP"
+        raise HTTPException(409, detail={"code": code, "message": str(exc)}) from exc
+    return {"runId": run_id, "history": history, "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/unarchive")
+async def unarchive_simulation_run(book_id: str, run_id: str, request: SimulationHistoryRequest):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        history = repository.unarchive_run(run_id, reason=request.reason)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    return {"runId": run_id, "history": history, "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/history")
+async def get_simulation_run_history(book_id: str, run_id: str,
+                                     limit: int = Query(100, ge=1, le=1000)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    if run.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    return {"runId": run_id, "history": repository.history_events(run_id, limit=limit),
+            "state": repository.history_state(run_id), "canonicalMutation": False}
 
 
 @app.get("/api/v1/books/{book_id}/simulation/branches")
@@ -3574,6 +3806,8 @@ async def get_simulation_run(book_id: str, run_id: str):
         raise HTTPException(404, detail={"code": "SIMULATION_SNAPSHOT_NOT_FOUND", "message": "run snapshot not found"})
     snapshot_evidence = _simulation_snapshot_evidence(str(book["id"]), snapshot)
     task = task_runtime.get(run.task_id) if run.task_id else None
+    history_state = repository.history_state(run_id)
+    outcome_service = SimulationOutcomeClusterService(repository)
     chapter_row = story_repository.db.fetchone(
         "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE book_id=?",
         (str(book["id"]),),
@@ -3594,6 +3828,8 @@ async def get_simulation_run(book_id: str, run_id: str):
             "currentCanon": snapshot_evidence["currentCanon"],
             "snapshotEvidence": snapshot_evidence["evidence"],
             "task": task,
+            "history": history_state,
+            "cohortId": outcome_service.cohort_id(run),
             "nextChapter": next_chapter, "stateHash": state.state_hash, "eventSequence": state.event_sequence,
             "events": [{"id": event.id, "sequence": event.sequence, "round": event.round_number,
                         "type": event.event_type, "actorId": event.actor_id,
@@ -3946,20 +4182,16 @@ async def query_simulation_analysis(book_id: str, run_id: str, request: Simulati
                 candidate_run = simulations.get_run(str(candidate))
                 if candidate_run.book_id != str(book["id"]):
                     raise ValueError("analyst comparison run does not belong to book")
-        analysis = NarrativeAnalyst(story_repository.db).ask(
-            run_id, request.question, tool=request.tool, arguments=arguments,
-        )
-        report = SimulationAnalysisReport(
-            id=uuid.uuid4().hex, book_id=run.book_id, simulation_run_id=run.id,
-            kind="analyst-query", title=request.question[:200], summary=analysis["answer"],
-            evidence={"source": "simulation_analyst_tools", "canonicalMutation": False,
-                      "question": request.question, "evidenceChain": analysis["evidenceChain"],
-                      "toolCalls": analysis["toolCalls"]},
-        )
-        SimulationAnalyst(story_repository.db).reports.create(report)
     except (TypeError, ValueError) as exc:
         raise HTTPException(422, detail={"code": "SIMULATION_ANALYST", "message": str(exc)}) from exc
-    return {"analysis": analysis, "report": report.to_record(), "canonicalMutation": False}
+    task = await _execute_simulation_capability_task(book, "simulation-analyst-query", {
+        "runId": run_id,
+        "question": request.question,
+        "tool": request.tool,
+        "arguments": arguments,
+        "title": request.question[:200],
+    })
+    return _simulation_capability_response(task)
 
 
 @app.get("/api/v1/books/{book_id}/simulation/analysis/{report_id}")
@@ -3978,10 +4210,12 @@ async def simulation_character_chat(book_id: str, run_id: str, agent_id: str, re
         run = get_simulation_repository().get_run(run_id)
         if run.book_id != str(book["id"]):
             raise ValueError("simulation run does not belong to book")
-        interaction = CharacterChatService(story_repository.db).interact(run_id, agent_id, request.prompt)
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "SIMULATION_CHARACTER_CHAT", "message": str(exc)}) from exc
-    return {"interaction": interaction.to_record(), "canonicalMutation": False}
+    task = await _execute_simulation_capability_task(book, "simulation-character-chat", {
+        "runId": run_id, "agentId": agent_id, "prompt": request.prompt,
+    })
+    return _simulation_capability_response(task)
 
 
 @app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/agents/{agent_id}/chat")
@@ -4005,12 +4239,12 @@ async def conduct_simulation_survey(book_id: str, run_id: str, request: Simulati
         run = get_simulation_repository().get_run(run_id)
         if run.book_id != str(book["id"]):
             raise ValueError("simulation run does not belong to book")
-        survey = SimulationSurveyService(story_repository.db).conduct(
-            run_id, request.question, request.agentIds,
-        )
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "SIMULATION_SURVEY", "message": str(exc)}) from exc
-    return {"survey": survey.to_record(), "canonicalMutation": False}
+    task = await _execute_simulation_capability_task(book, "simulation-survey", {
+        "runId": run_id, "question": request.question, "agentIds": request.agentIds,
+    })
+    return _simulation_capability_response(task)
 
 
 @app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/survey")
