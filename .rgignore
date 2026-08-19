@@ -1,0 +1,48 @@
+# Local runtime and user-owned data
+.venv/
+projects/
+data/
+.references/
+.novelforge-backups/
+.novelforge-secrets/
+.reasonix/
+
+# Browser, model, and tool output
+.playwright-cli/
+.mimocode/
+.agents/
+.claude/
+output/
+exports/
+studio/
+test-output/
+
+# Disposable snapshots and test sandboxes
+.storyflow-*/
+.storyflow-analysis-*/
+.phase5-*/
+
+# Build and test caches
+dist/
+build/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+*.py[cod]
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.log
+.coverage
+coverage.xml
+htmlcov/
+
+# Large tracked audit material; keep it under explicit evidence review
+docs/storyflow-canvas/evidence/
+docs/fable5-global-audit/
+docs/high-end-audit/
