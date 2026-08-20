@@ -51,7 +51,7 @@ The overall product verdict remains `PARTIAL` until the external-provider gate,
 production-scale performance gate, and complete browser acceptance matrix have
 authoritative evidence.
 
-Latest audit evidence (2026-08-20): the full repository is `1023 passed`, all
+Latest audit evidence (2026-08-20): the full repository is `1024 passed`, all
 five protected feature gates are `VERIFIED`, and the required deterministic
 10/20, 25/50, and 50/100 runtime benchmark passes with stable hashes and
 `canonicalMutation=false`. A fresh local browser session verified the current
@@ -66,4 +66,6 @@ Canon `2927a3c35e9d57aab719af3c0d09f6c6f8f468edd1a07ad512d0ae33fe079d7e`, and
 the source run is truthfully `STALE` after the write. A structured Faction
 territory perception regression and mixed Survey browser pass also completed;
 the overall verdict remains `PARTIAL` because the provider-backed browser and
-production-scale gates remain open.
+production-scale gates remain open. The current deterministic benchmark rerun
+measured `287.713/100.279/33.654` events per second at the required scales;
+this is a core-ledger baseline only.

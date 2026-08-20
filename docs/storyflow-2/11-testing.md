@@ -25,9 +25,15 @@ IDs after refresh.
 The same pass found and fixed a real structured Faction `territory` bug in
 `PerceptionBuilder`; the regression now covers list-shaped territory and
 mixed Faction Survey responses. Focused StoryFlow/Phase 1/writing tests are
-`128 passed`, and the protected `STORY-001` and `WRITE-001` gates are
+`129 passed`, and the protected `STORY-001` and `WRITE-001` gates are
 `VERIFIED`. This does not close real external-provider browser E2E or
-production-scale performance evidence.
+production-scale performance evidence. The current deterministic benchmark
+rerun completed 200/1,250/5,000 events at `287.713/100.279/33.654` events per
+second with stable hashes and `canonicalMutation=false`; it is a core-ledger
+baseline, not a provider-backed production SLA.
+A full repository rerun after the hard-bound Context Compiler fix completed
+`1024 passed in 16:59`; this current-tree result supersedes the older historical
+`1023 passed` note below.
 
 Required invariants are Canon immutability, knowledge isolation, branch
 isolation, deterministic replay, crash recovery, and Simulation-to-Planning

@@ -81,6 +81,13 @@ class SimulationContextCompiler:
         "goals", "relationships", "recent_memory", "relevant_memory", "recent_events",
         "observations", "available_actions", "world_rules",
     )
+    # Keep the high-signal event ledger ahead of duplicated/optional context
+    # when a bundle has to be reduced.  Identity, current state, and knowledge
+    # are the final sections considered for trimming.
+    _DROP_ORDER = (
+        "world_rules", "available_actions", "observations", "relevant_memory",
+        "recent_memory", "goals", "relationships", "recent_events", "beliefs",
+    )
 
     def compile(
         self,
@@ -150,17 +157,95 @@ class SimulationContextCompiler:
 
     @classmethod
     def _bound(cls, values: dict[str, Any], max_chars: int) -> tuple[dict[str, Any], list[str]]:
-        if len(json.dumps(values, ensure_ascii=True, sort_keys=True, default=str)) <= max_chars:
+        if cls._size(values) <= max_chars:
             return values, []
         omitted: list[str] = []
         # Preserve identity/state/knowledge first; trim lower-priority context
         # whole-section-at-a-time so the model never receives a malformed slice.
-        for section in reversed(cls._SECTIONS):
+        trim_order = cls._DROP_ORDER + ("local_world", "current_state", "identity", "knowledge")
+        for section in trim_order:
             candidate = dict(values)
             candidate[section] = [] if isinstance(values[section], (list, tuple)) else {}
-            if len(json.dumps(candidate, ensure_ascii=True, sort_keys=True, default=str)) <= max_chars:
+            if cls._size(candidate) < cls._size(values):
                 omitted.append(section)
                 values = candidate
-                if len(json.dumps(values, ensure_ascii=True, sort_keys=True, default=str)) <= max_chars:
-                    return values, list(reversed(omitted))
-        return values, list(reversed(omitted))
+                if cls._size(values) <= max_chars:
+                    return values, list(dict.fromkeys(omitted))
+        # A single identity/state/knowledge field can itself exceed the budget.
+        # Do not silently return an unbounded context in that case: recursively
+        # trim the lowest-priority remaining sections while preserving valid
+        # JSON shapes and deterministic ordering.  The empty section skeleton is
+        # below the minimum 256-character compiler budget, so this converges for
+        # every accepted budget even when one scalar contains megabytes of text.
+        for section in cls._DROP_ORDER:
+            if cls._size(values) <= max_chars:
+                break
+            current = values[section]
+            remaining = max(0, max_chars - cls._size({**values, section: [] if isinstance(current, (list, tuple)) else {}}))
+            trimmed = cls._trim_value(current, remaining)
+            if trimmed != current:
+                values = {**values, section: trimmed}
+                omitted.append(section)
+        if cls._size(values) > max_chars:
+            # The compiler's minimum budget leaves room for the empty skeleton,
+            # but retain a final defensive fallback if a future schema adds
+            # fields whose names alone exceed that budget.
+            values = {
+                section: ([] if section in {"goals", "recent_memory", "relevant_memory",
+                                            "recent_events", "observations", "available_actions",
+                                            "world_rules"} else {})
+                for section in cls._SECTIONS
+            }
+        return values, list(dict.fromkeys(omitted))
+
+    @staticmethod
+    def _size(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=True, sort_keys=True, default=str, separators=(",", ":")))
+
+    @classmethod
+    def _trim_value(cls, value: Any, max_chars: int) -> Any:
+        """Return a deterministic JSON-shaped prefix no larger than a budget."""
+        if max_chars <= 0:
+            return [] if isinstance(value, (list, tuple)) else {}
+        if cls._size(value) <= max_chars:
+            return value
+        if isinstance(value, str):
+            low, high = 0, len(value)
+            best = ""
+            while low <= high:
+                mid = (low + high) // 2
+                candidate = value[:mid]
+                if cls._size(candidate) <= max_chars:
+                    best = candidate
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            return best
+        if isinstance(value, Mapping):
+            result: dict[str, Any] = {}
+            for key in sorted(value, key=str):
+                candidate_key = str(key)
+                remaining = max_chars - cls._size(result) - cls._size(candidate_key) - 4
+                if remaining <= 0:
+                    break
+                candidate_value = cls._trim_value(value[key], remaining)
+                candidate = {**result, candidate_key: candidate_value}
+                if cls._size(candidate) > max_chars:
+                    break
+                result = candidate
+            return result
+        if isinstance(value, (list, tuple)):
+            result: list[Any] = []
+            for item in value:
+                remaining = max_chars - cls._size(result) - 2
+                if remaining <= 0:
+                    break
+                candidate_item = cls._trim_value(item, remaining)
+                candidate = [*result, candidate_item]
+                if cls._size(candidate) > max_chars:
+                    break
+                result = candidate
+            return result
+        if isinstance(value, (bool, int, float)) or value is None:
+            return value if cls._size(value) <= max_chars else None
+        return cls._trim_value(str(value), max_chars)

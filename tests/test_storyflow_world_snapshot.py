@@ -39,6 +39,7 @@ from src.storyflow.simulation import (
     SimulationClock,
     SimulationStageFailure,
     KnowledgeStatus,
+    AgentPerception,
     PerceptionBuilder,
     SimulationTaskHandlers,
     SimulationContextCompiler,
@@ -753,6 +754,20 @@ def test_simulation_context_compiler_is_bounded_and_agent_local(tmp_path):
     token_record = SimulationContextCompiler().compile(perception, max_tokens=128).to_record()
     assert token_record["truncation"]["budgetKind"] == "estimated-token"
     assert token_record["truncation"]["maxTokens"] == 128
+
+
+def test_simulation_context_compiler_hard_bounds_large_core_fields():
+    perception = AgentPerception(
+        agent_id="a", actor_type="character", identity={"name": "x" * 5000},
+        current_state={"status": "y" * 5000}, local_world={}, knowledge={"secret": "z" * 5000},
+        beliefs={}, goals=(), relationships={}, observations=(), recent_events=(), recent_memory=(),
+        available_actions=(), world_rules=(),
+    )
+    bundle = SimulationContextCompiler().compile(perception, max_chars=256)
+    body = bundle.to_record(include_hash=False)
+    values = {key: value for key, value in body.items() if key not in {"agentId", "actorType", "truncation"}}
+    assert len(json.dumps(values, ensure_ascii=True, sort_keys=True, separators=(",", ":"))) <= 256
+    assert bundle.truncation["applied"] is True
 
 
 def test_provider_decision_engine_returns_typed_action_and_generation_provenance(tmp_path):

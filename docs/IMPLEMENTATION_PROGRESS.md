@@ -19,9 +19,14 @@
 > the immutable run correctly became `STALE`. The fresh browser session had
 > zero console errors/warnings, no `[object Object]` rendering, and unique
 > event IDs after refresh. Focused StoryFlow/Phase 1/writing tests are
-> `128 passed`; STORY-001 and WRITE-001 are `VERIFIED`; static/protected-file
+> `129 passed`; STORY-001 and WRITE-001 are `VERIFIED`; static/protected-file
 > checks pass. This is deterministic local acceptance evidence; the real
-> external-provider matrix and production-scale gate remain **PARTIAL**.
+> external-provider matrix and production-scale gate remain **PARTIAL**. The
+> current deterministic benchmark rerun completed 200/1,250/5,000 events at
+> `287.713/100.279/33.654` events per second with stable hashes,
+> `COMPLETED`, and `canonicalMutation=false`; it remains a core-ledger
+> baseline, not a production-scale/provider SLA. A full repository rerun after
+> the hard-bound Context Compiler fix completed `1024 passed in 16:59`.
 
 > **StoryFlow 2.0 survey-scenario and intervention-history increment
 > (2026-08-20)**: Survey detail now exposes a bounded, persisted scenario

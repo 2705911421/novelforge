@@ -39,7 +39,8 @@ history operation: default run listings hide the latest deleted record, while
 run detail, replay, ledger, snapshot, and audit history remain readable. A
 deleted run cannot be archived/unarchived or resumed, and running runs are
 refused at the delete boundary. The Simulation Context Compiler also accepts
-an approximate token budget (`maxTokens`) alongside its character cap and
+an approximate token budget (`maxTokens`) alongside its character cap, hard
+trims oversized core fields instead of returning an unbounded bundle, and
 records the effective budget in the context evidence manifest.
 
 The explicit `SimulationRepository.rebuild_simulation_state()` seam now
