@@ -34,6 +34,7 @@ class SimulationAgentContextBundle:
     relationships: Mapping[str, Any]
     recent_memory: tuple[Mapping[str, Any], ...]
     relevant_memory: tuple[Mapping[str, Any], ...]
+    recent_events: tuple[Mapping[str, Any], ...]
     observations: tuple[Mapping[str, Any], ...]
     available_actions: tuple[str, ...]
     world_rules: tuple[Any, ...]
@@ -56,6 +57,7 @@ class SimulationAgentContextBundle:
             "relationships": _copy(self.relationships),
             "recentMemory": _copy(self.recent_memory),
             "relevantMemory": _copy(self.relevant_memory),
+            "recentEvents": _copy(self.recent_events),
             "observations": _copy(self.observations),
             "availableActions": _copy(self.available_actions),
             "worldRules": _copy(self.world_rules),
@@ -76,13 +78,21 @@ class SimulationContextCompiler:
 
     _SECTIONS = (
         "identity", "current_state", "local_world", "knowledge", "beliefs",
-        "goals", "relationships", "recent_memory", "relevant_memory",
+        "goals", "relationships", "recent_memory", "relevant_memory", "recent_events",
         "observations", "available_actions", "world_rules",
     )
 
-    def compile(self, perception: AgentPerception, *, max_chars: int | None = None) -> SimulationAgentContextBundle:
+    def compile(
+        self,
+        perception: AgentPerception,
+        *,
+        max_chars: int | None = None,
+        max_tokens: int | None = None,
+    ) -> SimulationAgentContextBundle:
         if max_chars is not None and max_chars < 256:
             raise ValueError("simulation context max_chars must be at least 256")
+        if max_tokens is not None and max_tokens < 64:
+            raise ValueError("simulation context max_tokens must be at least 64")
         recent = tuple(_copy(item) for item in perception.recent_memory)
         relevant = tuple(
             item for item in recent
@@ -98,20 +108,27 @@ class SimulationContextCompiler:
             "relationships": _copy(perception.relationships),
             "recent_memory": recent,
             "relevant_memory": relevant,
+            "recent_events": _copy(perception.recent_events),
             "observations": _copy(perception.observations),
             "available_actions": _copy(perception.available_actions),
             "world_rules": _copy(perception.world_rules),
         }
         truncation: dict[str, Any] = {
             "applied": False,
-            "budgetKind": "character-approximation",
+            "budgetKind": "estimated-token" if max_tokens is not None else "character-approximation",
             "maxChars": max_chars,
+            "maxTokens": max_tokens,
             "omittedSections": [],
         }
-        if max_chars is not None:
-            values, omitted = self._bound(values, max_chars)
+        effective_chars = max_chars
+        if max_tokens is not None:
+            token_chars = max_tokens * 4
+            effective_chars = token_chars if effective_chars is None else min(effective_chars, token_chars)
+        if effective_chars is not None:
+            values, omitted = self._bound(values, effective_chars)
             truncation["applied"] = bool(omitted)
             truncation["omittedSections"] = omitted
+            truncation["estimatedTokens"] = max(1, (len(json.dumps(values, ensure_ascii=True, sort_keys=True, default=str)) + 3) // 4)
         return SimulationAgentContextBundle(
             agent_id=perception.agent_id,
             actor_type=perception.actor_type,
@@ -124,6 +141,7 @@ class SimulationContextCompiler:
             relationships=values["relationships"],
             recent_memory=tuple(values["recent_memory"]),
             relevant_memory=tuple(values["relevant_memory"]),
+            recent_events=tuple(values["recent_events"]),
             observations=tuple(values["observations"]),
             available_actions=tuple(values["available_actions"]),
             world_rules=tuple(values["world_rules"]),

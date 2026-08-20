@@ -278,6 +278,7 @@ def test_simulation_adoption_chapter_intent_reaches_story_commit_through_worker(
             "chapter_number": 1,
             "context": "Use the adopted Simulation outcome as the chapter premise.",
             "plan": intent.to_dict(),
+            "storyflow_plan_node_id": adopted.planning_node_id,
             "simulation_adoption_id": adopted.id,
         },
         idempotency_key=f"simulation-to-canon:{adopted.id}:1",
@@ -294,7 +295,13 @@ def test_simulation_adoption_chapter_intent_reaches_story_commit_through_worker(
     assert outcome is not None and outcome["status"] == "completed"
     assert outcome["result"]["completed"] is True
     assert outcome["result"]["story_commit_id"]
+    assert outcome["result"]["storyflow_plan_node_id"] == adopted.planning_node_id
+    assert outcome["result"]["storyflow_plan_status"] == "ACCEPTED"
     assert {"review", "fact-extraction"} <= set(model.task_types)
+
+    graph, _ = StoryFlowPlanningService(database).load(book_id)
+    adopted_node = next(node for node in graph["nodes"] if node["id"] == adopted.planning_node_id)
+    assert adopted_node["status"] == "accepted"
 
     after = {
         table: int((database.fetchone(f"SELECT COUNT(*) AS count FROM {table}") or {"count": 0})["count"])

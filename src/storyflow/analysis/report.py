@@ -26,6 +26,12 @@ class SimulationAnalysisReport:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_record(self) -> dict[str, Any]:
+        section_keys = (
+            "keyEvents", "characterOutcomes", "factionOutcomes", "relationshipChanges",
+            "criticalTurningPoints", "foreshadowImpact", "plotThreadImpact",
+            "narrativeRisks", "narrativeOpportunities", "unexpectedEmergence",
+            "canonConflictWarnings", "potentialChapterPlans",
+        )
         return {
             "id": self.id,
             "bookId": self.book_id,
@@ -34,6 +40,7 @@ class SimulationAnalysisReport:
             "title": self.title,
             "summary": self.summary,
             "evidence": dict(self.evidence),
+            "sections": {key: self.evidence.get(key) for key in section_keys},
             "createdAt": self.created_at.isoformat(),
         }
 
@@ -122,9 +129,21 @@ class SimulationAnalyst:
         ]
         snapshot_world = snapshot.to_record().get("world", {})
         novel_state_keys = sorted(set(state.values) - set(snapshot_world))
+        conflicts = state.values.get("conflicts", state.values.get("conflict_state", []))
+        conflict_records = list(conflicts.values()) if isinstance(conflicts, Mapping) else list(conflicts or []) if isinstance(conflicts, (list, tuple)) else []
+        narrative_risks = [
+            {"type": "unresolved_conflict", "source": "sandbox_state", "conflict": item}
+            for item in conflict_records
+            if not (isinstance(item, Mapping) and str(item.get("status", "")).lower() in {"resolved", "closed"})
+        ][:50]
         narrative_opportunities = [
             {"eventId": item["eventId"], "sequence": item["sequence"], "reason": "persisted key event"}
             for item in key_events[:20]
+        ]
+        potential_chapter_plans = [
+            {"chapterHint": item["round"], "eventIds": [item["eventId"]],
+             "reason": "persisted turning point", "canonicalMutation": False}
+            for item in turning_points[:20]
         ]
         evidence = {
             "source": "persisted_simulation_event_ledger",
@@ -143,12 +162,14 @@ class SimulationAnalyst:
             "relationshipChanges": relationship_changes[:100],
             "criticalTurningPoints": turning_points,
             "foreshadowImpact": state.values.get("foreshadows", state.values.get("foreshadowImpact", {})),
-            "plotThreadImpact": state.values.get("plotThreads", state.values.get("plotThreadImpact", {})),
-            "narrativeRisks": [],
+            "plotThreadImpact": state.values.get(
+                "plot_threads", state.values.get("plotThreads", state.values.get("plotThreadImpact", {}))
+            ),
+            "narrativeRisks": narrative_risks,
             "narrativeOpportunities": narrative_opportunities,
             "unexpectedEmergence": [{"stateKey": key, "source": "sandbox_event_ledger"} for key in novel_state_keys],
             "canonConflictWarnings": [],
-            "potentialChapterPlans": [],
+            "potentialChapterPlans": potential_chapter_plans,
             "fieldEvidence": {
                 "keyEvents": [item["eventId"] for item in key_events],
                 "relationshipChanges": [item["eventId"] for item in relationship_changes],

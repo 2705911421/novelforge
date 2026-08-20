@@ -17,3 +17,8 @@ frequency. Every round stores active and inactive decisions with
 selection is an author pin and can activate a passive entity for that round.
 Unconfigured entities default to Tier C, so existence alone does not create a
 provider slot.
+
+Environment Setup persists the generated roster as
+`agents: { source: "snapshot", policies: { <agentId>: ... } }`. The scheduler
+unwraps that nested policy map before applying tier, frequency, and activation
+rules, so author-edited Tier A/B/C choices survive the configuration boundary.

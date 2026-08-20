@@ -123,6 +123,34 @@ class SimulationSurveyService:
     def surveys(self) -> SimulationSurveyRepository:
         return self._surveys
 
+    def scenario(self, survey_id: str) -> dict[str, Any]:
+        """Return a bounded, immutable handoff payload for a new Sandbox run.
+
+        A survey is an interaction read model, not a state mutation. The
+        scenario record therefore carries only the persisted question,
+        selected Agents, and their durable responses. Callers may use it to
+        fork the source run, but this method itself never changes Canon or
+        Simulation state.
+        """
+        survey = self._surveys.get(survey_id)
+        if survey is None:
+            raise ValueError(f"simulation survey not found: {survey_id}")
+        return {
+            "surveyId": survey.id,
+            "sourceRunId": survey.simulation_run_id,
+            "question": survey.question,
+            "agentIds": list(survey.agent_ids),
+            "status": survey.status,
+            "responses": [response.to_record() for response in survey.responses],
+            "evidence": {
+                "source": "simulation_surveys + simulation_survey_responses",
+                "surveyId": survey.id,
+                "sourceRunId": survey.simulation_run_id,
+                "canonicalMutation": False,
+            },
+            "canonicalMutation": False,
+        }
+
     def conduct(self, run_id: str, question: str, agent_ids: list[str] | None = None, *,
                 survey_id: str | None = None) -> SimulationSurvey:
         if not question or not question.strip():

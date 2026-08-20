@@ -1,5 +1,211 @@
 # NovelForge Implementation Progress
 
+> **StoryFlow 2.0 current browser-gate and perception hardening increment
+> (2026-08-20)**: A disposable 100-chapter fixture completed the local
+> browser workflow from WORLD snapshot through DRAFT/READY/RUNNING/PAUSED,
+> WAIT/intervention, branch execution/comparison, grounded Analyst, Character
+> Chat, mixed Character+Faction Survey, explicit Adoption, Planning Overlay,
+> ChapterIntent, and durable `write-next`. The first mixed Survey exposed a
+> real `territory`-list perception bug (`unhashable list`); structured
+> location normalization now covers snapshot context, nearby entities, and
+> event visibility, and the regression suite passes. With no live provider,
+> Chat/Survey persist `PROVIDER_UNAVAILABLE` fail-closed evidence; after the
+> deterministic acceptance worker processed the queued author task, Chapter
+> 101 reached `StoryCommit=accepted`, review `95/PASS`, one fact, and the
+> HISTORY card showed `write-next completed · 100%`. Canon remained at
+> `4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945` through
+> simulation, adoption, and queueing, then changed only after the accepted
+> StoryCommit to `2927a3c35e9d57aab719af3c0d09f6c6f8f468edd1a07ad512d0ae33fe079d7e`;
+> the immutable run correctly became `STALE`. The fresh browser session had
+> zero console errors/warnings, no `[object Object]` rendering, and unique
+> event IDs after refresh. Focused StoryFlow/Phase 1/writing tests are
+> `128 passed`; STORY-001 and WRITE-001 are `VERIFIED`; static/protected-file
+> checks pass. This is deterministic local acceptance evidence; the real
+> external-provider matrix and production-scale gate remain **PARTIAL**.
+
+> **StoryFlow 2.0 survey-scenario and intervention-history increment
+> (2026-08-20)**: Survey detail now exposes a bounded, persisted scenario
+> payload (question, selected Agent IDs, responses, and source evidence), and
+> `POST .../simulation/surveys/{survey_id}/run` forks the source Sandbox at its
+> latest event boundary into a new `READY` run. The child stores the scenario
+> in run configuration and retains branch lineage; the source run and Canon
+> remain unchanged. Simulation HISTORY/SIMULATE now also reads durable author
+> interventions, showing kind, rationale, delta, event ID, and author after
+> refresh. The focused Survey, intervention, and lifecycle API regressions
+> pass; the combined StoryFlow/Phase 1/writing integration suite is `128
+> passed`, Ruff, JavaScript syntax, compileall, protected-file, and diff checks
+> pass. These additions close local traceability seams but do not claim the
+> external-provider matrix, full browser acceptance, or production-scale
+> performance gate; product status remains **PARTIAL**.
+
+> **StoryFlow 2.0 final audit increment (2026-08-20)**: The pre-this-increment
+> full repository regression completed `1023 passed in 17:14`; all five protected feature
+> gates (`CW-001`, `MEMORY-001`, `REVIEW-001`, `STORY-001`, `WRITE-001`) are
+> `VERIFIED`. The audit closed four sandbox-boundary seams: Snapshot-derived
+> Agent knowledge now reaches only the selected Agent scope; INFORM/DECEIVE/
+> DISCLOSE_SECRET/SEND_MESSAGE propagate only explicit information to target
+> knowledge and recipient episodic memory; common typed actions (movement,
+> inventory, relationships, alliances, and goals) have deterministic
+> Sandbox state semantics; and MOVE/FLEE validation accepts the destination
+> location while other actions remain location-bound. Faction UNKNOWN
+> knowledge no longer falls back into visible context. The Studio bundle also
+> exposes a durable STOP control and hydrates scheduler/adoption/graph/report/
+> interaction panels concurrently from backend records. Ruff, JavaScript
+> syntax, compileall, protected-file, and diff checks pass. The exact
+> deterministic benchmark persisted 200/1,250/5,000 events at
+> 311.826/106.758/36.515 events per second, with stable hashes,
+> `runStatus=COMPLETED`, and `canonicalMutation=false`. A fresh headed local
+> browser session loaded the current bundle, durable runs, 29-agent roster,
+> STOP control, HISTORY adoption/ChapterIntent surface, and zero fresh
+> console errors/warnings. External-provider full matrix, production-scale
+> virtualization, and the complete 23-step browser gate remain unclaimed;
+> the current increment's focused StoryFlow/Phase 1/writing suite is `128
+> passed`; product status stays **PARTIAL**.
+
+> **StoryFlow 2.0 full browser workflow evidence increment (2026-08-20)**:
+> A fresh Playwright session against current Studio code and an isolated copy of
+> the real book exercised the end-to-end sandbox handoff: immutable snapshot,
+> DRAFT/READY/RUNNING/PAUSED transitions, persisted WAIT and author
+> intervention events, branch fork and branch-only state, outcome comparison,
+> grounded Analyst query, Character Chat and Survey failure evidence,
+> author Adoption, Planning node, ChapterIntent creation, and the durable
+> `write-next` queue. The branch run was
+> `438ec0146c444e68b3bfbed4ffe87865`; its Canon hash stayed
+> `4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945` before
+> and after the workflow, with `canonicalMutation=false`. Reloading the page
+> restored the branch tree, events, adopted proposal, Planning node, and
+> controls; a fresh console check reported zero errors or warnings. The
+> queued writing task remains durable and queued because this acceptance server
+> intentionally disabled the worker; Character Chat/Survey correctly record
+> `PROVIDER_UNAVAILABLE` without inventing answers. Automated writing-to-
+> StoryCommit coverage remains the authoritative Canon-mutation proof. Product
+> status remains **PARTIAL**.
+
+> **StoryFlow 2.0 ChapterIntent refresh visibility increment (2026-08-20)**:
+> The Adoption list now reads only the durable, author-owned
+> `control/runtime/chapter-*.intent.json` documents whose provenance names the
+> proposal, and exposes them as `chapterIntents` without touching Canon. The
+> HISTORY card renders the persisted chapter/status after refresh; the focused
+> API regression and a fresh browser reload both verified ChapterIntent 15 and
+> zero console errors. Product status remains **PARTIAL**.
+
+> **StoryFlow 2.0 durable write-next visibility increment (2026-08-20)**:
+> Adoption records now expose book-scoped `write-next` task summaries selected
+> by their persisted `simulation_adoption_id`. The HISTORY card renders the
+> durable task id, status, and progress after refresh; the isolated browser
+> pass showed `write-next queued · task 402a1e0accc241cc89a4f8113af7a24c ·
+> 0%` with zero console errors. The acceptance worker stayed disabled, so no
+> prose or Canon mutation is claimed from this queued task. Product status
+> remains **PARTIAL**.
+
+> The same deterministic worker was then run against that isolated queue as an
+> adversarial recovery check. The existing author gate rejected chapter 15
+> with `PREVIOUS_CHAPTER_NOT_COMMITTED` (`previous chapter 14 is not committed:
+> draft`); the task became `failed`, no model call or StoryCommit occurred, and
+> the Canon digest was unchanged. HISTORY now renders the durable error beside
+> the task status so this gate is actionable rather than hidden.
+
+> The failed-task path is also browser-visible: the HISTORY card renders the
+> persisted `PREVIOUS_CHAPTER_NOT_COMMITTED` reason and exposes the existing
+> durable task retry control; the isolated browser reports zero console errors.
+
+> **StoryFlow 2.0 retry-state truthfulness increment (2026-08-20)**: The
+> HISTORY write-next evidence now distinguishes a terminal
+> `failed/needs_author_decision` task from a requeued task that still carries
+> the previous failure detail. Requeued work is shown as `queued` with a
+> `last error` annotation and no duplicate retry control; terminal failures
+> retain the actionable Retry button. A fresh browser session against the
+> isolated backend rendered `write-next queued` plus `last error` after retry,
+> with zero console errors or warnings. Focused StoryFlow, writing-integration,
+> and persistence tests are `110 passed`; all five protected feature gates
+> remain `VERIFIED`. Product status remains **PARTIAL**.
+
+> **StoryFlow 2.0 deterministic browser writing handoff increment
+> (2026-08-20)**: A disposable copy of the browser acceptance database was
+> processed with the repository's deterministic acceptance model after the
+> author gate was satisfied. The existing adopted proposal and ChapterIntent
+> 15 task `402a1e0accc241cc89a4f8113af7a24c` reached `completed`, `100%`,
+> review score `95`, quality gate `PASS`, one committed fact, and an accepted
+> `StoryCommit`; the prerequisite chapter 14 was also committed by the same
+> deterministic worker. A fresh Studio browser session then reloaded HISTORY
+> and rendered the adopted proposal, Planning node, ChapterIntent 15, and
+> `write-next completed` evidence with zero console errors or warnings. The
+> run's immutable snapshot still reports the pre-write Canon hash and
+> `canonicalMutation=false`; the run is correctly marked `STALE` only because
+> the later StoryCommits changed the current Canon hash. This closes the
+> deterministic browser handoff evidence, not the real external-provider gate;
+> product status remains **PARTIAL**.
+
+> **StoryFlow 2.0 final current-tree verification increment (2026-08-20)**:
+> The full repository suite is `1009 passed in 16:22`; the five protected
+> feature gates are all `VERIFIED`; Ruff, JavaScript syntax, compileall,
+> protected-file, and diff checks pass. The deterministic benchmark completed
+> 200/1,250/5,000 events at 248.184/90.677/32.483 events per second with
+> `canonicalMutation=false` and `provider=deterministic-runtime-only`.
+> This is a reproducible core-ledger baseline, not a production provider SLA.
+
+> **StoryFlow 2.0 Adoption workspace refresh increment (2026-08-20)**:
+> The Simulation HISTORY workspace now refreshes from durable backend records
+> immediately after creating an Adoption proposal, so the persisted `PROPOSED`
+> card is visible without a manual reload. UI edits now round-trip the existing
+> structured payload instead of replacing it with a presentation-only marker;
+> a fresh current-code browser pass on an isolated copy of the real book
+> edited a structured proposal and confirmed its source IDs, event range,
+> proposed goals/threads, and `canonicalMutation=false` remained persisted.
+> The session produced 0 console errors/warnings. Product status remains
+> **PARTIAL**.
+
+> **StoryFlow 2.0 snapshot/adoption contract increment (2026-08-20)**:
+> WorldSnapshotBuilder now binds the latest revisioned Planning snapshot and
+> exports recorded faction/location states, power systems, entity knowledge,
+> plot threads, secrets, goals, conflicts, items, narrative obligations, and
+> current chapter position without writing Canon. Migration 43 makes the
+> SimulationAdoptionProposal fields (`sourceSimulationId`, branch/event range,
+> proposed Planning/plot/goal/foreshadow/ChapterIntent data, and provenance)
+> durable and visible in API responses; ChapterIntent provenance carries the
+> same boundary evidence. Migration 44 persists SimulationRun base Canon and
+> branch lineage (`base_canon_event_id`, `branch_parent_id`,
+> `branch_point_event_id`). The Event Timeline now expands persisted actor,
+> target, location, action, state-delta, payload, and causal evidence details.
+> Focused snapshot/adoption/lineage/API tests pass; the product remains
+> **PARTIAL** pending external provider E2E and complete browser
+> Writing/Review/StoryCommit execution.
+
+> **StoryFlow 2.0 spatial/provenance hardening increment (2026-08-20)**:
+> Added the explicit `PREPARING` run state with persisted configuration and a
+> fail/reload path, while preserving the legacy direct `DRAFT -> READY` API
+> transition. Action events now carry actor/location provenance and the
+> agent-local perception boundary hides location-scoped events from remote
+> agents while retaining direct communication visibility. Migration 42 adds
+> branch `parent_round`/`fork_snapshot_hash` and intervention `author` fields;
+> intervention kinds normalize to the typed contract with compatibility
+> aliases. New tests cover persistence, recovery, spatial isolation, branch
+> fork hashes, author provenance, invalid kinds, and API responses. The
+> combined StoryFlow/Phase 1 suite is `105 passed`; feature verification,
+> Ruff, compileall, JavaScript syntax, protected-file, and diff checks pass.
+> This is still a partial vertical slice: full browser acceptance, external
+> provider E2E, and complete Writing/Review/StoryCommit handoff remain
+> unclaimed.
+> The final full-repository run completed with `1003 passed` (16:17).
+
+> The same increment now also exposes persisted Adoption Edit/Reject actions
+> in the API and Simulation HISTORY workspace. Rejected proposals remain
+> visible without a Planning node; only an explicitly adopted proposal can
+> reach ChapterIntent or the durable write-next handoff.
+> A fresh current-code Playwright pass on an isolated copy of the real book
+> created, edited, rejected, and refreshed a proposal; the persisted UI showed
+> `REJECTED` with no Planning node and the browser reported zero errors.
+
+> **StoryFlow 2.0 branch causal-trace isolation fix (2026-08-19)**: Branch
+> causal backfill now writes only child-owned events while retaining inherited
+> parent evidence by event id, preserving the single-run causal batch invariant.
+> A real HTTP regression starts a branch, executes a child WAIT event, and
+> asserts the branch `/causal-trace` response is 200 with bounded evidence.
+> Fresh current-code browser verification observed the same branch trace at
+> HTTP 200 with zero console errors/warnings. Overall StoryFlow remains
+> **PARTIAL**; external-provider and full Writing/Review/StoryCommit browser
+> acceptance remain unclaimed.
+
 > **StoryFlow 2.0 run-scoped Provider Assignment increment (2026-08-19)**:
 > Simulation configuration now validates and normalizes capability assignments
 > (`agentDecisionProviderId`, `memoryProviderId`, `analystProviderId`, and
@@ -2005,3 +2211,335 @@ The final screenshot pass also exposed one Browser Use harness-only
 README and is not a page error. The result remains `PARTIAL`: this closes
 cursor correctness and interaction continuity, not true GPU virtualization,
 full predicate pushdown, or complete high-degree edge paging.
+
+## StoryFlow provider rejection and typed-action/graph increment (2026-08-20)
+
+Provider-supplied action names are now normalized before construction and
+unknown names reach the typed `ActionValidator` as durable rejected proposals.
+The persistent simulation-round task still completes its round bookkeeping,
+records the exact rejection reason, emits no actor action event, and preserves
+the selected provider id; a focused regression covers this fail-closed path.
+
+The Simulation workspace now exposes the complete 29-value `ActionType`
+ontology instead of a hand-picked subset. Analyze also renders the persisted
+dynamic graph as a deterministic, bounded SVG viewport (36 visible nodes with
+omitted-count evidence, typed styling, edge arrows, and click-to-inspect
+selection). It contains no synthetic timer/progress state: graph nodes and
+edges come only from the run projection, and the interaction remains
+`canonicalMutation=false`.
+
+A fresh headed browser session against the isolated real-book copy verified
+the graph SVG, 36-node bounded view, all 29 action options, graph-node agent
+selection, and zero console errors/warnings. This closes the local visibility
+and rejection evidence only; provider availability, large-scale graph
+virtualization, and production scheduler/performance remain `PARTIAL`.
+
+## StoryFlow world entity inventory and graph ontology increment (2026-08-20)
+
+The WORLD workspace now exposes immutable `snapshot.world` as a read-only
+entity inventory with counts and bounded previews for Characters, Factions,
+Locations, Relationships, Timeline, Foreshadows, Plot Threads, Secrets,
+Goals, Conflicts, Items, Facts, Narrative Obligations, World Rules, and Power
+Systems. This makes absent/empty Canon data visible rather than implying a
+complete Agent roster from a partial projection.
+
+The persisted Simulation graph projection now includes the same non-Agent
+narrative entity classes as typed nodes, and projection versioning invalidates
+old caches when the ontology changes. Against the isolated real-book run the
+API rebuilt `851` nodes (`50` Character/Faction/Location nodes plus `801`
+snapshot-backed narrative nodes) with `projectionVersion=2` at that probe; the bounded SVG
+still renders 36 nodes and remains read-only. A fresh browser check confirmed
+the inventory, graph count, and zero console errors/warnings. This is complete
+local entity visibility, not a claim of true large-scale GPU virtualization or
+provider-backed cognition; product status remains `PARTIAL`.
+
+## StoryFlow scheduler governance and live graph edges increment (2026-08-20)
+
+Tier C scheduling no longer treats the mere presence of a persistent goal as a
+round trigger. Goals remain explainable ranking evidence, while passive Agents
+activate from Sandbox events, relationships, conflicts, recent activity,
+author pins, or an explicit per-Agent `activateOnGoal` policy. This closes the
+default-all-passive-provider-slot loophole without changing Tier A/B policy or
+author pin semantics; focused scheduler and invalid-action regressions pass.
+
+The graph projection is now version `3` and rebuilds version `2` caches. It
+adds replayed `present_at`, `controls`, relationship, knowledge, narrative
+reference, and event-target node references while retaining legacy raw edge
+ids for compatibility. The EventSource timeline refreshes the graph read model
+after persisted Sandbox events, so the Analyze view does not depend on a
+synthetic timer. This remains a deterministic, bounded SVG/read-model path;
+production-scale virtualization and external-provider scheduling remain
+`PARTIAL`.
+
+The final current-code isolated-book browser/API pass observed `0 active / 29
+discovered` on the default Tier C preview, then streamed a persisted `TALK`
+round into the same WORLD view; the graph changed from `851 nodes / 0 edges /
+sequence 0` to `851 nodes / 1 edge / sequence 1` without a manual page reload.
+The run detail remained `canonicalMutation=false` and `snapshotFreshness=CURRENT`;
+the fresh console had `0` errors and `0` warnings.
+
+## StoryFlow event inspector and structured environment setup increment (2026-08-20)
+
+Timeline events now have a durable, book-scoped detail endpoint and lazy Studio
+inspector. Opening an event replays the immutable snapshot plus the persisted
+prefix and returns Actor before/after state, Agent-local Memory, pre-event
+Context, causal Why evidence, State Delta hashes, and related graph nodes/edges.
+The endpoint rejects cross-book/run event ids, keeps `canonicalMutation=false`,
+and the focused API regression proves the Canon fact count is unchanged. The
+browser inspector was checked after a fresh run selection and after a page
+reload; all six evidence sections loaded from the persisted event id with zero
+console errors or warnings. A stale-summary race during asynchronous run
+switching is now ignored instead of issuing a cross-run detail request.
+
+Environment Setup is no longer JSON-only in the Simulation workspace. DRAFT,
+PREPARING, READY, PAUSED, and PAUSED_BUDGET runs expose structured summaries
+and an author edit form for initial location, goals/activity, decision
+frequency, memory policy, clock duration, action budget, narrative randomness,
+conflict resolution, communication/world rules, and provider assignment. A
+book-scoped configuration endpoint persists the normalized object and refuses
+changes while a run is RUNNING or terminal. Focused API coverage and a fresh
+headed browser save/reload check passed; the configuration remains Sandbox-only.
+The overall product verdict remains `PARTIAL` because the real external
+provider gate, production-scale scheduling/virtualization, and full acceptance
+matrix are still open.
+
+## StoryFlow current-tree verification increment (2026-08-20)
+
+The current tree now passes the full repository suite with `1010 passed in
+15:40`, all five protected feature gates (`CW-001`, `MEMORY-001`,
+`REVIEW-001`, `STORY-001`, and `WRITE-001`) report `VERIFIED`, and Ruff,
+JavaScript syntax, compileall, protected-file, and diff checks are clean. The
+deterministic benchmark completed 200/1,250/5,000 persisted events at
+221.626/84.263/32.237 events per second with `canonicalMutation=false` and
+`provider=deterministic-runtime-only`. This is a reproducible local runtime
+baseline, not an external-provider SLA or production-scale guarantee; product
+status remains `PARTIAL`.
+
+## StoryFlow environment generation, evidence linking, and history increment (2026-08-20)
+
+Environment Setup now has a deterministic `SimulationConfigurationGenerator`
+that derives run-scoped agents/policies, goals, horizon, clock, memory,
+conflict, and provider-assignment defaults from the immutable World Snapshot.
+The API supports preview and explicit persistence; unknown author fields and
+budget settings are preserved, and the response records
+`source=immutable_simulation_world_snapshot` plus `canonicalMutation=false`.
+Repeated snapshot creation at the same Canon boundary is idempotent when the
+payload is identical and returns the already-persisted snapshot id, so creating
+multiple counterfactual runs cannot turn a normal workflow into a uniqueness
+error.
+
+Run history now has migration 45 append-only `DELETE` semantics. The Studio
+button soft-deletes a non-running run from the default list while retaining the
+run, snapshot, ledger, replay, and history evidence for direct inspection;
+archive/unarchive cannot erase or revive a deleted record. Branch comparison
+exposes explicit narrative dimensions (characters, factions, locations,
+relationships, goals, conflicts, secrets, knowledge, foreshadowing, plot
+threads, world variables, opportunities, and risks) in addition to raw state
+keys.
+
+Context compilation accepts a run-scoped approximate token budget and reports
+the effective cap and omitted sections. Analyst reports persist a stable
+`sections` map plus deterministic risk/chapter-plan fields; event evidence is
+clickable in Analyze and opens the same durable event inspector used by the
+timeline. Graph evidence now explicitly labels `SIMULATION`, run id, round,
+and ledger sequence. A fresh current-code headed browser session verified
+snapshot reuse, generated configuration persistence after reload, dynamic
+report-to-event evidence linking (including after local report refresh),
+SIMULATION graph metadata, and soft-delete HTTP 200/history retention on an
+isolated real-book copy. The initial duplicate-snapshot probe was a deliberate
+failure discovery; after the fix the fresh console had zero errors and
+warnings. External-provider execution, production-scale virtualization, and
+the full acceptance matrix remain open, so the product verdict remains
+`PARTIAL`.
+
+## StoryFlow final local verification after migration 45 (2026-08-20)
+
+The current tree now passes `1014 passed in 16:19`; the five protected feature
+gates remain `VERIFIED`. The focused StoryFlow suite is `97 passed` and phase
+persistence is `19 passed`. The current deterministic benchmark completed
+200/1,250/5,000 events at 252.568/90.539/32.360 events per second with stable
+state hashes, `runStatus=COMPLETED`, `canonicalMutation=false`, and
+`provider=deterministic-runtime-only`. This is a local deterministic ledger
+baseline, not an external-provider SLA or production-scale virtualization
+claim; overall status remains `PARTIAL`.
+
+The explicit replay seam is now named and exposed:
+`SimulationRepository.rebuild_simulation_state()` rebuilds only from the
+immutable snapshot plus append-only SimulationEvent ledger, while the
+book-scoped `/simulation/runs/{run_id}/replay` endpoint returns the rebuilt
+state/hash with `canonicalMutation=false`. A regression deletes the mutable
+graph projection rows, rebuilds the state, and verifies that the graph
+projector restores the exact hash. External-provider execution, production
+scale, and the complete browser acceptance matrix remain open.
+
+## StoryFlow isolated browser acceptance increment (2026-08-20)
+
+A fresh headed Playwright session against current code and an isolated copy of
+the real `玖安余陈` book completed the locally available workflow through the
+planning handoff. The run `9f2505d34f5545baae0a87d09e1c3448` was paused and
+resumed, received an author `WORLD_VARIABLE` intervention, was forked through
+the UI, started, and advanced with a persisted `WAIT` round. Analyze created a
+deterministic report, a grounded Analyst query, and a cross-run comparison;
+Interact persisted a Character Chat record and a 29-agent Character/Faction
+Survey (all responses explicitly `PROVIDER_UNAVAILABLE` because no provider
+was configured). History then created and adopted proposal
+`83da18cc1ba146c1bc1310b00130f737`, created ChapterIntent 15, and queued the
+durable `write-next` task `46006551086340a1bea9a9659ae72c90` at 0% without
+changing Canon. The run detail remained `snapshotFreshness=CURRENT` and
+`canonicalMutation=false`; the snapshot/current Canon hash stayed
+`4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945`.
+
+After closing the exploratory session, a new browser session loaded the
+persisted run and History overlay after refresh. It reported zero console
+errors/warnings and no HTTP 4xx/5xx responses; the adoption, Planning node,
+ChapterIntent, and queued write-next evidence were still visible. This is
+authoritative local browser evidence for the implemented path, not a claim
+that the external-provider, production-scale, or full 23-step acceptance
+gates are complete. Overall status remains `PARTIAL`.
+
+## StoryFlow writing handoff overlay closure (2026-08-20)
+
+The durable History `write-next` handoff now carries the adopted Planning node
+id as explicit task context. The worker uses that author-owned id only after a
+quality-gated StoryCommit is accepted, then marks the Planning node `ACCEPTED`
+and links the committed chapter; Simulation still never mutates Canon directly.
+Focused API and writing-integration regressions passed (`1` and `3` tests),
+including assertions for the accepted node and StoryCommit linkage.
+
+A fresh headed browser proof on an isolated project/run
+(`75844b774e4a4813b8e2a2e78ced3fed`) queued and completed task
+`62f85b2ccd6b4d38b92ecfd39ecf638b` at `100%`. The deterministic local worker
+reported review score `95`, quality gate `PASS`, and StoryCommit
+`1306e900...`; the source Planning node
+`planning:b50994542d814ef38f0a16255e2ef44b` was `ACCEPTED` and linked to the
+committed chapter. The browser displayed the completed task, recorded zero
+console errors/warnings, and all observed API requests returned HTTP `200`.
+This is deterministic local acceptance evidence rather than real-provider E2E;
+external-provider execution, production-scale scheduling, and the full
+acceptance matrix remain open. Overall status remains `PARTIAL`.
+
+## StoryFlow authorized provider and Agent-context increment (2026-08-20)
+
+The current Model Runtime reports one enabled, credentialed MiMo provider and
+the connection task completed on a copied SQLite database (`connected=true`,
+model `mimo-v2.5-pro`). A real-provider Simulation probe on that isolated copy
+ran three explicitly pinned Tier A Agents for ten durable rounds. The run
+reached `COMPLETED` at round 10 with 30 GenerationRuns, 30 GenerationAttempts,
+30 cost-ledger rows, stable Sandbox evidence, and an unchanged Canon hash.
+The same isolated run also completed real-provider Character Chat
+(`ANSWERED`), a three-Agent Survey (`COMPLETED`, three responses), and a
+provider-backed Analyst query; all returned `canonicalMutation=false`.
+
+That probe found and fixed two runtime gaps. Agent-local perception now falls
+back to the typed action ontology when a legacy snapshot has no explicit action
+catalog, and exposes only same-location entity references so provider models can
+distinguish `targets` from `location`. Empty rounds still persist `ROUND_CLOCK`
+for replay, but no longer report its null actor as `actedAgents=[""]`. Focused
+regressions cover the fallback vocabulary, local-entity boundary, and clock
+semantics. These are authorized-provider and isolated-runtime proofs; the full
+23-step browser/provider matrix and production-scale scheduling remain open.
+Overall status remains `PARTIAL`.
+
+## StoryFlow final verification and provider-browser increment (2026-08-20)
+
+The current tree passes the full repository suite: `1016 passed in 16:54`.
+The focused StoryFlow/world/persistence/writing regression passes `121 passed`.
+The protected verifier completed CW-001, MEMORY-001, REVIEW-001, STORY-001,
+and WRITE-001 as `VERIFIED`; Ruff, JavaScript syntax, compileall,
+protected-file, and `git diff --check` also pass.
+
+An isolated current-code Studio server was exercised in a fresh headed browser
+session. It created a run with persisted MiMo assignment, traversed
+DRAFT -> READY -> RUNNING, executed a typed WAIT round, queued a durable
+`simulation-round` task, and reloaded the completed task from durable storage.
+The run remained Sandbox-only (`canonicalMutation=false`) and the browser
+reported zero console errors/warnings with all observed requests successful.
+Screenshots are retained under `output/playwright/`. The external-provider
+runtime, full 23-step browser/provider matrix, and production-scale
+virtualization remain partial; product status remains `PARTIAL`.
+
+The current deterministic runtime benchmark covers the required 10/20,
+25/50, and 50/100 scales: 200/1,250/5,000 ledger events completed at
+127.678/54.297/28.981 events per second with stable hashes,
+`runStatus=COMPLETED`, and `canonicalMutation=false`. It is explicitly a
+deterministic-runtime-only throughput measurement, not a provider latency or
+production-scale virtualization claim.
+
+The follow-up fresh headed browser session against the same isolated provider
+copy also verified the newly exposed provider decision controls and adoption
+handoff. Selecting `Provider Agent decision` disabled the immediate execute
+button and changed the durable action to `Queue provider round`; the persisted
+Provider browser run displayed its completed `OBSERVE` event, provider
+assignment, budget ledger, and `canonicalMutation=false`. In HISTORY, an
+existing `ADOPTED` proposal loaded from `GET .../adoptions`, and clicking
+`Create ChapterIntent` returned HTTP `200` and reloaded `ChapterIntent 15 ·
+PLANNED`. The fresh session had zero console errors/warnings and every
+observed API request returned HTTP `200`; screenshot:
+`output/playwright/storyflow-provider-ui-final.png`. This closes the browser
+evidence for the current adoption/ChapterIntent/provider-mode UI seam, but not
+the full 23-step acceptance matrix or production-scale gate.
+
+The Provider Agent decision form now exposes a real multi-select Agent picker.
+It preselects the persisted scheduler's active slots, lets the author pin
+multiple Character/Faction Agents for one durable round, and sends the selected
+`agentIds` list through the existing idempotent `round-tasks` boundary. Clearing
+the picker restores the backend scheduler's tier policy; the roster is capped
+to a bounded 100-option working set with an explicit overflow note. A fresh
+headed browser pass against the isolated provider copy verified the enabled
+picker, active-slot marking, disabled synchronous execute control, and
+`Queue provider round`; console errors/warnings remained zero. Artifact:
+`output/playwright/storyflow-provider-multi-agent-ui.png`. This improves the
+multi-Agent UI seam but does not claim a 10-agent live-provider run or close
+production-scale virtualization.
+
+## StoryFlow scheduler configuration-boundary increment (2026-08-20)
+
+The gap audit found that Environment Setup generated nested Agent policies under
+`agents.policies`, while `AgentScheduler` only read the legacy top-level policy
+aliases. As a result, an author-selected Tier A/B policy could silently fall
+back to Tier C at runtime. The scheduler now unwraps the generated nested map,
+retains compatibility with the legacy `agentPolicies` and `agent_policies`
+forms, and preserves the explicit author-pin behavior. A focused regression
+proves a generated nested Tier A policy produces an active Tier A activation;
+the local scheduler/configuration tests pass. This is a correctness repair,
+not a claim that the external-provider or production-scale gates are closed.
+
+## StoryFlow performance Gate rerun (2026-08-20)
+
+The required deterministic benchmark was rerun against the current tree. The
+10-agent/20-round case persisted 200 events at 315.047 events/s, the
+25-agent/50-round case persisted 1,250 events at 55.415 events/s, and the
+50-agent/100-round case persisted 5,000 events at 17.390 events/s. All three
+runs reached `COMPLETED`, produced stable state hashes, and reported
+`canonicalMutation=false`. The benchmark is the exact deterministic scope
+specified by the reference Gate; provider latency and production-scale UI
+virtualization remain explicitly unclaimed.
+
+The post-repair isolated browser smoke loaded the current Studio bundle against
+the disposable provider fixture and rendered the Agent roster from the real
+API. Each visible card now displayed the replayed `stateHash` and
+`canonicalMutation=false`; the Provider picker was present and disabled in
+explicit mode. All observed backend responses were HTTP 200 and there were no
+page errors. The smoke captured
+`output/playwright/storyflow-roster-statehash-smoke.png`; two external resource
+requests were blocked by the local network policy and are not treated as clean
+console evidence.
+
+The Provider round boundary also now fails closed when an author-pinned
+`agentIds` entry is absent from the immutable snapshot. The durable task is
+marked `HANDLER_ERROR` before any Provider call or Sandbox event, instead of
+silently running an empty round. A focused regression covers the persisted
+failure and zero Provider-call invariant.
+
+## StoryFlow final current-tree verification (2026-08-20)
+
+The current tree passes the full repository suite: `1018 passed in 14:50`.
+The focused StoryFlow/world/persistence/writing regression passes `123 passed`.
+The protected verifier reports CW-001, MEMORY-001, REVIEW-001, STORY-001,
+and WRITE-001 as `VERIFIED`; Ruff, JavaScript syntax, compileall,
+`check_protected_files.py`, and `git diff --check` also pass. The latest
+changes specifically cover nested Environment Setup Agent policies and
+unknown pinned Agent ids failing before any Provider call or Sandbox event.
+All current evidence remains local/deterministic or isolated-provider evidence;
+the complete external-provider browser matrix, production-scale virtualization,
+and broad live-provider crash/recovery gate remain `PARTIAL`.

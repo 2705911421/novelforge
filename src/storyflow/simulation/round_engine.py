@@ -163,7 +163,11 @@ class SimulationRoundEngine:
             self._stage("event_persist")
         for event in persisted_events:
             event_ids.append(event.id)
-            acted.append(event.actor_id or "")
+            # ``ROUND_CLOCK`` is a durable ledger event for an empty or fully
+            # rejected round, not an Agent action.  Do not expose its null
+            # actor as a phantom ``actedAgents=[""]`` entry to the API/UI.
+            if event.event_type != "ROUND_CLOCK" and event.actor_id:
+                acted.append(event.actor_id)
             if event.action_id:
                 existing_actions[event.action_id] = event
             self.repository.remember_event(event)

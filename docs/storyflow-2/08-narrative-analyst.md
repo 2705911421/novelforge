@@ -20,3 +20,13 @@ invented. Provider-backed Analyst/Character Chat/Survey requests run through
 durable capability tasks when an enabled route is available; richer prose
 synthesis, causal graph inference, and real external-provider acceptance remain
 `PARTIAL`.
+
+`SimulationAnalysisReport.to_record()` now exposes a stable `sections` map for
+key events, outcomes, relationship changes, turning points, foreshadowing,
+plot threads, risks, opportunities, unexpected emergence, Canon conflict
+warnings, and potential chapter plans. The deterministic local analyst derives
+risks and chapter-plan candidates only from persisted conflicts and turning
+point events; it does not invent provider prose. Report records carry bounded
+event ids, and the Studio renders those ids as links to the durable event
+inspector. Branch comparison additionally reports explicit narrative
+dimensions rather than only top-level state-key differences.

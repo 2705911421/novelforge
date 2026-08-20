@@ -6,14 +6,53 @@
 
   function bookPath() { return `/books/${encodeURIComponent(S.book)}/simulation`; }
   function text(value) { return esc(String(value == null ? '' : value)); }
+  function jsonText(value) {
+    try { return text(JSON.stringify(value == null ? {} : value, null, 2)); }
+    catch (_) { return text(String(value == null ? '' : value)); }
+  }
   function compactValue(value) {
-    if (Array.isArray(value)) return value.join(', ');
-    if (value && typeof value === 'object') return Object.entries(value).map(([key, item]) => `${key}: ${item}`).join('; ');
+    if (Array.isArray(value)) return value.some((item) => item && typeof item === 'object') ? JSON.stringify(value) : value.join(', ');
+    if (value && typeof value === 'object') return JSON.stringify(value);
     return String(value == null ? '' : value);
   }
   function statusClass(status) { return `simulation-status simulation-status-${String(status || '').toLowerCase()}`; }
   function runSummary(run) {
     return `${run.currentRound}/${run.maxRounds} rounds · ${run.status}`;
+  }
+
+  // Keep the author-facing selector aligned with the backend ActionType
+  // ontology.  The server remains authoritative and validates every action;
+  // this list only prevents the UI from hiding valid typed actions.
+  const ACTION_TYPES = [
+    'MOVE', 'OBSERVE', 'TALK', 'ASK', 'ANSWER', 'INFORM', 'DECEIVE',
+    'HIDE_INFORMATION', 'DISCLOSE_SECRET', 'INVESTIGATE', 'PLAN', 'WAIT',
+    'ATTACK', 'DEFEND', 'HELP', 'BETRAY', 'FORM_ALLIANCE', 'BREAK_ALLIANCE',
+    'CHANGE_RELATIONSHIP', 'USE_ITEM', 'ACQUIRE_ITEM', 'LOSE_ITEM',
+    'PURSUE_GOAL', 'ABANDON_GOAL', 'REACT_TO_EVENT', 'MAKE_DECISION',
+    'SEND_MESSAGE', 'SUMMON', 'FLEE',
+  ];
+
+  function renderActionOptions(selected = 'WAIT') {
+    return ACTION_TYPES.map((action) => `<option value="${action}" ${action === selected ? 'selected' : ''}>${action}</option>`).join('');
+  }
+
+  function renderProviderAgentOptions() {
+    const agents = Array.isArray(state?.agents) ? state.agents : [];
+    const activeIds = new Set((state?.scheduler?.activeAgents || []).map((id) => String(id)));
+    const ordered = [...agents].sort((left, right) => {
+      const activeDelta = Number(activeIds.has(String(right.id))) - Number(activeIds.has(String(left.id)));
+      return activeDelta || String(left.id).localeCompare(String(right.id));
+    });
+    const visible = ordered.slice(0, 100);
+    const options = visible.map((agent) => {
+      const id = String(agent.id);
+      const active = activeIds.has(id);
+      return `<option value="${text(id)}" ${active ? 'selected' : ''}>${text(agent.name)} · ${text(agent.type)}${active ? ' · ACTIVE' : ''}</option>`;
+    }).join('');
+    const overflow = ordered.length > visible.length
+      ? ` <small class="simulation-evidence-note">Showing ${visible.length} of ${ordered.length}; scheduler still evaluates the full persisted roster.</small>`
+      : '';
+    return `<label>Provider agents<select class="input" name="providerAgentIds" multiple size="4" aria-describedby="simulation-provider-agents-note">${options}</select><small id="simulation-provider-agents-note">Selected Agents are author-pinned for this provider round; clear the selection to let the persisted scheduler choose active slots.${overflow}</small></label>`;
   }
 
   const WORKSPACES = [
@@ -68,6 +107,7 @@
     if (!state.runId) {
       state.detail = null;
       state.events = [];
+      state.eventDetails = {};
       return;
     }
     const runPath = `${bookPath()}/runs/${encodeURIComponent(state.runId)}`;
@@ -81,6 +121,7 @@
     } catch (error) { throw new Error(`Run detail or event ledger unavailable: ${error.message}`); }
     state.detail = detail;
     state.events = events.events || [];
+    state.eventDetails = {};
     state.comparison = null;
     state.scheduler = null;
     state.budget = null;
@@ -89,52 +130,51 @@
     try { roster = await api('GET', `${runPath}/agents`); }
     catch (error) { throw new Error(`Agent roster unavailable: ${error.message}`); }
     state.agents = roster.agents || [];
-    try {
-      state.scheduler = await api('GET', `${runPath}/scheduler?roundNumber=${encodeURIComponent((detail.run.currentRound || 0) + 1)}`);
-    } catch (error) { state.analysisError = `Scheduler unavailable: ${error.message}`; }
+    state.analysisError = '';
+    const roundNumber = (detail.run.currentRound || 0) + 1;
+    const [schedulerResult, adoptionResult, graphResult, reportResult, outcomesResult, interventionResult] = await Promise.allSettled([
+      api('GET', `${runPath}/scheduler?roundNumber=${encodeURIComponent(roundNumber)}`),
+      api('GET', `${runPath}/adoptions`),
+      api('GET', `${runPath}/graph?event_limit=1000`),
+      api('GET', `${runPath}/analysis?limit=20`),
+      api('GET', `${runPath}/outcomes`),
+      api('GET', `${runPath}/interventions?limit=100`),
+    ]);
+    if (schedulerResult.status === 'fulfilled') state.scheduler = schedulerResult.value;
+    else state.analysisError = `Scheduler unavailable: ${schedulerResult.reason.message}`;
     try {
       state.budget = await api('GET', `${runPath}/budget?estimatedCalls=${encodeURIComponent((state.scheduler?.activeAgents || []).length)}`);
-    } catch (error) { state.analysisError = state.analysisError || `Budget unavailable: ${error.message}`; }
-    try {
-      state.causality = await api('GET', `${runPath}/causal-trace?limit=200`);
-    } catch (error) { state.analysisError = state.analysisError || `Causal trace unavailable: ${error.message}`; }
-    let adoptionResponse;
-    try { adoptionResponse = await api('GET', `${runPath}/adoptions`); }
-    catch (error) { throw new Error(`Adoption proposals unavailable: ${error.message}`); }
-    state.proposals = adoptionResponse.proposals || [];
+    } catch (error) {
+      state.analysisError = state.analysisError || `Budget unavailable: ${error.message}`;
+    }
+    if (adoptionResult.status === 'fulfilled') state.proposals = adoptionResult.value.proposals || [];
+    else throw new Error(`Adoption proposals unavailable: ${adoptionResult.reason.message}`);
+    if (interventionResult.status === 'fulfilled') state.interventions = interventionResult.value.interventions || [];
+    else { state.interventions = []; state.analysisError = state.analysisError || `Interventions unavailable: ${interventionResult.reason.message}`; }
     state.graph = null;
     state.reports = [];
-    state.analysisError = '';
-    try {
-      state.graph = await api('GET', `${runPath}/graph?event_limit=1000`);
-    } catch (error) { state.analysisError = error.message; }
-    try {
-      const reportResponse = await api('GET', `${runPath}/analysis?limit=20`);
-      state.reports = reportResponse.reports || [];
-    } catch (error) { state.analysisError = state.analysisError || error.message; }
-    try {
-      state.outcomes = await api('GET', `${runPath}/outcomes`);
-    } catch (error) { state.analysisError = state.analysisError || `Outcome clusters unavailable: ${error.message}`; }
+    state.outcomes = null;
+    if (graphResult.status === 'fulfilled') state.graph = graphResult.value;
+    else state.analysisError = state.analysisError || `Graph unavailable: ${graphResult.reason.message}`;
+    if (reportResult.status === 'fulfilled') state.reports = reportResult.value.reports || [];
+    else state.analysisError = state.analysisError || `Reports unavailable: ${reportResult.reason.message}`;
+    if (outcomesResult.status === 'fulfilled') state.outcomes = outcomesResult.value;
+    else state.analysisError = state.analysisError || `Outcome clusters unavailable: ${outcomesResult.reason.message}`;
     const characters = state.agents.filter((agent) => agent.type === 'character');
     state.chatAgentId = characters.some((agent) => agent.id === state.chatAgentId)
       ? state.chatAgentId : (characters[0]?.id || '');
     state.interactionError = '';
-    if (state.chatAgentId) {
-      try {
-        const chatResponse = await api('GET', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/agents/${encodeURIComponent(state.chatAgentId)}/chat?limit=50`);
-        state.chatInteractions = chatResponse.interactions || [];
-      } catch (error) {
-        state.chatInteractions = [];
-        state.interactionError = error.message;
-      }
-    } else state.chatInteractions = [];
-    try {
-      const surveyResponse = await api('GET', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/survey?limit=20`);
-      state.surveys = surveyResponse.surveys || [];
-    } catch (error) {
-      state.surveys = [];
-      state.interactionError = state.interactionError || error.message;
-    }
+    const chatRequest = state.chatAgentId
+      ? api('GET', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/agents/${encodeURIComponent(state.chatAgentId)}/chat?limit=50`)
+      : Promise.resolve({ interactions: [] });
+    const [chatResult, surveyResult] = await Promise.allSettled([
+      chatRequest,
+      api('GET', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/survey?limit=20`),
+    ]);
+    if (chatResult.status === 'fulfilled') state.chatInteractions = chatResult.value.interactions || [];
+    else { state.chatInteractions = []; state.interactionError = chatResult.reason.message; }
+    if (surveyResult.status === 'fulfilled') state.surveys = surveyResult.value.surveys || [];
+    else { state.surveys = []; state.interactionError = state.interactionError || surveyResult.reason.message; }
     connectEventStream();
   }
 
@@ -163,6 +203,11 @@
       if (body) body.innerHTML = renderTimeline();
       const metric = document.querySelector('[data-sim-event-sequence]');
       if (metric) metric.textContent = String(sequence);
+      // The backend projects the Sandbox graph during the same durable round;
+      // refresh its read model on the live event stream so graph state does
+      // not lag behind the timeline.  Failures stay silent here and remain
+      // visible through the explicit Graph refresh control.
+      void refreshGraph(true);
     });
     source.onerror = () => {
       if (source.readyState === window.EventSource.CLOSED && state.eventSource === source) state.eventSource = null;
@@ -226,11 +271,64 @@
 
   function renderTimeline() {
     if (!state.events.length) return '<div class="simulation-empty simulation-empty-compact">No persisted sandbox events.</div>';
-    return state.events.map((event) => `<article class="simulation-event">
-      <div><b>#${text(event.sequence)}</b><span>${text(event.type)}</span></div>
-      <p>${text(event.actorId || 'Author')} ${event.targetIds?.length ? `→ ${text(event.targetIds.join(', '))}` : ''}</p>
-      <small>Round ${text(event.round)} · ${text(event.visibilityScope || 'world')}</small>
-    </article>`).join('');
+    return state.events.map((event) => {
+      const targets = Array.isArray(event.targetIds) ? event.targetIds.join(', ') : '';
+      const detail = state.eventDetails?.[event.id];
+      return `<details class="simulation-event"><summary data-sim-event-toggle="${text(event.id)}"><div><b>#${text(event.sequence)}</b><span>${text(event.type)}</span></div>
+        <p>${text(event.actorId || 'Author')} ${targets ? `→ ${text(targets)}` : ''}</p>
+        <small>Round ${text(event.round)} · ${text(event.simulationTime || 'simulation time unknown')} · ${text(event.location || 'location unknown')} · ${text(event.visibilityScope || 'world')} · click for persisted evidence</small></summary>
+        <div class="simulation-event-detail" data-sim-event-detail="${text(event.id)}">${detail ? renderEventInspector(detail) : '<p class="dim-note">Open this event to load Actor, Memory, Context, Why, State Delta, and related graph changes from durable Sandbox evidence.</p>'}</div>
+      </details>`;
+    }).join('');
+  }
+
+  function renderEventInspector(detail) {
+    const event = detail?.event || {};
+    const actor = detail?.actor;
+    const memory = detail?.memory || {};
+    const context = detail?.context;
+    const why = detail?.why || {};
+    const delta = detail?.stateDelta || {};
+    const graph = detail?.relatedGraphChanges || {};
+    const causes = (why.causedBy || []).map((cause) => `<li><b>${text(cause.causeType)}</b> ${text(cause.causeId)} · ${text(cause.relation)}</li>`).join('');
+    const memoryRows = (memory.items || []).map((item) => `<li><b>${text(item.type)}</b> ${text(compactValue(item.content))}<small>round ${text(item.createdRound)} · ${text(item.id)}</small></li>`).join('');
+    const graphEdges = (graph.edges || []).map((edge) => `<li><b>${text(edge.type || 'related_to')}</b> ${text(edge.sourceNodeId || edge.source)} → ${text(edge.targetNodeId || edge.target)}${edge.sequence ? ` · sequence ${text(edge.sequence)}` : ''}</li>`).join('');
+    return `<div class="simulation-event-inspector" data-sim-event-inspector="${text(event.id)}">
+      <section data-sim-event-evidence="actor"><h5>Actor</h5><p><b>${text(actor?.id || event.actorId || 'Author')}</b> · ${text(actor?.type || event.actorType || 'author')} · target ${text((event.targetIds || []).join(', ') || 'none')}</p>${actor ? `<pre>${jsonText({ before: actor.before, after: actor.after })}</pre>` : ''}</section>
+      <section data-sim-event-evidence="memory"><h5>Memory</h5><ul>${memoryRows || '<li class="dim-note">No agent-local memory was persisted for this event.</li>'}</ul><small>Agent-scoped memory only · ${text(memory.evidence?.source || 'simulation_agent_memories')}</small></section>
+      <section data-sim-event-evidence="context"><h5>Context</h5>${context ? `<p><b>${text(context.identity?.name || context.agentId)}</b> · ${text(context.actorType)} · pre-event sequence ${text(context.beforeEventSequence)}</p><pre>${jsonText({ currentState: context.currentState, localWorld: context.localWorld, knowledge: context.knowledge, beliefs: context.beliefs, goals: context.goals, relationships: context.relationships, observations: context.observations, recentEvents: context.recentEvents, recentMemory: context.recentMemory, availableActions: context.availableActions, worldRules: context.worldRules })}</pre>` : '<p class="dim-note">No actor context was available for this event.</p>'}</section>
+      <section data-sim-event-evidence="why"><h5>Why</h5><p>${text(why.intent || why.reasoningSummary || 'No explicit intent recorded.')}</p><ul>${causes || '<li class="dim-note">No causal references recorded.</li>'}</ul><small>Persisted causal trace · canonicalMutation=false</small></section>
+      <section data-sim-event-evidence="state-delta"><h5>State Delta</h5><pre>${jsonText({ changed: delta.changed, beforeStateHash: delta.beforeStateHash, afterStateHash: delta.afterStateHash, beforeEventSequence: delta.beforeEventSequence, afterEventSequence: delta.afterEventSequence })}</pre></section>
+      <section data-sim-event-evidence="graph-changes"><h5>Related Graph Changes</h5><ul>${graphEdges || '<li class="dim-note">No graph edge touched this event.</li>'}</ul><small>${text(graph.evidence?.source || 'persisted_simulation_graph_projection')} · ${text((graph.nodes || []).length)} related node(s) · canonicalMutation=false</small></section>
+    </div>`;
+  }
+
+  async function loadEventDetail(eventId, output) {
+    if (!eventId || !output || !state.runId) return;
+    const cached = state.eventDetails?.[eventId];
+    if (cached) { output.innerHTML = renderEventInspector(cached); return; }
+    output.innerHTML = '<p class="dim-note">Loading persisted event evidence...</p>';
+    const runId = state.runId;
+    try {
+      const result = await api('GET', `${bookPath()}/runs/${encodeURIComponent(runId)}/events/${encodeURIComponent(eventId)}`);
+      if (state.runId !== runId) return;
+      state.eventDetails = { ...(state.eventDetails || {}), [eventId]: result };
+      output.innerHTML = renderEventInspector(result);
+    } catch (error) {
+      output.innerHTML = `<p class="warn-banner">Event evidence unavailable: ${text(error.message)}</p>`;
+    }
+  }
+
+  async function inspectReportEvent(eventId) {
+    if (!eventId) return;
+    const summary = Array.from(document.querySelectorAll('[data-sim-event-toggle]'))
+      .find((item) => item.dataset.simEventToggle === eventId);
+    if (!summary) { toast('The report event is not present in the current ledger.', 'warning'); return; }
+    const container = summary.closest('details');
+    const output = container?.querySelector('[data-sim-event-detail]');
+    if (container) container.open = true;
+    await loadEventDetail(eventId, output);
+    summary.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 
   function renderCausality() {
@@ -240,6 +338,15 @@
       <small>${text(trace.actorId || 'Author')} · ${text(trace.causedBy?.length || 0)} persisted cause(s)</small>
       <div class="simulation-causal-causes">${(trace.causedBy || []).map((cause) => `<span class="simulation-causal-cause"><b>${text(cause.causeType)}</b> ${text(cause.causeId)} · ${text(cause.relation)}</span>`).join('') || '<span class="dim-note">No supported cause evidence</span>'}</div>
     </article>`).join('') + '<small class="simulation-evidence-note">Causal trace is derived from persisted Sandbox events, memories, interventions, relationships, goals, and world rules · canonicalMutation=false</small>';
+  }
+
+  function renderInterventions() {
+    if (!(state.interventions || []).length) return '<p class="dim-note">No author interventions recorded for this run.</p>';
+    return state.interventions.map((item) => `<article class="simulation-intervention-item">
+      <div><b>${text(item.kind)}</b><span>${text(item.author || 'author')} · ${text(item.createdAt)}</span></div>
+      <p>${text(item.rationale)}</p><pre>${jsonText(item.stateDelta)}</pre>
+      <small>Event ${text(item.eventId)} · intervention ${text(item.id)}</small>
+    </article>`).join('') + '<small class="simulation-evidence-note">Persisted in simulation_interventions and the Sandbox event ledger · canonicalMutation=false</small>';
   }
 
   function characterAgents() {
@@ -256,21 +363,61 @@
   function renderSurveys() {
     if (!(state.surveys || []).length) return '<p class="dim-note">No persisted surveys yet.</p>';
     return state.surveys.map((survey) => `<article class="simulation-survey-result"><div><b>${text(survey.question)}</b><span class="${statusClass(survey.status)}">${text(survey.status)}</span></div>
-      ${(survey.responses || []).map((item) => `<p><b>${text(item.agentId)}</b> · ${text(item.status)}: ${text(item.response)}</p>`).join('')}</article>`).join('');
+      ${(survey.responses || []).map((item) => `<p><b>${text(item.agentId)}</b> · ${text(item.status)}: ${text(item.response)}</p>`).join('')}
+      <button class="btn btn-ghost btn-sm" type="button" data-sim-survey-run="${text(survey.id)}">Start Simulation from this scenario</button></article>`).join('');
   }
 
   function renderGraph() {
     if (!state.graph) return `<p class="dim-note">Graph unavailable${state.analysisError ? `: ${text(state.analysisError)}` : '.'}</p>`;
     const nodes = state.graph.nodes || [];
     const edges = state.graph.edges || [];
-    return `<div class="simulation-graph-metrics"><span><b>${text(nodes.length)}</b> nodes</span><span><b>${text(edges.length)}</b> edges</span><span>sequence <b>${text(state.graph.eventSequence)}</b></span></div>
-      <div class="simulation-graph-list">${nodes.slice(0, 40).map((node) => `<article><b>${text(node.label || node.simulationId)}</b><small>${text(node.type)} · ${text(node.simulationId)}</small></article>`).join('') || '<p class="dim-note">No projected nodes.</p>'}</div>
-      <small class="simulation-evidence-note">${text(state.graph.evidence?.source || 'replayed simulation state')} · canonicalMutation=false</small>`;
+    const visibleNodes = nodes.slice(0, 36);
+    const width = 760;
+    const columns = Math.max(1, Math.min(6, Math.ceil(Math.sqrt(Math.max(1, visibleNodes.length)))));
+    const rows = Math.max(1, Math.ceil(visibleNodes.length / columns));
+    const height = Math.max(240, rows * 82 + 46);
+    const positions = new Map();
+    visibleNodes.forEach((node, index) => {
+      const column = index % columns;
+      const row = Math.floor(index / columns);
+      positions.set(String(node.simulationId || node.id), {
+        x: ((column + 0.5) * width) / columns,
+        y: 26 + ((row + 0.5) * (height - 48)) / rows,
+      });
+    });
+    const nodeFor = (value) => {
+      const raw = String(value || '');
+      return positions.get(raw) || positions.get(raw.split(':').pop());
+    };
+    const graphEdges = edges.map((edge) => {
+      const source = nodeFor(edge.sourceNodeId || edge.source);
+      const target = nodeFor(edge.targetNodeId || edge.target);
+      if (!source || !target) return '';
+      return `<line class="simulation-graph-edge" x1="${source.x}" y1="${source.y}" x2="${target.x}" y2="${target.y}" tabindex="-1"><title>${text(edge.type || 'related_to')} · ${text(edge.sequence || '')}</title></line>`;
+    }).join('');
+    const graphNodes = visibleNodes.map((node) => {
+      const position = positions.get(String(node.simulationId || node.id));
+      const type = String(node.type || 'Node').toLowerCase();
+      const id = text(node.simulationId || node.id);
+      return `<g class="simulation-graph-node simulation-graph-node-${text(type)}" data-sim-graph-node="${id}" tabindex="0" role="button" aria-label="Inspect ${text(node.label || node.simulationId || node.id)}" transform="translate(${position.x} ${position.y})"><circle r="18"></circle><text y="32" text-anchor="middle">${text(String(node.label || node.simulationId || node.id).slice(0, 22))}</text><title>${text(node.label || node.simulationId || node.id)} · ${text(node.type || 'Node')}</title></g>`;
+    }).join('');
+    const omitted = Math.max(0, nodes.length - visibleNodes.length);
+    return `<div class="simulation-graph-metrics"><span><b>${text(state.graph.evidence?.mode || 'SIMULATION')}</b> mode</span><span>run <b>${text(state.graph.evidence?.runId || state.runId)}</b></span><span>round <b>${text(state.graph.evidence?.round ?? state.detail?.run?.currentRound ?? 0)}</b></span><span><b>${text(nodes.length)}</b> nodes</span><span><b>${text(edges.length)}</b> edges</span><span>sequence <b>${text(state.graph.eventSequence)}</b></span></div>
+      <div class="simulation-graph-viewport" role="img" aria-label="Persisted simulation graph"><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet"><defs><marker id="simulation-graph-arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z"></path></marker></defs><g class="simulation-graph-edges">${graphEdges}</g><g class="simulation-graph-nodes">${graphNodes}</g></svg></div>
+      <div class="simulation-graph-legend"><span><i class="simulation-graph-legend-dot simulation-graph-legend-character"></i>Character</span><span><i class="simulation-graph-legend-dot simulation-graph-legend-faction"></i>Faction</span><span><i class="simulation-graph-legend-dot simulation-graph-legend-location"></i>Location</span><span><i class="simulation-graph-legend-dot simulation-graph-legend-narrative"></i>Narrative evidence</span></div>
+      <div class="simulation-graph-list">${visibleNodes.map((node) => `<article><b>${text(node.label || node.simulationId)}</b><small>${text(node.type)} · ${text(node.simulationId)}</small></article>`).join('') || '<p class="dim-note">No projected nodes.</p>'}</div>
+      <small class="simulation-evidence-note">${text(state.graph.evidence?.source || 'replayed simulation state')} · canonicalMutation=false${omitted ? ` · showing ${visibleNodes.length} of ${nodes.length} nodes` : ''}</small>`;
   }
 
   function renderReports() {
     if (!(state.reports || []).length) return '<p class="dim-note">No persisted reports for this run.</p>';
-    return state.reports.map((report) => `<article class="simulation-report-item"><div><b>${text(report.title)}</b><small>${text(report.kind)}</small></div><p>${text(report.summary)}</p><small>State ${text(report.evidence?.stateHash || 'recorded')} · ${text(report.createdAt)}</small></article>`).join('');
+    return state.reports.map((report) => {
+      const evidenceItems = Array.isArray(report.evidence?.keyEvents) && report.evidence.keyEvents.length
+        ? report.evidence.keyEvents : (Array.isArray(report.evidence?.eventIds) ? report.evidence.eventIds.slice(0, 12) : []);
+      const evidenceIds = evidenceItems.map((item) => typeof item === 'object' ? (item.eventId || item.id || '') : item).filter(Boolean);
+      const links = evidenceIds.map((eventId) => `<button class="btn btn-ghost btn-sm" data-sim-report-event="${text(eventId)}">Inspect event ${text(eventId)}</button>`).join('');
+      return `<article class="simulation-report-item"><div><b>${text(report.title)}</b><small>${text(report.kind)}</small></div><p>${text(report.summary)}</p><small>State ${text(report.evidence?.stateHash || 'recorded')} · ${text(report.createdAt)}</small>${links ? `<div class="row row-wrap simulation-report-evidence-links">${links}</div>` : '<small class="dim-note">No clickable event evidence recorded.</small>'}</article>`;
+    }).join('');
   }
 
   function renderOutcomes() {
@@ -288,8 +435,10 @@
     const comparison = state.comparison;
     if (!comparison) return '<p class="dim-note">Choose two runs to compare persisted sandbox outcomes.</p>';
     const changed = Object.entries(comparison.changedKeys || {});
+    const dimensions = Object.entries(comparison.dimensionChanges || {});
     return `<div class="simulation-compare-metrics"><span>Common sequence <b>${text(comparison.commonEventSequence)}</b></span><span>Left-only <b>${text((comparison.leftOnlyEvents || []).length)}</b></span><span>Right-only <b>${text((comparison.rightOnlyEvents || []).length)}</b></span></div>
       <p><small>Left hash:</small> ${text(comparison.leftStateHash)}</p><p><small>Right hash:</small> ${text(comparison.rightStateHash)}</p>
+      <h5>Dimension changes</h5><div class="simulation-change-list">${dimensions.map(([key, value]) => `<article><b>${text(key)}</b><small>left: ${text(compactValue(value.left))}</small><small>right: ${text(compactValue(value.right))}</small></article>`).join('') || '<p class="dim-note">No listed narrative dimension changed.</p>'}</div>
       <div class="simulation-change-list">${changed.map(([key, value]) => `<article><b>${text(key)}</b><small>left: ${text(compactValue(value.left))}</small><small>right: ${text(compactValue(value.right))}</small></article>`).join('') || '<p class="dim-note">No top-level state differences.</p>'}</div>
       <small class="simulation-evidence-note">Persisted event ledger comparison · canonicalMutation=false</small>`;
   }
@@ -313,8 +462,23 @@
 
   function renderConfiguration() {
     const configuration = state.detail?.run?.configuration || {};
-    if (!Object.keys(configuration).length) return '<p class="dim-note">No explicit environment configuration; runtime defaults apply.</p>';
-    return `<pre class="simulation-config-json">${text(JSON.stringify(configuration, null, 2))}</pre><small class="simulation-evidence-note">Persisted sandbox configuration · canonicalMutation=false</small>`;
+    const editable = ['DRAFT', 'PREPARING', 'READY', 'PAUSED', 'PAUSED_BUDGET'].includes(state.detail?.run?.status);
+    const value = (key, fallback = '') => configuration[key] == null ? fallback : configuration[key];
+    const structured = [
+      ['Agents', value('agents', { source: 'snapshot' })],
+      ['Initial location', value('initialLocation', 'snapshot-defined')],
+      ['Goals', value('goals', [])],
+      ['Activity', value('activity', {})],
+      ['Decision frequency', value('decisionFrequency', 'per_round')],
+      ['Memory policy', value('memoryPolicy', 'run_scoped')],
+      ['Simulation horizon', value('simulationHorizon', state.detail?.run?.maxRounds || 'run max rounds')],
+      ['Round duration', value('clock', { roundDuration: '1 day' })],
+      ['Max actions / round', value('maxActionsPerRound', 1)],
+      ['Narrative randomness', value('narrativeRandomness', 0)],
+      ['Conflict resolution', value('conflictResolution', 'deterministic')],
+      ['Provider assignment', value('providerAssignment', {})],
+    ];
+    return `<div class="simulation-config-summary"><div class="simulation-config-grid">${structured.map(([label, item]) => `<div><small>${text(label)}</small><b>${text(compactValue(item))}</b></div>`).join('')}</div>${editable ? '<div class="row row-wrap"><button class="btn btn-ghost btn-sm" data-sim-config-generate>Generate from immutable snapshot</button><button class="btn btn-ghost btn-sm" data-sim-config-edit>Edit environment setup</button></div>' : ''}</div><pre class="simulation-config-json">${jsonText(configuration)}</pre><small class="simulation-evidence-note">Persisted sandbox configuration · ${editable ? 'author-editable before the next round' : 'locked for this run state'} · canonicalMutation=false</small>`;
   }
 
   function renderScheduler() {
@@ -332,7 +496,7 @@
         <span><b>${text(agent.name)}</b><small>${text(agent.type)} · ${text(agent.id)}</small></span>
         <span class="${agent.alive === false ? 'simulation-scheduler-passive' : 'simulation-scheduler-active'}">${agent.alive === false ? 'DEAD' : 'ALIVE'}</span>
       </button>
-      <div class="simulation-agent-card-meta"><span>${text(agent.location || 'location unknown')}</span><span>${text(compactValue(agent.goals) || 'no goals recorded')}</span></div>
+      <div class="simulation-agent-card-meta"><span>${text(compactValue(agent.location) || 'location unknown')}</span><span>${text(compactValue(agent.goals) || 'no goals recorded')}</span></div>
       <small class="simulation-agent-card-evidence">stateHash ${text(agent.stateHash || 'not recorded')} · canonicalMutation=false</small>
     </article>`).join('')}</div><small class="simulation-evidence-note">Roster is derived from replayed SimulationWorldState; selecting an Agent loads bounded perception and memory evidence.</small>`;
   }
@@ -366,9 +530,38 @@
       <small class="simulation-evidence-note">Canonical source: ${text(detail.snapshotEvidence?.canonicalSource || 'sqlite.narrative_events')} · canonicalMutation=false</small>`;
   }
 
+  function renderWorldInventory() {
+    const world = state.detail?.snapshot?.world || {};
+    const collections = [
+      ['characters', 'Characters'], ['factions', 'Factions'], ['locations', 'Locations'],
+      ['relationships', 'Relationships'], ['timeline', 'Timeline'], ['foreshadows', 'Foreshadows'],
+      ['plot_threads', 'Plot threads'], ['secrets', 'Secrets'], ['story_goals', 'Story goals'],
+      ['conflicts', 'Conflicts'], ['items', 'Items'], ['known_facts', 'Known facts'],
+      ['narrative_obligations', 'Narrative obligations'], ['world_rules', 'World rules'],
+      ['power_systems', 'Power systems'],
+    ];
+    const count = (value) => Array.isArray(value) ? value.length
+      : (value && typeof value === 'object' ? Object.keys(value).length : (value ? 1 : 0));
+    const summary = collections.map(([key, label]) => `<span class="simulation-world-count"><b>${text(count(world[key]))}</b><small>${text(label)}</small></span>`).join('');
+    const entries = [];
+    collections.forEach(([key, label]) => {
+      const value = world[key];
+      const values = Array.isArray(value) ? value.map((item, index) => [index, item])
+        : (value && typeof value === 'object' ? Object.entries(value) : []);
+      values.slice(0, 8).forEach(([index, item]) => {
+        const record = item && typeof item === 'object' ? item : { value: item };
+        const id = record.id || record.key || index;
+        const labelValue = record.name || record.title || record.rule_text || record.content || record.goal || id;
+        entries.push(`<li><b>${text(labelValue)}</b><small>${text(label)} 路 ${text(id)}</small></li>`);
+      });
+    });
+    return `<div class="simulation-world-counts">${summary}</div><ul class="simulation-world-entities">${entries.slice(0, 40).join('') || '<li class="dim-note">No additional snapshot entities recorded.</li>'}</ul><small class="simulation-evidence-note">Read-only inventory from immutable snapshot.world 路 canonicalMutation=false</small>`;
+  }
+
   function nextStatus(run) {
     if (!run) return null;
     if (run.status === 'DRAFT') return { status: 'READY', label: 'Prepare run' };
+    if (run.status === 'PREPARING') return { status: 'READY', label: 'Mark ready' };
     if (run.status === 'READY') return { status: 'RUNNING', label: 'Start run' };
     if (run.status === 'RUNNING') return { status: 'PAUSED', label: 'Pause run' };
     if (run.status === 'PAUSED') return { status: 'RUNNING', label: 'Resume run' };
@@ -390,9 +583,11 @@
         <div class="simulation-run-actions">
           <span class="${statusClass(run.status)}">${text(run.status)}</span>
           ${transition ? `<button class="btn btn-primary" data-sim-transition="${transition.status}">${transition.label}</button>` : ''}
-          <button class="btn btn-secondary" data-sim-branch>Fork branch</button>
-          <button class="btn btn-ghost" data-sim-replicate>Duplicate repeat</button>
-          ${detail.history?.archived ? '<button class="btn btn-ghost" data-sim-unarchive>Unarchive</button>' : '<button class="btn btn-ghost" data-sim-archive>Archive</button>'}
+           <button class="btn btn-secondary" data-sim-branch>Fork branch</button>
+           <button class="btn btn-ghost" data-sim-replicate>Duplicate repeat</button>
+           ${['DRAFT', 'PREPARING', 'READY', 'RUNNING', 'PAUSED', 'PAUSED_BUDGET', 'FAILED'].includes(run.status) ? '<button class="btn btn-ghost" data-sim-stop>Stop run</button>' : ''}
+           ${detail.history?.deleted ? '<span class="simulation-evidence-note">Deleted from History; evidence retained</span>' : (detail.history?.archived ? '<button class="btn btn-ghost" data-sim-unarchive>Unarchive</button>' : '<button class="btn btn-ghost" data-sim-archive>Archive</button>')}
+          ${detail.history?.deleted ? '' : '<button class="btn btn-ghost" data-sim-delete>Delete from History</button>'}
         </div>
       </div>
       <div class="simulation-metrics" aria-label="Simulation evidence">
@@ -404,7 +599,7 @@
       ${renderWorkspaceNav()}
       <div class="simulation-grid">
         <section class="simulation-panel simulation-branch-tree-panel" data-sim-workspaces="history"><div class="simulation-panel-heading"><h4>Branch Tree</h4><button class="btn btn-ghost btn-sm" data-sim-refresh>Refresh</button></div>${renderBranchTree()}</section>
-        <section class="simulation-panel simulation-provenance-panel" data-sim-workspaces="world"><div class="simulation-panel-heading"><h4>World Snapshot provenance</h4><small>Immutable Canon boundary</small></div>${renderSnapshotProvenance()}</section>
+        <section class="simulation-panel simulation-provenance-panel" data-sim-workspaces="world"><div class="simulation-panel-heading"><h4>World Snapshot provenance</h4><small>Immutable Canon boundary</small></div>${renderSnapshotProvenance()}<h5 class="simulation-subheading">World entity inventory</h5>${renderWorldInventory()}</section>
         <section class="simulation-panel simulation-task-panel" data-sim-workspaces="simulate history"><div class="simulation-panel-heading"><h4>Durable round task</h4><button class="btn btn-ghost btn-sm" data-sim-refresh>Refresh</button></div>${renderTask()}</section>
         <section class="simulation-panel" data-sim-workspaces="world simulate"><div class="simulation-panel-heading"><h4>Environment configuration</h4><small>Run-scoped, detached from Canon</small></div>${renderConfiguration()}</section>
         <section class="simulation-panel simulation-agent-roster-panel" data-sim-workspaces="agents"><div class="simulation-panel-heading"><h4>Agent roster</h4><small>Character and Faction entities replayed into this Sandbox</small></div>${renderAgentRoster()}</section>
@@ -421,13 +616,16 @@
             <button class="btn btn-secondary" type="submit">Apply intervention</button>
           </form>
         </section>
+        <section class="simulation-panel" data-sim-workspaces="simulate history"><div class="simulation-panel-heading"><h4>Intervention history</h4><button class="btn btn-ghost btn-sm" data-sim-refresh>Refresh</button></div>${renderInterventions()}</section>
         <section class="simulation-panel" data-sim-workspaces="agents simulate"><div class="simulation-panel-heading"><h4>Run next round</h4><small>Typed action · validator · append-only ledger</small></div>
           <form data-sim-round class="simulation-form">
-            <div class="simulation-form-grid"><label>Agent<select class="input" name="actorId" required>${(state.agents || []).map((agent) => `<option value="${text(agent.id)}" data-agent-type="${text(agent.type)}">${text(agent.name)} · ${text(agent.type)} · ${text(agent.id)}</option>`).join('')}</select></label><label>Action<select class="input" name="actionType"><option value="WAIT">WAIT</option><option value="OBSERVE">OBSERVE</option><option value="MOVE">MOVE</option><option value="TALK">TALK</option><option value="INFORM">INFORM</option><option value="PLAN">PLAN</option></select></label></div>
+            <div class="simulation-form-grid"><label>Decision mode<select class="input" name="decisionMode"><option value="explicit" selected>Explicit author action</option><option value="provider">Provider Agent decision</option></select></label><label>Decision role<select class="input" name="decisionRole"><option value="planner" selected>Planner</option><option value="writer">Writer</option><option value="reviewer">Reviewer</option></select></label></div>
+            <div class="simulation-form-grid"><label>Agent<select class="input" name="actorId" required>${(state.agents || []).map((agent) => `<option value="${text(agent.id)}" data-agent-type="${text(agent.type)}">${text(agent.name)} · ${text(agent.type)} · ${text(agent.id)}</option>`).join('')}</select></label><label>Action<select class="input" name="actionType">${renderActionOptions()}</select></label></div>
+            <div class="simulation-provider-agent-picker" data-sim-provider-agent-picker>${renderProviderAgentOptions()}</div>
             <div class="simulation-agent-evidence" data-sim-agent-evidence>Select an Agent to inspect its local state.</div>
             <label>Intent<input class="input" name="intent" placeholder="What is this agent trying to do?"></label>
             <label>Effects (JSON)<textarea class="ta" name="effects" required>{}</textarea></label>
-            <div class="row row-wrap"><button class="btn btn-primary" type="submit" data-sim-round-mode="execute">Execute round</button><button class="btn btn-secondary" type="submit" data-sim-round-mode="queue">Queue durable round</button></div>
+            <div class="row row-wrap"><button class="btn btn-primary" type="submit" data-sim-round-mode="execute">Execute explicit round</button><button class="btn btn-secondary" type="submit" data-sim-round-mode="queue">Queue durable round</button></div>
           </form>
         </section>
         <section class="simulation-panel" data-sim-workspaces="analyze history"><div class="simulation-panel-heading"><h4>Evidence analysis</h4><small>Deterministic ledger report</small></div>
@@ -482,6 +680,18 @@
 
   function bind() {
     document.querySelectorAll('[data-sim-refresh]').forEach((button) => button.addEventListener('click', refresh));
+    const timeline = document.querySelector('[data-sim-timeline-body]');
+    timeline?.addEventListener('click', (event) => {
+      const summary = event.target.closest('[data-sim-event-toggle]');
+      if (!summary || !timeline.contains(summary)) return;
+      const eventId = summary.dataset.simEventToggle;
+      // A run switch is asynchronous.  Ignore a click from the previous
+      // run's DOM until the new persisted ledger has rendered.
+      if (!(state.events || []).some((item) => item.id === eventId)) return;
+      const output = summary.closest('[data-sim-event]')?.querySelector('[data-sim-event-detail]')
+        || summary.parentElement?.querySelector('[data-sim-event-detail]');
+      window.queueMicrotask(() => loadEventDetail(eventId, output));
+    });
     document.querySelectorAll('[data-sim-workspace]').forEach((button) => button.addEventListener('click', () => {
       state.workspace = button.dataset.simWorkspace;
       try { window.localStorage.setItem(workspaceStorageKey(), state.workspace); } catch (_) { /* optional */ }
@@ -489,10 +699,14 @@
     }));
     document.querySelectorAll('[data-sim-run]').forEach((button) => button.addEventListener('click', async () => {
       state.runId = button.dataset.simRun;
+      state.detail = null;
+      state.events = [];
+      state.eventDetails = {};
       await refresh();
     }));
     document.querySelector('[data-sim-new]')?.addEventListener('click', createRun);
-    document.querySelector('[data-sim-transition]')?.addEventListener('click', transitionRun);
+     document.querySelector('[data-sim-transition]')?.addEventListener('click', transitionRun);
+     document.querySelector('[data-sim-stop]')?.addEventListener('click', stopRun);
     document.querySelector('[data-sim-branch]')?.addEventListener('click', branchRun);
     document.querySelector('[data-sim-intervention]')?.addEventListener('submit', intervene);
     document.querySelector('[data-sim-analysis]')?.addEventListener('submit', analyze);
@@ -500,32 +714,108 @@
     document.querySelector('[data-sim-compare]')?.addEventListener('submit', compareRuns);
     document.querySelector('[data-sim-outcomes-refresh]')?.addEventListener('click', refreshOutcomes);
     document.querySelector('[data-sim-replicate]')?.addEventListener('click', replicateRun);
-    document.querySelector('[data-sim-archive]')?.addEventListener('click', () => changeArchiveState('archive'));
-    document.querySelector('[data-sim-unarchive]')?.addEventListener('click', () => changeArchiveState('unarchive'));
-    document.querySelector('[data-sim-graph-refresh]')?.addEventListener('click', refreshGraph);
+     document.querySelector('[data-sim-archive]')?.addEventListener('click', () => changeArchiveState('archive'));
+     document.querySelector('[data-sim-unarchive]')?.addEventListener('click', () => changeArchiveState('unarchive'));
+     document.querySelector('[data-sim-delete]')?.addEventListener('click', deleteRun);
+     document.querySelector('[data-sim-graph-refresh]')?.addEventListener('click', refreshGraph);
     document.querySelector('[data-sim-chat]')?.addEventListener('submit', chat);
     document.querySelector('[data-sim-chat] select[name="agentId"]')?.addEventListener('change', switchChatAgent);
     document.querySelector('[data-sim-survey]')?.addEventListener('submit', survey);
+    document.querySelectorAll('[data-sim-survey-run]').forEach((button) => button.addEventListener('click', () => startSurveyScenario(button.dataset.simSurveyRun)));
     document.querySelector('[data-sim-round]')?.addEventListener('submit', executeRound);
     document.querySelectorAll('[data-sim-task-action]').forEach((button) => button.addEventListener('click', controlSimulationTask));
     document.querySelector('[data-sim-adoption]')?.addEventListener('submit', proposeAdoption);
-    document.querySelector('[data-sim-budget]')?.addEventListener('submit', updateBudget);
-    document.querySelectorAll('[data-sim-adopt]').forEach((button) => button.addEventListener('click', () => adoptProposal(button.dataset.simAdopt)));
-    document.querySelectorAll('[data-sim-intent]').forEach((button) => button.addEventListener('click', () => createChapterIntent(button.dataset.simIntent, button.previousElementSibling.value)));
+     document.querySelector('[data-sim-budget]')?.addEventListener('submit', updateBudget);
+     document.querySelector('[data-sim-config-edit]')?.addEventListener('click', editConfiguration);
+     document.querySelector('[data-sim-config-generate]')?.addEventListener('click', generateConfiguration);
+     bindReportEvidence();
+     document.querySelectorAll('[data-sim-adopt]').forEach((button) => button.addEventListener('click', () => adoptProposal(button.dataset.simAdopt)));
+    document.querySelectorAll('[data-sim-edit]').forEach((button) => button.addEventListener('click', () => {
+      const card = button.closest('[data-sim-proposal-card]');
+      const proposal = (state.proposals || []).find((item) => item.id === button.dataset.simEdit);
+      editProposal(
+        button.dataset.simEdit,
+        card?.querySelector('[data-sim-proposal-title]')?.value,
+        card?.querySelector('[data-sim-proposal-summary]')?.value,
+        proposal?.payload,
+      );
+    }));
+    document.querySelectorAll('[data-sim-reject]').forEach((button) => button.addEventListener('click', () => rejectProposal(button.dataset.simReject)));
+    document.querySelectorAll('[data-sim-intent]').forEach((button) => button.addEventListener('click', () => {
+      const row = button.closest('.simulation-intent-row');
+      createChapterIntent(button.dataset.simIntent, row?.querySelector('input[name="chapterNumber"]')?.value);
+    }));
     document.querySelectorAll('[data-sim-write]').forEach((button) => button.addEventListener('click', () => queueWritingTask(button.dataset.simWrite, button.parentElement.querySelector('input[name="chapterNumber"]')?.value)));
+    document.querySelectorAll('[data-sim-write-retry]').forEach((button) => button.addEventListener('click', () => retryWritingTask(button.dataset.simWriteRetry)));
     document.querySelector('[data-sim-round] select[name="actorId"]')?.addEventListener('change', inspectSelectedAgent);
+    document.querySelector('[data-sim-round] select[name="decisionMode"]')?.addEventListener('change', updateRoundMode);
     document.querySelectorAll('[data-sim-agent-select]').forEach((button) => button.addEventListener('click', () => {
       const select = document.querySelector('[data-sim-round] select[name="actorId"]');
       if (!select) return;
       select.value = button.dataset.simAgentSelect;
       inspectSelectedAgent();
     }));
+    document.querySelectorAll('[data-sim-graph-node]').forEach((node) => node.addEventListener('click', () => {
+      const select = document.querySelector('[data-sim-round] select[name="actorId"]');
+      if (!select || ![...select.options].some((option) => option.value === node.dataset.simGraphNode)) return;
+      select.value = node.dataset.simGraphNode;
+      inspectSelectedAgent();
+    }));
     inspectSelectedAgent();
+    updateRoundMode();
+  }
+
+  function updateRoundMode() {
+    const form = document.querySelector('[data-sim-round]');
+    if (!form) return;
+    const provider = form.elements.decisionMode?.value === 'provider';
+    const execute = form.querySelector('[data-sim-round-mode="execute"]');
+    const queue = form.querySelector('[data-sim-round-mode="queue"]');
+    if (execute) {
+      execute.disabled = provider;
+      execute.textContent = provider ? 'Provider requires durable task' : 'Execute explicit round';
+    }
+    if (queue) queue.textContent = provider ? 'Queue provider round' : 'Queue durable round';
+    const providerAgents = form.elements.providerAgentIds;
+    if (providerAgents) providerAgents.disabled = !provider;
+  }
+
+  function bindReportEvidence() {
+    document.querySelectorAll('[data-sim-report-event]').forEach((button) => {
+      if (button.dataset.simReportBound === 'true') return;
+      button.dataset.simReportBound = 'true';
+      button.addEventListener('click', () => inspectReportEvent(button.dataset.simReportEvent));
+    });
   }
 
   function renderProposals() {
     if (!(state.proposals || []).length) return '<p class="dim-note">No adoption proposals yet.</p>';
-    return (state.proposals || []).map((proposal) => `<article class="simulation-proposal"><div><b>${text(proposal.title)}</b><span class="${statusClass(proposal.status)}">${text(proposal.status)}</span></div><p>${text(proposal.summary)}</p><small>${text(proposal.id)}</small>${proposal.status === 'PROPOSED' ? `<button class="btn btn-secondary btn-sm" data-sim-adopt="${text(proposal.id)}">Adopt into Planning</button>` : `<small>Planning node: ${text(proposal.planningNodeId || 'recorded')}</small><div class="row simulation-intent-row"><input class="input" type="number" min="1" name="chapterNumber" value="${text(state.detail?.nextChapter || 1)}" aria-label="Chapter number"><button class="btn btn-secondary btn-sm" data-sim-intent="${text(proposal.id)}">Create ChapterIntent</button><button class="btn btn-ghost btn-sm" data-sim-write="${text(proposal.id)}">Queue write-next</button></div>`}</article>`).join('');
+    return (state.proposals || []).map((proposal) => {
+      const id = text(proposal.id);
+      let controls = '';
+      if (proposal.status === 'PROPOSED') {
+        controls = `<div class="simulation-proposal-edit"><label>Title<input class="input" data-sim-proposal-title value="${text(proposal.title)}"></label><label>Summary<textarea class="ta" data-sim-proposal-summary>${text(proposal.summary)}</textarea></label><div class="row"><button class="btn btn-secondary btn-sm" data-sim-adopt="${id}">Adopt into Planning</button><button class="btn btn-ghost btn-sm" data-sim-edit="${id}">Save edit</button><button class="btn btn-ghost btn-sm" data-sim-reject="${id}">Reject</button></div></div>`;
+      } else if (proposal.status === 'ADOPTED') {
+        const persistedIntents = Array.isArray(proposal.chapterIntents) ? proposal.chapterIntents : [];
+        const intentEvidence = persistedIntents.map((intent) => `<small class="simulation-intent-evidence">ChapterIntent ${text(intent.chapter_number || intent.chapterNumber)} · ${text(intent.status || 'PLANNED')} · persisted author overlay</small>`).join('');
+        const writingTasks = Array.isArray(proposal.writingTasks) ? proposal.writingTasks : [];
+        const writingEvidence = writingTasks.map((task) => {
+          const taskStatus = String(task.status || 'queued');
+          const terminalFailure = ['failed', 'needs_author_decision'].includes(taskStatus);
+          const errorEvidence = task.error
+            ? ` · ${terminalFailure ? 'error' : 'last error'}: ${text(task.error)}`
+            : '';
+          const retryAction = terminalFailure
+            ? ` <button class="btn btn-ghost btn-sm" data-sim-write-retry="${text(task.id)}">Retry</button>`
+            : '';
+          return `<small class="simulation-intent-evidence">write-next ${text(taskStatus)} · task ${text(task.id)} · ${text(task.progressPercent ?? 0)}%${errorEvidence}${retryAction}</small>`;
+        }).join('');
+        controls = `<small>Planning node: ${text(proposal.planningNodeId || 'recorded')}</small>${intentEvidence}${writingEvidence}<div class="row simulation-intent-row"><input class="input" type="number" min="1" name="chapterNumber" value="${text(state.detail?.nextChapter || 1)}" aria-label="Chapter number"><button class="btn btn-secondary btn-sm" data-sim-intent="${id}">Create ChapterIntent</button><button class="btn btn-ghost btn-sm" data-sim-write="${id}">Queue write-next</button></div>`;
+      } else {
+        controls = '<small class="dim-note">Rejected; no Planning node was created.</small>';
+      }
+      return `<article class="simulation-proposal" data-sim-proposal-card><div><b>${text(proposal.title)}</b><span class="${statusClass(proposal.status)}">${text(proposal.status)}</span></div><p>${text(proposal.summary)}</p><small>${id}</small>${controls}</article>`;
+    }).join('');
   }
 
   function createRun() {
@@ -536,6 +826,55 @@
     overlay.querySelector('[data-sim-create-close]').focus();
     overlay.querySelectorAll('[data-sim-create-close]').forEach((button) => button.addEventListener('click', () => overlay.remove()));
     overlay.querySelector('[data-sim-create-form]').addEventListener('submit', submitCreateRun);
+  }
+
+  function editConfiguration() {
+    if (!state.detail?.run) return;
+    const configuration = state.detail.run.configuration || {};
+    const jsonValue = (key, fallback) => text(JSON.stringify(configuration[key] == null ? fallback : configuration[key], null, 2));
+    document.body.insertAdjacentHTML('beforeend', `<div class="modal-overlay" id="simulation-config-modal" role="dialog" aria-modal="true" aria-labelledby="simulation-config-title">
+      <div class="modal simulation-create-modal"><div class="modal-header"><div><h3 id="simulation-config-title">Edit environment setup</h3><p class="dim-note">Run-scoped configuration; Canon remains read only.</p></div><button class="close-x" type="button" data-sim-config-close aria-label="Close">×</button></div>
+      <form data-sim-config-form class="simulation-form"><div class="simulation-form-grid"><label>Initial location<input class="input" name="initialLocation" value="${text(configuration.initialLocation || '')}" placeholder="snapshot-defined"></label><label>Decision frequency<select class="input" name="decisionFrequency"><option value="per_round" ${configuration.decisionFrequency === 'per_round' || !configuration.decisionFrequency ? 'selected' : ''}>per round</option><option value="event_driven" ${configuration.decisionFrequency === 'event_driven' ? 'selected' : ''}>event driven</option><option value="on_activation" ${configuration.decisionFrequency === 'on_activation' ? 'selected' : ''}>on activation</option></select></label><label>Memory policy<select class="input" name="memoryPolicy"><option value="run_scoped" ${configuration.memoryPolicy === 'run_scoped' || !configuration.memoryPolicy ? 'selected' : ''}>run scoped</option><option value="episodic_plus_semantic" ${configuration.memoryPolicy === 'episodic_plus_semantic' ? 'selected' : ''}>episodic + semantic</option><option value="episodic_only" ${configuration.memoryPolicy === 'episodic_only' ? 'selected' : ''}>episodic only</option></select></label><label>Round duration<input class="input" name="roundDuration" value="${text(configuration.clock?.roundDuration || '1 day')}"></label><label>Max actions / round<input class="input" type="number" min="1" max="100" name="maxActionsPerRound" value="${text(configuration.maxActionsPerRound ?? 1)}"></label><label>Narrative randomness<input class="input" type="number" min="0" max="1" step="0.01" name="narrativeRandomness" value="${text(configuration.narrativeRandomness ?? 0)}"></label><label>Conflict resolution<select class="input" name="conflictResolution"><option value="deterministic" ${configuration.conflictResolution !== 'priority' ? 'selected' : ''}>deterministic</option><option value="priority" ${configuration.conflictResolution === 'priority' ? 'selected' : ''}>priority</option></select></label></div><label>Agents / tier policies (JSON)<textarea class="ta" name="agents" required>${jsonValue('agents', { source: 'snapshot' })}</textarea></label><label>Goals (JSON)<textarea class="ta" name="goals" required>${jsonValue('goals', [])}</textarea></label><label>Activity (JSON)<textarea class="ta" name="activity" required>${jsonValue('activity', {})}</textarea></label><label>Communication rules (JSON)<textarea class="ta" name="communicationRules" required>${jsonValue('communicationRules', {})}</textarea></label><label>World rules (JSON)<textarea class="ta" name="worldRules" required>${jsonValue('worldRules', {})}</textarea></label><label>Provider / model assignment (JSON)<textarea class="ta" name="providerAssignment" required>${jsonValue('providerAssignment', {})}</textarea></label><div class="row"><span class="spacer"></span><button class="btn btn-secondary" type="button" data-sim-config-close>Cancel</button><button class="btn btn-primary" type="submit">Save environment setup</button></div></form></div></div>`);
+    const overlay = document.getElementById('simulation-config-modal');
+    overlay.querySelectorAll('[data-sim-config-close]').forEach((button) => button.addEventListener('click', () => overlay.remove()));
+    overlay.querySelector('[data-sim-config-form]').addEventListener('submit', submitConfiguration);
+  }
+
+  async function submitConfiguration(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const parse = (name, fallback) => {
+      try {
+        const value = JSON.parse(form.elements[name].value || 'null');
+        return value == null ? fallback : value;
+      } catch (_) { throw new Error(`${name} must be valid JSON.`); }
+    };
+    let configuration;
+    try {
+      const existing = { ...(state.detail?.run?.configuration || {}) };
+      configuration = {
+        ...existing,
+        agents: existing.agents || { source: 'snapshot' },
+        initialLocation: form.initialLocation.value.trim() || null,
+        decisionFrequency: form.decisionFrequency.value,
+        memoryPolicy: form.memoryPolicy.value,
+        clock: { ...(existing.clock || {}), roundDuration: form.roundDuration.value.trim() || '1 day' },
+        maxActionsPerRound: Number(form.maxActionsPerRound.value),
+        narrativeRandomness: Number(form.narrativeRandomness.value),
+        conflictResolution: form.conflictResolution.value,
+        agents: parse('agents', { source: 'snapshot' }), goals: parse('goals', []), activity: parse('activity', {}),
+        communicationRules: parse('communicationRules', {}),
+        worldRules: parse('worldRules', {}), providerAssignment: parse('providerAssignment', {}),
+      };
+      if (!Number.isInteger(configuration.maxActionsPerRound) || configuration.maxActionsPerRound < 1 || configuration.maxActionsPerRound > 100) throw new Error('Max actions / round must be between 1 and 100.');
+      if (!Number.isFinite(configuration.narrativeRandomness) || configuration.narrativeRandomness < 0 || configuration.narrativeRandomness > 1) throw new Error('Narrative randomness must be between 0 and 1.');
+    } catch (error) { toast(error.message, 'warning'); return; }
+    try {
+      await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/configuration`, { configuration, replace: true });
+      document.getElementById('simulation-config-modal')?.remove();
+      toast('Environment setup persisted for this Sandbox run.', 'success');
+      await refresh();
+    } catch (error) { toast(error.message, 'error'); }
   }
 
   async function submitCreateRun(event) {
@@ -568,6 +907,16 @@
     if (!status || !state.runId) return;
     try {
       await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/status`, { status });
+      await refresh();
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
+  async function stopRun() {
+    if (!state.runId) return;
+    if (typeof window.confirm === 'function' && !window.confirm('Stop this Simulation run? Its Sandbox evidence will remain available.')) return;
+    try {
+      await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/status`, { status: 'CANCELLED' });
+      toast('Simulation stopped; Sandbox evidence was retained.', 'success');
       await refresh();
     } catch (error) { toast(error.message, 'error'); }
   }
@@ -629,16 +978,28 @@
     event.preventDefault();
     const form = event.currentTarget;
     const submitter = event.submitter;
+    const decisionMode = form.decisionMode?.value || 'explicit';
+    const decisionRole = form.decisionRole?.value || 'planner';
     let effects;
     try { effects = JSON.parse(form.effects.value); } catch (_) { toast('Effects must be valid JSON.', 'warning'); return; }
     const action = {
       actionType: form.actionType.value, actorId: form.actorId.value.trim(), actorType: form.actorId.selectedOptions[0]?.dataset.agentType || 'character', intent: form.intent.value.trim(), effects,
     };
     if (!action.actorId) { toast('Actor ID is required.', 'warning'); return; }
-    const suffix = submitter?.dataset.simRoundMode === 'queue' ? '/round-tasks' : '/rounds';
+    const providerMode = decisionMode === 'provider';
+    const queued = providerMode || submitter?.dataset.simRoundMode === 'queue';
+    const suffix = queued ? '/round-tasks' : '/rounds';
+    const selectedProviderAgents = providerMode
+      ? [...(form.elements.providerAgentIds?.selectedOptions || [])].map((option) => option.value).filter(Boolean)
+      : [];
     try {
-      const result = await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}${suffix}`, { actions: [action] });
-      toast(submitter?.dataset.simRoundMode === 'queue' ? `Round task queued: ${result.taskId}` : `Round ${result.roundNumber} persisted.`, 'success');
+      const result = await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}${suffix}`, {
+        actions: providerMode ? [] : [action],
+        decisionMode,
+        decisionRole,
+        agentIds: selectedProviderAgents,
+      });
+      toast(queued ? `${providerMode ? 'Provider round' : 'Round'} task queued: ${result.taskId}` : `Round ${result.roundNumber} persisted.`, 'success');
       await refresh();
     } catch (error) { toast(error.message, 'error'); }
   }
@@ -659,7 +1020,7 @@
     const output = document.querySelector('[data-sim-agent-evidence]');
     if (!select || !output || !select.value) return;
     const agent = (state.agents || []).find((item) => item.id === select.value);
-    if (agent) output.innerHTML = `<b>${text(agent.name)}</b> · ${text(agent.type)} · ${text(agent.location || 'location unknown')}<br><small>Goals: ${text(compactValue(agent.goals) || 'none recorded')} · sandbox-local evidence</small>`;
+    if (agent) output.innerHTML = `<b>${text(agent.name)}</b> · ${text(agent.type)} · ${text(compactValue(agent.location) || 'location unknown')}<br><small>Goals: ${text(compactValue(agent.goals) || 'none recorded')} · sandbox-local evidence</small>`;
     try {
       const result = await api('GET', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/agents/${encodeURIComponent(select.value)}?event_limit=5`);
       output.innerHTML = `<b>${text(result.perception.identity?.name || agent?.name || select.value)}</b> · ${text(agent?.type || 'character')} · ${text(result.perception.currentState?.location || result.perception.currentState?.territory || 'location unknown')}<br><small>Visible events: ${text(result.perception.recentEvents?.length || 0)} · Memories: ${text(result.perception.recentMemory?.length || 0)} · local perception only</small>`;
@@ -677,7 +1038,10 @@
       state.reports = [report, ...(state.reports || []).filter((item) => item.id !== report.id)];
       output.innerHTML = `<p><b>${text(report.title)}</b></p><p>${text(report.summary || 'Evidence report created.')}</p><small>State hash ${text(report.evidence?.stateHash || 'recorded')}</small>`;
       const history = document.querySelector('.simulation-report-history');
-      if (history) history.innerHTML = renderReports();
+      if (history) {
+        history.innerHTML = renderReports();
+        bindReportEvidence();
+      }
     } catch (error) { toast(error.message, 'error'); }
   }
 
@@ -746,7 +1110,26 @@
     } catch (error) { toast(error.message, 'error'); }
   }
 
-  async function refreshGraph() {
+  async function deleteRun() {
+    if (!state.runId) return;
+    const reason = window.prompt('Reason for deleting this run from History (evidence is retained)', '') ?? '';
+    try {
+      await api('DELETE', `${bookPath()}/runs/${encodeURIComponent(state.runId)}`, { reason });
+      toast('Simulation removed from History; Sandbox evidence was retained.', 'success');
+      await refresh();
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
+  async function generateConfiguration() {
+    if (!state.runId) return;
+    try {
+      await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/configuration/generate`, { replace: true });
+      toast('Environment setup generated from the immutable snapshot.', 'success');
+      await refresh();
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
+  async function refreshGraph(silent = false) {
     if (!state.runId) return;
     try {
       state.graph = await api('GET', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/graph?event_limit=1000`);
@@ -757,7 +1140,7 @@
       state.analysisError = error.message;
       const output = document.querySelector('.simulation-graph-result');
       if (output) output.innerHTML = renderGraph();
-      toast(error.message, 'error');
+      if (!silent) toast(error.message, 'error');
     }
   }
 
@@ -800,15 +1183,29 @@
     } catch (error) { toast(error.message, 'error'); }
   }
 
+  async function startSurveyScenario(surveyId) {
+    if (!surveyId || !state.runId) return;
+    const name = window.prompt('Name for the new survey scenario run (optional)', '') ?? '';
+    try {
+      const result = await api('POST', `${bookPath()}/surveys/${encodeURIComponent(surveyId)}/run`, {
+        name: name.trim() || null,
+        configuration: { decisionFrequency: 'per_round', surveyScenarioSource: surveyId },
+      });
+      state.runId = result.runId;
+      toast('Survey scenario forked into a new READY Sandbox run.', 'success');
+      await refresh();
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
   async function proposeAdoption(event) {
     event.preventDefault();
     const form = event.currentTarget;
-    const output = document.getElementById('simulation-adoption-result');
     try {
-      const result = await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/adoptions`, {
+      await api('POST', `${bookPath()}/runs/${encodeURIComponent(state.runId)}/adoptions`, {
         title: form.title.value.trim(), summary: form.summary.value.trim(), payload: { source: 'simulation-workspace' },
       });
-      output.innerHTML = `<p><b>Proposal created</b></p><p>${text(result.proposalId)}</p><small>Explicit adoption is required before Planning or Canon changes.</small>`;
+      form.reset();
+      await refresh();
       toast('Adoption proposal persisted; Canon is unchanged.', 'success');
     } catch (error) { toast(error.message, 'error'); }
   }
@@ -821,12 +1218,36 @@
     } catch (error) { toast(error.message, 'error'); }
   }
 
+  async function editProposal(proposalId, title, summary, existingPayload) {
+    const cleanTitle = String(title || '').trim();
+    if (!cleanTitle) { toast('Proposal title is required.', 'warning'); return; }
+    const payload = existingPayload && typeof existingPayload === 'object' && !Array.isArray(existingPayload)
+      ? existingPayload
+      : { source: 'simulation-workspace' };
+    try {
+      await api('POST', `${bookPath()}/adoptions/${encodeURIComponent(proposalId)}/edit`, {
+        title: cleanTitle, summary: String(summary || ''), payload,
+      });
+      toast('Proposal edit persisted.', 'success');
+      await refresh();
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
+  async function rejectProposal(proposalId) {
+    try {
+      await api('POST', `${bookPath()}/adoptions/${encodeURIComponent(proposalId)}/reject`, {});
+      toast('Proposal rejected; no Planning node was created.', 'success');
+      await refresh();
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
   async function createChapterIntent(proposalId, chapterNumber) {
     const chapter = Number(chapterNumber);
     if (!Number.isInteger(chapter) || chapter < 1) { toast('Chapter number must be at least 1.', 'warning'); return; }
     try {
       await api('POST', `${bookPath()}/adoptions/${encodeURIComponent(proposalId)}/chapter-intent`, { chapterNumber: chapter });
       toast(`ChapterIntent created for chapter ${chapter}.`, 'success');
+      await refresh();
     } catch (error) { toast(error.message, 'error'); }
   }
 
@@ -837,18 +1258,31 @@
       const result = await api('POST', `${bookPath()}/adoptions/${encodeURIComponent(proposalId)}/writing-task`, {
         chapterNumber: chapter, context: 'Simulation adoption handoff', count: 1,
       });
-      toast(`Durable write-next task queued: ${result.taskId}`, 'success');
+      const status = String(result.status || 'queued');
+      toast(`Durable write-next task ${status}: ${result.taskId}`, status === 'queued' ? 'success' : 'warning');
+      await refresh();
+    } catch (error) { toast(error.message, 'error'); }
+  }
+
+  async function retryWritingTask(taskId) {
+    try {
+      const result = await api('POST', `/tasks/${encodeURIComponent(taskId)}/retry`, {});
+      toast(`Durable write-next retry ${result.status || 'queued'}: ${taskId}`, 'success');
+      await refresh();
     } catch (error) { toast(error.message, 'error'); }
   }
 
   PAGES.simulation = async function simulationPage() {
     if (state?.eventSource) state.eventSource.close();
-    state = { runs: [], branchTree: { nodes: [], edges: [] }, workspace: initialWorkspace(), runId: '', detail: null, events: [], agents: [], proposals: [], surveys: [], chatInteractions: [], chatAgentId: '', interactionError: '', graph: null, scheduler: null, budget: null, causality: null, reports: [], outcomes: null, comparison: null, analysisError: '', loading: true, error: '' };
+    state = { runs: [], branchTree: { nodes: [], edges: [] }, workspace: initialWorkspace(), runId: '', detail: null, events: [], eventDetails: {}, agents: [], proposals: [], interventions: [], surveys: [], chatInteractions: [], chatAgentId: '', interactionError: '', graph: null, scheduler: null, budget: null, causality: null, reports: [], outcomes: null, comparison: null, analysisError: '', loading: true, error: '' };
     render();
     await refresh();
   };
   if (typeof renderNav === 'function') renderNav();
   if (typeof S !== 'undefined' && S.page === 'simulation' && S.book) {
-    window.setTimeout(() => go('simulation'), 0);
+    // Enter through the real router; no timer drives or represents simulation
+    // progress.  The backend EventSource and durable task state are the only
+    // runtime clocks exposed by this workspace.
+    go('simulation');
   }
 }());

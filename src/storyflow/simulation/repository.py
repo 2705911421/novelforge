@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import uuid
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Iterable, Mapping
 
@@ -12,10 +13,11 @@ from src.core.database import Database
 from src.storyflow.world.repository import WorldSnapshotRepository
 
 from .models import SimulationBranch, SimulationCheckpoint, SimulationEvent, SimulationIntervention, SimulationRun, SimulationRunStatus, SimulationWorldState
-from .actions import ActionValidator, NarrativeAction
+from .actions import ActionType, ActionValidator, NarrativeAction
 from .clock import SimulationClock
 from .memory import AgentMemory, AgentMemoryRepository, AgentMemoryType
 from .scheduler import AgentActivation
+from .knowledge import KnowledgeScope, KnowledgeStatus
 
 
 class SimulationRepository:
@@ -32,18 +34,34 @@ class SimulationRepository:
     def remember_event(self, event: SimulationEvent, *, importance: float = 0.5) -> AgentMemory | None:
         if not event.actor_id:
             return None
+        base_content = {"event_type": event.event_type, "payload": event.payload,
+                        "targets": event.target_ids}
         memory = AgentMemory(
             simulation_run_id=event.simulation_run_id, agent_id=event.actor_id,
-            memory_type=AgentMemoryType.EPISODIC,
-            content={"event_type": event.event_type, "payload": event.payload,
-                     "targets": event.target_ids},
+            memory_type=AgentMemoryType.EPISODIC, content=base_content,
             source_simulation_event_ids=(event.id,), importance=importance,
             created_round=event.round_number, last_accessed_round=event.round_number,
             id=hashlib.sha256(
                 f"episodic:{event.simulation_run_id}:{event.actor_id}:{event.id}".encode("utf-8")
             ).hexdigest(),
         )
-        return self.memories.add(memory)
+        actor_memory = self.memories.add(memory)
+        # Communication is an Agent-local memory input as well as a knowledge
+        # delta.  Recipients get their own immutable-idempotent episodic row;
+        # unrelated Agents never receive a broadcast copy.
+        for target_id in sorted({str(item) for item in event.target_ids if str(item) and str(item) != str(event.actor_id)}):
+            recipient = AgentMemory(
+                simulation_run_id=event.simulation_run_id, agent_id=target_id,
+                memory_type=AgentMemoryType.EPISODIC,
+                content={**base_content, "received": True, "sender_id": event.actor_id},
+                source_simulation_event_ids=(event.id,), importance=importance,
+                created_round=event.round_number, last_accessed_round=event.round_number,
+                id=hashlib.sha256(
+                    f"episodic:{event.simulation_run_id}:{target_id}:{event.id}:received".encode("utf-8")
+                ).hexdigest(),
+            )
+            self.memories.add(recipient)
+        return actor_memory
 
     def create_run(self, run: SimulationRun) -> SimulationRun:
         snapshot = self._snapshots.get(run.snapshot_id)
@@ -51,21 +69,26 @@ class SimulationRepository:
             raise ValueError(f"snapshot not found: {run.snapshot_id}")
         if snapshot.book_id != run.book_id:
             raise ValueError("simulation run book does not match snapshot")
+        if run.base_canon_event_id and run.base_canon_event_id != snapshot.base_canon_event_id:
+            raise ValueError("simulation run base Canon event does not match snapshot")
+        persisted = run if run.base_canon_event_id else replace(run, base_canon_event_id=snapshot.base_canon_event_id)
         with self._database.transaction() as conn:
             conn.execute(
                 """INSERT INTO simulation_runs(
                     id, book_id, snapshot_id, name, status, current_round,
                     max_rounds, seed, created_at, description, purpose, created_by, configuration, task_id,
-                    started_at, paused_at, completed_at, simulation_time
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (run.id, run.book_id, run.snapshot_id, run.name, run.status.value,
-                 run.current_round, run.max_rounds, run.seed, run.created_at.isoformat(), run.description,
-                 run.purpose, run.created_by, json.dumps(run.configuration, sort_keys=True), run.task_id,
-                 run.started_at.isoformat() if run.started_at else None,
-                 run.paused_at.isoformat() if run.paused_at else None,
-                 run.completed_at.isoformat() if run.completed_at else None, run.simulation_time),
+                    started_at, paused_at, completed_at, simulation_time,
+                    base_canon_event_id, branch_parent_id, branch_point_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (persisted.id, persisted.book_id, persisted.snapshot_id, persisted.name, persisted.status.value,
+                 persisted.current_round, persisted.max_rounds, persisted.seed, persisted.created_at.isoformat(), persisted.description,
+                 persisted.purpose, persisted.created_by, json.dumps(persisted.configuration, sort_keys=True), persisted.task_id,
+                 persisted.started_at.isoformat() if persisted.started_at else None,
+                 persisted.paused_at.isoformat() if persisted.paused_at else None,
+                 persisted.completed_at.isoformat() if persisted.completed_at else None, persisted.simulation_time,
+                 persisted.base_canon_event_id, persisted.branch_parent_id, persisted.branch_point_event_id),
             )
-        return run
+        return persisted
 
     def append_event(self, event: SimulationEvent) -> SimulationEvent:
         with self._database.transaction() as conn:
@@ -131,27 +154,48 @@ class SimulationRepository:
         fork_round = fork_event.round_number if fork_event else 0
         fork_time = (fork_event.simulation_time if fork_event and fork_event.simulation_time
                      else SimulationClock.time_from_start(parent, fork_round))
+        # Persist a digest of the exact detached state at the fork boundary.
+        # This is derived from the immutable snapshot plus the parent prefix,
+        # never from mutable Canon tables or the parent's later state.
+        fork_state = SimulationWorldState.from_snapshot(
+            self._snapshots.get(parent.snapshot_id)  # validated by create_run
+        )
+        for event in parent_events:
+            if event.sequence > branch.fork_sequence:
+                break
+            fork_state = fork_state.apply_event(event)
+        if fork_time is not None and fork_state.values.get("simulation_time") != fork_time:
+            fork_values = json.loads(json.dumps(fork_state.values, sort_keys=True))
+            fork_values["simulation_time"] = fork_time
+            fork_state = SimulationWorldState(fork_state.snapshot_id, fork_values, fork_state.event_sequence)
+        fork_snapshot_hash = fork_state.state_hash
         child = SimulationRun(branch.branch_run_id, parent.book_id, parent.snapshot_id, name,
                               SimulationRunStatus.READY, fork_round, parent.max_rounds,
                               parent.seed if seed is None else seed,
                               description=parent.description, purpose=parent.purpose,
                               created_by=parent.created_by, configuration=parent.configuration,
-                              simulation_time=fork_time)
+                              simulation_time=fork_time,
+                              base_canon_event_id=parent.base_canon_event_id,
+                              branch_parent_id=parent.id,
+                              branch_point_event_id=fork_event.id if fork_event else None)
         with self._database.transaction() as conn:
             conn.execute(
                 """INSERT INTO simulation_runs(
                     id, book_id, snapshot_id, name, status, current_round,
                     max_rounds, seed, created_at, description, purpose, created_by, configuration,
-                    task_id, started_at, paused_at, completed_at, simulation_time
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    task_id, started_at, paused_at, completed_at, simulation_time,
+                    base_canon_event_id, branch_parent_id, branch_point_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (child.id, child.book_id, child.snapshot_id, child.name, child.status.value,
                  child.current_round, child.max_rounds, child.seed, child.created_at.isoformat(), child.description,
                  child.purpose, child.created_by, json.dumps(child.configuration, sort_keys=True), child.task_id,
-                 None, None, None, child.simulation_time),
+                 None, None, None, child.simulation_time,
+                 child.base_canon_event_id, child.branch_parent_id, child.branch_point_event_id),
             )
             conn.execute(
-                "INSERT INTO simulation_branches(id, parent_run_id, branch_run_id, fork_sequence, created_at) VALUES (?, ?, ?, ?, ?)",
-                (branch.id, branch.parent_run_id, branch.branch_run_id, branch.fork_sequence, branch.created_at.isoformat()),
+                "INSERT INTO simulation_branches(id, parent_run_id, branch_run_id, fork_sequence, parent_round, fork_snapshot_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (branch.id, branch.parent_run_id, branch.branch_run_id, branch.fork_sequence,
+                 fork_round, fork_snapshot_hash, branch.created_at.isoformat()),
             )
         # Materialize the inherited branch view immediately; it remains a
         # rebuildable sandbox read model and never participates in Canon.
@@ -167,22 +211,53 @@ class SimulationRepository:
             simulation_run_id=run.id, sequence=state.event_sequence + 1,
             round_number=event_round,
             simulation_time=SimulationClock.time_for_round(run, event_round),
-            event_type="INTERVENTION", payload={"kind": intervention.kind, "rationale": intervention.rationale},
+            event_type="INTERVENTION", payload={"kind": intervention.kind, "rationale": intervention.rationale,
+                                                  "author": intervention.author, "roundNumber": event_round},
             state_delta=intervention.state_delta, visibility_scope="world",
         )
         self.append_event(event)
         self._database.execute(
             """INSERT INTO simulation_interventions(
-                id, simulation_run_id, kind, state_delta, rationale, event_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                id, simulation_run_id, kind, state_delta, rationale, author, event_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (intervention.id, run.id, intervention.kind, json.dumps(intervention.state_delta, sort_keys=True),
-             intervention.rationale, event.id, intervention.created_at.isoformat()),
+             intervention.rationale, intervention.author, event.id, intervention.created_at.isoformat()),
         )
         from src.storyflow.analysis.causality import SimulationCausalityService
         SimulationCausalityService(self).ensure_for_run(run.id, event_id=event.id)
         from src.storyflow.analysis.graph import SimulationGraphProjector
         SimulationGraphProjector(self).project(run.id, event_limit=5000)
         return event
+
+    def interventions(self, run_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        """List durable author interventions for one isolated Simulation run."""
+        if limit < 1 or limit > 1000:
+            raise ValueError("intervention limit must be between 1 and 1000")
+        # Fail closed for callers that accidentally pass a missing run.
+        self.get_run(run_id)
+        rows = self._database.fetchall(
+            """SELECT id, simulation_run_id, kind, state_delta, rationale,
+                      author, event_id, created_at
+                 FROM simulation_interventions
+                WHERE simulation_run_id=?
+                ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (run_id, limit),
+        )
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                state_delta = json.loads(row["state_delta"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                state_delta = {}
+            if not isinstance(state_delta, Mapping):
+                state_delta = {}
+            records.append({
+                "id": row["id"], "runId": row["simulation_run_id"],
+                "kind": row["kind"], "stateDelta": dict(state_delta),
+                "rationale": row["rationale"], "author": row["author"],
+                "eventId": row["event_id"], "createdAt": row["created_at"],
+            })
+        return records
 
     def transition_run(self, run_id: str, status: SimulationRunStatus) -> SimulationRun:
         row = self._database.fetchone("SELECT * FROM simulation_runs WHERE id=?", (run_id,))
@@ -198,6 +273,9 @@ class SimulationRepository:
             paused_at=datetime.fromisoformat(row["paused_at"]) if row["paused_at"] else None,
             completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
             simulation_time=row["simulation_time"],
+            base_canon_event_id=row["base_canon_event_id"],
+            branch_parent_id=row["branch_parent_id"],
+            branch_point_event_id=row["branch_point_event_id"],
         )
         updated = current.transition(status)
         if updated is current:
@@ -232,7 +310,7 @@ class SimulationRepository:
             raise ValueError("simulation configuration must be an object")
         current = self.get_run(run_id)
         if current.status not in {
-            SimulationRunStatus.DRAFT, SimulationRunStatus.READY,
+            SimulationRunStatus.DRAFT, SimulationRunStatus.PREPARING, SimulationRunStatus.READY,
             SimulationRunStatus.PAUSED, SimulationRunStatus.PAUSED_BUDGET,
         }:
             raise ValueError(f"simulation configuration cannot change while run is {current.status}")
@@ -374,6 +452,9 @@ class SimulationRepository:
             paused_at=datetime.fromisoformat(row["paused_at"]) if row["paused_at"] else None,
             completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
             simulation_time=row["simulation_time"],
+            base_canon_event_id=row["base_canon_event_id"],
+            branch_parent_id=row["branch_parent_id"],
+            branch_point_event_id=row["branch_point_event_id"],
         )
 
     def _history_row(self, run_id: str):
@@ -388,9 +469,11 @@ class SimulationRepository:
     def history_state(self, run_id: str) -> dict[str, Any]:
         """Return the latest archive state for a run."""
         row = self._history_row(run_id)
-        archived = bool(row and row["action"] == "ARCHIVE")
+        deleted = bool(row and row["action"] == "DELETE")
+        archived = bool(row and row["action"] in {"ARCHIVE", "DELETE"})
         return {
             "archived": archived,
+            "deleted": deleted,
             "action": row["action"] if row else None,
             "reason": row["reason"] if row else "",
             "changedAt": row["created_at"] if row else None,
@@ -414,10 +497,14 @@ class SimulationRepository:
 
     def _append_history_action(self, run_id: str, action: str, reason: str = "") -> dict[str, Any]:
         run = self.get_run(run_id)
-        if action not in {"ARCHIVE", "UNARCHIVE"}:
+        if action not in {"ARCHIVE", "UNARCHIVE", "DELETE"}:
             raise ValueError("unsupported simulation history action")
         current = self.history_state(run_id)
-        if (action == "ARCHIVE" and current["archived"]) or (action == "UNARCHIVE" and not current["archived"]):
+        if action == "DELETE" and current["deleted"]:
+            return current
+        if (action == "ARCHIVE" and current["archived"] and not current["deleted"]) or (
+            action == "UNARCHIVE" and not current["archived"]
+        ):
             return current
         history_id = uuid.uuid4().hex
         created_at = datetime.now().isoformat()
@@ -434,11 +521,27 @@ class SimulationRepository:
         run = self.get_run(run_id)
         if run.status is SimulationRunStatus.RUNNING:
             raise ValueError("running simulation runs must be paused or stopped before archive")
+        if self.history_state(run_id)["deleted"]:
+            raise ValueError("deleted simulation runs cannot be archived")
         return self._append_history_action(run_id, "ARCHIVE", reason)
 
     def unarchive_run(self, run_id: str, *, reason: str = "") -> dict[str, Any]:
         """Restore an archived run to the default History listing."""
+        if self.history_state(run_id)["deleted"]:
+            raise ValueError("deleted simulation runs cannot be unarchived")
         return self._append_history_action(run_id, "UNARCHIVE", reason)
+
+    def delete_run(self, run_id: str, *, reason: str = "") -> dict[str, Any]:
+        """Soft-delete a run from History while preserving Sandbox evidence.
+
+        The immutable run/event/snapshot rows remain queryable by id for audit
+        and replay.  This is deliberately not a destructive SQL delete and
+        cannot affect Canon.
+        """
+        run = self.get_run(run_id)
+        if run.status is SimulationRunStatus.RUNNING:
+            raise ValueError("running simulation runs must be paused or stopped before delete")
+        return self._append_history_action(run_id, "DELETE", reason)
 
     def list_runs(self, book_id: str, *, limit: int = 100, include_archived: bool = False) -> list[SimulationRun]:
         if not book_id:
@@ -449,11 +552,11 @@ class SimulationRepository:
             """SELECT r.id
                FROM simulation_runs r
                WHERE r.book_id=?
-                 AND (? OR COALESCE((
-                     SELECT h.action FROM simulation_run_history h
-                     WHERE h.simulation_run_id=r.id
-                     ORDER BY h.created_at DESC, h.id DESC LIMIT 1
-                 ), 'UNARCHIVE') <> 'ARCHIVE')
+                  AND (? OR COALESCE((
+                      SELECT h.action FROM simulation_run_history h
+                      WHERE h.simulation_run_id=r.id
+                      ORDER BY h.created_at DESC, h.id DESC LIMIT 1
+                  ), 'UNARCHIVE') NOT IN ('ARCHIVE', 'DELETE'))
                ORDER BY r.created_at DESC, r.id DESC LIMIT ?""",
             (book_id, int(include_archived), limit),
         )
@@ -543,7 +646,10 @@ class SimulationRepository:
         result = validator.validate(action, state)
         if not result.valid:
             raise ValueError("invalid simulation action: " + "; ".join(result.errors))
-        event = self._event_from_action(run_id, action, state.event_sequence + 1, round_number, simulation_time)
+        event = self._event_from_action(
+            run_id, action, state.event_sequence + 1, round_number, simulation_time,
+            actor_location=self._actor_location(state, action), state=state,
+        )
         return self.append_event(event)
 
     def append_actions(
@@ -573,7 +679,10 @@ class SimulationRepository:
             result = validator.validate(action, state)
             if not result.valid:
                 raise ValueError("invalid simulation action: " + "; ".join(result.errors))
-            event = self._event_from_action(run_id, action, state.event_sequence + 1, round_number, simulation_time)
+            event = self._event_from_action(
+                run_id, action, state.event_sequence + 1, round_number, simulation_time,
+                actor_location=self._actor_location(state, action), state=state,
+            )
             events.append(event)
             state = state.apply_event(event)
 
@@ -639,14 +748,38 @@ class SimulationRepository:
 
         SimulationCausalityService(self).record_events(events)
 
-    @staticmethod
+    @classmethod
     def _event_from_action(
+        cls,
         run_id: str,
         action: NarrativeAction,
         sequence: int,
         round_number: int,
         simulation_time: str | None = None,
+        *,
+        actor_location: str | None = None,
+        state: SimulationWorldState | None = None,
     ) -> SimulationEvent:
+        location = action.location or actor_location
+        payload = {
+            "intent": action.intent,
+            "arguments": dict(action.arguments),
+            "reasoning_summary": action.reasoning_summary,
+            "source_generation_run": action.source_generation_run,
+        }
+        if location is not None:
+            payload["location"] = location
+        event_id = uuid.uuid4().hex
+        state_delta = cls._intrinsic_action_delta(state, action) if state is not None else {}
+        state_delta = cls._merge_state_delta(state_delta, dict(action.effects))
+        if state is not None:
+            propagation, evidence = cls._knowledge_propagation_delta(
+                state, action, event_id=event_id, run_id=run_id, sequence=sequence,
+            )
+            if propagation:
+                for key, value in propagation.items():
+                    state_delta[key] = cls._merge_state_delta(state_delta.get(key), value)
+                payload["knowledgePropagation"] = evidence
         return SimulationEvent(
             simulation_run_id=run_id,
             sequence=sequence,
@@ -658,11 +791,267 @@ class SimulationRepository:
             target_ids=action.target_ids,
             action_id=action.id,
             source_generation_run_id=action.source_generation_run,
-            payload={"intent": action.intent, "arguments": dict(action.arguments),
-                     "reasoning_summary": action.reasoning_summary,
-                     "source_generation_run": action.source_generation_run},
-            state_delta=dict(action.effects),
+            payload=payload,
+            state_delta=state_delta,
+            id=event_id,
         )
+
+    @classmethod
+    def _intrinsic_action_delta(
+        cls, state: SimulationWorldState, action: NarrativeAction,
+    ) -> dict[str, Any]:
+        """Apply small, deterministic ontology semantics before custom effects.
+
+        Providers are allowed to return a typed action with no bespoke state
+        delta.  These common narrative actions therefore update only the
+        selected Agent's detached state.  The explicit ``effects`` payload is
+        merged afterwards and remains authoritative for richer scenarios.
+        """
+        action_type = str(action.action_type)
+        if action_type not in {
+            ActionType.MOVE.value, ActionType.FLEE.value, ActionType.ACQUIRE_ITEM.value,
+            ActionType.LOSE_ITEM.value, ActionType.CHANGE_RELATIONSHIP.value,
+            ActionType.FORM_ALLIANCE.value, ActionType.BREAK_ALLIANCE.value,
+            ActionType.PURSUE_GOAL.value, ActionType.ABANDON_GOAL.value,
+        }:
+            return {}
+        collection_name = "factions" if action.actor_type == "faction" else "characters"
+        entities = state.values.get(collection_name, {})
+        if not isinstance(entities, Mapping) or action.actor_id not in entities:
+            return {}
+        copied = json.loads(json.dumps(entities, sort_keys=True))
+        actor = copied.get(action.actor_id)
+        if not isinstance(actor, dict):
+            return {}
+        arguments = action.arguments if isinstance(action.arguments, Mapping) else {}
+        changed = False
+
+        if action_type in {ActionType.MOVE.value, ActionType.FLEE.value} and action.location:
+            key = "territory" if action.actor_type == "faction" else "location"
+            if actor.get(key) != action.location:
+                actor[key] = action.location
+                changed = True
+
+        item = next((arguments.get(key) for key in ("item", "itemId", "item_id")
+                     if arguments.get(key) not in (None, "")), None)
+        if item is not None and action_type in {ActionType.ACQUIRE_ITEM.value, ActionType.LOSE_ITEM.value}:
+            inventory = actor.get("inventory")
+            inventory = list(inventory) if isinstance(inventory, (list, tuple, set, frozenset)) else []
+            item = str(item)
+            if action_type == ActionType.ACQUIRE_ITEM.value and item not in inventory:
+                inventory.append(item)
+                changed = True
+            elif action_type == ActionType.LOSE_ITEM.value and item in inventory:
+                inventory = [value for value in inventory if str(value) != item]
+                changed = True
+            actor["inventory"] = inventory
+
+        target_ids = [str(target) for target in action.target_ids if str(target)]
+        relationship = next((arguments.get(key) for key in (
+            "relationship", "relationshipType", "relationship_type", "value"
+        ) if arguments.get(key) not in (None, "")), None)
+        if target_ids and action_type in {
+            ActionType.CHANGE_RELATIONSHIP.value, ActionType.FORM_ALLIANCE.value,
+            ActionType.BREAK_ALLIANCE.value,
+        }:
+            relationships = actor.get("relationships")
+            relationships = dict(relationships) if isinstance(relationships, Mapping) else {}
+            allies = actor.get("allies")
+            allies = list(allies) if isinstance(allies, (list, tuple, set, frozenset)) else []
+            for target_id in target_ids:
+                if action_type == ActionType.FORM_ALLIANCE.value:
+                    relationships[target_id] = "allied"
+                    if target_id not in allies:
+                        allies.append(target_id)
+                elif action_type == ActionType.BREAK_ALLIANCE.value:
+                    relationships.pop(target_id, None)
+                    allies = [value for value in allies if str(value) != target_id]
+                elif relationship is not None:
+                    relationships[target_id] = relationship
+                changed = True
+            actor["relationships"] = relationships
+            if action_type in {ActionType.FORM_ALLIANCE.value, ActionType.BREAK_ALLIANCE.value}:
+                actor["allies"] = allies
+
+        goal = next((arguments.get(key) for key in ("goal", "goalId", "goal_id", "goalText")
+                     if arguments.get(key) not in (None, "")), None)
+        if goal is not None and action_type in {ActionType.PURSUE_GOAL.value, ActionType.ABANDON_GOAL.value}:
+            goals = actor.get("goals")
+            goals = list(goals) if isinstance(goals, (list, tuple, set, frozenset)) else []
+            if action_type == ActionType.PURSUE_GOAL.value and goal not in goals:
+                goals.append(goal)
+            elif action_type == ActionType.ABANDON_GOAL.value:
+                goals = [value for value in goals if str(value) != str(goal)]
+            else:
+                changed = False
+            actor["goals"] = goals
+            changed = True
+
+        return {collection_name: copied} if changed else {}
+
+    @classmethod
+    def _knowledge_propagation_delta(
+        cls,
+        state: SimulationWorldState,
+        action: NarrativeAction,
+        *,
+        event_id: str,
+        run_id: str,
+        sequence: int,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Materialize explicit communication into agent-local Sandbox knowledge.
+
+        The event ledger is the only durable source for this projection.  We
+        copy the selected target scopes and attach the event id as provenance;
+        no Canon fact catalog is ever copied wholesale.  Messages without an
+        explicit fact id receive a deterministic, local ``message:`` key so
+        an Agent can actually retrieve what it was told on the next round.
+        """
+        action_type = str(action.action_type)
+        if action_type not in {
+            ActionType.INFORM.value,
+            ActionType.DECEIVE.value,
+            ActionType.DISCLOSE_SECRET.value,
+            ActionType.SEND_MESSAGE.value,
+        } or not action.target_ids:
+            return {}, []
+
+        values = state.values
+        actor_collection = values.get("factions" if action.actor_type == "faction" else "characters", {})
+        actor = actor_collection.get(action.actor_id) if isinstance(actor_collection, Mapping) else None
+        actor = actor if isinstance(actor, Mapping) else {}
+        scope = KnowledgeScope(action.actor_id, values, actor=actor)
+        reported_ids = ActionValidator._reported_information_ids(action)
+        arguments = action.arguments if isinstance(action.arguments, Mapping) else {}
+        message = next((arguments.get(key) for key in ("message", "content", "claim", "text")
+                        if isinstance(arguments.get(key), str) and arguments.get(key).strip()), None)
+        # SEND_MESSAGE/INFORM may carry a free-form message rather than a
+        # canonical fact id.  Keep it local and deterministic instead of
+        # silently dropping the communication.
+        if not reported_ids and message:
+            digest = hashlib.sha256(
+                f"{run_id}:{sequence}:{action.actor_id}:{str(message).strip()}".encode("utf-8")
+            ).hexdigest()[:20]
+            reported_ids = {f"message:{digest}"}
+
+        if not reported_ids:
+            return {}, []
+
+        status = KnowledgeStatus.KNOWS
+        if action_type == ActionType.DECEIVE.value:
+            status = KnowledgeStatus.BELIEVES
+        elif action_type == ActionType.SEND_MESSAGE.value:
+            status = KnowledgeStatus.HEARD_RUMOR
+        explicit_status = arguments.get("knowledgeStatus") or arguments.get("knowledge_status")
+        if explicit_status:
+            try:
+                status = KnowledgeStatus(str(explicit_status).upper())
+            except ValueError:
+                pass
+
+        records: dict[str, dict[str, Any]] = {}
+        secrets = values.get("secrets", {})
+        for fact_id in sorted(reported_ids):
+            item = next((candidate for candidate in scope.items() if candidate.fact_id == fact_id), None)
+            secret = secrets.get(fact_id) if isinstance(secrets, Mapping) else None
+            secret = secret if isinstance(secret, Mapping) else {}
+            content = message or (item.content if item is not None else None)
+            if content is None:
+                content = secret.get("content", secret.get("value", secret.get("description", fact_id)))
+            records[fact_id] = {
+                "id": fact_id,
+                "content": content,
+                "status": status.value,
+                "confidence": item.confidence if item is not None else 1.0,
+                "sourceEventIds": [event_id],
+            }
+
+        entity_knowledge = json.loads(json.dumps(values.get("entity_knowledge") or values.get("entityKnowledge") or {}, sort_keys=True))
+        if not isinstance(entity_knowledge, dict):
+            entity_knowledge = {}
+        characters = json.loads(json.dumps(values.get("characters") or {}, sort_keys=True))
+        factions = json.loads(json.dumps(values.get("factions") or {}, sort_keys=True))
+        evidence: list[dict[str, Any]] = []
+        for target_id in sorted({str(item) for item in action.target_ids}):
+            target_collection = factions if action.actor_type == "faction" and target_id in factions else characters
+            if target_id not in target_collection and target_id in factions:
+                target_collection = factions
+            target = target_collection.get(target_id)
+            existing_scope = entity_knowledge.get(target_id, {})
+            entity_knowledge[target_id] = cls._merge_knowledge_scope(existing_scope, records)
+            if isinstance(target, Mapping):
+                target = dict(target)
+                key = "known_information" if target_collection is factions else "known_facts"
+                target[key] = cls._merge_knowledge_scope(target.get(key), records).get(key, records)
+                target_collection[target_id] = target
+            evidence.append({"targetId": target_id, "informationIds": sorted(records), "status": status.value})
+        return {
+            "entity_knowledge": entity_knowledge,
+            "characters": characters,
+            "factions": factions,
+        }, evidence
+
+    @staticmethod
+    def _merge_knowledge_scope(existing: Any, records: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+        """Merge records while preserving legacy list/map knowledge shapes."""
+        if isinstance(existing, Mapping):
+            result = json.loads(json.dumps(existing, sort_keys=True))
+        elif isinstance(existing, (list, tuple, set, frozenset)):
+            result = {"known_facts": list(existing)}
+        else:
+            result = {"known_facts": []}
+        wrapper = next((key for key in (
+            "known_facts", "knownFacts", "facts", "known_information", "knownInformation", "knowledge", "items"
+        ) if key in result), None)
+        if wrapper is not None:
+            value = result[wrapper]
+            if isinstance(value, Mapping):
+                value = dict(value)
+                value.update({key: dict(record) for key, record in records.items()})
+                result[wrapper] = value
+            elif isinstance(value, list):
+                by_id = {
+                    str(item.get("id") or item.get("factId")): item
+                    for item in value if isinstance(item, Mapping) and (item.get("id") or item.get("factId"))
+                }
+                for key, record in records.items():
+                    by_id[key] = dict(record)
+                result[wrapper] = list(by_id.values())
+            else:
+                result[wrapper] = {key: dict(record) for key, record in records.items()}
+            return result
+        result.update({key: dict(record) for key, record in records.items()})
+        return result
+
+    @staticmethod
+    def _merge_state_delta(existing: Any, propagated: Any) -> Any:
+        """Merge propagation with an explicit action effect without loss."""
+        if not isinstance(existing, Mapping) or not isinstance(propagated, Mapping):
+            return propagated
+        merged = json.loads(json.dumps(existing, sort_keys=True))
+        for key, value in propagated.items():
+            current = merged.get(key)
+            if isinstance(current, Mapping) and isinstance(value, Mapping):
+                nested = dict(current)
+                for nested_key, nested_value in value.items():
+                    if isinstance(nested.get(nested_key), Mapping) and isinstance(nested_value, Mapping):
+                        item = dict(nested[nested_key])
+                        item.update(nested_value)
+                        nested[nested_key] = item
+                    else:
+                        nested[nested_key] = nested_value
+                merged[key] = nested
+            else:
+                merged[key] = value
+        return merged
+
+    @staticmethod
+    def _actor_location(state: SimulationWorldState, action: NarrativeAction) -> str | None:
+        collection = state.values.get("factions" if action.actor_type == "faction" else "characters", {})
+        actor = collection.get(action.actor_id) if isinstance(collection, Mapping) else None
+        if not isinstance(actor, Mapping):
+            return None
+        return actor.get("location") or actor.get("territory")
 
     def events(self, run_id: str) -> list[SimulationEvent]:
         own_rows = self._database.fetchall(
@@ -686,7 +1075,14 @@ class SimulationRepository:
                      if event.sequence <= branch["fork_sequence"]]
         return inherited + own
 
-    def replay(self, run_id: str) -> SimulationWorldState:
+    def rebuild_simulation_state(self, run_id: str) -> SimulationWorldState:
+        """Rebuild detached Sandbox state from the immutable snapshot and ledger.
+
+        The snapshot plus append-only ``SimulationEvent`` rows are the only
+        authoritative inputs.  Agent state, relationship state, and graph
+        rows are deliberately not read here; callers can delete/rebuild those
+        mutable read models without changing the resulting state hash.
+        """
         run = self._database.fetchone("SELECT snapshot_id, simulation_time FROM simulation_runs WHERE id=?", (run_id,))
         if run is None:
             raise ValueError(f"simulation run not found: {run_id}")
@@ -701,3 +1097,7 @@ class SimulationRepository:
             values["simulation_time"] = run["simulation_time"]
             state = SimulationWorldState(state.snapshot_id, values, state.event_sequence)
         return state
+
+    def replay(self, run_id: str) -> SimulationWorldState:
+        """Backward-compatible name for the explicit state rebuild seam."""
+        return self.rebuild_simulation_state(run_id)

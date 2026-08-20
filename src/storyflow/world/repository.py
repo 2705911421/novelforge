@@ -16,6 +16,7 @@ class WorldSnapshotRepository:
         self._database = database
 
     def create(self, snapshot: SimulationWorldSnapshot) -> SimulationWorldSnapshot:
+        world_payload = json.dumps(snapshot.to_record()["world"], ensure_ascii=True, sort_keys=True)
         with self._database.transaction() as conn:
             book = conn.execute(
                 "SELECT project_id FROM books WHERE id=?", (snapshot.book_id,)
@@ -25,10 +26,30 @@ class WorldSnapshotRepository:
             if book["project_id"] != snapshot.project_id:
                 raise ValueError("snapshot project_id does not own book_id")
             existing = conn.execute(
-                "SELECT id FROM simulation_world_snapshots WHERE id=?", (snapshot.snapshot_id,)
+                "SELECT * FROM simulation_world_snapshots WHERE id=?", (snapshot.snapshot_id,)
             ).fetchone()
             if existing is not None:
-                return snapshot
+                return self._from_row(existing)
+            # WorldSnapshotBuilder includes creation time in the content id, so
+            # rebuilding the same Canon boundary produces a new candidate id.
+            # Reuse an identical persisted payload instead of violating the
+            # boundary uniqueness constraint; a genuinely different payload is
+            # left to the database constraint to reject.
+            existing_rows = conn.execute(
+                """SELECT * FROM simulation_world_snapshots
+                   WHERE book_id=? AND base_canon_event_id=? AND canon_hash=?
+                     AND planning_snapshot_hash IS ?
+                   ORDER BY created_at ASC, id ASC""",
+                (
+                    snapshot.book_id,
+                    snapshot.base_canon_event_id,
+                    snapshot.canon_hash,
+                    snapshot.planning_snapshot_hash,
+                ),
+            ).fetchall()
+            for existing in existing_rows:
+                if existing["world_payload"] == world_payload:
+                    return self._from_row(existing)
             conn.execute(
                 """INSERT INTO simulation_world_snapshots(
                     id, project_id, book_id, base_canon_event_id, canon_hash,
@@ -45,18 +66,14 @@ class WorldSnapshotRepository:
                     snapshot.planning_snapshot_id,
                     snapshot.planning_snapshot_hash,
                     snapshot.snapshot_version,
-                    json.dumps(snapshot.to_record()["world"], ensure_ascii=True, sort_keys=True),
+                    world_payload,
                     snapshot.created_at.isoformat(),
                 ),
             )
         return snapshot
 
-    def get(self, snapshot_id: str) -> SimulationWorldSnapshot | None:
-        row = self._database.fetchone(
-            "SELECT * FROM simulation_world_snapshots WHERE id=?", (snapshot_id,)
-        )
-        if row is None:
-            return None
+    @staticmethod
+    def _from_row(row: object) -> SimulationWorldSnapshot:
         return SimulationWorldSnapshot.from_record({
             "book_id": row["book_id"],
             "project_id": row["project_id"],
@@ -69,3 +86,11 @@ class WorldSnapshotRepository:
             "world": json.loads(row["world_payload"]),
             "created_at": row["created_at"],
         })
+
+    def get(self, snapshot_id: str) -> SimulationWorldSnapshot | None:
+        row = self._database.fetchone(
+            "SELECT * FROM simulation_world_snapshots WHERE id=?", (snapshot_id,)
+        )
+        if row is None:
+            return None
+        return self._from_row(row)

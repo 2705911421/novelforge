@@ -91,10 +91,11 @@ class ActionValidator:
         elif isinstance(actor, Mapping):
             if actor.get("alive") is False:
                 errors.append("dead actors cannot act")
-            if action.location and actor.get("location") and actor["location"] != action.location:
+            if (action.location and actor.get("location") and actor["location"] != action.location
+                    and action_type not in {ActionType.MOVE.value, ActionType.FLEE.value}):
                 errors.append("actor is not at the action location")
             required = set(action.preconditions.get("known_facts", ()))
-            scope = KnowledgeScope(action.actor_id, state.values)
+            scope = KnowledgeScope(action.actor_id, state.values, actor=actor)
             if scope.items():
                 missing = sorted(fact for fact in required if not scope.allows(
                     fact, (KnowledgeStatus.KNOWS, KnowledgeStatus.BELIEVES, KnowledgeStatus.HEARD_RUMOR)))
@@ -106,6 +107,23 @@ class ActionValidator:
             item = action.arguments.get("item")
             if action_type == ActionType.USE_ITEM and item not in inventory:
                 errors.append(f"actor does not possess item: {item}")
+            if action_type in {ActionType.INFORM, ActionType.DECEIVE, ActionType.DISCLOSE_SECRET}:
+                reported = self._reported_information_ids(action)
+                if reported:
+                    allowed = (
+                        KnowledgeStatus.KNOWS, KnowledgeStatus.BELIEVES,
+                        KnowledgeStatus.SUSPECTS, KnowledgeStatus.HEARD_RUMOR,
+                        KnowledgeStatus.SECRET_OWNER,
+                    )
+                    unknown = sorted(fact_id for fact_id in reported if not scope.allows(fact_id, allowed))
+                    for fact_id in unknown:
+                        secret_record = state.values.get("secrets", {})
+                        owner = (secret_record.get(fact_id, {}).get("owner")
+                                 if isinstance(secret_record, Mapping)
+                                 and isinstance(secret_record.get(fact_id), Mapping) else None)
+                        if action_type == ActionType.DISCLOSE_SECRET and owner == action.actor_id:
+                            continue
+                        errors.append(f"actor cannot disclose unknown information: {fact_id}")
         entities = {}
         if isinstance(characters, Mapping):
             entities.update(characters)
@@ -128,3 +146,29 @@ class ActionValidator:
         if action_type in {ActionType.MOVE, ActionType.FLEE} and not action.location:
             errors.append("movement actions require a location")
         return ActionValidation(not errors, tuple(errors))
+
+    @staticmethod
+    def _reported_information_ids(action: NarrativeAction) -> set[str]:
+        values: set[str] = set()
+        arguments = action.arguments if isinstance(action.arguments, Mapping) else {}
+        keys = (
+            "fact", "factId", "fact_id", "facts", "secret", "secretId", "secret_id", "secrets",
+            "informationId", "information_id", "informationIds", "information_ids", "information",
+        )
+
+        def collect(value: Any) -> None:
+            if isinstance(value, str) and value.strip():
+                values.add(value.strip())
+            elif isinstance(value, Mapping):
+                candidate = next((value[key] for key in (
+                    "id", "factId", "fact_id", "secretId", "secret_id", "informationId", "information_id"
+                ) if value.get(key) not in (None, "")), None)
+                if candidate is not None:
+                    collect(candidate)
+            elif isinstance(value, (list, tuple, set, frozenset)):
+                for item in value:
+                    collect(item)
+
+        for key in keys:
+            collect(arguments.get(key))
+        return values

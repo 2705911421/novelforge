@@ -26,6 +26,7 @@ def _event_record(event: Any) -> dict[str, Any]:
         "targetIds": list(event.target_ids),
         "actionId": event.action_id,
         "sourceGenerationRunId": event.source_generation_run_id,
+        "location": event.payload.get("location") if isinstance(event.payload, Mapping) else None,
         "payload": dict(event.payload),
         "stateDelta": dict(event.state_delta),
         "visibilityScope": event.visibility_scope,
@@ -215,7 +216,7 @@ class SimulationAnalystTools:
         return self._query_snapshot_collection(run_id, "foreshadows", "query_foreshadow_impacts")
 
     def query_plot_thread_impacts(self, run_id: str) -> dict[str, Any]:
-        return self._query_snapshot_collection(run_id, "timeline", "query_plot_thread_impacts")
+        return self._query_snapshot_collection(run_id, "plot_threads", "query_plot_thread_impacts")
 
     def query_world_rules(self, run_id: str) -> dict[str, Any]:
         return self._query_snapshot_collection(run_id, "world_rules", "query_world_rules")

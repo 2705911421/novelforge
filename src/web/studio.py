@@ -69,13 +69,14 @@ from src.story_graph import (
 )
 from src.storyflow.analysis import (BranchComparisonService, SimulationAnalyst,
                                     SimulationCausalityService, SimulationGraphProjector,
-                                    SimulationOutcomeClusterService)
+                                    SimulationOutcomeClusterService, SimulationEventDetailService)
 from src.storyflow.interaction import CharacterChatService, SimulationSurveyService
 from src.storyflow.planning import SimulationAdoptionService, SimulationChapterIntentService
 from src.storyflow.simulation import (ActionType, NarrativeAction, PerceptionBuilder, SimulationBranch,
                                       SimulationIntervention, SimulationRepository, SimulationRoundEngine,
                                       SimulationRun, SimulationRunStatus, SimulationTaskHandlers,
-                                      AgentScheduler, SimulationBudgetController, SimulationProviderAssignment)
+                                      AgentScheduler, SimulationBudgetController, SimulationProviderAssignment,
+                                      SimulationConfigurationGenerator)
 from src.storyflow.world import (WorldSnapshotBuilder, WorldSnapshotRepository,
                                   compare_snapshot_with_canon)
 from src.pipeline.control_surface import ChapterIntent, ControlSurface
@@ -489,6 +490,7 @@ class SimulationBranchCreateRequest(BaseModel):
 class SimulationInterventionRequest(BaseModel):
     kind: str
     rationale: str
+    author: Optional[str] = None
     stateDelta: dict[str, Any] = Field(default_factory=dict)
     roundNumber: Optional[int] = Field(None, ge=0)
 
@@ -525,7 +527,22 @@ class SimulationBudgetUpdateRequest(BaseModel):
     costPer1KTokens: Optional[float] = Field(None, ge=0)
 
 
+class SimulationConfigurationRequest(BaseModel):
+    configuration: dict[str, Any] = Field(default_factory=dict)
+    replace: bool = False
+
+
+class SimulationConfigurationGenerateRequest(BaseModel):
+    replace: bool = False
+
+
 class SimulationAdoptionRequest(BaseModel):
+    title: str
+    summary: str = ""
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class SimulationAdoptionEditRequest(BaseModel):
     title: str
     summary: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -563,6 +580,91 @@ class SimulationCharacterChatRequest(BaseModel):
 class SimulationSurveyRequest(BaseModel):
     question: str
     agentIds: Optional[list[str]] = None
+
+
+class SimulationSurveyRunRequest(BaseModel):
+    name: Optional[str] = None
+    seed: Optional[int] = None
+    configuration: dict[str, Any] = Field(default_factory=dict)
+
+
+def _simulation_chapter_intents_for_proposal(book: dict[str, Any], proposal_id: str) -> list[dict[str, Any]]:
+    """Read durable ChapterIntent control documents linked to an adoption."""
+    project_id = str(book.get("project_id") or book.get("id") or "")
+    if not project_id:
+        return []
+    runtime_dir = project_mgr.get_project_dir(project_id) / "control" / "runtime"
+    if not runtime_dir.is_dir():
+        return []
+    intents: list[dict[str, Any]] = []
+    for path in sorted(runtime_dir.glob("chapter-*.intent.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        provenance = data.get("provenance")
+        if not isinstance(provenance, list):
+            continue
+        if any(isinstance(item, dict) and item.get("proposalId") == proposal_id for item in provenance):
+            intents.append(data)
+    return intents
+
+
+def _simulation_writing_tasks_for_proposal(book: dict[str, Any], proposal_id: str) -> list[dict[str, Any]]:
+    """Return book-scoped durable write-next task summaries for an adoption."""
+    project_id = str(book.get("project_id") or book.get("id") or "")
+    if not project_id:
+        return []
+    tasks: list[dict[str, Any]] = []
+    for task in task_runtime.list(project_id=project_id, limit=200):
+        if task.get("type") != "write-next":
+            continue
+        data = task.get("data") if isinstance(task.get("data"), dict) else {}
+        if data.get("simulation_adoption_id") != proposal_id:
+            continue
+        tasks.append({
+            "id": task.get("id") or task.get("taskId"),
+            "type": task.get("type"),
+            "status": task.get("status"),
+            "stage": task.get("stage"),
+            "progressPercent": task.get("progressPercent", task.get("progress", 0)),
+            "chapterNumber": task.get("chapterNumber") or data.get("chapter_number"),
+            "error": task.get("error"),
+            "updatedAt": task.get("updated_at") or task.get("updatedAt"),
+        })
+    return tasks
+
+
+def _simulation_adoption_record(
+    item: Any, *, chapter_intents: list[dict[str, Any]] | None = None,
+    writing_tasks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Expose the structured simulation-to-planning handoff contract."""
+    return {
+        "id": item.id,
+        "runId": item.simulation_run_id,
+        "title": item.title,
+        "summary": item.summary,
+        "status": item.status,
+        "payload": dict(item.payload),
+        "sourceSimulationId": item.source_simulation_id,
+        "sourceBranchId": item.source_branch_id,
+        "sourceEventRange": item.source_event_range,
+        "proposedPlanningNodes": list(item.proposed_planning_nodes),
+        "proposedPlotThreads": list(item.proposed_plot_threads),
+        "proposedCharacterGoals": list(item.proposed_character_goals),
+        "proposedForeshadows": list(item.proposed_foreshadows),
+        "proposedChapterIntents": list(item.proposed_chapter_intents),
+        "provenance": item.provenance,
+        "planningNodeId": item.planning_node_id,
+        "planningRevision": item.planning_revision,
+        "chapterIntents": list(chapter_intents or []),
+        "writingTasks": list(writing_tasks or []),
+        "createdAt": item.created_at.isoformat(),
+        "canonicalMutation": False,
+    }
 
 TRANSLATION_UPLOAD_MAX_BYTES = 8 * 1024 * 1024
 
@@ -3518,7 +3620,7 @@ async def create_simulation_snapshot(book_id: str):
         raise HTTPException(409, detail={"code": "SIMULATION_CANON_REQUIRED", "message": "authoritative book is required"})
     try:
         snapshot = WorldSnapshotBuilder(story_repository.db).build(str(book["id"]))
-        WorldSnapshotRepository(story_repository.db).create(snapshot)
+        snapshot = WorldSnapshotRepository(story_repository.db).create(snapshot)
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "SIMULATION_SNAPSHOT", "message": str(exc)}) from exc
     return {"snapshotId": snapshot.snapshot_id, "snapshot": snapshot.to_record(), "canonicalMutation": False}
@@ -3558,8 +3660,10 @@ async def create_simulation_run(book_id: str, request: SimulationRunCreateReques
     run = SimulationRun(uuid.uuid4().hex, str(book["id"]), snapshot.snapshot_id, request.name,
                         max_rounds=request.maxRounds, seed=request.seed, description=request.description,
                         purpose=request.purpose, configuration=configuration)
-    repository.create_run(run)
+    run = repository.create_run(run)
     return {"runId": run.id, "status": run.status.value, "snapshotId": run.snapshot_id,
+            "baseCanonEventId": run.base_canon_event_id,
+            "branchParentId": run.branch_parent_id, "branchPointEventId": run.branch_point_event_id,
             "configuration": dict(run.configuration), "canonicalMutation": False}
 
 
@@ -3572,11 +3676,14 @@ async def list_simulation_runs(book_id: str, limit: int = Query(100, ge=1, le=10
     return {"runs": [
         {"id": run.id, "snapshotId": run.snapshot_id, "name": run.name, "status": run.status.value,
          "currentRound": run.current_round, "maxRounds": run.max_rounds, "seed": run.seed,
+         "baseCanonEventId": run.base_canon_event_id,
+         "branchParentId": run.branch_parent_id, "branchPointEventId": run.branch_point_event_id,
          "simulationTime": run.simulation_time,
          "description": run.description, "purpose": run.purpose,
          "taskId": run.task_id,
          "cohortId": SimulationOutcomeClusterService(repository).cohort_id(run),
          "archived": repository.history_state(run.id)["archived"],
+         "deleted": repository.history_state(run.id)["deleted"],
          "taskStatus": (task_runtime.get(run.task_id) or {}).get("status") if run.task_id else None,
          "createdAt": run.created_at.isoformat(), "startedAt": run.started_at.isoformat() if run.started_at else None,
          "pausedAt": run.paused_at.isoformat() if run.paused_at else None,
@@ -3626,7 +3733,7 @@ async def replicate_simulation_runs(book_id: str, run_id: str, request: Simulati
                 description=source.description, purpose=source.purpose,
                 created_by=source.created_by, configuration=configuration,
             )
-            repository.create_run(child)
+            child = repository.create_run(child)
         created.append(child)
     return {
         "sourceRunId": run_id,
@@ -3717,6 +3824,24 @@ async def unarchive_simulation_run(book_id: str, run_id: str, request: Simulatio
     return {"runId": run_id, "history": history, "canonicalMutation": False}
 
 
+@app.delete("/api/v1/books/{book_id}/simulation/runs/{run_id}")
+async def delete_simulation_run(book_id: str, run_id: str, request: SimulationHistoryRequest):
+    """Soft-delete a run from History without deleting Sandbox evidence."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        history = repository.delete_run(run_id, reason=request.reason)
+    except ValueError as exc:
+        code = "SIMULATION_RUN_DELETE"
+        if "running" in str(exc):
+            code = "SIMULATION_RUN_MUST_STOP"
+        raise HTTPException(409, detail={"code": code, "message": str(exc)}) from exc
+    return {"runId": run_id, "history": history, "canonicalMutation": False}
+
+
 @app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/history")
 async def get_simulation_run_history(book_id: str, run_id: str,
                                      limit: int = Query(100, ge=1, le=1000)):
@@ -3745,7 +3870,8 @@ async def list_simulation_branches(book_id: str, limit: int = Query(1000, ge=1, 
     repository = get_simulation_repository()
     runs = repository.list_runs(str(book["id"]), limit=limit)
     rows = story_repository.db.fetchall(
-        """SELECT b.id, b.parent_run_id, b.branch_run_id, b.fork_sequence, b.created_at
+        """SELECT b.id, b.parent_run_id, b.branch_run_id, b.fork_sequence,
+                  b.parent_round, b.fork_snapshot_hash, b.created_at
            FROM simulation_branches b
            JOIN simulation_runs parent ON parent.id=b.parent_run_id
            JOIN simulation_runs child ON child.id=b.branch_run_id
@@ -3768,6 +3894,8 @@ async def list_simulation_branches(book_id: str, limit: int = Query(1000, ge=1, 
             "parentRunId": branch["parent_run_id"] if branch else None,
             "branchId": branch["id"] if branch else None,
             "forkSequence": branch["fork_sequence"] if branch else None,
+            "parentRound": branch["parent_round"] if branch else None,
+            "forkSnapshotHash": branch["fork_snapshot_hash"] if branch else None,
             "createdAt": run.created_at.isoformat(),
             "isRoot": branch is None,
         }
@@ -3778,6 +3906,8 @@ async def list_simulation_branches(book_id: str, limit: int = Query(1000, ge=1, 
                 "parentRunId": branch["parent_run_id"],
                 "runId": run.id,
                 "forkSequence": branch["fork_sequence"],
+                "parentRound": branch["parent_round"],
+                "forkSnapshotHash": branch["fork_snapshot_hash"],
                 "createdAt": branch["created_at"],
             })
     return {
@@ -3815,6 +3945,8 @@ async def get_simulation_run(book_id: str, run_id: str):
     next_chapter = int((chapter_row or {}).get("max_number") or 0) + 1
     return {"run": {"id": run.id, "snapshotId": run.snapshot_id, "name": run.name, "status": run.status.value,
                      "currentRound": run.current_round, "maxRounds": run.max_rounds, "seed": run.seed,
+                     "baseCanonEventId": run.base_canon_event_id,
+                     "branchParentId": run.branch_parent_id, "branchPointEventId": run.branch_point_event_id,
                      "simulationTime": run.simulation_time,
                      "description": run.description, "purpose": run.purpose,
                      "configuration": dict(run.configuration), "createdAt": run.created_at.isoformat(),
@@ -3834,7 +3966,34 @@ async def get_simulation_run(book_id: str, run_id: str):
             "events": [{"id": event.id, "sequence": event.sequence, "round": event.round_number,
                         "type": event.event_type, "actorId": event.actor_id,
                         "sourceGenerationRunId": event.source_generation_run_id} for event in events],
-            "canonicalMutation": False}
+             "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/replay")
+async def rebuild_simulation_state(book_id: str, run_id: str):
+    """Rebuild the Sandbox state from the immutable snapshot and event ledger."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        state = repository.rebuild_simulation_state(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_REPLAY", "message": str(exc)}) from exc
+    return {
+        "runId": run_id,
+        "snapshotId": state.snapshot_id,
+        "eventSequence": state.event_sequence,
+        "stateHash": state.state_hash,
+        "state": dict(state.values),
+        "evidence": {
+            "source": "immutable_simulation_snapshot + simulation_event_ledger",
+            "rebuildable": True,
+            "canonicalMutation": False,
+        },
+        "canonicalMutation": False,
+    }
 
 
 @app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/task")
@@ -3926,6 +4085,60 @@ async def update_simulation_budget(book_id: str, run_id: str, request: Simulatio
             "canonicalMutation": False}
 
 
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/configuration")
+async def update_simulation_configuration(book_id: str, run_id: str, request: SimulationConfigurationRequest):
+    """Persist author-edited environment setup before a Sandbox round runs."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        updated = repository.update_configuration(
+            run_id, request.configuration, replace=request.replace,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_CONFIGURATION", "message": str(exc)}) from exc
+    return {
+        "runId": run_id,
+        "runStatus": updated.status.value,
+        "configuration": dict(updated.configuration),
+        "canonicalMutation": False,
+    }
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/configuration/generate")
+async def generate_simulation_configuration(
+    book_id: str, run_id: str, request: SimulationConfigurationGenerateRequest,
+):
+    """Preview or persist deterministic Environment Setup from the snapshot."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        snapshot = WorldSnapshotRepository(story_repository.db).get(run.snapshot_id)
+        if snapshot is None or snapshot.book_id != run.book_id:
+            raise ValueError("simulation snapshot not found")
+        generated = SimulationConfigurationGenerator().generate(run, snapshot)
+        updated = repository.update_configuration(run_id, generated, replace=True) if request.replace else run
+    except ValueError as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_CONFIGURATION_GENERATE", "message": str(exc)}) from exc
+    return {
+        "runId": run_id,
+        "runStatus": updated.status.value,
+        "configuration": generated,
+        "persisted": bool(request.replace),
+        "evidence": {
+            "source": "immutable_simulation_world_snapshot",
+            "snapshotId": run.snapshot_id,
+            "canonicalMutation": False,
+        },
+        "canonicalMutation": False,
+    }
+
+
 @app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/events")
 async def get_simulation_events(book_id: str, run_id: str, after_sequence: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000)):
     book = resolve_story_graph_book(book_id)
@@ -3942,7 +4155,9 @@ async def get_simulation_events(book_id: str, run_id: str, after_sequence: int =
          "simulationTime": event.simulation_time, "type": event.event_type,
          "actorType": event.actor_type, "actorId": event.actor_id, "targetIds": event.target_ids,
          "actionId": event.action_id, "sourceGenerationRunId": event.source_generation_run_id,
-         "payload": event.payload, "visibilityScope": event.visibility_scope}
+         "location": event.payload.get("location") if isinstance(event.payload, dict) else None,
+         "payload": event.payload, "stateDelta": event.state_delta,
+         "visibilityScope": event.visibility_scope}
         for event in events
     ], "nextSequence": events[-1].sequence if events else after_sequence, "canonicalMutation": False}
 
@@ -4044,6 +4259,7 @@ async def stream_simulation_events(
                 "targetIds": event.target_ids,
                 "actionId": event.action_id,
                 "sourceGenerationRunId": event.source_generation_run_id,
+                "location": event.payload.get("location") if isinstance(event.payload, dict) else None,
                 "payload": event.payload,
                 "stateDelta": event.state_delta,
                 "visibilityScope": event.visibility_scope,
@@ -4057,6 +4273,20 @@ async def stream_simulation_events(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/events/{event_id}")
+async def get_simulation_event_detail(book_id: str, run_id: str, event_id: str):
+    """Return replayed, agent-scoped evidence for one Timeline event."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        return SimulationEventDetailService(repository).build(run_id, event_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_EVENT_DETAIL", "message": str(exc)}) from exc
 
 
 @app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/agents")
@@ -4083,6 +4313,8 @@ async def list_simulation_agents(book_id: str, run_id: str):
                 "location": actor.get("location") or actor.get("territory"),
                 "alive": actor.get("alive", True),
                 "goals": actor.get("goals") or actor.get("current_priorities") or [],
+                "stateHash": state.state_hash,
+                "canonicalMutation": False,
             })
     return {"runId": run_id, "agents": agents, "stateHash": state.state_hash, "canonicalMutation": False}
 
@@ -4133,6 +4365,7 @@ async def compare_simulation_runs(book_id: str, left: str = Query(...), right: s
     return {"leftRunId": result.left_run_id, "rightRunId": result.right_run_id,
             "commonEventSequence": result.common_event_sequence, "leftStateHash": result.left_state_hash,
             "rightStateHash": result.right_state_hash, "changedKeys": result.changed_keys,
+            "dimensionChanges": result.dimension_changes,
             "leftOnlyEvents": result.left_only_events, "rightOnlyEvents": result.right_only_events,
             "evidence": result.evidence}
 
@@ -4263,10 +4496,72 @@ async def list_simulation_surveys(book_id: str, run_id: str, limit: int = Query(
 @app.get("/api/v1/books/{book_id}/simulation/surveys/{survey_id}")
 async def get_simulation_survey(book_id: str, survey_id: str):
     book = resolve_story_graph_book(book_id)
-    survey = SimulationSurveyService(story_repository.db).surveys.get(survey_id)
+    service = SimulationSurveyService(story_repository.db)
+    survey = service.surveys.get(survey_id)
     if survey is None or survey.book_id != str(book["id"]):
         raise HTTPException(404, detail={"code": "SIMULATION_SURVEY_NOT_FOUND", "message": "book-scoped survey not found"})
-    return {"survey": survey.to_record(), "canonicalMutation": False}
+    scenario = service.scenario(survey_id)
+    return {"survey": survey.to_record(), "scenario": scenario, "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/surveys/{survey_id}/run")
+async def start_simulation_from_survey(
+    book_id: str, survey_id: str, request: SimulationSurveyRunRequest,
+):
+    """Fork the source Sandbox at its current ledger boundary for a survey scenario.
+
+    Survey responses become run-scoped configuration evidence. The source run
+    and Canon stay unchanged; the child is an ordinary READY Sandbox branch.
+    """
+    book = resolve_story_graph_book(book_id)
+    service = SimulationSurveyService(story_repository.db)
+    repository = get_simulation_repository()
+    try:
+        survey = service.surveys.get(survey_id)
+        if survey is None or survey.book_id != str(book["id"]):
+            raise ValueError("book-scoped survey not found")
+        scenario = service.scenario(survey_id)
+        source = repository.get_run(survey.simulation_run_id)
+        if source.book_id != str(book["id"]):
+            raise ValueError("survey source run does not belong to book")
+        configuration = json.loads(json.dumps(dict(source.configuration), ensure_ascii=True, sort_keys=True))
+        requested = request.configuration
+        if not isinstance(requested, dict):
+            raise ValueError("survey scenario configuration must be an object")
+        configuration.update(json.loads(json.dumps(requested, ensure_ascii=True, sort_keys=True)))
+        try:
+            assignment = SimulationProviderAssignment.from_configuration(configuration)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if "providerAssignment" in configuration or "provider_assignment" in configuration:
+            configuration.pop("provider_assignment", None)
+            configuration["providerAssignment"] = assignment.to_record()
+        configuration["surveyScenario"] = scenario
+        events = repository.events(source.id)
+        child_id = uuid.uuid4().hex
+        fork_sequence = events[-1].sequence if events else 0
+        child = repository.create_branch(
+            source.id,
+            SimulationBranch(uuid.uuid4().hex, source.id, child_id, fork_sequence),
+            name=(request.name or f"Survey scenario · {survey.question[:48]}").strip() or "Survey scenario",
+            seed=request.seed if request.seed is not None else source.seed + 1,
+        )
+        child = repository.update_configuration(child.id, configuration, replace=True)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_SURVEY_SCENARIO", "message": str(exc)}) from exc
+    return {
+        "surveyId": survey_id,
+        "sourceRunId": source.id,
+        "runId": child.id,
+        "status": child.status.value,
+        "snapshotId": child.snapshot_id,
+        "branchParentId": child.branch_parent_id,
+        "branchPointEventId": child.branch_point_event_id,
+        "forkSequence": fork_sequence,
+        "configuration": dict(child.configuration),
+        "scenario": scenario,
+        "canonicalMutation": False,
+    }
 
 
 @app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/status")
@@ -4300,8 +4595,15 @@ async def create_simulation_branch(book_id: str, request: SimulationBranchCreate
         child = repository.create_branch(request.parentRunId, branch, name=request.name)
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "SIMULATION_BRANCH", "message": str(exc)}) from exc
+    metadata = story_repository.db.fetchone(
+        "SELECT parent_round, fork_snapshot_hash FROM simulation_branches WHERE id=?",
+        (branch.id,),
+    )
     return {"branchId": branch.id, "parentRunId": branch.parent_run_id, "runId": child.id,
-            "forkSequence": branch.fork_sequence, "status": child.status.value, "canonicalMutation": False}
+            "forkSequence": branch.fork_sequence,
+            "parentRound": metadata["parent_round"] if metadata else None,
+            "forkSnapshotHash": metadata["fork_snapshot_hash"] if metadata else None,
+            "status": child.status.value, "canonicalMutation": False}
 
 
 @app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/interventions")
@@ -4312,13 +4614,31 @@ async def intervene_simulation_run(book_id: str, run_id: str, request: Simulatio
         run = repository.get_run(run_id)
         if run.book_id != str(book["id"]):
             raise ValueError("simulation run does not belong to book")
-        intervention = SimulationIntervention(run_id, request.kind, request.stateDelta, request.rationale)
+        intervention = SimulationIntervention(
+            run_id, request.kind, request.stateDelta, request.rationale,
+            author=request.author,
+        )
         event = repository.intervene(intervention, round_number=request.roundNumber)
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "SIMULATION_INTERVENTION", "message": str(exc)}) from exc
     return {"runId": run_id, "interventionId": intervention.id, "eventId": event.id,
             "sequence": event.sequence, "simulationTime": event.simulation_time,
+            "kind": intervention.kind, "author": intervention.author,
             "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/interventions")
+async def list_simulation_interventions(book_id: str, run_id: str, limit: int = Query(100, ge=1, le=1000)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        interventions = repository.interventions(run_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_INTERVENTIONS", "message": str(exc)}) from exc
+    return {"runId": run_id, "interventions": interventions, "canonicalMutation": False}
 
 
 @app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/rounds")
@@ -4335,8 +4655,15 @@ async def execute_simulation_round(book_id: str, run_id: str, request: Simulatio
         for item in request.actions:
             if item.actorId in actions:
                 raise ValueError(f"duplicate action actor: {item.actorId}")
+            action_name = item.actionType.upper()
+            try:
+                action_type: ActionType | str = ActionType(action_name)
+            except ValueError:
+                # Preserve an unsupported author action long enough for the
+                # same validator/rejection contract used by durable tasks.
+                action_type = action_name
             actions[item.actorId] = NarrativeAction(
-                action_type=ActionType(item.actionType.upper()), actor_id=item.actorId,
+                action_type=action_type, actor_id=item.actorId,
                 actor_type=item.actorType,
                 target_ids=tuple(item.targetIds), location=item.location, intent=item.intent,
                 arguments=item.arguments, preconditions=item.preconditions, effects=item.effects,
@@ -4433,8 +4760,8 @@ async def propose_simulation_adoption(book_id: str, run_id: str, request: Simula
         )
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "SIMULATION_ADOPTION", "message": str(exc)}) from exc
-    return {"proposalId": proposal.id, "runId": run_id, "status": proposal.status,
-            "canonicalMutation": False}
+    record = _simulation_adoption_record(proposal)
+    return {"proposalId": proposal.id, **record}
 
 
 @app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/adoptions")
@@ -4448,11 +4775,13 @@ async def list_simulation_adoptions(book_id: str, run_id: str, limit: int = Quer
     except ValueError as exc:
         raise HTTPException(404, detail={"code": "SIMULATION_ADOPTIONS", "message": str(exc)}) from exc
     return {"runId": run_id, "proposals": [
-        {"id": item.id, "title": item.title, "summary": item.summary, "status": item.status,
-         "planningNodeId": item.planning_node_id, "planningRevision": item.planning_revision,
-         "createdAt": item.created_at.isoformat()}
-        for item in proposals
-    ], "canonicalMutation": False}
+        _simulation_adoption_record(
+            item,
+            chapter_intents=_simulation_chapter_intents_for_proposal(book, item.id),
+            writing_tasks=_simulation_writing_tasks_for_proposal(book, item.id),
+        ) for item in proposals
+    ],
+            "canonicalMutation": False}
 
 
 @app.post("/api/v1/books/{book_id}/simulation/adoptions/{proposal_id}/adopt")
@@ -4467,8 +4796,37 @@ async def adopt_simulation_proposal(book_id: str, proposal_id: str, request: Sim
         )
     except ValueError as exc:
         raise HTTPException(409, detail={"code": "SIMULATION_ADOPTION", "message": str(exc)}) from exc
-    return {"proposalId": proposal.id, "status": proposal.status, "planningNodeId": proposal.planning_node_id,
-            "planningRevision": proposal.planning_revision, "canonicalMutation": False}
+    record = _simulation_adoption_record(proposal)
+    return {"proposalId": proposal.id, **record}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/adoptions/{proposal_id}/edit")
+async def edit_simulation_proposal(book_id: str, proposal_id: str, request: SimulationAdoptionEditRequest):
+    book = resolve_story_graph_book(book_id)
+    row = story_repository.db.fetchone("SELECT book_id FROM simulation_adoptions WHERE id=?", (proposal_id,))
+    if row is None or str(row["book_id"]) != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_ADOPTION_NOT_FOUND", "message": "book-scoped proposal not found"})
+    try:
+        proposal = SimulationAdoptionService(story_repository.db).edit(
+            proposal_id, title=request.title, summary=request.summary, payload=request.payload,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_ADOPTION_EDIT", "message": str(exc)}) from exc
+    record = _simulation_adoption_record(proposal)
+    return {"proposalId": proposal.id, **record}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/adoptions/{proposal_id}/reject")
+async def reject_simulation_proposal(book_id: str, proposal_id: str):
+    book = resolve_story_graph_book(book_id)
+    row = story_repository.db.fetchone("SELECT book_id FROM simulation_adoptions WHERE id=?", (proposal_id,))
+    if row is None or str(row["book_id"]) != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_ADOPTION_NOT_FOUND", "message": "book-scoped proposal not found"})
+    try:
+        proposal = SimulationAdoptionService(story_repository.db).reject(proposal_id)
+    except ValueError as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_ADOPTION_REJECT", "message": str(exc)}) from exc
+    return {"proposalId": proposal.id, "status": proposal.status, "canonicalMutation": False}
 
 
 @app.post("/api/v1/books/{book_id}/simulation/adoptions/{proposal_id}/chapter-intent")
@@ -4484,6 +4842,7 @@ async def create_simulation_chapter_intent(book_id: str, proposal_id: str, reque
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "SIMULATION_CHAPTER_INTENT", "message": str(exc)}) from exc
     return {"bookId": book["id"], "proposalId": proposal_id, "intent": intent.to_dict(),
+            "chapterIntents": [intent.to_dict()],
             "savedTo": "control/runtime/chapter-intent", "canonicalMutation": False}
 
 
@@ -4527,6 +4886,12 @@ async def enqueue_simulation_writing_task(book_id: str, proposal_id: str, reques
             "write-next", project_id=project_id, book_id=authoritative_book_id,
             data={"chapter_number": request.chapterNumber, "context": request.context,
                   "count": request.count, "plan": intent.to_dict(),
+                  # Carry the adopted Planning overlay through the durable
+                  # writing handoff.  The WritingPipeline uses this id only
+                  # after an accepted StoryCommit to mark the author-owned
+                  # intent fulfilled; it never lets Simulation write Canon.
+                  "storyflow_plan_node_id": intent.source_node_ids[0]
+                  if intent.source_node_ids else None,
                   "simulation_adoption_id": proposal_id, **run_config},
             idempotency_key=f"simulation-writing:{proposal_id}:{request.chapterNumber}",
         )
@@ -4534,6 +4899,7 @@ async def enqueue_simulation_writing_task(book_id: str, proposal_id: str, reques
         raise HTTPException(409, detail={"code": "SIMULATION_WRITING_TASK", "message": str(exc)}) from exc
     return {"proposalId": proposal_id, "taskId": task["id"], "status": task["status"],
             "chapterNumber": request.chapterNumber, "intent": intent.to_dict(),
+            "writingTasks": _simulation_writing_tasks_for_proposal(book, proposal_id),
             "canonicalMutation": False}
 
 

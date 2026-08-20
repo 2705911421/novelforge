@@ -79,7 +79,7 @@ class SimulationCausalityService:
             for actor_id in actors
         }
         intervention_rows = self._database.fetchall(
-            """SELECT id, event_id, kind, rationale FROM simulation_interventions
+            """SELECT id, event_id, kind, rationale, author FROM simulation_interventions
                WHERE simulation_run_id=? ORDER BY created_at, id""",
             (run_id,),
         )
@@ -124,7 +124,12 @@ class SimulationCausalityService:
             if not selected:
                 raise ValueError(f"simulation event not found: {event_id}")
             events = selected
-        self.record_events(events)
+        # A branch's replayed ledger includes the parent prefix, but causal
+        # rows must be written under the event's owning run.  Keep the batch
+        # single-run invariant in ``record_events`` while still allowing
+        # ``traces_for_run`` to read inherited parent evidence by event id.
+        own_events = [event for event in events if event.simulation_run_id == run_id]
+        self.record_events(own_events)
         return self.traces_for_run(run_id, event_id=event_id)
 
     def causes_for_event(self, run_id: str, event_id: str, *, ensure: bool = True) -> list[CausalTrace]:
@@ -270,6 +275,7 @@ class SimulationCausalityService:
             add("intervention", intervention["id"], "author_intervention", {
                 "source": "simulation_interventions",
                 "kind": intervention["kind"],
+                "author": intervention["author"],
                 "eventId": intervention["event_id"],
             })
 
@@ -337,7 +343,7 @@ class SimulationCausalityService:
         if event.event_type == "INTERVENTION":
             event_ids.add(event.id)
         source_rows = rows if rows is not None else self._database.fetchall(
-            """SELECT id, event_id, kind, rationale FROM simulation_interventions
+            """SELECT id, event_id, kind, rationale, author FROM simulation_interventions
                WHERE simulation_run_id=? ORDER BY created_at, id""",
             (event.simulation_run_id,),
         )

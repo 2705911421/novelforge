@@ -18,7 +18,9 @@ action, targets, location, intent, arguments, effects, confidence,
 reasoning_summary, expected_effect. reasoning_summary is an auditable short
 rationale, never hidden chain-of-thought. Do not include Canon facts that are
 not present in the supplied context. A proposal is validated by the runtime;
-do not claim that it was applied."""
+do not claim that it was applied. Use `targets` only for entity ids present in
+the supplied context (never a location name or free-form prose); use the
+`location` field for a location id."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,8 +46,9 @@ class SimulationDecisionEngine:
 
     def decide(self, perception: AgentPerception, *, task_id: str, run_id: str,
                round_number: int, max_chars: int | None = None,
+               max_tokens: int | None = None,
                action_id: str | None = None) -> SimulationDecision:
-        context = self._compiler.compile(perception, max_chars=max_chars)
+        context = self._compiler.compile(perception, max_chars=max_chars, max_tokens=max_tokens)
         request = {
             "simulationRunId": run_id,
             "roundNumber": round_number,
@@ -77,12 +80,21 @@ class SimulationDecisionEngine:
         if bool(raw.get("skip")) or str(raw.get("action") or raw.get("actionType") or "").upper() in {"", "SKIP", "NONE"}:
             return SimulationDecision(None, context, dict(raw), self._generation_run_id())
         action_name = raw.get("action") or raw.get("actionType") or raw.get("action_type")
+        normalized_action = str(action_name).upper()
+        # Preserve an unknown provider action as a typed-but-invalid proposal.
+        # The round engine must let ActionValidator record a rejection (and
+        # continue the sandbox clock) instead of raising before the validator
+        # can produce durable evidence or a retryable task result.
+        try:
+            action_type: ActionType | str = ActionType(normalized_action)
+        except ValueError:
+            action_type = normalized_action
         raw_arguments: Any = raw.get("arguments")
         raw_effects: Any = raw.get("effects")
         arguments = dict(raw_arguments) if isinstance(raw_arguments, Mapping) else {}
         effects = dict(raw_effects) if isinstance(raw_effects, Mapping) else {}
         action = NarrativeAction(
-            action_type=ActionType(str(action_name).upper()),
+            action_type=action_type,
             actor_id=perception.agent_id,
             actor_type=str(raw.get("actorType") or perception.actor_type),
             target_ids=tuple(raw.get("targets") or raw.get("targetIds") or raw.get("target_ids") or ()),

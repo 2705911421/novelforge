@@ -2149,6 +2149,108 @@ def _apply_v41(conn: sqlite3.Connection) -> None:
     _execute_sql_script(conn, PHASE_41_STORYFLOW_HISTORY_SQL)
 
 
+PHASE_42_STORYFLOW_PROVENANCE_SQL = """
+-- Keep fork and intervention provenance first-class and queryable.  These
+-- columns describe Sandbox lineage only; they never become Canon state.
+ALTER TABLE simulation_branches ADD COLUMN parent_round INTEGER;
+ALTER TABLE simulation_branches ADD COLUMN fork_snapshot_hash TEXT;
+ALTER TABLE simulation_interventions ADD COLUMN author TEXT NOT NULL DEFAULT 'author';
+"""
+
+
+def _apply_v42(conn: sqlite3.Connection) -> None:
+    """Persist branch fork hashes and explicit intervention authors."""
+    _execute_sql_script(conn, PHASE_42_STORYFLOW_PROVENANCE_SQL)
+
+
+PHASE_43_STORYFLOW_ADOPTION_PROVENANCE_SQL = """
+-- Keep the simulation-to-planning handoff queryable without requiring
+-- consumers to interpret an opaque payload.  These fields remain Sandbox /
+-- Planning-overlay metadata and never write Canon tables.
+ALTER TABLE simulation_adoptions ADD COLUMN source_simulation_id TEXT;
+ALTER TABLE simulation_adoptions ADD COLUMN source_branch_id TEXT;
+ALTER TABLE simulation_adoptions ADD COLUMN source_event_range JSON NOT NULL DEFAULT '{}';
+ALTER TABLE simulation_adoptions ADD COLUMN proposed_planning_nodes JSON NOT NULL DEFAULT '[]';
+ALTER TABLE simulation_adoptions ADD COLUMN proposed_plot_threads JSON NOT NULL DEFAULT '[]';
+ALTER TABLE simulation_adoptions ADD COLUMN proposed_character_goals JSON NOT NULL DEFAULT '[]';
+ALTER TABLE simulation_adoptions ADD COLUMN proposed_foreshadows JSON NOT NULL DEFAULT '[]';
+ALTER TABLE simulation_adoptions ADD COLUMN proposed_chapter_intents JSON NOT NULL DEFAULT '[]';
+ALTER TABLE simulation_adoptions ADD COLUMN provenance JSON NOT NULL DEFAULT '{}';
+"""
+
+
+def _apply_v43(conn: sqlite3.Connection) -> None:
+    """Persist structured, auditable Adoption metadata at the handoff boundary."""
+    _execute_sql_script(conn, PHASE_43_STORYFLOW_ADOPTION_PROVENANCE_SQL)
+
+
+PHASE_44_STORYFLOW_RUN_LINEAGE_SQL = """
+-- Make Canon and branch lineage explicit on every SimulationRun.  The
+-- references are descriptive Sandbox provenance; they do not authorize a
+-- write to Canon.
+ALTER TABLE simulation_runs ADD COLUMN base_canon_event_id TEXT;
+ALTER TABLE simulation_runs ADD COLUMN branch_parent_id TEXT;
+ALTER TABLE simulation_runs ADD COLUMN branch_point_event_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_simulation_runs_branch_parent
+    ON simulation_runs(branch_parent_id)
+    WHERE branch_parent_id IS NOT NULL;
+"""
+
+
+def _apply_v44(conn: sqlite3.Connection) -> None:
+    """Persist first-class Canon and branch lineage on simulation runs."""
+    _execute_sql_script(conn, PHASE_44_STORYFLOW_RUN_LINEAGE_SQL)
+
+
+PHASE_45_STORYFLOW_HISTORY_DELETE_SQL = """
+-- Soft deletion is an append-only History action.  Rebuild the v41 table so
+-- existing databases accept DELETE while preserving every prior row.
+DROP TRIGGER IF EXISTS prevent_simulation_run_history_update;
+DROP TRIGGER IF EXISTS prevent_simulation_run_history_delete;
+DROP INDEX IF EXISTS idx_simulation_run_history_run_created;
+DROP INDEX IF EXISTS idx_simulation_run_history_book_created;
+ALTER TABLE simulation_run_history RENAME TO simulation_run_history_v41;
+
+CREATE TABLE simulation_run_history (
+    id TEXT PRIMARY KEY,
+    simulation_run_id TEXT NOT NULL REFERENCES simulation_runs(id) ON DELETE RESTRICT,
+    book_id TEXT NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL,
+    CHECK(action IN ('ARCHIVE', 'UNARCHIVE', 'DELETE'))
+);
+
+INSERT INTO simulation_run_history(id, simulation_run_id, book_id, action, reason, created_at)
+SELECT id, simulation_run_id, book_id, action, reason, created_at
+FROM simulation_run_history_v41;
+DROP TABLE simulation_run_history_v41;
+
+CREATE INDEX idx_simulation_run_history_run_created
+    ON simulation_run_history(simulation_run_id, created_at DESC, id DESC);
+CREATE INDEX idx_simulation_run_history_book_created
+    ON simulation_run_history(book_id, created_at DESC, id DESC);
+
+CREATE TRIGGER prevent_simulation_run_history_update
+BEFORE UPDATE ON simulation_run_history
+BEGIN
+    SELECT RAISE(ABORT, 'simulation run history is append-only');
+END;
+
+CREATE TRIGGER prevent_simulation_run_history_delete
+BEFORE DELETE ON simulation_run_history
+BEGIN
+    SELECT RAISE(ABORT, 'simulation run history is append-only');
+END;
+"""
+
+
+def _apply_v45(conn: sqlite3.Connection) -> None:
+    """Allow soft-delete History actions without deleting Sandbox evidence."""
+    _execute_sql_script(conn, PHASE_45_STORYFLOW_HISTORY_DELETE_SQL)
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -2202,6 +2304,10 @@ _MIGRATIONS = (
     _Migration(39, "storyflow_scheduler_cost_control", _apply_v39, PHASE_39_STORYFLOW_SCHEDULER_COST_SQL),
     _Migration(40, "storyflow_simulation_causal_trace", _apply_v40, PHASE_40_STORYFLOW_CAUSAL_TRACE_SQL),
     _Migration(41, "storyflow_simulation_history", _apply_v41, PHASE_41_STORYFLOW_HISTORY_SQL),
+    _Migration(42, "storyflow_simulation_provenance", _apply_v42, PHASE_42_STORYFLOW_PROVENANCE_SQL),
+    _Migration(43, "storyflow_adoption_provenance", _apply_v43, PHASE_43_STORYFLOW_ADOPTION_PROVENANCE_SQL),
+    _Migration(44, "storyflow_run_lineage", _apply_v44, PHASE_44_STORYFLOW_RUN_LINEAGE_SQL),
+    _Migration(45, "storyflow_history_soft_delete", _apply_v45, PHASE_45_STORYFLOW_HISTORY_DELETE_SQL),
 )
 
 _RUNTIME_EXTENSION_NAME = "narrative_runtime_v2"

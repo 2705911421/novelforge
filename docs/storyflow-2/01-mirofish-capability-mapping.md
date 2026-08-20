@@ -23,3 +23,17 @@ reference source, prompt, CSS, component, or algorithm is copied.
 | Variable injection | Intervention | intervention event table | UI | Author intervention is event-ledgered | P0 | Parent/sibling isolation test |
 | Simulation branching | SimulationBranch | prefix replay + child ledger | branch memory/checkpoint UI | Fork at immutable event sequence | P0 | A/B isolation test |
 | Future comparison | BranchComparisonService | persisted state/event comparison | nested/causal compare UI | Deterministic evidence first | P1 | Divergent event ids and state hashes |
+
+## Current implementation overlay (2026-08-20)
+
+The original audit table intentionally records the gaps observed before the
+vertical-slice work. The current tree closes the listed local gaps through
+`src/storyflow/` and the Studio Simulation workspace: immutable snapshots now
+export the recorded world collections, typed graph projection includes
+non-Agent narrative entities, profile/context/decision/scheduler/budget seams
+are durable, and Adoption reaches ChapterIntent and `write-next`. Remaining
+gaps are the explicitly separate real-provider gate, production-scale graph
+virtualization, and broad crash/provider-quality coverage; Tier C goal-trigger
+governance and replayed state-reference graph edges are now covered locally.
+Those remaining gates stay `PARTIAL` rather than being hidden by the
+historical table.

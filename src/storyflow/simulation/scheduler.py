@@ -113,8 +113,17 @@ class AgentScheduler:
             location = actor.get("location") or actor.get("territory")
             goals = actor.get("goals") or actor.get("current_priorities") or ()
             if goals:
+                # An open goal is useful ranking evidence, but it is not a
+                # dynamic trigger by itself.  Goals are usually persistent
+                # Canon data; treating their presence as a trigger would
+                # promote every passive entity to a provider slot on every
+                # round.  Authors can opt a passive Agent into goal-driven
+                # activation with ``activateOnGoal`` below.
                 reasons.append("open_goals")
                 score += 30.0
+                if self._flag(policy, "activateOnGoal", "activate_on_goal", "goalDriven", "goal_driven"):
+                    reasons.append("goal_trigger")
+                    score += 20.0
             if self._nearby_event(agent_id, location, scoped_events):
                 reasons.append("nearby_event")
                 score += 25.0
@@ -150,7 +159,7 @@ class AgentScheduler:
             dynamic_signal = any(
                 reason == "author_pinned"
                 or reason == "author_pinned_policy"
-                or reason in {"open_goals", "nearby_event", "relationship_trigger",
+                or reason in {"goal_trigger", "nearby_event", "relationship_trigger",
                               "conflict_involvement", "recent_activity"}
                 or reason.startswith("narrative_relevance:")
                 for reason in reasons
@@ -202,10 +211,23 @@ class AgentScheduler:
 
     @staticmethod
     def _policies(configuration: Mapping[str, Any]) -> Mapping[str, Any]:
-        for key in ("agentPolicies", "agent_policies", "agents"):
+        for key in ("agentPolicies", "agent_policies"):
             value = configuration.get(key)
             if isinstance(value, Mapping):
                 return value
+        # Environment Setup stores the generated roster under
+        # ``agents: {source, policies}``.  Treat the nested policies as the
+        # authoritative per-Agent configuration while keeping the legacy
+        # top-level aliases above intact.
+        agents = configuration.get("agents")
+        if isinstance(agents, Mapping):
+            nested = agents.get("policies")
+            if isinstance(nested, Mapping):
+                return nested
+            # Older callers used ``agents`` itself as the policy map.  Keep
+            # that shape working unless it is only a source marker.
+            if any(str(agent_id) not in {"source", "policies"} for agent_id in agents):
+                return agents
         return {}
 
     @staticmethod
@@ -222,6 +244,21 @@ class AgentScheduler:
         except (TypeError, ValueError):
             return default
         return value if value > 0 else default
+
+    @staticmethod
+    def _flag(policy: Mapping[str, Any], *keys: str) -> bool:
+        """Read an opt-in boolean policy without truthiness surprises."""
+        for key in keys:
+            if key not in policy:
+                continue
+            value = policy[key]
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return value != 0
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on", "always"}
+        return False
 
     @staticmethod
     def _recent_activity(agent_id: str, round_number: int, events: Iterable[SimulationEvent]) -> bool:

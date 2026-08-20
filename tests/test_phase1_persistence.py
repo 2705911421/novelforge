@@ -65,7 +65,7 @@ def _legacy_project(root, project_id="legacy", content="Markdown body"):
 
 
 def test_migration_engine_records_versions_and_rejects_checksum_tampering(phase_db):
-    assert phase_db.fetchone("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 41
+    assert phase_db.fetchone("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 45
     with phase_db.transaction() as conn:
         conn.execute("UPDATE schema_migrations SET checksum='tampered' WHERE version=2")
     with pytest.raises(MigrationError, match="checksum mismatch"):

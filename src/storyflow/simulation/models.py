@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any, ClassVar, Mapping
 import hashlib
 import json
 import uuid
@@ -15,6 +15,7 @@ from src.storyflow.world.snapshot import SimulationWorldSnapshot
 
 class SimulationRunStatus(StrEnum):
     DRAFT = "DRAFT"
+    PREPARING = "PREPARING"
     READY = "READY"
     RUNNING = "RUNNING"
     PAUSED = "PAUSED"
@@ -25,7 +26,10 @@ class SimulationRunStatus(StrEnum):
 
 
 RUN_STATUS_TRANSITIONS: dict[SimulationRunStatus, frozenset[SimulationRunStatus]] = {
-    SimulationRunStatus.DRAFT: frozenset({SimulationRunStatus.READY, SimulationRunStatus.CANCELLED}),
+    # Keep the direct DRAFT -> READY path for existing API clients while
+    # exposing the explicit preparation boundary required by StoryFlow.
+    SimulationRunStatus.DRAFT: frozenset({SimulationRunStatus.PREPARING, SimulationRunStatus.READY, SimulationRunStatus.CANCELLED}),
+    SimulationRunStatus.PREPARING: frozenset({SimulationRunStatus.READY, SimulationRunStatus.FAILED, SimulationRunStatus.CANCELLED}),
     SimulationRunStatus.READY: frozenset({SimulationRunStatus.RUNNING, SimulationRunStatus.CANCELLED}),
     SimulationRunStatus.RUNNING: frozenset({SimulationRunStatus.PAUSED, SimulationRunStatus.PAUSED_BUDGET, SimulationRunStatus.COMPLETED, SimulationRunStatus.FAILED, SimulationRunStatus.CANCELLED}),
     SimulationRunStatus.PAUSED: frozenset({SimulationRunStatus.RUNNING, SimulationRunStatus.CANCELLED}),
@@ -65,12 +69,17 @@ class SimulationRun:
     paused_at: datetime | None = None
     completed_at: datetime | None = None
     simulation_time: str | None = None
+    base_canon_event_id: str | None = None
+    branch_parent_id: str | None = None
+    branch_point_event_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.id or not self.book_id or not self.snapshot_id:
             raise ValueError("run id, book_id, and snapshot_id are required")
         if self.current_round < 0 or self.max_rounds < 1:
             raise ValueError("round values are invalid")
+        if self.branch_parent_id == self.id:
+            raise ValueError("a simulation run cannot parent itself")
         object.__setattr__(self, "configuration", _json_copy(dict(self.configuration)))
 
     def transition(self, status: SimulationRunStatus) -> "SimulationRun":
@@ -86,7 +95,8 @@ class SimulationRun:
                              self.started_at or (now if status is SimulationRunStatus.RUNNING else None),
                              now if status is SimulationRunStatus.PAUSED else self.paused_at,
                              now if status in {SimulationRunStatus.COMPLETED, SimulationRunStatus.FAILED, SimulationRunStatus.CANCELLED} else self.completed_at,
-                             self.simulation_time)
+                             self.simulation_time, self.base_canon_event_id,
+                             self.branch_parent_id, self.branch_point_event_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,12 +106,16 @@ class SimulationBranch:
     branch_run_id: str
     fork_sequence: int
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    parent_round: int | None = None
+    fork_snapshot_hash: str | None = None
 
     def __post_init__(self) -> None:
         if not self.id or not self.parent_run_id or not self.branch_run_id:
             raise ValueError("branch identifiers are required")
         if self.parent_run_id == self.branch_run_id or self.fork_sequence < 0:
             raise ValueError("invalid branch parent or fork sequence")
+        if self.parent_round is not None and self.parent_round < 0:
+            raise ValueError("branch parent round must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,10 +126,26 @@ class SimulationIntervention:
     rationale: str
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    author: str | None = "author"
+
+    ALLOWED_KINDS: ClassVar[frozenset[str]] = frozenset({
+        "EVENT", "STATE_CHANGE", "KNOWLEDGE_CHANGE", "RELATIONSHIP_CHANGE",
+        "WORLD_VARIABLE", "LOCATION_CHANGE", "GOAL_CHANGE",
+        # These aliases existed in the first vertical slice.  Normalize them
+        # to the typed contract instead of breaking persisted/API callers.
+        "SET-VARIABLE", "WEATHER",
+    })
 
     def __post_init__(self) -> None:
         if not self.simulation_run_id or not self.kind or not self.rationale:
             raise ValueError("intervention run, kind, and rationale are required")
+        normalized = str(self.kind).strip().upper()
+        if normalized not in self.ALLOWED_KINDS:
+            raise ValueError(f"unsupported intervention kind: {self.kind}")
+        aliases = {"SET-VARIABLE": "WORLD_VARIABLE", "WEATHER": "WORLD_VARIABLE"}
+        object.__setattr__(self, "kind", aliases.get(normalized, normalized))
+        author = str(self.author or "author").strip()
+        object.__setattr__(self, "author", author or "author")
 
 
 @dataclass(frozen=True, slots=True)

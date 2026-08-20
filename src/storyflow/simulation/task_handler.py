@@ -198,8 +198,16 @@ class SimulationTaskHandlers:
             if actor_id in action_map:
                 raise ValueError(f"duplicate action actor: {actor_id}")
             stable_id = f"{task['id']}:{item.get('actionId') or actor_id}"
+            action_name = str(item.get("actionType", "")).upper()
+            try:
+                action_type: ActionType | str = ActionType(action_name)
+            except ValueError:
+                # Keep an unknown model/author action typed enough to reach
+                # the durable validator.  Rejecting it in the parser would
+                # lose the round's auditable rejection evidence.
+                action_type = action_name
             action_map[actor_id] = NarrativeAction(
-                action_type=ActionType(str(item.get("actionType", "")).upper()),
+                action_type=action_type,
                 actor_id=actor_id,
                 actor_type=str(item.get("actorType", "character")),
                 target_ids=tuple(item.get("targetIds") or ()),
@@ -218,6 +226,13 @@ class SimulationTaskHandlers:
         if requested not in (None, []):
             if not isinstance(requested, list) or any(not isinstance(item, str) or not item for item in requested):
                 raise ValueError("simulation task agentIds must be a list of non-empty strings")
+            available_ids = set(self._agent_ids(state.values))
+            missing_ids = sorted(set(requested) - available_ids)
+            if missing_ids:
+                raise ValueError(
+                    "simulation task agentIds not found in the immutable snapshot: "
+                    + ", ".join(missing_ids)
+                )
         # Explicit actions are author-pinned slots; provider mode uses the
         # configured tier policy when no explicit selection was supplied.
         requested_for_scheduler = requested
@@ -251,10 +266,15 @@ class SimulationTaskHandlers:
                 return self._pause_for_budget(run_id, round_number, exc, budget, activations, provider_assignment)
             context_config = run.configuration.get("context") if isinstance(run.configuration, dict) else {}
             max_chars = context_config.get("maxChars", context_config.get("max_chars")) if isinstance(context_config, dict) else None
+            max_tokens = context_config.get("maxTokens", context_config.get("max_tokens")) if isinstance(context_config, dict) else None
             try:
                 max_chars = int(max_chars) if max_chars is not None else None
             except (TypeError, ValueError):
                 raise ValueError("simulation context maxChars must be an integer") from None
+            try:
+                max_tokens = int(max_tokens) if max_tokens is not None else None
+            except (TypeError, ValueError):
+                raise ValueError("simulation context maxTokens must be an integer") from None
             decision_engine = SimulationDecisionEngine(
                 self._model_manager,
                 role=decision_role,
@@ -272,6 +292,7 @@ class SimulationTaskHandlers:
                     run_id=run_id,
                     round_number=round_number,
                     max_chars=max_chars,
+                    max_tokens=max_tokens,
                     action_id=f"{task['id']}:decision:{perception.agent_id}",
                 ).action
 
