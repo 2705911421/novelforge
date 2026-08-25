@@ -21,7 +21,7 @@ from src.storyflow.interaction.character_chat import CharacterChatService
 from src.storyflow.interaction.survey import SimulationSurveyService
 from .scheduler import AgentScheduler
 from .budget import SimulationBudgetController, SimulationBudgetExceeded
-from .provider_routing import SimulationProviderAssignment
+from .provider_routing import SimulationCapabilityRouter, SimulationProviderAssignment
 
 
 class SimulationTaskHandlers:
@@ -185,9 +185,21 @@ class SimulationTaskHandlers:
                                else SimulationProviderAssignment.from_configuration(run.configuration))
         memory_provider_id = provider_assignment.provider_for("memory")
         embedding_provider_id = provider_assignment.provider_for("embedding")
-        if (memory_provider_id or embedding_provider_id) and self._model_manager is None:
-            capability = "memory" if memory_provider_id else "embedding"
-            raise ValueError(f"SIMULATION_{capability.upper()}_PROVIDER_UNAVAILABLE: no durable model manager is configured")
+        if decision_mode == "provider":
+            if self._model_manager is None:
+                raise ValueError("SIMULATION_PROVIDER_UNAVAILABLE: no durable model manager is configured")
+            SimulationCapabilityRouter.validate_assignment(
+                self._model_manager, provider_assignment, "agent_decision"
+            )
+        for capability, provider_id in (("memory", memory_provider_id), ("embedding", embedding_provider_id)):
+            if provider_id:
+                if self._model_manager is None:
+                    raise ValueError(
+                        f"SIMULATION_{capability.upper()}_PROVIDER_UNAVAILABLE: no durable model manager is configured"
+                    )
+                SimulationCapabilityRouter.validate_assignment(
+                    self._model_manager, provider_assignment, capability
+                )
         action_map: dict[str, NarrativeAction] = {}
         for item in actions:
             if not isinstance(item, dict):
@@ -253,8 +265,6 @@ class SimulationTaskHandlers:
         if decision_mode == "provider" or memory_provider_id or embedding_provider_id:
             budget = SimulationBudgetController(self._repository, run, round_number=round_number, task_id=task["id"])
         if decision_mode == "provider":
-            if self._model_manager is None:
-                raise ValueError("SIMULATION_PROVIDER_UNAVAILABLE: no durable model manager is configured")
             all_agents = self._agent_ids(state.values)
             if not all_agents:
                 raise ValueError("SIMULATION_PROVIDER_NO_AGENTS: no sandbox agents")

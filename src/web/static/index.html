@@ -226,12 +226,32 @@ select.input{cursor:pointer}
 </style>
 <link rel="stylesheet" href="/static/studio-theme.css?v=20260814-paper-default-1" onerror="this.onerror=null;this.href='studio-theme.css'">
 <link rel="stylesheet" href="/static/storyflow.css?v=20260820-simulation-audit-4" onerror="this.onerror=null;this.href='storyflow.css'">
+<link rel="stylesheet" href="/static/studio-shell.css?v=20260821-workbench-5" onerror="this.onerror=null;this.href='studio-shell.css'">
 </head>
 <body>
 <button class="mobile-nav-toggle" id="mobile-nav-toggle" type="button" aria-controls="studio-sidebar" aria-expanded="false"><span class="mobile-nav-icon" aria-hidden="true"></span><span>导航</span></button>
 <div class="mobile-nav-backdrop" id="mobile-nav-backdrop"></div>
-<div class="app">
-<aside class="sidebar" id="studio-sidebar">
+<div class="app studio-shell" id="studio-shell">
+<header class="studio-global-bar" id="studio-global-bar" role="banner">
+  <div class="studio-global-brand" aria-label="NovelForge Studio">NovelForge <small>Workbench</small></div>
+  <button class="studio-global-project" id="studio-global-project" type="button" title="打开作品浏览器">
+    <span class="studio-global-project-mark" aria-hidden="true">—</span>
+    <span class="studio-global-project-name">未选择作品</span>
+  </button>
+  <span class="studio-global-route" id="studio-global-route" aria-live="polite">Dashboard</span>
+  <span class="studio-global-spacer"></span>
+  <div class="studio-global-actions" role="toolbar" aria-label="工作区命令">
+    <button class="studio-global-action" type="button" data-shell-action="command" title="打开命令面板（Ctrl+K）">⌘K 命令</button>
+    <button class="studio-global-action" type="button" data-shell-action="panels" title="打开或关闭工作区面板">面板</button>
+    <button class="studio-global-action" type="button" data-shell-action="focus" title="切换专注模式（Ctrl+Shift+F）">专注</button>
+    <button class="studio-global-action" type="button" data-shell-action="outer-inspector" title="打开外层 Inspector" aria-pressed="false">Inspector</button>
+  </div>
+</header>
+<div class="studio-workbench" id="studio-workbench">
+<aside class="studio-activity-bar" id="studio-activity-bar" aria-label="工作区 Activity Bar">
+  <nav class="studio-activity-nav" id="studio-activity-nav"></nav>
+</aside>
+<aside class="sidebar studio-explorer" id="studio-sidebar">
 <div class="sidebar-header">
 <h1>NovelForge</h1>
 <p>AI 长篇小说创作平台</p>
@@ -242,9 +262,13 @@ select.input{cursor:pointer}
 <span id="conn-text">实时同步就绪</span>
 </div>
 </aside>
-<main class="main">
+<main class="main studio-main">
 <div id="page" style="display:flex;flex-direction:column;height:100%;overflow:hidden"></div>
 </main>
+<aside class="studio-shell-inspector" id="studio-shell-inspector" aria-label="Workspace Inspector" hidden></aside>
+</div>
+<section class="studio-bottom-panel" id="studio-bottom-panel" aria-label="Bottom Panel" hidden></section>
+<button class="studio-focus-exit" type="button" data-shell-action="focus-exit" title="退出专注模式">退出专注</button>
 </div>
 <div class="toast-wrap" id="toasts"></div>
 <div id="modal-root"></div>
@@ -360,7 +384,7 @@ const modelWork = (() => {
   let collapsed = false;
   try { collapsed = window.localStorage.getItem(collapsedKey) === '1'; } catch (_) {}
 
-  const activeStatuses = new Set(['queued', 'running', 'waiting_on_child', 'paused', 'cancelling']);
+  const activeStatuses = new Set(['queued', 'pending', 'running', 'waiting_on_child', 'paused', 'cancelling']);
   const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'needs_author_decision']);
 
   function routeLabel(method, path, body) {
@@ -431,7 +455,7 @@ const modelWork = (() => {
 
   function taskStatus(task) {
     if (!task) return '模型请求处理中';
-    if (task.status === 'queued') return '等待 Worker 领取';
+    if (task.status === 'queued' || task.status === 'pending') return '等待 Worker 领取';
     if (task.status === 'paused') return '已暂停，等待恢复';
     if (task.status === 'cancelling') return '正在安全取消';
     if (task.status === 'failed') return '处理失败';
@@ -442,7 +466,7 @@ const modelWork = (() => {
 
   function determinate(task, progress) {
     if (!task) return false;
-    if (task.status === 'queued' || task.status === 'completed') return progress !== null;
+    if (task.status === 'queued' || task.status === 'pending' || task.status === 'completed') return progress !== null;
     const stage = task.stage || task.checkpoint?.stage;
     return progress !== null && progress > 0 && stage && !['running', 'queued'].includes(stage);
   }
@@ -452,7 +476,7 @@ const modelWork = (() => {
     const isDeterminate = determinate(task, progress);
     const width = progress === null ? 0 : progress;
     const compact = options.compact ? ' model-work-inline-compact' : '';
-    const progressText = isDeterminate ? `${progress}%` : (task?.status === 'queued' ? '等待领取' : '处理中');
+    const progressText = isDeterminate ? `${progress}%` : (task?.status === 'queued' || task?.status === 'pending' ? '等待领取' : '处理中');
     return `<div class="model-work-inline${compact}">
       <div class="model-work-inline-head"><b>${esc(label || taskLabel(task))}</b><span>${esc(taskStatus(task))}</span></div>
       <div class="model-work-track"><div class="model-work-fill${isDeterminate ? '' : ' is-indeterminate'}" style="width:${isDeterminate ? width : 36}%"></div></div>
@@ -489,13 +513,22 @@ const modelWork = (() => {
     if (!task || item.request) return detail;
     if (task.status === 'running') return `<button type="button" class="btn btn-sm btn-secondary" onclick="modelWork.controlTask('${escAttr(item.id)}','pause')">暂停</button><button type="button" class="btn btn-sm btn-danger" onclick="modelWork.controlTask('${escAttr(item.id)}','cancel')">停止</button>${detail}`;
     if (task.status === 'paused') return `<button type="button" class="btn btn-sm btn-primary" onclick="modelWork.controlTask('${escAttr(item.id)}','resume')">继续</button><button type="button" class="btn btn-sm btn-danger" onclick="modelWork.controlTask('${escAttr(item.id)}','cancel')">停止</button>${detail}`;
-    if (task.status === 'queued') return `<button type="button" class="btn btn-sm btn-primary" onclick="modelWork.controlTask('${escAttr(item.id)}','start')">开始</button><button type="button" class="btn btn-sm btn-danger" onclick="modelWork.controlTask('${escAttr(item.id)}','cancel')">停止</button>${detail}`;
+    if (task.status === 'queued' || task.status === 'pending') return `<button type="button" class="btn btn-sm btn-primary" onclick="modelWork.controlTask('${escAttr(item.id)}','start')">开始</button><button type="button" class="btn btn-sm btn-danger" onclick="modelWork.controlTask('${escAttr(item.id)}','cancel')">停止</button>${detail}`;
     return detail;
   }
 
   function render() {
     const root = document.getElementById('model-work-indicator');
     if (!root) return;
+    // Tasks is the authoritative full-screen control surface.  Hiding the
+    // duplicate floating card there prevents it from intercepting clicks on
+    // the table's pause/cancel/retry actions; leaving the page restores the
+    // compact global progress surface without losing the durable task row.
+    if (S.page === 'tasks') {
+      root.setAttribute('aria-hidden', 'true');
+      root.innerHTML = '';
+      return;
+    }
     const visible = [...items.values()].filter((item) => !item.finished);
     if (!visible.length) {
       root.setAttribute('aria-hidden', 'true');
@@ -514,7 +547,7 @@ const modelWork = (() => {
         const status = taskStatus(task);
         return `<div class="model-work-item"><div class="model-work-item-head"><b>${esc(taskLabel(task, item.label))}</b><span>${esc(status)}</span></div>
           <div class="model-work-track" role="progressbar" aria-label="${esc(taskLabel(task, item.label))}" aria-valuemin="0" aria-valuemax="100"${isDeterminate ? ` aria-valuenow="${width}"` : ' aria-valuetext="模型正在处理"'}><div class="model-work-fill${isDeterminate ? '' : ' is-indeterminate'}" style="width:${isDeterminate ? width : 36}%"></div></div>
-          <div class="model-work-item-foot"><span>${esc(stage)}</span><span>${isDeterminate ? `${width}%` : '处理中'}</span></div><div class="model-work-actions">${taskControls(item)}</div></div>`;
+          <div class="model-work-item-foot"><span>${esc(item.error || stage)}</span><span>${isDeterminate ? `${width}%` : '处理中'}</span></div>${item.error ? `<div class="dim-note" style="color:var(--error)">状态读取失败，正在重试：${esc(item.error)}</div>` : ''}<div class="model-work-actions">${taskControls(item)}</div></div>`;
       }).join('')}</div>
       ${visible.length > 5 ? '<div class="model-work-more">还有任务在后台运行，可在「任务管理」中查看全部。</div>' : ''}
     </section>`;
@@ -545,8 +578,9 @@ const modelWork = (() => {
       item.polling = true;
       const poll = async () => {
         try {
-          const task = await api('GET', '/tasks/' + encodeURIComponent(taskId));
+          const task = await api('GET', '/tasks/' + encodeURIComponent(taskId), undefined, undefined, { background: true });
           item.task = task;
+          item.error = '';
           if (terminalStatuses.has(task.status)) {
             items.delete(taskId);
             render();
@@ -572,7 +606,7 @@ const modelWork = (() => {
     restoredScope = scope;
     try {
       const query = S.book ? `?projectId=${encodeURIComponent(S.book)}` : '';
-      const data = await api('GET', '/tasks' + query);
+      const data = await api('GET', '/tasks' + query, undefined, undefined, { background: true });
       (data.tasks || []).filter((task) => activeStatuses.has(task.status) && MODEL_TASK_TYPES.has(task.type)).slice(0, 8)
         .forEach((task) => attachTask(task.id, task.displayName || task.operationLabel, task));
     } catch (_) {
@@ -607,12 +641,63 @@ const modelWork = (() => {
 })();
 window.modelWork = modelWork;
 
+// ===== Legacy page async lifecycle =====
+// Durable tasks intentionally outlive a page, but the legacy page watcher,
+// request and timer must not.  StudioShell aborts this signal on navigation;
+// these helpers make that boundary explicit for code that predates the shell.
+function pageSignal(signal) {
+  return signal || window.__studioWorkspaceSignal || null;
+}
+function pageAbortError() {
+  const error = new Error('页面请求已取消');
+  error.name = 'AbortError';
+  return error;
+}
+function pageTimeout(callback, delay, signal) {
+  const scopedSignal = pageSignal(signal);
+  if(scopedSignal?.aborted)return null;
+  let timer=0;
+  const onAbort=()=>{if(timer)window.clearTimeout(timer);};
+  timer=window.setTimeout(()=>{
+    scopedSignal?.removeEventListener('abort',onAbort);
+    if(!scopedSignal?.aborted)callback();
+  },delay);
+  scopedSignal?.addEventListener('abort',onAbort,{once:true});
+  return timer;
+}
+function pageSleep(delay, signal) {
+  const scopedSignal=pageSignal(signal);
+  if(scopedSignal?.aborted)return Promise.reject(pageAbortError());
+  return new Promise((resolve,reject)=>{
+    let timer=0;
+    const onAbort=()=>{
+      if(timer)window.clearTimeout(timer);
+      scopedSignal?.removeEventListener('abort',onAbort);
+      reject(pageAbortError());
+    };
+    timer=window.setTimeout(()=>{
+      scopedSignal?.removeEventListener('abort',onAbort);
+      resolve();
+    },delay);
+    scopedSignal?.addEventListener('abort',onAbort,{once:true});
+  });
+}
+
 // ===== API =====
-async function api(method, path, body, isForm){
+async function api(method, path, body, isForm, requestOptions){
   const modelLabel = modelWork.labelForRequest(method, path, body);
   const requestId = modelLabel ? modelWork.beginRequest(modelLabel) : null;
   try {
     const opts={method,headers:{}};
+    // Workspace renders own a short-lived request scope.  Interactive actions
+    // and durable task polling intentionally stay outside it so navigation
+    // cancels only stale page assembly, not background work tracking.
+    const requestSignal = requestOptions?.signal || (
+      requestOptions?.background
+        ? null
+        : (window.__studioRenderingPage ? window.__studioRenderSignal : window.__studioWorkspaceSignal)
+    );
+    if(requestSignal && !requestSignal.aborted) opts.signal=requestSignal;
     if(body && !isForm){opts.headers['Content-Type']='application/json';opts.body=JSON.stringify(body);}
     if(isForm){opts.body=body;}
     const res=await fetch('/api/v1'+path,opts);
@@ -650,7 +735,11 @@ function modal(html,large){
   const root=document.getElementById('modal-root');
   root.innerHTML=`<div class="modal-overlay" onclick="if(event.target===this)closeModal()"><div class="modal ${large?'modal-lg':''}">${html}</div></div>`;
 }
-function closeModal(){document.getElementById('modal-root').innerHTML='';}
+function closeModal(){
+  if(window._chapterEditorCleanup)window._chapterEditorCleanup();
+  if(window._chapterEditorAutoInterval){clearInterval(window._chapterEditorAutoInterval);window._chapterEditorAutoInterval=null;}
+  document.getElementById('modal-root').innerHTML='';
+}
 
 // ===== Helpers =====
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
@@ -912,7 +1001,7 @@ function toggleBookExtensions(bookId){S.expandedBooks[bookId]=true;S.expandedExt
 function loadBooksForNav(){
   if(S.books.length||window._bookNavLoading||IS_FILE_PREVIEW)return;
   window._bookNavLoading=true;
-  api('GET','/books').then(data=>{S.books=data.books||[];renderNav();}).catch(()=>{}).finally(()=>{window._bookNavLoading=false;});
+  api('GET','/books',undefined,undefined,{background:true}).then(data=>{S.books=data.books||[];renderNav();}).catch(()=>{}).finally(()=>{window._bookNavLoading=false;});
 }
 function goForBook(page,bookId){
   setActiveBook(bookId);
@@ -941,11 +1030,20 @@ http://127.0.0.1:8000/</pre></div></div>`;
 async function render(){
   const p=document.getElementById('page');
   if(IS_FILE_PREVIEW){renderFilePreview(p);return;}
+  const renderToken=window.__studioRenderToken;
+  if(renderToken!==undefined && renderToken!==window.__studioRenderToken)return;
   const fn=PAGES[S.page];
   if(!fn){p.innerHTML='<div class="content"><div class="empty-state"><h2>页面开发中</h2></div></div>';return;}
   p.innerHTML='<div class="loading"><div class="spinner"></div>加载中...</div>';
-  try{ await fn(p); }
-  catch(e){ p.innerHTML=`<div class="header"><h2>出错了</h2></div><div class="content"><div class="card"><p style="color:var(--error)">${esc(e.message)}</p></div></div>`; }
+  try{
+    await fn(p);
+    if(renderToken!==undefined && renderToken!==window.__studioRenderToken)return;
+  }
+  catch(e){
+    if(e&&e.name==='AbortError') return;
+    if(renderToken!==undefined && renderToken!==window.__studioRenderToken)return;
+    p.innerHTML=`<div class="header"><h2>出错了</h2></div><div class="content"><div class="card"><p style="color:var(--error)">${esc(e.message)}</p></div></div>`;
+  }
 }
 
 // ===== SSE =====
@@ -986,12 +1084,12 @@ PAGES.dashboard=async(p)=>{
   }
   renderNav();
   // Fetch health and tasks in parallel
-  let health=null,tasks=[];
-  try{[health,{tasks:tasks=[]}]=await Promise.all([api('GET','/health'),api('GET','/tasks').catch(()=>({tasks:[]}))]);}catch(_){}
+  let health=null,tasks=[],healthError=false;
+  try{[health,{tasks:tasks=[]}]=await Promise.all([api('GET','/health'),api('GET','/tasks').catch(()=>({tasks:[]}))]);}catch(_){healthError=true;}
   const statusCounts=tasks.reduce((a,t)=>{a[t.status]=(a[t.status]||0)+1;return a;},{});
   const activeTasks=tasks.filter(t=>['running','queued','paused'].includes(t.status));
   const totalChapters=S.books.reduce((a,b)=>a+(b.chaptersWritten||0),0);
-  const healthOk=!health||((health.checks||[]).every(c=>c.status==='ok'));
+  const healthOk=!!health&&health.status!=='unhealthy'&&((health.checks||[]).every(c=>c.status==='ok'));
   if(!S.books.length){
     p.innerHTML=header('我的创作','融合 inkOS 审查引擎与连续创作管线')+
       `<div class="content"><div class="empty-state">
@@ -1037,6 +1135,7 @@ PAGES.dashboard=async(p)=>{
       <div class="grid grid-3">${health.checks.slice(0,6).map(c=>`<div style="padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm)">
         <div class="row"><span style="font-size:16px">${c.status==='ok'?'✔':c.status==='warning'?'⚠':'✘'}</span><b class="text-sm">${esc(c.name)}</b></div>
         <p class="dim-note text-sm" style="margin-top:4px">${esc(c.message)}</p></div>`).join('')}</div></div>`:''}
+    ${healthError?`<div class="card mt16"><div class="card-title-row"><h3>系统健康</h3><button class="btn btn-sm btn-ghost" onclick="go('doctor')">重试诊断 →</button></div><p class="dim-note">健康状态读取失败，当前系统状态不能确认。</p></div>`:''}
   </div>`;
 };
 async function openBook(id){ setActiveBook(id); try{const d=await api('GET','/books');S.books=d.books||[];}catch(_){}; renderNav(); go('book'); }
@@ -1114,7 +1213,7 @@ async function doCreate(){
     toast('创建成功','success'); await openBook(r.id);
     if(creationMode==='planned'){
       const uploads=[['c-story-bible-file','story_bible'],['c-story-outline-file','reference'],['c-language-plan-file','language_plan']]; let imported=0;
-      for(const [id,sourceType] of uploads){const file=document.getElementById(id)?.files?.[0]; if(!file)continue; const form=new FormData(); form.append('file',file); form.append('sourceType',sourceType); form.append('confirmSteps','false'); const response=await fetch('/api/v1/books/'+encodeURIComponent(r.id)+'/planning-sources',{method:'POST',body:form}); if(!response.ok)throw new Error((await response.json().catch(()=>({}))).detail||response.statusText); imported++;}
+      for(const [id,sourceType] of uploads){const file=document.getElementById(id)?.files?.[0]; if(!file)continue; const form=new FormData(); form.append('file',file); form.append('sourceType',sourceType); form.append('confirmSteps','false'); await api('POST','/books/'+encodeURIComponent(r.id)+'/planning-sources',form,true); imported++;}
       if(imported){await api('POST','/books/'+r.id+'/planning-sources/prepare',{}); toast('规划资料已导入，请逐步审阅 25 步清单','success');}
       else toast('作品已创建，请先完成 25 步规划向导','info');
       go('wizard');
@@ -1202,16 +1301,16 @@ async function refreshPlanningSummary(){
       toast('当前 Studio Worker 被环境变量禁用。取消 NOVELFORGE_DISABLE_STUDIO_WORKER 并重启服务后再重试。','error');
       return;
     }
-    const r=await api('POST','/books/'+S.book+'/planning-summary/generate',{});
-    toast('已重新提交理解任务','info');watchPlanningSummary(r.taskId);
+    await api('POST','/books/'+S.book+'/planning-summary/generate',{});
+    toast('已重新提交理解任务','info');watchPlanningSummary();
   }catch(e){toast(e.message,'error');}
 }
-function watchPlanningSummary(){
+function watchPlanningSummary(signal=pageSignal()){
   if(window._planningSummaryTimer)clearTimeout(window._planningSummaryTimer);
-  window._planningSummaryTimer=setTimeout(async()=>{
-    if(S.page!=='book')return;
-    try{const r=await api('GET','/books/'+S.book+'/planning-summary');if(r.summary){render();return;}if(['queued','running'].includes(r.status))watchPlanningSummary();}catch(_){watchPlanningSummary();}
-  },1800);
+  window._planningSummaryTimer=pageTimeout(async()=>{
+    if(S.page!=='book'||signal?.aborted)return;
+    try{const r=await api('GET','/books/'+S.book+'/planning-summary',undefined,undefined,{signal});if(r.summary){render();return;}if(['queued','running'].includes(r.status))watchPlanningSummary(signal);}catch(error){if(error?.name!=='AbortError')watchPlanningSummary(signal);}
+  },1800,signal);
 }
 function stat(v,l){return `<div class="card stat-card"><div class="stat-value">${v}</div><div class="stat-label">${l}</div></div>`;}
 
@@ -1288,7 +1387,12 @@ function logLine(t){
   const d=document.createElement('div'); d.className='log-line';
   d.textContent='· '+t; box.appendChild(d); box.scrollTop=box.scrollHeight;
 }
-function stopContinuous(){ window.removeEventListener('task-update',onContUpdate); _contTask=null; logLine('已停止监听（后台任务继续运行）'); }
+function stopContinuous(){
+  window.removeEventListener('task-update',onContUpdate);
+  if(window._continuousPollTimer){window.clearTimeout(window._continuousPollTimer);window._continuousPollTimer=null;}
+  _contTask=null;
+  logLine('已停止监听（后台任务继续运行）');
+}
 async function continuousTaskAction(action){
   if(!_contTask)return;
   try{await api('POST','/tasks/'+_contTask+'/'+action);toast('任务状态已更新','success');pollTask(_contTask);}
@@ -1303,17 +1407,24 @@ function renderTaskActions(t){
   if(t.status==='failed') actions.push(`<button class="btn btn-sm btn-secondary" onclick="continuousTaskAction('retry')">重试</button>`);
   el.innerHTML=`${statusBadge(t.status)}<span class="dim-note">阶段：${esc(t.stage||'queued')}</span>${actions.join('')}`;
 }
-async function pollTask(id){
-  if(!id) return;
+async function pollTask(id, signal=window.__studioWorkspaceSignal){
+  // Continuous writing is durable server work, but this page watcher is not.
+  // Navigation or an explicit "stop listening" must prevent stale timers and
+  // detached DOM nodes from receiving later task snapshots.
+  if(!id || _contTask!==id || signal?.aborted) return;
   try{
-    const t = await api('GET','/tasks/'+id);
+    const t = await api('GET','/tasks/'+id,undefined,undefined,{signal});
+    if(_contTask!==id || signal?.aborted) return;
     if(window.modelWork) window.modelWork.attachTask(id,t.displayName||t.operationLabel||'连续创作',t);
     renderTaskProgress(t);
     renderTaskActions(t);
-    if(['queued','running','waiting_on_child','cancelling'].includes(t.status)){ setTimeout(()=>pollTask(id),2000); }
+    if(['queued','pending','running','waiting_on_child','cancelling'].includes(t.status)){ window._continuousPollTimer=pageTimeout(()=>pollTask(id,signal),2000,signal); }
     else if(t.status==='completed'){ logLine('✔ 全部完成'); renderTaskResults(t); }
     else if(t.status==='failed'){ logLine('✘ 失败: '+(t.error||'')); }
-  }catch(e){ setTimeout(()=>pollTask(id),3000); }
+  }catch(e){
+    if(signal?.aborted || _contTask!==id || e?.name==='AbortError') return;
+    window._continuousPollTimer=pageTimeout(()=>pollTask(id,signal),3000,signal);
+  }
 }
 let _lastProg='';
 function renderTaskProgress(t){
@@ -1477,11 +1588,15 @@ async function wizardSave(stepKey){
 }
 async function wizardConfirm(stepKey){
   const draft=val('wizard-draft').trim(); if(!draft)return toast('请先写下你的答案','warning');
+  const flightKey=`${S.book||''}:${stepKey}`;
+  if(S._wizardConfirmInFlight)return;
+  S._wizardConfirmInFlight=flightKey;
   try{
     await api('POST','/books/'+S.book+'/wizard/steps/'+stepKey,{draft,source:'author'});
     await api('POST','/books/'+S.book+'/wizard/steps/'+stepKey+'/confirm');
     S._wizardStepNumber=Math.min((S._wizardStepNumber||1)+1,25);toast('已确认，进入下一步','success');render();
   }catch(e){toast(e.message,'error');}
+  finally{if(S._wizardConfirmInFlight===flightKey)S._wizardConfirmInFlight='';}
 }
 async function wizardGenerate(stepKey){
   try{toast('AI 建议任务已提交','info');const r=await api('POST','/books/'+S.book+'/wizard/steps/'+stepKey+'/generate',{brief:val('wizard-draft')});if(r.suggestion){window._wizardSuggestion=r.suggestion;}render();}
@@ -1541,7 +1656,7 @@ PAGES.chapters=async(p)=>{
   const studioIntent=window.__chapterStudioIntent;
   if(studioIntent){
     window.__chapterStudioIntent=null;
-    window.setTimeout(()=>{
+    pageTimeout(()=>{
       const number=Number(studioIntent.number)||1;
       const input=document.getElementById('op-num');
       if(input)input.value=String(number);
@@ -1596,7 +1711,7 @@ async function loadChapterWorkspace(number){
 }
 function openStoryFlowView(view, focus){
   go('storyflow');
-  window.setTimeout(()=>window.storyflow?.open(view, focus), 450);
+  pageTimeout(()=>window.storyflow?.open(view, focus), 450);
 }
 function openChapterStudioAction(action, number){
   const chapterNumber=Number(number);
@@ -1622,27 +1737,33 @@ async function writeNext(){
     if(!renderPlanningGate(s,e))toast(e.message,'error');
   }
 }
-async function monitorWriteTask(tid){
-  const s=document.getElementById('wn-status'); if(!s)return;
+async function monitorWriteTask(tid, signal=pageSignal()){
+  const s=document.getElementById('wn-status'); if(!s||signal?.aborted)return;
   try{
-    const t=await api('GET','/tasks/'+tid); S.activeTasks[tid]=t;
+    const t=await api('GET','/tasks/'+tid,undefined,undefined,{signal});
+    if(signal?.aborted)return;
+    S.activeTasks[tid]=t;
     if(window.modelWork) window.modelWork.attachTask(tid,'章节写作',t);
     const detail=t.error||t.error_code||(typeof t.progress==='string'&&t.progress)||t.status||'处理中';
     const failed=t.status==='failed'||t.status==='needs_author_decision';
     s.innerHTML=`<div class="warn-banner"${failed?' style="border-color:var(--error);color:var(--error)"':''}>✍ 任务 ${esc(t.id)}：${esc(detail)}</div>`;
-    if(['queued','running','paused','cancelling'].includes(t.status)) setTimeout(()=>monitorWriteTask(tid),2000);
+    if(['queued','pending','running','paused','cancelling'].includes(t.status)) pageTimeout(()=>monitorWriteTask(tid,signal),2000,signal);
     else if(t.status==='completed'){localStorage.removeItem(WRITE_TASK_KEY+S.book);toast('新章节完成','success');go('chapters');}
   }catch(e){
+    if(e?.name==='AbortError'||signal?.aborted)return;
     s.innerHTML=`<div class="warn-banner" style="border-color:var(--error);color:var(--error)">✘ 无法读取任务 ${esc(tid)}：${esc(e.message)}</div>`;
   }
 }
 function taskDetail(task){
   return task.error || task.error_code || task.checkpoint?.state?.message || task.stage || task.status || '处理中';
 }
-async function waitForTask(taskId, renderStatus, maxPolls=300){
-  let polls=0;
+async function waitForTask(taskId, renderStatus, maxPolls=300, signal=pageSignal()){
+  let polls=0; let lastTask=null;
   while(polls<maxPolls){
-    const task=await api('GET','/tasks/'+taskId); S.activeTasks[taskId]=task;
+    if(signal?.aborted)throw pageAbortError();
+    const task=await api('GET','/tasks/'+taskId,undefined,undefined,{signal});
+    if(signal?.aborted)throw pageAbortError();
+    lastTask=task; S.activeTasks[taskId]=task;
     if(window.modelWork) window.modelWork.attachTask(taskId,task.displayName||task.operationLabel||task.type,task);
     if(renderStatus)renderStatus(task);
     if(task.status==='completed'){if(window.modelWork)window.modelWork.finishTask(taskId);return task;}
@@ -1662,8 +1783,11 @@ async function waitForTask(taskId, renderStatus, maxPolls=300){
         if(error?.message&&/Worker/.test(error.message))throw error;
       }
     }
-    await new Promise(resolve=>setTimeout(resolve,1000));
+    await pageSleep(1000,signal);
   }
+  const timeout=new Error(`任务 ${taskId} 轮询超时（${maxPolls} 次）`);
+  timeout.code='TASK_POLL_TIMEOUT'; timeout.taskId=taskId; timeout.lastTask=lastTask;
+  throw timeout;
 }
 async function opAudit(){
   const num=+val('op-num'); const out=document.getElementById('op-out');
@@ -2011,6 +2135,49 @@ function drawScoreChart(scores){
   }).join('');
 }
 
+function renderNativeReviewChapter(chapter){
+  if(!chapter)return '<div class="card"><p class="muted">该章节还没有可供审查的已保存版本。</p></div>';
+  const review=chapter.latestReview;
+  const reviewPassed=Boolean(review?.passed)&&review?.verdict==='pass';
+  const issues=Array.isArray(review?.issues)?review.issues:[];
+  const commits=Array.isArray(chapter.pendingCommits)?chapter.pendingCommits:[];
+  const acceptable=new Set(chapter.acceptableCommitIds||[]);
+  const reviewSummary=review
+    ? `<div class="gate-box"><div class="gate ${reviewPassed?'pass':'fail'}"><div class="g-label">最新 Review</div><div class="g-val">${review.overall_score??'—'} 分</div></div><div class="gate ${reviewPassed?'pass':'fail'}"><div class="g-label">结论</div><div class="g-val">${esc(review.verdict||'待处理')}</div></div><div class="gate ${chapter.blockingIssueCount?'fail':'pass'}"><div class="g-label">阻断问题</div><div class="g-val">${chapter.blockingIssueCount||0}</div></div></div>`
+    : '<div class="warn-banner">本章还没有原生 Review。请先运行章节审查，Review 必须针对当前 ChapterVersion。</div>';
+  const issueMarkup=issues.length
+    ? `<div class="workspace-section"><b>Review 问题</b><ul>${issues.slice(0,8).map(issue=>`<li>${esc(issue.description||'未提供问题描述')} · ${esc(issue.severity||'medium')} · ${esc(issue.status||'open')}</li>`).join('')}</ul></div>`
+    : '';
+  const commitMarkup=commits.length
+    ? commits.map(commit=>{
+        const canAccept=acceptable.has(commit.id);
+        const action=canAccept&&review
+          ? `<button class="btn btn-sm btn-primary" onclick="acceptReviewedCommit('${escAttr(commit.id)}','${escAttr(review.id)}',${chapter.number})">作者确认并接受</button>`
+          : '<span class="dim-note">等待匹配的通过 Review</span>';
+        return `<div class="list-row"><span><b class="mono">${esc(commit.id)}</b><br><span class="dim-note">ChapterVersion ${esc(commit.chapterVersionId||'—')} · ${esc(commit.status||'pending')}</span></span><span>${action}</span></div>`;
+      }).join('')
+    : '<p class="muted">当前没有待接受的 StoryCommit。写作或导入流程应先持久化 pending commit，再由本工作台完成作者确认。</p>';
+  return `<div class="workspace-section"><div class="row row-wrap"><b>第 ${chapter.number} 章 · ${esc(chapter.title||'未命名')}</b><span class="dim-note">版本 ${esc(chapter.latestVersion?.version??'—')} · ${esc(chapter.latestVersion?.wordCount??0)} 字</span><span class="spacer"></span>${statusBadge(chapter.status||'draft')}</div>${reviewSummary}${issueMarkup}<div class="workspace-section"><b>待接受 StoryCommit</b>${commitMarkup}</div>${chapter.canAccept?'<div class="success-banner">Review 已通过且版本精确匹配；仍需作者明确确认后才会写入 Canon。</div>':'<div class="info-banner">Canon 接受条件：当前版本、通过 Review、无阻断问题，并由作者明确确认。</div>'}</div>`;
+}
+window.loadNativeReviewWorkspace=async function(){
+  const chapterNumber=Number(val('rw-chapter')||1);
+  const out=document.getElementById('native-review-out');
+  if(!out||!Number.isInteger(chapterNumber)||chapterNumber<1)return toast('请填写有效的章节号','warning');
+  out.innerHTML='<div class="loading"><div class="spinner"></div>正在读取本章 Review 与 Canon 接受状态…</div>';
+  try{
+    const workspace=await api('GET','/books/'+S.book+'/review-workspace?chapter='+chapterNumber,undefined,false,{background:true});
+    out.innerHTML=renderNativeReviewChapter(workspace.chapters?.[0]||null);
+  }catch(e){out.innerHTML=`<div class="warn-banner" style="border-color:var(--error);color:var(--error)">无法读取本章 Review 工作台：${esc(e.message)}</div>`;}
+};
+window.acceptReviewedCommit=async function(commitId,reviewId,chapterNumber){
+  if(!confirm(`确认接受第 ${chapterNumber} 章的 Review 结果，并将 StoryCommit 写入 Canon？`))return;
+  try{
+    const result=await api('POST','/books/'+S.book+'/chapters/'+chapterNumber+'/accept-reviewed-commit',{commitId,reviewId,authorConfirmed:true},false,{background:true});
+    toast(result.idempotent?'Canon 已确认（重复请求已幂等处理）':'Canon 已接受 StoryCommit','success');
+    await window.loadNativeReviewWorkspace();
+  }catch(e){toast(e.message,'error');}
+};
+
 // ===== 联合审查 =====
 PAGES.jointreview=async(p)=>{
   if(!S.book){go('dashboard');return;}
@@ -2018,6 +2185,10 @@ PAGES.jointreview=async(p)=>{
   const n=b.chaptersWritten||0;
   const daemon=await api('GET','/daemon').catch(()=>({}));
   let history=[]; try{history=(await api('GET','/books/'+S.book+'/joint-reviews')).reviews||[];}catch(_){ }
+  let nativeWorkspace={};
+  let nativeWorkspaceError='';
+  try{nativeWorkspace=await api('GET','/books/'+S.book+'/review-workspace?chapter='+(n||1));}catch(e){nativeWorkspaceError=e.message||'读取 Review 工作台失败';}
+  const nativeChapter=nativeWorkspace.chapters?.[0]||null;
   const daemonBanner=daemon.disabledByEnvironment
     ? '<div class="warn-banner"><b>任务 Worker 当前被环境变量禁用。</b><span>联合审查可以排队，但不会被领取。请重启 Studio 服务并取消 NOVELFORGE_DISABLE_STUDIO_WORKER。</span></div>'
     : daemon.running
@@ -2027,6 +2198,15 @@ PAGES.jointreview=async(p)=>{
   `<div class="content">
     <div class="info-banner"><b>联合审查做什么：</b><span>它不直接改正文，而是把连续章节放在一起检查，指出跨章矛盾与需要作者决定的地方。连续创作达到设定间隔时也会自动触发。</span></div>
     ${daemonBanner}
+    <div class="card">
+      <div class="card-title-row"><h3>章节 Review → Canon 接受</h3><span class="dim-note">Review 只读；Canon 变更必须经过作者确认</span></div>
+      <div class="row row-wrap" style="align-items:flex-end">
+        <div class="field" style="margin:0"><label>章节号</label><input class="input" id="rw-chapter" type="number" value="${nativeChapter?.number||n||1}" min="1" style="width:110px"></div>
+        <button class="btn btn-secondary" onclick="loadNativeReviewWorkspace()">读取本章状态</button>
+      </div>
+      ${nativeWorkspaceError?`<div class="warn-banner" style="border-color:var(--error);color:var(--error)">无法读取 Review 工作台：${esc(nativeWorkspaceError)}</div>`:''}
+      <div id="native-review-out">${renderNativeReviewChapter(nativeChapter)}</div>
+    </div>
     <div class="card">
       <div class="row row-wrap" style="align-items:flex-end">
         <div class="field" style="margin:0"><label>起始章</label><input class="input" id="jr-start" type="number" value="1" min="1" style="width:110px"></div>
@@ -2264,29 +2444,32 @@ PAGES.import=async(p)=>{
   </div><div id="imp-inspect"></div></div>`;
 };
 async function doDraftImport(){
+  const signal=pageSignal();
   const folder=document.getElementById('draft-folder'), files=[...(folder?.files||[])];
   if(!files.length)return toast('请选择初稿文件夹、文件或压缩包','error');
   const out=document.getElementById('draft-import-out'); out.textContent='正在保存初稿附件并排队分析…';
   const fd=new FormData(); const bible=document.getElementById('draft-story-bible')?.files?.[0]; const language=document.getElementById('draft-language-plan')?.files?.[0];
   if(bible)fd.append('storyBible',bible); if(language)fd.append('languagePlan',language); files.forEach(file=>fd.append('draftFiles',file,file.webkitRelativePath||file.name));
   try{const queued=await api('POST','/books/'+encodeURIComponent(S.book)+'/draft-imports',fd,true);out.textContent=`已保存 ${queued.documentIds?.length||0} 个资料，分析任务 ${queued.taskId} 排队中…`;const task=await waitForTask(queued.taskId,t=>{out.textContent=`初稿分析 ${t.status}：${taskDetail(t)}`;});if(task.status==='completed'){out.textContent='✔ 初稿偏移分析完成，可在下方查看报告。';toast('初稿分析完成','success');}else{out.textContent=`分析未完成：${task.error||taskDetail(task)}`;toast('初稿分析失败','error');}}
-  catch(e){out.textContent=e.message;toast(e.message,'error');}
-  finally{await PAGES.import(document.getElementById('page'));}
+  catch(e){if(e?.name==='AbortError')return;out.textContent=e.message;toast(e.message,'error');}
+  finally{if(!signal?.aborted&&S.page==='import')await PAGES.import(document.getElementById('page'));}
 }
 async function showDraftImportReport(importId){
   try{const data=await api('GET','/books/'+encodeURIComponent(S.book)+'/draft-imports/'+encodeURIComponent(importId));const item=data.draftImport||{},r=item.report||{};const dims=(r.drift_dimensions||[]).map(x=>`<div class="card"><b>${esc(x.dimension||'未命名')} · ${esc(x.severity||'')}</b><p class="dim-note mt8">${esc(x.impact||'')}</p><p>${esc(x.recommendation||'')}</p>${(x.evidence||[]).map(e=>`<blockquote>${esc(e.source||'')}：${esc(e.quote||'')}</blockquote>`).join('')}</div>`).join('')||'<p class="dim-note">模型没有返回具体维度问题，详见局限。</p>';const plan=r.continuation_plan||{};modal(`<div class="modal-header"><div><h3>初稿偏移分析</h3><p class="dim-note">${esc(item.status||'')} · ${esc(r.verdict||'')} · 偏移分 ${r.drift_score==null?'—':esc(r.drift_score)}</p></div><button class="close-x" onclick="closeModal()">×</button></div><p>${esc(r.summary||'暂无摘要')}</p><div class="divider"></div><h4>优先级发现</h4><div class="mt16">${dims}</div><div class="divider"></div><h4>后续调整</h4><ul style="margin-left:18px;line-height:1.9">${(plan.repair_first||[]).map(x=>`<li>先修：${esc(x)}</li>`).join('')}${(plan.next_chapters||[]).map(x=>`<li>续写：${esc(x)}</li>`).join('')}${(plan.do_not_change||[]).map(x=>`<li>保留：${esc(x)}</li>`).join('')}</ul><p class="dim-note mt16">局限：${(r.limitations||[]).map(x=>esc(x)).join('；')||'模型未补充局限。'}</p>`,true);}
   catch(e){toast(e.message,'error');}
 }
 async function retryDraftImport(importId){
-  try{const queued=await api('POST','/books/'+encodeURIComponent(S.book)+'/draft-imports/'+encodeURIComponent(importId)+'/retry');const task=await waitForTask(queued.taskId,t=>{});toast(task.status==='completed'?'初稿分析重试完成':'初稿分析重试失败',task.status==='completed'?'success':'error');await PAGES.import(document.getElementById('page'));}catch(e){toast(e.message,'error');}
+  const signal=pageSignal();
+  try{const queued=await api('POST','/books/'+encodeURIComponent(S.book)+'/draft-imports/'+encodeURIComponent(importId)+'/retry');const task=await waitForTask(queued.taskId,t=>{},300,signal);if(signal?.aborted)return;toast(task.status==='completed'?'初稿分析重试完成':'初稿分析重试失败',task.status==='completed'?'success':'error');if(S.page==='import')await PAGES.import(document.getElementById('page'));}catch(e){if(e?.name!=='AbortError')toast(e.message,'error');}
 }
 async function doImport(){
+  const signal=pageSignal();
   const f=document.getElementById('imp-file').files[0]; if(!f)return toast('请选择文件','error');
   const out=document.getElementById('imp-out'), docType=val('imp-type'); out.textContent='正在保存附件并排队…';
   const fd=new FormData(); fd.append('file',f); fd.append('docType',docType);
   try{ const queued=await api('POST','/books/'+S.book+'/documents',fd,true); out.textContent=`附件已保存，任务 ${queued.taskId} 排队中…`; const task=await waitForTask(queued.taskId,t=>{out.textContent=`解析任务 ${t.status}：${taskDetail(t)}`;}); out.textContent=`✔ 已索引 ${(task.result||{}).chunk_count??0} 个分块`; toast('文档已完成索引','success'); }
-  catch(e){ toast(e.message,'error'); }
-  finally{await PAGES.import(document.getElementById('page'));}
+  catch(e){ if(e?.name!=='AbortError')toast(e.message,'error'); }
+  finally{if(!signal?.aborted&&S.page==='import')await PAGES.import(document.getElementById('page'));}
 }
 async function searchRag(){
   const query=val('rag-query').trim(), out=document.getElementById('rag-out');
@@ -2301,10 +2484,11 @@ async function searchRag(){
   }catch(e){out.innerHTML=`<div class="warn-banner">${esc(e.message)}</div>`;}
 }
 async function retryDocument(documentId){
+  const signal=pageSignal();
   const out=document.getElementById('imp-inspect'); out.innerHTML='<div class="loading"><div class="spinner"></div>正在重新排队…</div>';
   try{const queued=await api('POST','/books/'+S.book+'/documents/'+documentId+'/retry');const task=await waitForTask(queued.taskId,t=>{out.innerHTML=`<div class="warn-banner">重试任务 ${esc(t.status)}：${esc(taskDetail(t))}</div>`;});out.innerHTML=`<div class="success-banner">已重新建立 ${(task.result||{}).chunk_count??0} 个分块。</div>`;toast('文档重试完成','success');}
-  catch(e){out.innerHTML=`<div class="warn-banner">${esc(e.message)}</div>`;}
-  finally{await PAGES.import(document.getElementById('page'));}
+  catch(e){if(e?.name!=='AbortError')out.innerHTML=`<div class="warn-banner">${esc(e.message)}</div>`;}
+  finally{if(!signal?.aborted&&S.page==='import')await PAGES.import(document.getElementById('page'));}
 }
 async function inspectDocument(documentId){
   const out=document.getElementById('imp-inspect'); out.innerHTML='<div class="loading"><div class="spinner"></div>正在读取分块…</div>';
@@ -2318,14 +2502,15 @@ PAGES.tasks=async(p)=>{
     p.innerHTML=header('任务管理','任务管理已整合到作品下，请先打开一部作品。','<button class="btn btn-primary" onclick="go(\'dashboard\')">选择作品</button>')+'<div class="content"><div class="empty-state"><h2>请选择作品</h2><p>打开作品后，这里只展示该作品的任务、提示词、模型输出与处理记录。</p></div></div>';
     return;
   }
-  let tasks=[],genRuns={};
-  try{const r=await api('GET','/tasks?projectId='+encodeURIComponent(S.book));tasks=r.tasks||[];}catch(e){tasks=[];}
+  let tasks=[],taskLoadError='';
+  try{const r=await api('GET','/tasks?projectId='+encodeURIComponent(S.book));tasks=r.tasks||[];}catch(e){taskLoadError=e.message||'无法读取持久化任务';}
   const daemon=await api('GET','/daemon').catch(()=>({}));
   const statusCounts=tasks.reduce((a,t)=>{a[t.status]=(a[t.status]||0)+1;return a;},{});
-  const activeCount=(statusCounts.running||0)+(statusCounts.queued||0)+(statusCounts.paused||0)+(statusCounts.cancelling||0);
+  const activeCount=(statusCounts.running||0)+(statusCounts.queued||0)+(statusCounts.pending||0)+(statusCounts.paused||0)+(statusCounts.cancelling||0);
   p.innerHTML=header('任务管理',`${esc(bookName())} · 持久任务队列：写作、审查、修订、连续创作等后台任务实时监控`,
     `<button class="btn btn-secondary" onclick="PAGES.tasks(document.getElementById('page'))">刷新</button>`)+
   `<div class="content">
+    ${taskLoadError?`<div class="warn-banner" style="border-color:var(--error);color:var(--error)"><b>任务状态读取失败。</b><span>${esc(taskLoadError)}</span><button class="btn btn-sm btn-secondary" onclick="PAGES.tasks(document.getElementById('page'))">重试</button></div>`:''}
     ${daemon.disabledByEnvironment?'<div class="warn-banner"><b>Studio Worker 被环境变量禁用。</b><span>排队任务会保留，但不会自动执行。请重启服务并取消 NOVELFORGE_DISABLE_STUDIO_WORKER。</span></div>':daemon.running?'<div class="success-banner">Studio Worker 正在运行，任务会从持久队列领取。</div>':'<div class="warn-banner"><b>没有运行中的 Studio Worker。</b><span>新任务会停留在队列中。</span><button class="btn btn-sm btn-secondary" onclick="startStudioDaemonForPage()">启动 Worker</button></div>'}
     <div class="grid grid-4 mb16">
       <div class="card stat-card"><div class="stat-value accent">${tasks.length}</div><div class="stat-label">总任务</div></div>
@@ -2368,7 +2553,7 @@ function renderTaskList(tasks){
     if(t.status==='paused'){actions.push(`<button class="btn btn-sm btn-primary" onclick="taskQueueAction('${t.id}','resume')">恢复</button>`);actions.push(`<button class="btn btn-sm btn-danger" onclick="taskQueueAction('${t.id}','cancel')">取消</button>`);}
     if(['failed','needs_author_decision'].includes(t.status)){actions.push(`<button class="btn btn-sm btn-secondary" onclick="taskQueueAction('${t.id}','retry')">从检查点继续</button>`);}
     if(t.status==='needs_author_decision'){actions.push(`<button class="btn btn-sm btn-danger" onclick="taskQueueAction('${t.id}','cancel')">结束任务</button>`);}
-    if(t.status==='queued'){actions.push(`<button class="btn btn-sm btn-danger" onclick="taskQueueAction('${t.id}','cancel')">取消</button>`);}
+    if(t.status==='queued'||t.status==='pending'){actions.push(`<button class="btn btn-sm btn-danger" onclick="taskQueueAction('${t.id}','cancel')">取消</button>`);}
     actions.push(`<button class="btn btn-sm btn-ghost" onclick="showTaskDetail('${t.id}')">详情</button>`);
     return `<tr data-status="${t.status}" data-type="${t.type||''}">
       <td><span class="mono">${esc((t.id||'').slice(0,12))}</span></td>
@@ -2385,7 +2570,7 @@ function filterTasks(){
   const status=document.getElementById('task-filter-status').value;
   const type=document.getElementById('task-filter-type').value;
   let filtered=window._allTasks||[];
-  if(status)filtered=filtered.filter(t=>t.status===status);
+  if(status)filtered=filtered.filter(t=>status==='queued'?['queued','pending'].includes(t.status):t.status===status);
   if(type)filtered=filtered.filter(t=>t.type===type);
   document.getElementById('task-list-container').innerHTML=renderTaskList(filtered);
 }
@@ -2508,15 +2693,15 @@ PAGES.doctor=async(p)=>{
 };
 
 // ===== Boot =====
-renderNav();
-initSSE();
-loadBooksForNav();
-if(window.modelWork) window.modelWork.restoreActiveTasks();
-// `services` was the old duplicate navigation entry. Keep existing browser
-// state usable after the navigation consolidation while preserving the
-// internal Provider/Model page for the AI 配置 action.
-const bootPage=S.page==='services'?'agent-config':S.page;
-go(S.book?bootPage:'dashboard');
+let studioLegacyBootStarted=false;
+window.__studioStartLegacyBoot=function(){
+  if(studioLegacyBootStarted)return;
+  studioLegacyBootStarted=true;
+  renderNav();
+  initSSE();
+  loadBooksForNav();
+  if(window.modelWork) window.modelWork.restoreActiveTasks();
+};
 </script>
 <script>
 (function(){
@@ -2532,10 +2717,15 @@ go(S.book?bootPage:'dashboard');
     };
     document.body.appendChild(script);
   }
-loadStudioAsset('/static/studio-enhancements.js?v=20260812-model-progress-2','studio-enhancements.js',function(){
-    loadStudioAsset('/static/studio-visual.js?v=20260814-paper-default-2','studio-visual.js',function(){
-      loadStudioAsset('/static/studio-storyflow.js?v=20260814-runtime-readiness-1','studio-storyflow.js',function(){
-        loadStudioAsset('/static/studio-simulation.js?v=20260820-simulation-audit-4','studio-simulation.js');
+  loadStudioAsset('/static/studio-shell.js?v=20260821-workbench-7','studio-shell.js',function(){
+    loadStudioAsset('/static/studio-enhancements.js?v=20260812-model-progress-2','studio-enhancements.js',function(){
+      loadStudioAsset('/static/studio-visual.js?v=20260814-paper-default-2','studio-visual.js',function(){
+        loadStudioAsset('/static/studio-storyflow.js?v=20260821-workspace-lifecycle-2','studio-storyflow.js',function(){
+          loadStudioAsset('/static/studio-simulation.js?v=20260820-simulation-audit-4','studio-simulation.js',function(){
+            if(typeof window.startStudioShell==='function') window.startStudioShell();
+            if(typeof window.__studioStartLegacyBoot==='function') window.__studioStartLegacyBoot();
+          });
+        });
       });
     });
   });

@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from .actions import ActionType, NarrativeAction
 from .context import SimulationAgentContextBundle, SimulationContextCompiler
 from .perception import AgentPerception
+from .provider_routing import SimulationCapabilityRouter, SimulationProviderAssignment
 
 
 SIMULATION_DECISION_SYSTEM = """You are a NovelForge simulation Agent decision model.
@@ -39,6 +40,15 @@ class SimulationDecisionEngine:
                  compiler: SimulationContextCompiler | None = None) -> None:
         if model_manager is None:
             raise ValueError("simulation decision model manager is required")
+        if not provider_id:
+            raise ValueError(
+                "SIMULATION_PROVIDER_ASSIGNMENT_REQUIRED: agent_decision"
+            )
+        SimulationCapabilityRouter.validate_assignment(
+            model_manager,
+            SimulationProviderAssignment(agent_decision_provider_id=provider_id),
+            "agent_decision",
+        )
         self._model_manager = model_manager
         self._role = role
         self._provider_id = provider_id

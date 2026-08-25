@@ -9,7 +9,7 @@ import json
 import uuid
 
 from src.core.database import Database
-from src.story_graph import StoryFlowPlanningService
+from src.story_graph import StoryFlowPlanningError, StoryFlowPlanningService
 from src.storyflow.simulation.repository import SimulationRepository
 
 
@@ -212,6 +212,9 @@ class SimulationAdoptionService:
         if row["status"] != "PROPOSED":
             raise ValueError(f"simulation adoption proposal is not adoptable: {row['status']}")
         proposal = self._row(row)
+        recovered = self._recover_existing_planning_node(proposal)
+        if recovered is not None:
+            return recovered
         metadata = {"simulationAdoption": {
             "proposalId": proposal.id,
             "simulationRunId": proposal.simulation_run_id,
@@ -227,15 +230,61 @@ class SimulationAdoptionService:
             "payload": dict(proposal.payload),
             "boundary": "simulation_to_planning_only",
         }}
-        _, revision, node = self._planning.add_node(
-            row["book_id"], title=row["title"], summary=row["summary"], subtype="simulation-adoption",
-            status="PLANNED", metadata=metadata, source="author", expected_revision=expected_revision,
-        )
+        deterministic_node_id = f"planning:simulation-adoption:{proposal_id}"
+        try:
+            _, revision, node = self._planning.add_node(
+                row["book_id"], title=row["title"], summary=row["summary"], subtype="simulation-adoption",
+                status="PLANNED", metadata=metadata, source="author", expected_revision=expected_revision,
+                node_id=deterministic_node_id,
+            )
+        except StoryFlowPlanningError:
+            # A second adopter may have won the revisioned workspace write
+            # after the first request's read.  Re-read the durable planning
+            # overlay and heal the adoption row instead of creating a second
+            # node or reporting an ambiguous success.
+            recovered = self._recover_existing_planning_node(proposal)
+            if recovered is not None:
+                return recovered
+            raise
         self._database.execute(
             "UPDATE simulation_adoptions SET status='ADOPTED', planning_node_id=?, planning_revision=? WHERE id=?",
             (node["id"], revision, proposal_id),
         )
         return self._row(self._database.fetchone("SELECT * FROM simulation_adoptions WHERE id=?", (proposal_id,)))
+
+    def _recover_existing_planning_node(
+        self, proposal: SimulationAdoptionProposal,
+    ) -> SimulationAdoptionProposal | None:
+        """Heal a proposal after a crash between overlay and status writes.
+
+        The planning workspace and adoption catalog share SQLite but are
+        written by separate services.  A process can therefore persist the
+        node and die before marking the proposal ``ADOPTED``.  The stable node
+        id plus provenance makes the retry idempotent; multiple matches are a
+        corruption signal and fail closed rather than choosing one silently.
+        """
+        graph, revision = self._planning.load(proposal.book_id)
+        matches: list[dict[str, Any]] = []
+        for raw_node in graph.get("nodes", []):
+            if not isinstance(raw_node, dict):
+                continue
+            metadata = raw_node.get("metadata") if isinstance(raw_node.get("metadata"), dict) else {}
+            adoption = metadata.get("simulationAdoption") if isinstance(metadata, dict) else None
+            if isinstance(adoption, dict) and adoption.get("proposalId") == proposal.id:
+                matches.append(raw_node)
+        if not matches:
+            return None
+        unique: dict[str, dict[str, Any]] = {str(node.get("id")): node for node in matches}
+        if len(unique) != 1:
+            raise ValueError(
+                f"simulation adoption has multiple planning nodes: {proposal.id}"
+            )
+        node = next(iter(unique.values()))
+        self._database.execute(
+            "UPDATE simulation_adoptions SET status='ADOPTED', planning_node_id=?, planning_revision=? WHERE id=? AND status='PROPOSED'",
+            (node["id"], revision, proposal.id),
+        )
+        return self._row(self._database.fetchone("SELECT * FROM simulation_adoptions WHERE id=?", (proposal.id,)))
 
     def edit(self, proposal_id: str, *, title: str, summary: str,
              payload: Mapping[str, Any]) -> SimulationAdoptionProposal:

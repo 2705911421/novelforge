@@ -1867,6 +1867,35 @@
       '<div class="provider-editor-body"><div id="provider-model-list" class="grid grid-2">' + pairs.map((pair) => providerModelCard(pair[0], pair[1])).join('') + '</div>' +
       '<aside class="provider-guide" aria-label="Provider 配置流程"><div class="provider-guide-kicker">配置流程</div><h3>把模型接入写作链路</h3><p>先完成一个可用 Provider，再为规划、写作和审查分配模型。</p><ol class="provider-guide-steps"><li>添加 Provider 和 Model，填写服务地址。</li><li>获取模型列表，测试连接是否正常。</li><li>保存 Agent 路由，开始使用创作管线。</li></ol><div class="provider-guide-note"><b>安全边界</b><span>API Key 只保存到受保护存储，页面不会回显。</span></div></aside></div>';
     content.prepend(providerSection);
+    const runtimeSection = document.createElement('section');
+    runtimeSection.className = 'card runtime-center-card';
+    runtimeSection.id = 'runtime-center';
+    runtimeSection.innerHTML = '<div class="loading"><div class="spinner"></div>正在读取 Runtime Plane 状态…</div>';
+    content.prepend(runtimeSection);
+    try {
+      const [registryState, capabilityState, policyState, toolState] = await Promise.all([
+        api('GET', '/runtime/registry'),
+        api('GET', '/runtime/capabilities'),
+        api('GET', '/compute/policy'),
+        api('GET', '/runtime/tools'),
+      ]);
+      const capabilities = Object.fromEntries((capabilityState.runtimes || []).map((item) => [item.runtimeType, item]));
+      const runtimeRows = (registryState.runtimes || []).map((item) => {
+        const manifest = item.manifest || {};
+        const installation = item.installation || {};
+        const capability = capabilities[manifest.runtimeType] || {};
+        const action = installation.state === 'not_installed'
+          ? '<button class="btn btn-sm btn-secondary" onclick="runtimePlaneAction(\'' + escAttr(manifest.runtimeType) + '\',\'install\')">安装 / 发现</button>'
+          : '<button class="btn btn-sm btn-ghost" onclick="runtimePlaneAction(\'' + escAttr(manifest.runtimeType) + '\',\'discover\')">重新发现</button>';
+        return '<div class="list-row runtime-row" style="align-items:flex-start"><div><b>' + esc(manifest.displayName || manifest.runtimeType) + '</b><div class="dim-note mt8">' + esc(manifest.protocol || 'unknown') + ' · ' + esc(manifest.acquisition || 'unknown') + (installation.path ? ' · ' + esc(installation.path) : '') + '</div></div><div class="spacer"></div><div style="text-align:right">' + statusBadge(installation.state || 'unknown') + '<div class="dim-note mt8">' + esc((capability.integrationGrade || '—') + ' · ' + (capability.models || []).length + ' models') + '</div>' + action + '</div></div>';
+      }).join('') || '<p class="dim-note">暂无 Runtime manifest。</p>';
+      const toolRows = (toolState.tools || []).map((tool) => '<span class="badge ' + (tool.authority === 'authority' ? 'badge-warning' : tool.authority === 'proposal' ? 'badge-info' : 'badge-muted') + '">' + esc(tool.name) + ' · ' + esc(tool.authority) + '</span>').join('');
+      runtimeSection.innerHTML = '<div class="card-title-row"><div><h2>Runtime Center / Marketplace</h2><p class="dim-note">Runtime、模型、Reasoning 与 NovelForge 领域权限分层；运行时状态来自持久化 Registry，不把 manifest 当作已就绪。</p></div><span class="badge badge-info">Control / Compute / Runtime</span></div>' +
+        '<div class="grid grid-2"><div><h3>Runtime Registry</h3>' + runtimeRows + '</div><div><h3>Compute Policy</h3><div class="kv"><span>Capability</span><b>' + esc(policyState.floor) + ' → ' + esc(policyState.preferred) + ' → ' + esc(policyState.ceiling) + '</b></div><div class="kv"><span>Critical floor</span><b>' + esc(policyState.criticalFloor) + '</b></div><div class="kv"><span>Agent self-escalation</span><b>' + (policyState.allowAgentEscalation ? '允许（需审批）' : '禁止') + '</b></div><div class="kv"><span>Budget</span><b>' + esc(String(policyState.budget?.available ?? '—')) + ' NF_CU available</b></div></div></div>' +
+        '<div class="workspace-section"><b>Tool Gateway catalog</b><div class="row row-wrap mt8">' + (toolRows || '<span class="dim-note">暂无工具</span>') + '</div><p class="dim-note mt8">Authority 工具必须同时满足任务 allowlist、Canon-write 约束、运行时批准和作者确认；Agent 不能直接写 SQLite。</p></div>';
+    } catch (error) {
+      runtimeSection.innerHTML = '<div class="warn-banner" style="border-color:var(--error);color:var(--error)"><b>Runtime Plane 状态读取失败。</b><span>' + esc(error.message || 'unknown error') + '</span></div>';
+    }
     const routeList = p.querySelector('#agent-route-list');
     if (routeList) {
       const roles = config.roles || Object.keys(MODEL_ROLES);
@@ -1898,6 +1927,15 @@
     if (mcpEnvironment) mcpEnvironment.placeholder = '每行填写一项，敏感值使用环境变量名';
     const mcpHeaders = content.querySelector('#mcp-headers');
     if (mcpHeaders) mcpHeaders.placeholder = '每行填写一项请求头，敏感值使用环境变量名';
+  };
+
+  window.runtimePlaneAction = async function (runtimeType, action) {
+    try {
+      const result = await api('POST', '/runtime/' + encodeURIComponent(runtimeType) + '/' + action, action === 'install' ? { approved: true } : undefined);
+      toast((result.installation?.state || 'runtime state updated') + ' · ' + runtimeType, 'success');
+      const page = document.getElementById('page');
+      if (page && typeof PAGES['agent-config'] === 'function') await PAGES['agent-config'](page);
+    } catch (error) { toast(error.message || 'Runtime operation failed', 'error'); }
   };
   // Deep links and old scripts may still call services; render the unified page.
   PAGES.services = PAGES['agent-config'];

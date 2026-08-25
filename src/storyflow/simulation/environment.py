@@ -43,7 +43,8 @@ class SimulationConfigurationGenerator:
 
         initial_location = self._initial_location(characters, factions, locations)
         existing = deepcopy(dict(run.configuration))
-        clock = existing.get("clock") if isinstance(existing.get("clock"), Mapping) else {}
+        clock_value = existing.get("clock")
+        clock: Mapping[str, Any] = clock_value if isinstance(clock_value, Mapping) else {}
         world_rules = world.get("world_rules", world.get("worldRules", {}))
         if not isinstance(world_rules, Mapping):
             world_rules = {}

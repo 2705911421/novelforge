@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from src.core.config import Config
 from src.core.database import Database
+from src.core.models import Character, Faction, Location
 from src.core.project import ProjectManager
 from src.core.story_repository import StoryRepository
 from src.core.task_runtime import TaskRuntime
@@ -88,6 +89,30 @@ def test_planning_import_is_durable_and_generates_read_only_views(tmp_path, monk
     assert {row["filename"] for row in sources} == {"玖安余陈_故事圣经_总整理_20260621.md", "语言规划_玖安余陈.md"}
     assert any("记忆与真相" in row["content"] for row in sources)
     assert db.count("story_architecture_views", "project_id=?", (book_id,)) == 4
+
+
+def test_authoritative_legacy_project_save_upserts_entities_without_composite_unique_indexes(tmp_path, monkeypatch):
+    _studio, db, repository, manager, _runtime = _studio_workspace(tmp_path, monkeypatch)
+    project = manager.create_project("兼容项目写入")
+    project.characters["测试角色"] = Character(
+        name="测试角色", description="角色描述", personality="克制", background="背景"
+    )
+    project.factions["测试势力"] = Faction(
+        name="测试势力", description="势力描述", leader="领袖", goals=["目标"]
+    )
+    project.locations["测试地点"] = Location(
+        name="测试地点", description="地点描述", type="city", significance="重要"
+    )
+
+    manager.save_project(project)
+    manager.save_project(project)
+
+    book = repository.book_for_project(project.id)
+    assert book is not None
+    book_id = book["id"]
+    assert db.count("characters", "book_id=? AND name=?", (book_id, "测试角色")) == 1
+    assert db.count("factions", "book_id=? AND name=?", (book_id, "测试势力")) == 1
+    assert db.count("locations", "book_id=? AND name=?", (book_id, "测试地点")) == 1
 
 
 def test_thought_http_entry_persists_answer_and_queues_follow_up(tmp_path, monkeypatch):

@@ -1,12 +1,16 @@
 """Legacy-compatible FastAPI routes backed by the durable Studio runtime."""
 
 import os
+import secrets
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, FileResponse
     from pydantic import BaseModel
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
 except ImportError:
     raise ImportError("需要安装 fastapi 和 uvicorn: pip install fastapi uvicorn")
 
@@ -20,6 +24,40 @@ from ..llm.model_runtime import build_model_runtime
 
 app = FastAPI(title="NovelForge", description="AI小说创作平台")
 
+# Keep the legacy-compatible surface under the same deployment boundary as
+# Studio. This bearer-key gate is intentionally small: it is not a substitute
+# for user/role identity, but it prevents the old UI/API from becoming an
+# unauthenticated bypass when the Workbench is protected.
+_NOVELFORGE_API_KEY = os.environ.get("NOVELFORGE_API_KEY")
+_NOVELFORGE_DEPLOYMENT_MODE = os.environ.get(
+    "NOVELFORGE_DEPLOYMENT_MODE",
+    os.environ.get("NOVELFORGE_ENV", "development"),
+).strip().lower()
+_NOVELFORGE_AUTH_REQUIRED = bool(_NOVELFORGE_API_KEY) or _NOVELFORGE_DEPLOYMENT_MODE in {
+    "production", "prod", "staging",
+}
+
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    """Fail-closed bearer-key protection for the legacy HTTP surface."""
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/api/health":
+            return await call_next(request)
+        if not _NOVELFORGE_AUTH_REQUIRED:
+            return await call_next(request)
+        if not _NOVELFORGE_API_KEY:
+            return JSONResponse({"error": "AUTH_CONFIGURATION_MISSING"}, status_code=503)
+        authorization = request.headers.get("Authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        if token and secrets.compare_digest(token, _NOVELFORGE_API_KEY):
+            return await call_next(request)
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+
+if _NOVELFORGE_AUTH_REQUIRED:
+    app.add_middleware(APIKeyMiddleware)
+
 # 全局实例
 workspace_root = Path(os.environ.get("NOVELFORGE_ROOT", Path.cwd())).resolve()
 config = Config(project_path=str(workspace_root))
@@ -32,9 +70,35 @@ except Exception:
     model_runtime = None
 
 
+@asynccontextmanager
+async def legacy_lifespan(_app):
+    """Keep the compatibility surface on the same durable startup boundary."""
+    task_runtime.recover_expired_leases()
+    projection = story_repository.ensure_projection_freshness()
+    app.state.projection = projection
+    try:
+        yield
+    finally:
+        app.state.projection = None
+
+
+# ``app`` is created before the legacy-compatible globals so imports remain
+# cheap and test fixtures can replace the database seam.  Install the
+# lifespan after those globals exist; FastAPI's router owns the active context.
+app.router.lifespan_context = legacy_lifespan
+
+
 def _config_int(section: str, key: str, default: int) -> int:
     value = config.get(section, key, default=default)
     return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _authoritative_book_id(project_id: str) -> str:
+    """Resolve the durable book scope used by worker-facing legacy routes."""
+    book = story_repository.book_for_project(project_id)
+    if not book:
+        raise HTTPException(409, "项目没有 authoritative book")
+    return str(book["id"])
 
 
 class CreateProjectRequest(BaseModel):
@@ -72,6 +136,12 @@ async def index():
     return DASHBOARD_HTML
 
 
+@app.get("/api/health")
+async def liveness_check():
+    """Minimal public liveness probe without database or runtime details."""
+    return {"status": "ok", "service": "novelforge-legacy"}
+
+
 @app.get("/api/projects")
 async def list_projects():
     """列出所有项目"""
@@ -100,8 +170,9 @@ async def run_wizard(project_id: str, req: WizardRequest):
     project = project_mgr.load_project(project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
+    book_id = _authoritative_book_id(project_id)
     task = task_runtime.enqueue(
-        "world-bootstrap", project_id=project_id, book_id=project_id, data={"brief": req.user_input}
+        "world-bootstrap", project_id=project_id, book_id=book_id, data={"brief": req.user_input}
     )
     return {"taskId": task["id"], "status": task["status"], "message": "世界观任务已排队"}
 
@@ -173,6 +244,36 @@ async def get_task(task_id: str):
     if not task:
         raise HTTPException(404, "任务不存在")
     return task
+
+
+def _legacy_task_control(task_id: str, operation: str):
+    """Expose the same durable task state machine to the compatibility UI."""
+    try:
+        return getattr(task_runtime, operation)(task_id)
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    except TaskStateError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/tasks/{task_id}/pause")
+async def pause_task(task_id: str):
+    return _legacy_task_control(task_id, "pause")
+
+
+@app.post("/api/tasks/{task_id}/resume")
+async def resume_task(task_id: str):
+    return _legacy_task_control(task_id, "resume")
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    return _legacy_task_control(task_id, "cancel")
+
+
+@app.post("/api/tasks/{task_id}/retry")
+async def retry_task(task_id: str):
+    return _legacy_task_control(task_id, "retry")
 
 
 @app.get("/api/projects/{project_id}/export")

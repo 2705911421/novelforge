@@ -367,6 +367,7 @@ def test_world_snapshot_builder_exports_recorded_states_and_story_obligations(tm
     snapshot = WorldSnapshotBuilder(database).build("book-1")
     assert snapshot.story_state_version == 4
     assert snapshot.planning_snapshot_id == "planning-snapshot-2"
+    assert snapshot.planning_snapshot_hash is not None
     assert len(snapshot.planning_snapshot_hash) == 64
     assert snapshot.world["factions"]["f"]["territory"] == {"room": "controlled"}
     assert snapshot.world["faction_states"]["f"]["power_level"] == "strong"
@@ -475,9 +476,11 @@ def test_rebuild_simulation_state_ignores_deleted_derived_projections(tmp_path):
     assert rebuilt.event_sequence == expected.event_sequence == 1
     assert restored_graph.state_hash == graph.state_hash == expected.state_hash
     assert restored_graph.evidence["canonicalMutation"] is False
-    assert database.fetchone(
+    projection_meta = database.fetchone(
         "SELECT state_hash FROM simulation_graph_projection_meta WHERE simulation_run_id=?", ("rebuild-run",)
-    )["state_hash"] == expected.state_hash
+    )
+    assert projection_meta is not None
+    assert projection_meta["state_hash"] == expected.state_hash
 
 
 def test_event_ledger_rejects_duplicate_sequence(tmp_path):
@@ -781,7 +784,7 @@ def test_provider_decision_engine_returns_typed_action_and_generation_provenance
     state = SimulationWorldState.from_snapshot(snapshot)
     perception = PerceptionBuilder().build("a", state)
     manager = _ProviderDecisionManager()
-    decision = SimulationDecisionEngine(manager).decide(
+    decision = SimulationDecisionEngine(manager, provider_id="provider-a").decide(
         perception, task_id="task-1", run_id="run-1", round_number=1,
         action_id="task-1:decision:a",
     )
@@ -943,7 +946,7 @@ def test_provider_simulation_round_fails_closed_without_route_or_events(tmp_path
         runtime, SimulationTaskHandlers(database, model_manager=manager).mapping(), retry_delay_seconds=0,
     ).execute_once("provider-fail-worker"))
     assert result["status"] == "failed"
-    assert result["error_code"] == "MODEL_ROUTE_UNAVAILABLE"
+    assert result["error_code"] == "SIMULATION_PROVIDER_ASSIGNMENT_REQUIRED"
     assert simulations.events("provider-fail") == []
 
 
@@ -1312,7 +1315,10 @@ def test_simulation_budget_pauses_without_provider_calls_and_resumes_after_incre
     simulations = SimulationRepository(database)
     simulations.create_run(SimulationRun(
         "budget-run", "book-1", snapshot.snapshot_id, "Budget",
-        max_rounds=1, configuration={"budget": {"maxGenerationCalls": 1, "estimatedTokensPerCall": 10}},
+        max_rounds=1, configuration={
+            "budget": {"maxGenerationCalls": 1, "estimatedTokensPerCall": 10},
+            "providerAssignment": {"agentDecisionProviderId": "provider-a"},
+        },
     ))
     simulations.transition_run("budget-run", SimulationRunStatus.READY)
     simulations.transition_run("budget-run", SimulationRunStatus.RUNNING)
@@ -1400,7 +1406,8 @@ def test_provider_simulation_round_persists_generation_runs_attempts_and_context
     simulations.create_run(SimulationRun(
         "provider-persist", "book-1", snapshot.snapshot_id, "Provider persist",
         configuration={"providerAssignment": {
-            "memoryProviderId": "provider-a", "embeddingProviderId": "provider-a",
+            "agentDecisionProviderId": "provider-a", "memoryProviderId": "provider-a",
+            "embeddingProviderId": "provider-a",
         }},
     ))
     simulations.transition_run("provider-persist", SimulationRunStatus.READY)
@@ -1973,7 +1980,7 @@ def test_studio_simulation_snapshot_and_run_api_are_book_scoped(tmp_path, monkey
             facts=[{"fact_type": "event", "content": "Canon advanced"}],
             state_changes={"weather": "clear"},
         )
-        repository.accept_story_commit(commit_id)
+        repository.accept_story_commit_legacy(commit_id, reason="simulation snapshot fixture")
         canon_counts = {
             "narrative_events": fetch_required(database,
                 "SELECT COUNT(*) AS count FROM narrative_events WHERE book_id=?", (book_id,)
@@ -2083,6 +2090,10 @@ def test_studio_simulation_lifecycle_branch_intervention_and_adoption_api(tmp_pa
         assert round_response.json()["actedAgents"] == ["agent-a"]
         assert round_response.json()["checkpointId"]
         assert round_response.json()["simulationTime"] == "2000-01-02T00:00:00Z"
+        assert round_response.json()["executionMode"] == "synchronous_preview"
+        assert round_response.json()["recoverable"] is False
+        assert round_response.json()["durableTaskId"] is None
+        assert "/round-tasks" in round_response.json()["recoveryBoundary"]
         timeline = client.get(f"/api/v1/books/{book_id}/simulation/runs/{run}/events?after_sequence=0")
         assert timeline.status_code == 200
         assert len(timeline.json()["events"]) == 2

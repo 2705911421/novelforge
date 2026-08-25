@@ -11,6 +11,7 @@ import re
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
 from typing import Any, ContextManager, Iterator, Optional
 
@@ -23,6 +24,9 @@ from src.core.generation_attempts import (
     response_from_artifact,
     stable_hash,
 )
+from src.runtime.contracts import AgentTask, AgentTaskProfile, AgentRunStatus, ComputePlan, RuntimeEvent
+from src.runtime.persistence import AgentRunStore
+from src.context.bundles import ContextBundleStore
 
 from .gateway import ImageResponse, LLMConfig, LLMResponse, ModelGateway, ProviderType
 from .agent_prompts import (
@@ -169,6 +173,67 @@ class CredentialError(ModelConfigurationError):
     """A credential reference cannot be persisted or resolved."""
 
 
+_SENSITIVE_CONFIG_KEYS = frozenset({
+    "apikey",
+    "authorization",
+    "accesstoken",
+    "refreshtoken",
+    "password",
+    "secret",
+    "secretkey",
+    "credential",
+    "credentials",
+    "privatekey",
+    "signingkey",
+    "encryptionkey",
+})
+
+
+def _normalized_config_key(key: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+
+def _validate_safe_config(value: Any, *, path: str = "config") -> None:
+    """Reject secret-shaped provider/model config before it reaches SQLite.
+
+    Credentials have a dedicated protected-file or environment-reference
+    boundary.  Arbitrary nested config is still supported for non-secret
+    provider options, but a caller must not smuggle a second credential path
+    through that JSON object.
+    """
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if _normalized_config_key(key) in _SENSITIVE_CONFIG_KEYS:
+                raise ModelConfigurationError(
+                    "MODEL_CONFIGURATION",
+                    f"{path}.{key} must use apiKey or credentialEnv instead of persisted config",
+                )
+            _validate_safe_config(nested, path=f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            _validate_safe_config(nested, path=f"{path}[{index}]")
+
+
+def _redact_config(value: Any) -> Any:
+    """Keep legacy rows readable without returning any stored secret value."""
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if _normalized_config_key(key) in _SENSITIVE_CONFIG_KEYS else _redact_config(nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_config(nested) for nested in value]
+    return value
+
+
+_STAGED_CREDENTIALS: ContextVar[list[str] | None] = ContextVar(
+    "novelforge_staged_credentials", default=None,
+)
+_RETIRED_CREDENTIALS: ContextVar[list[str] | None] = ContextVar(
+    "novelforge_retired_credentials", default=None,
+)
+
+
 class CredentialStore:
     """Keep raw secrets outside SQLite using user-scoped Windows DPAPI files."""
 
@@ -271,6 +336,38 @@ class ModelRepository:
         self.db = db
         self.credentials = credentials
 
+    @contextmanager
+    def _configuration_transaction(self) -> Iterator[Any]:
+        """Make protected credential files follow the SQLite transaction."""
+        staged: list[str] = []
+        retired: list[str] = []
+        token = _STAGED_CREDENTIALS.set(staged)
+        retired_token = _RETIRED_CREDENTIALS.set(retired)
+        try:
+            with self.db.transaction() as conn:
+                yield conn
+        except Exception:
+            # The DB transaction has rolled back; remove only references
+            # created by this failed configuration attempt.
+            for reference in staged:
+                self.credentials.remove(reference)
+            raise
+        else:
+            # SQLite now points at the replacement reference.  Remove only
+            # the old protected files after commit; if validation failed above
+            # the old reference remains usable and no secret is lost.
+            for reference in retired:
+                try:
+                    self.credentials.remove(reference)
+                except Exception:
+                    # Credential cleanup is best-effort after the durable
+                    # pointer has moved; a stale file must not make a
+                    # successful configuration update look like a failure.
+                    continue
+        finally:
+            _STAGED_CREDENTIALS.reset(token)
+            _RETIRED_CREDENTIALS.reset(retired_token)
+
     def configuration(self) -> dict[str, Any]:
         providers = [self._provider_dict(row) for row in self.db.fetchall(
             "SELECT * FROM model_providers ORDER BY name"
@@ -331,7 +428,7 @@ class ModelRepository:
             raise ModelConfigurationError("MODEL_CONFIGURATION", "providers, models, and routes are required")
         if not isinstance(system_prompts, dict):
             raise ModelConfigurationError("MODEL_CONFIGURATION", "systemPrompts must be an object")
-        with self.db.transaction() as conn:
+        with self._configuration_transaction() as conn:
             for item in providers:
                 self._upsert_provider(conn, item)
             for item in models:
@@ -387,10 +484,27 @@ class ModelRepository:
                     )
         return self.configuration()
 
-    def resolve(self, role: str, *, provider_id: Optional[str] = None) -> dict[str, Any]:
+    def resolve(self, role: str, *, provider_id: Optional[str] = None,
+                model_id: Optional[str] = None) -> dict[str, Any]:
         if role not in MODEL_ROLES:
             raise ModelConfigurationError("MODEL_ROUTE_UNAVAILABLE", "unknown agent role")
-        if provider_id:
+        if model_id:
+            clauses = ["(m.id=? OR m.model_id=?)", "m.enabled=TRUE", "p.enabled=TRUE"]
+            params: list[Any] = [model_id, model_id]
+            if provider_id:
+                clauses.append("p.id=?")
+                params.append(provider_id)
+            row = self.db.fetchone(
+                f"""SELECT m.*, p.name AS provider_name, p.provider_type, p.base_url, p.credential_ref,
+                          p.config AS provider_config, p.enabled AS provider_enabled,
+                          r.system_prompt AS route_system_prompt,
+                          r.system_prompt_version AS route_system_prompt_version
+                   FROM models m JOIN model_providers p ON p.id=m.provider_id
+                   LEFT JOIN agent_model_routes r ON r.model_id=m.id AND r.agent_role=?
+                   WHERE {' AND '.join(clauses)} ORDER BY m.created_at LIMIT 1""",
+                (role, *params),
+            )
+        elif provider_id:
             row = self.db.fetchone(
                 """SELECT m.*, p.name AS provider_name, p.provider_type, p.base_url, p.credential_ref,
                           p.config AS provider_config, p.enabled AS provider_enabled,
@@ -411,6 +525,17 @@ class ModelRepository:
         if not row:
             raise ModelConfigurationError("MODEL_ROUTE_UNAVAILABLE", f"no enabled model route for {role}")
         return dict(row)
+
+    def validate_provider_assignment(self, role: str, provider_id: str) -> dict[str, Any]:
+        """Validate an explicit provider before a GenerationRun is allocated.
+
+        Simulation assignments are fail-closed: resolving the enabled model and
+        credential here keeps missing/disabled configuration from falling into a
+        global role route or leaving a misleading GenerationRun behind.
+        """
+        resolved = self.resolve(role, provider_id=provider_id)
+        self.credentials.resolve(resolved.get("credential_ref"))
+        return resolved
 
     def provider(self, provider_id: str) -> dict[str, Any]:
         row = self.db.fetchone("SELECT * FROM model_providers WHERE id=?", (provider_id,))
@@ -606,6 +731,12 @@ class ModelRepository:
         ).fetchone()
         if name_conflict:
             raise ModelConfigurationError("MODEL_CONFIGURATION", "provider name is already in use")
+        config = item.get("config", {})
+        if not isinstance(config, dict):
+            raise ModelConfigurationError("MODEL_CONFIGURATION", "provider config must be an object")
+        # Validate before storing a raw API key so a rejected update cannot
+        # leave an orphaned protected credential file behind.
+        _validate_safe_config(config, path="provider.config")
         raw_key = item.get("apiKey", item.get("api_key", ""))
         env_ref = item.get("credentialEnv", item.get("credential_env", ""))
         if raw_key and env_ref:
@@ -616,13 +747,17 @@ class ModelRepository:
             if not isinstance(raw_key, str):
                 raise ModelConfigurationError("MODEL_CONFIGURATION", "API Key must be text")
             credential_ref = self.credentials.store(raw_key)
+            staged = _STAGED_CREDENTIALS.get()
+            if staged is not None:
+                staged.append(credential_ref)
         elif env_ref:
             if not isinstance(env_ref, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_ref):
                 raise ModelConfigurationError("MODEL_CONFIGURATION", "invalid credential environment variable")
             credential_ref = f"env:{env_ref}"
-        config = item.get("config", {})
-        if not isinstance(config, dict):
-            raise ModelConfigurationError("MODEL_CONFIGURATION", "provider config must be an object")
+        if existing and existing["credential_ref"] and existing["credential_ref"] != credential_ref:
+            retired = _RETIRED_CREDENTIALS.get()
+            if retired is not None:
+                retired.append(existing["credential_ref"])
         conn.execute(
             """INSERT INTO model_providers(id, name, provider_type, base_url, credential_ref, enabled, config,
                created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
@@ -653,6 +788,7 @@ class ModelRepository:
         capabilities = item.get("capabilities", [])
         if not isinstance(config, dict) or not isinstance(capabilities, list):
             raise ModelConfigurationError("MODEL_CONFIGURATION", "model config and capabilities are invalid")
+        _validate_safe_config(config, path="model.config")
         conn.execute(
             """INSERT INTO models(id, provider_id, name, model_id, capabilities, enabled, config, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
@@ -669,13 +805,14 @@ class ModelRepository:
                 "baseUrl": row["base_url"] or "", "enabled": bool(row["enabled"]),
                 "credentialConfigured": bool(row["credential_ref"]),
                 "credentialSource": "environment" if str(row["credential_ref"] or "").startswith("env:") else "protected" if row["credential_ref"] else "none",
-                "config": json.loads(row["config"] or "{}")}
+                "config": _redact_config(json.loads(row["config"] or "{}"))}
 
     @staticmethod
     def _model_dict(row: Any) -> dict[str, Any]:
         return {"id": row["id"], "providerId": row["provider_id"], "name": row["name"],
                 "modelId": row["model_id"], "enabled": bool(row["enabled"]),
-                "capabilities": json.loads(row["capabilities"] or "[]"), "config": json.loads(row["config"] or "{}")}
+                "capabilities": json.loads(row["capabilities"] or "[]"),
+                "config": _redact_config(json.loads(row["config"] or "{}"))}
 
     @staticmethod
     def _run_dict(row: Any) -> dict[str, Any]:
@@ -693,6 +830,11 @@ class PersistentModelRuntime:
         self.gateway = gateway or ModelGateway()
         self._task_id: ContextVar[Optional[str]] = ContextVar("novelforge_model_task_id", default=None)
         self._last_run_id: ContextVar[Optional[str]] = ContextVar("novelforge_model_last_run_id", default=None)
+        self._last_agent_run_id: ContextVar[Optional[str]] = ContextVar("novelforge_agent_last_run_id", default=None)
+
+    def validate_provider(self, provider_id: str, role: str) -> dict[str, Any]:
+        """Validate an explicit provider without invoking the external gateway."""
+        return self.repository.validate_provider_assignment(role, provider_id)
 
     @contextmanager
     def task_scope(self, task_id: str) -> Iterator[None]:
@@ -705,6 +847,10 @@ class PersistentModelRuntime:
     def last_generation_run_id(self) -> str | None:
         """Return the latest GenerationRun created/recovered in this task context."""
         return self._last_run_id.get()
+
+    def last_agent_run_id(self) -> str | None:
+        """Return the outer AgentRun for the latest provider invocation."""
+        return self._last_agent_run_id.get()
 
     @staticmethod
     def _build_prompt_layout(
@@ -831,12 +977,177 @@ class PersistentModelRuntime:
                 for item in (manifest.get(collection_name) or [])
             )
 
+    def _ensure_agent_task(self, task_id: str, task_type: str, role: str) -> AgentTask:
+        """Create the compatibility AgentTask envelope once per durable task."""
+        db = self.repository.db
+        existing = db.fetchone("SELECT * FROM agent_tasks WHERE task_id=?", (task_id,))
+        if existing:
+            return self._agent_task_from_row(existing, role=role, task_type=task_type)
+        durable = db.fetchone("SELECT * FROM tasks WHERE id=?", (task_id,))
+        if durable is None:
+            raise ModelConfigurationError("MODEL_TASK_NOT_FOUND", "durable task does not exist")
+        project_id = durable.get("project_id")
+        if project_id and not db.fetchone("SELECT id FROM projects WHERE id=?", (project_id,)):
+            project_id = None
+        agent_task_id = f"agent-{task_id}"
+        profile = AgentTaskProfile(role=role, task_type=task_type)
+        now = datetime.now().isoformat()
+        with db.transaction() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO agent_tasks(
+                       id, task_id, task_type, role, project_id, constraints,
+                       expected_output, input_payload, profile, status, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, '{}', 'AgentArtifact', ?, ?, 'planned', ?, ?)""",
+                (
+                    agent_task_id, task_id, task_type, role, project_id,
+                    json.dumps({"durableTaskId": task_id}, ensure_ascii=False),
+                    json.dumps(profile.to_dict(), ensure_ascii=False), now, now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM agent_tasks WHERE task_id=?", (task_id,)).fetchone()
+        return self._agent_task_from_row(dict(row), role=role, task_type=task_type)
+
+    @staticmethod
+    def _agent_task_from_row(row: dict[str, Any], *, role: str, task_type: str) -> AgentTask:
+        def decode(name: str, default: Any) -> Any:
+            try:
+                value = json.loads(row.get(name) or "")
+                return value if value is not None else default
+            except (TypeError, json.JSONDecodeError):
+                return default
+
+        profile_data = decode("profile", {})
+        if not isinstance(profile_data, dict):
+            profile_data = {}
+        profile = AgentTaskProfile(
+            role=str(profile_data.get("role") or row.get("role") or role),
+            task_type=str(profile_data.get("taskType") or row.get("task_type") or task_type),
+            allowed_tools=tuple(profile_data.get("allowedTools") or ()),
+            forbidden_tools=tuple(profile_data.get("forbiddenTools") or ()),
+            minimum_capability=str(profile_data.get("minimumCapability") or "C1"),
+            preferred_capability=str(profile_data.get("preferredCapability") or "C2"),
+            maximum_capability=str(profile_data.get("maximumCapability") or "C3"),
+            minimum_reasoning=str(profile_data.get("minimumReasoning") or "medium"),
+            preferred_reasoning=str(profile_data.get("preferredReasoning") or "high"),
+            maximum_reasoning=str(profile_data.get("maximumReasoning") or "xhigh"),
+        )
+        constraints = decode("constraints", {})
+        input_payload = decode("input_payload", {})
+        return AgentTask(
+            task_id=str(row["id"]),
+            task_type=str(row.get("task_type") or task_type),
+            role=str(row.get("role") or role),
+            project_id=row.get("project_id"),
+            chapter_id=row.get("chapter_id"),
+            intent_id=row.get("intent_id"),
+            context_bundle_id=row.get("context_bundle_id"),
+            constraints=constraints if isinstance(constraints, dict) else {},
+            expected_output=str(row.get("expected_output") or "AgentArtifact"),
+            input_payload=input_payload if isinstance(input_payload, dict) else {},
+            profile=profile,
+            parent_task_id=row.get("parent_task_id"),
+            created_at=str(row.get("created_at") or datetime.now().isoformat()),
+        )
+
+    def _start_agent_run(
+        self,
+        *,
+        agent_task: AgentTask,
+        durable_task_id: str,
+        resolved: dict[str, Any],
+        prompt_version: str,
+        context_manifest: dict[str, Any] | None,
+        reasoning: str,
+        output_budget: int,
+    ) -> tuple[AgentRunStore, str]:
+        store = AgentRunStore(self.repository.db)
+        context_bundle_id = None
+        if isinstance(context_manifest, dict):
+            candidate = context_manifest.get("bundleId") or context_manifest.get("contextBundleId")
+            if candidate and self.repository.db.fetchone("SELECT id FROM context_bundles WHERE id=?", (candidate,)):
+                context_bundle_id = str(candidate)
+            if context_bundle_id is None:
+                task_row = self.repository.db.fetchone(
+                    "SELECT project_id, book_id FROM tasks WHERE id=?", (durable_task_id,)
+                ) or {}
+                bundle = ContextBundleStore(self.repository.db).create(
+                    project_id=context_manifest.get("projectId") or task_row.get("project_id"),
+                    book_id=context_manifest.get("bookId") or task_row.get("book_id"),
+                    author_intent_snapshot=context_manifest.get("authorIntent") if isinstance(context_manifest.get("authorIntent"), dict) else {},
+                    story_bible_snapshot=context_manifest.get("storyBible") if isinstance(context_manifest.get("storyBible"), dict) else {},
+                    canon_commit=context_manifest.get("canonCommit"),
+                    planning_snapshot=context_manifest.get("planning") if isinstance(context_manifest.get("planning"), dict) else {},
+                    chapter_intent=context_manifest.get("chapterIntent") if isinstance(context_manifest.get("chapterIntent"), dict) else {},
+                    memory_evidence=[item for item in context_manifest.get("items", []) if isinstance(item, dict)],
+                    provenance={
+                        "source": "PersistentModelRuntime",
+                        "taskId": durable_task_id,
+                        "role": agent_task.role,
+                        "manifestSchemaVersion": context_manifest.get("schemaVersion", 1),
+                    },
+                )
+                context_bundle_id = bundle.bundle_id
+        plan = ComputePlan(
+            plan_id=generate_id(),
+            runtime_type="api",
+            model_id=str(resolved.get("model_id") or resolved.get("id") or "unknown"),
+            reasoning=reasoning,
+            capability="C2",
+            context_budget=max(0, len(json.dumps(context_manifest or {}, ensure_ascii=False)) * 2),
+            output_budget=max(0, int(output_budget or 0)),
+            maximum_escalation="C3",
+            rationale=("legacy PersistentModelRuntime compatibility adapter",),
+        )
+        run = store.create(
+            task=agent_task,
+            durable_task_id=durable_task_id,
+            compute_plan=plan,
+            context_bundle_id=context_bundle_id,
+            prompt_version=prompt_version,
+        )
+        run_id = str(run["id"])
+        store.append_event(
+            run_id, agent_task,
+            RuntimeEvent("api", "turn.started", {"generationRunId": None}, agent_run_id=run_id),
+        )
+        return store, run_id
+
+    @staticmethod
+    def _agent_run_failed(store: AgentRunStore, run_id: str, task: AgentTask, code: str, detail: str) -> None:
+        current = store.get(run_id) or {}
+        if current.get("status") in {AgentRunStatus.RUNNING.value, AgentRunStatus.PAUSED.value}:
+            store.transition(run_id, AgentRunStatus.FAILED.value, error_code=code, error_detail=detail)
+        store.append_event(
+            run_id, task, RuntimeEvent("api", "error", {"code": code, "detail": detail}, agent_run_id=run_id)
+        )
+
+    @staticmethod
+    def _agent_run_succeeded(store: AgentRunStore, run_id: str, task: AgentTask, response: LLMResponse) -> None:
+        artifact = {
+            "content": response.content,
+            "contentType": "markdown",
+            "model": response.model,
+            "provider": response.provider,
+        }
+        usage = {
+            "inputTokens": response.prompt_tokens,
+            "outputTokens": response.completion_tokens,
+            "totalTokens": response.tokens_used,
+            "latencyMs": response.latency_ms,
+        }
+        store.transition(run_id, AgentRunStatus.SUCCEEDED.value, usage=usage, artifacts=artifact)
+        store.append_event(
+            run_id, task,
+            RuntimeEvent("api", "turn.completed", {"artifact": artifact, "usage": usage}, agent_run_id=run_id),
+        )
+
     def invoke(self, role: str, messages: list[dict[str, Any]], system: str = "", *, json_mode: bool = False,
                provider_id: Optional[str] = None, **kwargs: Any) -> LLMResponse:
         task_id = self._task_id.get()
         if not task_id:
             raise ModelConfigurationError("MODEL_TASK_CONTEXT_REQUIRED", "model invocation requires a durable task")
-        resolved = self.repository.resolve(role, provider_id=provider_id)
+        selected_model_id = kwargs.pop("model_id", None)
+        resolved = self.repository.resolve(role, provider_id=provider_id, model_id=selected_model_id)
         route_system_prompt = _effective_route_prompt(role, resolved.get("route_system_prompt"))
         caller_system = str(system or "").strip()
         if route_system_prompt and caller_system:
@@ -845,7 +1156,11 @@ class PersistentModelRuntime:
             effective_system = route_system_prompt or caller_system or DEFAULT_AGENT_SYSTEM_PROMPTS.get(role, "")
         prompt_key = kwargs.pop("prompt_key", None) or f"agent-route:{role}:system"
         prompt_version = kwargs.pop("prompt_version", None)
+        prompt_registry = kwargs.pop("prompt_registry", None)
+        if not isinstance(prompt_registry, dict):
+            prompt_registry = None
         task_stage = str(kwargs.pop("task_stage", "") or role)
+        reasoning = str(kwargs.pop("reasoning", "high") or "high")
         context_manifest = kwargs.pop("context_manifest", None)
         if not prompt_version:
             configured_version = int(resolved.get("route_system_prompt_version") or 0)
@@ -868,6 +1183,7 @@ class PersistentModelRuntime:
             "prompt_sha256": prompt_sha256,
             "persisted_prompt_sha256": hashlib.sha256(persisted_prompt.encode("utf-8")).hexdigest(),
             "prompt_source": "agent-contract+route-override",
+            "prompt_registry": deepcopy(prompt_registry),
             "context_manifest": runtime_context_manifest,
         }
         context_hash = stable_hash(runtime_context_manifest or {})
@@ -881,13 +1197,18 @@ class PersistentModelRuntime:
             "promptVersion": prompt_version,
             "promptHash": prompt_sha256,
             "persistedPromptHash": input_reference["persisted_prompt_sha256"],
+            "promptRegistry": prompt_registry,
             "contextHash": context_hash,
             "messages": messages,
             "jsonMode": bool(json_mode),
+            "reasoning": reasoning,
             "options": kwargs,
         })
         base_idempotency_key = f"{task_id}:{task_stage}:{request_hash}"
         attempts = GenerationAttemptStore(self.repository.db)
+        agent_task: AgentTask | None = None
+        agent_store: AgentRunStore | None = None
+        agent_run_id: str | None = None
 
         def recover(existing: dict[str, Any]) -> LLMResponse:
             self._last_run_id.set(str(existing.get("generation_run_id") or "") or None)
@@ -898,6 +1219,15 @@ class PersistentModelRuntime:
             )
             if run is not None and run["status"] != "succeeded":
                 self.repository.finish_run(existing["generation_run_id"], response)
+            recovered_agent = self.repository.db.fetchone(
+                "SELECT id FROM agent_runs WHERE task_id=? AND status IN ('running', 'paused') ORDER BY started_at DESC LIMIT 1",
+                (task_id,),
+            )
+            if recovered_agent:
+                recovered_task = self._ensure_agent_task(task_id, task_stage, role)
+                recovered_store = AgentRunStore(self.repository.db)
+                self._last_agent_run_id.set(str(recovered_agent["id"]))
+                self._agent_run_succeeded(recovered_store, str(recovered_agent["id"]), recovered_task, response)
             attempts.consume(existing["id"])
             return response
 
@@ -945,11 +1275,23 @@ class PersistentModelRuntime:
             return recover(attempt)
         if runtime_context_manifest is not None:
             self.repository.attach_context_manifest(run_id, runtime_context_manifest)
+        agent_task = self._ensure_agent_task(task_id, task_stage, role)
+        agent_store, agent_run_id = self._start_agent_run(
+            agent_task=agent_task,
+            durable_task_id=task_id,
+            resolved=resolved,
+            prompt_version=str(prompt_version),
+            context_manifest=runtime_context_manifest,
+            reasoning=reasoning,
+            output_budget=int(kwargs.get("max_tokens") or 0),
+        )
+        self._last_agent_run_id.set(agent_run_id)
         try:
             secret = self.repository.credentials.resolve(resolved.get("credential_ref"))
         except CredentialError as exc:
             attempts.fail(attempt["id"], exc.code, str(exc))
             self.repository.fail_run(run_id, exc.code)
+            self._agent_run_failed(agent_store, agent_run_id, agent_task, exc.code, str(exc))
             raise
         try:
             model_config = json.loads(resolved.get("config") or "{}")
@@ -966,17 +1308,28 @@ class PersistentModelRuntime:
         except Exception as exc:
             attempts.fail(attempt["id"], "MODEL_CONFIGURATION", str(exc))
             self.repository.fail_run(run_id, "MODEL_CONFIGURATION")
+            self._agent_run_failed(agent_store, agent_run_id, agent_task, "MODEL_CONFIGURATION", str(exc))
             raise ModelConfigurationError("MODEL_CONFIGURATION", "model configuration error") from exc
         try:
             attempts.mark_requesting(attempt["id"])
             response = self.gateway.chat(provider_name, messages, effective_system, json_mode=json_mode, **kwargs)
+            if not isinstance(response, LLMResponse):
+                raise ModelConfigurationError(
+                    "PROVIDER_INVALID_RESPONSE", "model provider returned an invalid response"
+                )
+            if not response.content or not response.content.strip():
+                raise ModelConfigurationError(
+                    "PROVIDER_EMPTY_RESPONSE", "model provider returned an empty response"
+                )
         except Exception as exc:
-            code = self._error_code(exc)
+            code = getattr(exc, "code", None) or self._error_code(exc)
             attempts.fail(attempt["id"], code, str(exc))
             self.repository.fail_run(run_id, code)
+            self._agent_run_failed(agent_store, agent_run_id, agent_task, code, str(exc))
             raise ModelConfigurationError(code, "model provider invocation failed") from exc
         attempts.persist_response(attempt["id"], response)
         self.repository.finish_run(run_id, response)
+        self._agent_run_succeeded(agent_store, agent_run_id, agent_task, response)
         attempts.consume(attempt["id"])
         return response
 
@@ -1165,6 +1518,10 @@ class PersistentMultiModelManager:
 
     def last_generation_run_id(self) -> str | None:
         return self.runtime.last_generation_run_id()
+
+    def validate_provider(self, provider_id: str, role: str) -> dict[str, Any]:
+        """Expose the simulation fail-closed preflight on the manager facade."""
+        return self.runtime.validate_provider(provider_id, role)
 
     def get_client(self, role: str = "primary") -> PersistentModelClient:
         resolved_role = self._legacy_roles.get(role, role)

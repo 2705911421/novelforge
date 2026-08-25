@@ -20,8 +20,10 @@ silently become a second source of truth.
 | Tasks, leases, recovery | `TaskRuntime` | worker heartbeat / HTTP status | AUTHORITATIVE RUNTIME | lease and status transitions are fenced |
 | StoryFlow / Story Graph | `StoryGraphProjector` | StoryFlow browser views and planning overlay | READ-ONLY PROJECTION | planning nodes do not mutate Canon |
 | Planning / Story Bible | published planning snapshot | StoryFlow plan nodes, context manifest | AUTHORITATIVE PLANNING INPUT | writer receives the selected immutable snapshot |
-| Existing novel import | `CanonicalImportService` proposals + author acceptance | `canonical_imports`, `canonical_import_items` | AUTHORITATIVE WORKFLOW | proposal never creates a StoryCommit; acceptance does |
+| Existing novel import | `CanonicalImportService` proposals + author acceptance | `canonical_imports`, `canonical_import_items` | AUTHORITATIVE WORKFLOW | proposal never creates a StoryCommit; acceptance does; legacy `/import/canon` now stages chapter proposals and never copies mutable world/entity fields directly |
 | Backup and restore | `BackupManager` | backup artifacts and operation log | RECOVERY BOUNDARY | restore rebinds the database and runs replay |
+| Legacy DAL facts/commits | none | `src/core/dal.py` compatibility rows | COMPATIBILITY_ONLY | facts are `legacy_dal`/`unverified`; commits are forced `pending`; lifecycle acceptance stays in `StoryRepository` |
+| Legacy `/api` UI and current `/api/v1/books` identity | `TaskRuntime` plus project/book resolver | legacy queue routes and `projectId`/`authoritativeBookId` fields | COMPATIBILITY_ONLY | old routes enqueue/read the durable runtime; `books[].id` remains a project id for old clients and must not be treated as the authoritative Book id |
 | Legacy file MemorySystem (`src/core/memory.py`) | none | compatibility reader/writer for old callers | COMPATIBILITY_READ_ONLY | not merged into Canonical Memory |
 | Legacy pipeline RAG (`src/pipeline/rag.py`) | none | compatibility retriever | DEPRECATED | new writing path uses durable RAG |
 | Direct `StateTracker` writes | none for Canon | `src/core/state_tracking.py` | COMPATIBILITY_READ_ONLY | legacy rows have no event provenance and are excluded from replay-owned deletion |

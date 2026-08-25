@@ -20,6 +20,19 @@ from .scheduler import AgentActivation
 from .knowledge import KnowledgeScope, KnowledgeStatus
 
 
+class SimulationRunDeletedError(ValueError):
+    """Raised when a mutating operation targets a deleted simulation run."""
+
+    code = "SIMULATION_RUN_DELETED"
+
+    def __init__(self, run_id: str, operation: str) -> None:
+        self.run_id = run_id
+        self.operation = operation
+        super().__init__(
+            f"deleted simulation run cannot {operation}: {run_id}"
+        )
+
+
 class SimulationRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
@@ -34,6 +47,7 @@ class SimulationRepository:
     def remember_event(self, event: SimulationEvent, *, importance: float = 0.5) -> AgentMemory | None:
         if not event.actor_id:
             return None
+        self._assert_run_mutable(event.simulation_run_id, operation="record memory")
         base_content = {"event_type": event.event_type, "payload": event.payload,
                         "targets": event.target_ids}
         memory = AgentMemory(
@@ -92,6 +106,7 @@ class SimulationRepository:
 
     def append_event(self, event: SimulationEvent) -> SimulationEvent:
         with self._database.transaction() as conn:
+            self._assert_run_mutable(event.simulation_run_id, operation="append an event", conn=conn)
             run = conn.execute("SELECT id FROM simulation_runs WHERE id=?", (event.simulation_run_id,)).fetchone()
             if run is None:
                 raise ValueError(f"simulation run not found: {event.simulation_run_id}")
@@ -142,6 +157,7 @@ class SimulationRepository:
     def create_branch(self, parent_run_id: str, branch: SimulationBranch, *, name: str,
                       seed: int | None = None) -> SimulationRun:
         parent = self.get_run(parent_run_id)
+        self._assert_run_mutable(parent_run_id, operation="create a branch")
         if branch.parent_run_id != parent_run_id:
             raise ValueError("branch parent mismatch")
         if branch.branch_run_id == parent_run_id:
@@ -157,9 +173,10 @@ class SimulationRepository:
         # Persist a digest of the exact detached state at the fork boundary.
         # This is derived from the immutable snapshot plus the parent prefix,
         # never from mutable Canon tables or the parent's later state.
-        fork_state = SimulationWorldState.from_snapshot(
-            self._snapshots.get(parent.snapshot_id)  # validated by create_run
-        )
+        fork_snapshot = self._snapshots.get(parent.snapshot_id)
+        if fork_snapshot is None:
+            raise ValueError(f"simulation snapshot not found: {parent.snapshot_id}")
+        fork_state = SimulationWorldState.from_snapshot(fork_snapshot)
         for event in parent_events:
             if event.sequence > branch.fork_sequence:
                 break
@@ -179,6 +196,7 @@ class SimulationRepository:
                               branch_parent_id=parent.id,
                               branch_point_event_id=fork_event.id if fork_event else None)
         with self._database.transaction() as conn:
+            self._assert_run_mutable(parent_run_id, operation="create a branch", conn=conn)
             conn.execute(
                 """INSERT INTO simulation_runs(
                     id, book_id, snapshot_id, name, status, current_round,
@@ -205,6 +223,7 @@ class SimulationRepository:
 
     def intervene(self, intervention: SimulationIntervention, *, round_number: int | None = None) -> SimulationEvent:
         run = self.get_run(intervention.simulation_run_id)
+        self._assert_run_mutable(run.id, operation="record an intervention")
         state = self.recover(run.id)
         event_round = run.current_round if round_number is None else round_number
         event = SimulationEvent(
@@ -216,13 +235,15 @@ class SimulationRepository:
             state_delta=intervention.state_delta, visibility_scope="world",
         )
         self.append_event(event)
-        self._database.execute(
-            """INSERT INTO simulation_interventions(
-                id, simulation_run_id, kind, state_delta, rationale, author, event_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (intervention.id, run.id, intervention.kind, json.dumps(intervention.state_delta, sort_keys=True),
-             intervention.rationale, intervention.author, event.id, intervention.created_at.isoformat()),
-        )
+        with self._database.transaction() as conn:
+            self._assert_run_mutable(run.id, operation="persist an intervention", conn=conn)
+            conn.execute(
+                """INSERT INTO simulation_interventions(
+                    id, simulation_run_id, kind, state_delta, rationale, author, event_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (intervention.id, run.id, intervention.kind, json.dumps(intervention.state_delta, sort_keys=True),
+                 intervention.rationale, intervention.author, event.id, intervention.created_at.isoformat()),
+            )
         from src.storyflow.analysis.causality import SimulationCausalityService
         SimulationCausalityService(self).ensure_for_run(run.id, event_id=event.id)
         from src.storyflow.analysis.graph import SimulationGraphProjector
@@ -260,32 +281,34 @@ class SimulationRepository:
         return records
 
     def transition_run(self, run_id: str, status: SimulationRunStatus) -> SimulationRun:
-        row = self._database.fetchone("SELECT * FROM simulation_runs WHERE id=?", (run_id,))
-        if row is None:
-            raise ValueError(f"simulation run not found: {run_id}")
-        current = SimulationRun(
-            id=row["id"], book_id=row["book_id"], snapshot_id=row["snapshot_id"], name=row["name"],
-            status=SimulationRunStatus(row["status"]), current_round=row["current_round"],
-            max_rounds=row["max_rounds"], seed=row["seed"], created_at=datetime.fromisoformat(row["created_at"]),
-            description=row["description"], purpose=row["purpose"], created_by=row["created_by"],
-            configuration=json.loads(row["configuration"] or "{}"), task_id=row["task_id"],
-            started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
-            paused_at=datetime.fromisoformat(row["paused_at"]) if row["paused_at"] else None,
-            completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
-            simulation_time=row["simulation_time"],
-            base_canon_event_id=row["base_canon_event_id"],
-            branch_parent_id=row["branch_parent_id"],
-            branch_point_event_id=row["branch_point_event_id"],
-        )
-        updated = current.transition(status)
-        if updated is current:
-            return current
-        self._database.execute(
-            "UPDATE simulation_runs SET status=?, started_at=?, paused_at=?, completed_at=? WHERE id=?",
-            (updated.status.value, updated.started_at.isoformat() if updated.started_at else None,
-             updated.paused_at.isoformat() if updated.paused_at else None,
-             updated.completed_at.isoformat() if updated.completed_at else None, run_id),
-        )
+        with self._database.transaction() as conn:
+            self._assert_run_mutable(run_id, operation=f"transition to {status.value}", conn=conn)
+            row = conn.execute("SELECT * FROM simulation_runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                raise ValueError(f"simulation run not found: {run_id}")
+            current = SimulationRun(
+                id=row["id"], book_id=row["book_id"], snapshot_id=row["snapshot_id"], name=row["name"],
+                status=SimulationRunStatus(row["status"]), current_round=row["current_round"],
+                max_rounds=row["max_rounds"], seed=row["seed"], created_at=datetime.fromisoformat(row["created_at"]),
+                description=row["description"], purpose=row["purpose"], created_by=row["created_by"],
+                configuration=json.loads(row["configuration"] or "{}"), task_id=row["task_id"],
+                started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+                paused_at=datetime.fromisoformat(row["paused_at"]) if row["paused_at"] else None,
+                completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+                simulation_time=row["simulation_time"],
+                base_canon_event_id=row["base_canon_event_id"],
+                branch_parent_id=row["branch_parent_id"],
+                branch_point_event_id=row["branch_point_event_id"],
+            )
+            updated = current.transition(status)
+            if updated is current:
+                return current
+            conn.execute(
+                "UPDATE simulation_runs SET status=?, started_at=?, paused_at=?, completed_at=? WHERE id=?",
+                (updated.status.value, updated.started_at.isoformat() if updated.started_at else None,
+                 updated.paused_at.isoformat() if updated.paused_at else None,
+                 updated.completed_at.isoformat() if updated.completed_at else None, run_id),
+            )
         return updated
 
     def bind_task(self, run_id: str, task_id: str) -> SimulationRun:
@@ -293,6 +316,7 @@ class SimulationRepository:
         if not run_id or not task_id:
             raise ValueError("run_id and task_id are required")
         with self._database.transaction() as conn:
+            self._assert_run_mutable(run_id, operation="bind a task", conn=conn)
             run = conn.execute("SELECT book_id FROM simulation_runs WHERE id=?", (run_id,)).fetchone()
             if run is None:
                 raise ValueError(f"simulation run not found: {run_id}")
@@ -309,6 +333,7 @@ class SimulationRepository:
         if not isinstance(updates, Mapping):
             raise ValueError("simulation configuration must be an object")
         current = self.get_run(run_id)
+        self._assert_run_mutable(run_id, operation="change configuration")
         if current.status not in {
             SimulationRunStatus.DRAFT, SimulationRunStatus.PREPARING, SimulationRunStatus.READY,
             SimulationRunStatus.PAUSED, SimulationRunStatus.PAUSED_BUDGET,
@@ -317,10 +342,12 @@ class SimulationRepository:
         configuration = dict(updates) if replace else json.loads(json.dumps(current.configuration, sort_keys=True))
         if not replace:
             configuration.update(json.loads(json.dumps(dict(updates), sort_keys=True)))
-        self._database.execute(
-            "UPDATE simulation_runs SET configuration=? WHERE id=?",
-            (json.dumps(configuration, ensure_ascii=True, sort_keys=True), run_id),
-        )
+        with self._database.transaction() as conn:
+            self._assert_run_mutable(run_id, operation="change configuration", conn=conn)
+            conn.execute(
+                "UPDATE simulation_runs SET configuration=? WHERE id=?",
+                (json.dumps(configuration, ensure_ascii=True, sort_keys=True), run_id),
+            )
         return self.get_run(run_id)
 
     def persist_agent_activations(self, run_id: str, round_number: int,
@@ -329,6 +356,7 @@ class SimulationRepository:
         if round_number < 1:
             raise ValueError("activation round must be positive")
         with self._database.transaction() as conn:
+            self._assert_run_mutable(run_id, operation="persist agent activations", conn=conn)
             run = conn.execute("SELECT id FROM simulation_runs WHERE id=?", (run_id,)).fetchone()
             if run is None:
                 raise ValueError(f"simulation run not found: {run_id}")
@@ -379,6 +407,7 @@ class SimulationRepository:
         GenerationRun and a simulation run.  No substring or task-name guess
         is used, so unrelated writing generations cannot be charged here.
         """
+        self._assert_run_mutable(run_id, operation="reconcile generation costs")
         rows = self._database.fetchall(
             """SELECT id, task_id, agent_role, input_reference, status,
                       prompt_tokens, completion_tokens, total_tokens
@@ -410,6 +439,7 @@ class SimulationRepository:
         if not pending:
             return
         with self._database.transaction() as conn:
+            self._assert_run_mutable(run_id, operation="reconcile generation costs", conn=conn)
             conn.executemany(
                 """INSERT OR IGNORE INTO simulation_cost_ledger(
                     id, simulation_run_id, task_id, round_number, agent_id,
@@ -456,6 +486,34 @@ class SimulationRepository:
             branch_parent_id=row["branch_parent_id"],
             branch_point_event_id=row["branch_point_event_id"],
         )
+
+    def _assert_run_mutable(self, run_id: str, *, operation: str, conn: Any | None = None) -> None:
+        """Reject every mutation after the append-only DELETE tombstone.
+
+        History is intentionally the source of truth for the soft-delete state;
+        keeping the guard here means retries, worker restarts, and direct domain
+        callers cannot reanimate a run through a less common mutation method.
+        """
+        if conn is None:
+            run = self._database.fetchone("SELECT id FROM simulation_runs WHERE id=?", (run_id,))
+            history = self._database.fetchone(
+                """SELECT action FROM simulation_run_history
+                   WHERE simulation_run_id=?
+                   ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (run_id,),
+            )
+        else:
+            run = conn.execute("SELECT id FROM simulation_runs WHERE id=?", (run_id,)).fetchone()
+            history = conn.execute(
+                """SELECT action FROM simulation_run_history
+                   WHERE simulation_run_id=?
+                   ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (run_id,),
+            ).fetchone()
+        if run is None:
+            raise ValueError(f"simulation run not found: {run_id}")
+        if history is not None and history["action"] == "DELETE":
+            raise SimulationRunDeletedError(run_id, operation)
 
     def _history_row(self, run_id: str):
         return self._database.fetchone(
@@ -566,6 +624,7 @@ class SimulationRepository:
         if round_number < 0:
             raise ValueError("round number must be non-negative")
         with self._database.transaction() as conn:
+            self._assert_run_mutable(run_id, operation="advance a round", conn=conn)
             updated = conn.execute(
                 "UPDATE simulation_runs SET current_round=?, simulation_time=COALESCE(?, simulation_time) WHERE id=? AND current_round < ?",
                 (round_number, simulation_time, run_id, round_number),
@@ -581,9 +640,11 @@ class SimulationRepository:
                 raise ValueError("simulation round did not advance")
 
     def checkpoint(self, run_id: str) -> SimulationCheckpoint:
+        self._assert_run_mutable(run_id, operation="write a checkpoint")
         state = self.replay(run_id)
         checkpoint = SimulationCheckpoint(run_id, state.event_sequence, state.state_hash, state.values)
         with self._database.transaction() as conn:
+            self._assert_run_mutable(run_id, operation="write a checkpoint", conn=conn)
             existing = conn.execute(
                 "SELECT id FROM simulation_checkpoints WHERE simulation_run_id=? AND event_sequence=?",
                 (run_id, state.event_sequence),
@@ -641,6 +702,7 @@ class SimulationRepository:
 
     def append_action(self, run_id: str, action: NarrativeAction, *, round_number: int = 0,
                       validator: ActionValidator | None = None, simulation_time: str | None = None) -> SimulationEvent:
+        self._assert_run_mutable(run_id, operation="append an action")
         validator = validator or ActionValidator()
         state = self.replay(run_id)
         result = validator.validate(action, state)
@@ -687,6 +749,7 @@ class SimulationRepository:
             state = state.apply_event(event)
 
         with self._database.transaction() as conn:
+            self._assert_run_mutable(run_id, operation="append actions", conn=conn)
             run = conn.execute("SELECT id FROM simulation_runs WHERE id=?", (run_id,)).fetchone()
             if run is None:
                 raise ValueError(f"simulation run not found: {run_id}")
@@ -923,8 +986,9 @@ class SimulationRepository:
         scope = KnowledgeScope(action.actor_id, values, actor=actor)
         reported_ids = ActionValidator._reported_information_ids(action)
         arguments = action.arguments if isinstance(action.arguments, Mapping) else {}
-        message = next((arguments.get(key) for key in ("message", "content", "claim", "text")
-                        if isinstance(arguments.get(key), str) and arguments.get(key).strip()), None)
+        message = next((candidate for key in ("message", "content", "claim", "text")
+                        for candidate in [arguments.get(key)]
+                        if isinstance(candidate, str) and candidate.strip()), None)
         # SEND_MESSAGE/INFORM may carry a free-form message rather than a
         # canonical fact id.  Keep it local and deterministic instead of
         # silently dropping the communication.
@@ -994,6 +1058,7 @@ class SimulationRepository:
     @staticmethod
     def _merge_knowledge_scope(existing: Any, records: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
         """Merge records while preserving legacy list/map knowledge shapes."""
+        result: dict[str, Any]
         if isinstance(existing, Mapping):
             result = json.loads(json.dumps(existing, sort_keys=True))
         elif isinstance(existing, (list, tuple, set, frozenset)):

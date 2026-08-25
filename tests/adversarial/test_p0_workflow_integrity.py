@@ -212,7 +212,15 @@ def test_persistent_model_manager_routes_pipeline_chat_and_records_role(tmp_path
 
 def test_authoritative_committed_status_survives_compatibility_readback(writing_deps):
     database, repository, _runtime, project_id, book_id = writing_deps
-    repository.append_chapter_version(book_id, 1, "Committed chapter")
+    version = repository.append_chapter_version(book_id, 1, "Committed chapter")
+    chapter = database.fetchone(
+        "SELECT id FROM chapters WHERE book_id=? AND number=1", (book_id,)
+    )
+    assert chapter is not None
+    commit_id = repository.create_story_commit(
+        chapter["id"], chapter_version_id=version["version_id"],
+    )
+    repository.accept_story_commit_legacy(commit_id, reason="status readback fixture")
     repository.transition_chapter_status(project_id, 1, "drafted")
     repository.transition_chapter_status(project_id, 1, "approved")
     repository.transition_chapter_status(project_id, 1, "committed")
@@ -368,7 +376,7 @@ def test_edit_invalidates_superseded_facts_and_replay_excludes_them(writing_deps
         facts=[{"fact_type": "event", "content": "A killed B"}],
         state_changes={"B": "dead"},
     )
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="workflow fixture")
 
     repository.append_chapter_version(book_id, 1, "B escaped")
 
@@ -393,7 +401,7 @@ def test_story_commit_backup_runs_after_commit_and_is_readable(writing_deps, tmp
         chapter_id, chapter_version_id=version["version_id"], facts=[{"content": "saved"}]
     )
 
-    result = repository.accept_story_commit(commit_id)
+    result = repository.accept_story_commit_legacy(commit_id, reason="backup fixture")
 
     assert result["backup"]["created"] is True
     from src.core.backup import BackupManager

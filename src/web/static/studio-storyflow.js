@@ -3853,7 +3853,7 @@
   }
 
   async function checkGraphFreshness() {
-    if (!state || !S.book || !state.graphSnapshotId || state.loading || state.graphFreshnessLoading) return;
+    if (!state || !S.book || !state.graphSnapshotId || state.loading || state.graphFreshnessLoading || state.graphFreshnessDisabled) return;
     state.graphFreshnessLoading = true;
     try {
       const query = new URLSearchParams({ fromSnapshot: state.graphSnapshotId });
@@ -3882,6 +3882,14 @@
     } catch (error) {
       if (!state) return;
       state.graphFreshnessError = error.message;
+      // Empty projects have a truthful graph projection but no authoritative
+      // book yet.  Do not retry the same permanent 409 every 12 seconds;
+      // leave the boundary visible and wait for a new workspace load.
+      if (error?.status === 409 && /authoritative book/i.test(String(error.message || ''))) {
+        state.graphFreshnessDisabled = true;
+        window.clearInterval(state.graphFreshnessTimer);
+        state.graphFreshnessTimer = null;
+      }
       renderToolbar();
     } finally {
       if (state) state.graphFreshnessLoading = false;
@@ -4978,6 +4986,7 @@
       contextEvidence: null, generationRunTrace: null, generationContextGraph: null, reconciliationCandidates: null, selectionProjection: null, drag: null, pan: null, box: null, connection: null, layoutDirty: false, searchTimer: null, candidateTimer: null, candidateTaskId: null, analysisTimer: null, analysisTaskId: null, analysisResult: null, analysisTrace: null, generationTimer: null, generationTaskId: null, chapterImpact: null, chapterVersionCompare: null, modelWorkObserver: null,
       analysisHistory: [], analysisHistoryLoaded: false, candidateSets: [], candidateSetsRevision: 0, candidateSetsLoading: false, candidateSetsError: null, recoverableForecastTasks: [], recoverableForecastTasksLoading: false, recoverableForecastTasksError: null, recoveringForecastTaskId: null, candidateComparison: null, candidateLineage: null, snapshotDiff: null, canonicalReplay: null, canonicalDiff: null,
       storyHealth: null, storyHealthLoading: false, storyHealthError: null, storyHealthLookback: 8, storyHealthRequestId: 0,
+      graphFreshnessDisabled: false,
     };
     if (state.focus) state.selected = new Set([state.focus]);
     if (!S.book) {
@@ -4997,6 +5006,7 @@
   };
 
   window.storyflow = {
+    destroy,
     reload: loadGraph,
     focus(id) { if (!state) return; state.focus = id; state.selected = new Set([id]); loadGraph(); },
     open(view, id) {
@@ -5028,7 +5038,10 @@
         focus: existingIntent.focus || '',
         sourcePage: existingIntent.sourcePage || (legacyRouteViews[S.page] ? S.page : ''),
       };
-      window.setTimeout(() => go('storyflow'), 0);
+      // The Workbench loader now starts this module before the shell and lets
+      // the shell own the first render. Calling the legacy router here would
+      // race that deep-link render and could put Dashboard back over Canvas.
+      window.__storyflowRouteIntentPending = true;
     }
   }
 }());

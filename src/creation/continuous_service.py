@@ -244,6 +244,12 @@ class ContinuousWritingService:
                         "chapter_number": chapter_number,
                         "context": context,
                         "parent_task_id": task["id"],
+                        "strict_planning": bool(data.get("strict_planning")),
+                        "planning_snapshot_id": data.get("planning_snapshot_id"),
+                        "planning_snapshot_version": data.get("planning_snapshot_version"),
+                        "planning_snapshot_checksum": data.get("planning_snapshot_checksum"),
+                        "prompt_policy_versions": data.get("prompt_policy_versions", {}),
+                        "quality_policy": data.get("quality_policy", {}),
                     },
                     stage="blocked",
                     idempotency_key=f"continuous-child:{task['id']}:{chapter_number}",
@@ -573,6 +579,12 @@ class ContinuousWritingService:
         if not isinstance(chapter_number, int):
             raise TaskStateError("chapter decision is missing chapter_number")
         latest = self._latest_chapter_version(parent.get("book_id"), chapter_number)
+        expected_version_id = context.get("draft_version_id")
+        if expected_version_id is not None:
+            if latest is None or str(latest.get("version_id")) != str(expected_version_id):
+                raise TaskStateError(
+                    "chapter candidate version changed; author must review the current version"
+                )
         if latest:
             context.update({
                 "chapter_id": latest["chapter_id"],

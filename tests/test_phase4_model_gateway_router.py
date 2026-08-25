@@ -59,6 +59,192 @@ def test_configuration_is_persistent_and_never_returns_raw_credential(model_runt
     assert fresh.resolve("writer")["model_id"] == "test-model"
 
 
+def test_model_config_rejects_nested_credentials_before_storing_raw_key(tmp_path):
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    repository = ModelRepository(database, CredentialStore(tmp_path))
+
+    with pytest.raises(ModelConfigurationError, match="persisted config"):
+        repository.save_configuration({
+            "providers": [{
+                "id": "unsafe-provider",
+                "name": "Unsafe provider",
+                "providerType": "openai",
+                "baseUrl": "https://example.invalid/v1",
+                "apiKey": "raw-key-that-must-not-be-orphaned",
+                "config": {"headers": {"Authorization": "Bearer nested-secret"}},
+            }],
+            "models": [],
+            "routes": {},
+        })
+
+    assert database.fetchone("SELECT id FROM model_providers WHERE id=?", ("unsafe-provider",)) is None
+    secret_dir = tmp_path / ".novelforge-secrets"
+    assert not secret_dir.exists() or list(secret_dir.iterdir()) == []
+
+
+def test_failed_configuration_removes_new_protected_credentials_after_later_validation(tmp_path):
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+
+    class TrackingCredentialStore(CredentialStore):
+        def __init__(self):
+            super().__init__(tmp_path)
+            self.stored = []
+            self.removed = []
+
+        def store(self, secret):
+            self.stored.append(secret)
+            return "dpapi:staged-credential"
+
+        def remove(self, reference):
+            self.removed.append(reference)
+
+    credentials = TrackingCredentialStore()
+    repository = ModelRepository(database, credentials)
+
+    with pytest.raises(ModelConfigurationError, match="route writer"):
+        repository.save_configuration({
+            "providers": [{
+                "id": "provider",
+                "name": "Provider",
+                "providerType": "openai",
+                "baseUrl": "https://example.invalid/v1",
+                "apiKey": "raw-key",
+            }],
+            "models": [{
+                "id": "model",
+                "providerId": "provider",
+                "name": "Model",
+                "modelId": "model",
+            }],
+            "routes": {"writer": "missing-model"},
+        })
+
+    assert credentials.stored == ["raw-key"]
+    assert credentials.removed == ["dpapi:staged-credential"]
+    assert database.fetchone("SELECT id FROM model_providers WHERE id=?", ("provider",)) is None
+    assert database.fetchone("SELECT id FROM models WHERE id=?", ("model",)) is None
+
+
+def test_model_configuration_redacts_sensitive_keys_from_legacy_rows(tmp_path):
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    database.execute(
+        """INSERT INTO model_providers
+           (id, name, provider_type, base_url, config)
+           VALUES (?, ?, ?, ?, ?)""",
+        (
+            "legacy-provider", "Legacy provider", "custom", "https://example.invalid/v1",
+            json.dumps({"headers": {"Authorization": "Bearer old-secret"}, "timeout": 30}),
+        ),
+    )
+    database.execute(
+        """INSERT INTO models
+           (id, provider_id, name, model_id, capabilities, config)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            "legacy-model", "legacy-provider", "Legacy model", "legacy-model",
+            "[]", json.dumps({"api_key": "old-model-secret", "temperature": 0.2}),
+        ),
+    )
+
+    configuration = ModelRepository(database, CredentialStore(tmp_path)).configuration()
+    provider = configuration["providers"][0]
+    model = configuration["models"][0]
+    assert provider["config"] == {"headers": {"Authorization": "[REDACTED]"}, "timeout": 30}
+    assert model["config"] == {"api_key": "[REDACTED]", "temperature": 0.2}
+    assert "old-secret" not in json.dumps(configuration)
+    assert "old-model-secret" not in json.dumps(configuration)
+
+
+def test_credential_rotation_retires_old_protected_reference_after_commit(tmp_path):
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+
+    class TrackingCredentialStore(CredentialStore):
+        def __init__(self):
+            super().__init__(tmp_path)
+            self.counter = 0
+            self.removed = []
+
+        def store(self, secret):
+            self.counter += 1
+            return f"dpapi:{self.counter:032x}"
+
+        def remove(self, reference):
+            self.removed.append(reference)
+
+    credentials = TrackingCredentialStore()
+    repository = ModelRepository(database, credentials)
+    base = {
+        "id": "provider",
+        "name": "Provider",
+        "providerType": "openai",
+        "baseUrl": "https://example.invalid/v1",
+    }
+    repository.save_configuration({
+        "providers": [{**base, "apiKey": "first-key"}],
+        "models": [],
+        "routes": {},
+    })
+    repository.save_configuration({
+        "providers": [{**base, "credentialEnv": "NOVELFORGE_TEST_KEY"}],
+        "models": [],
+        "routes": {},
+    })
+
+    assert credentials.removed == ["dpapi:00000000000000000000000000000001"]
+    rotated = database.fetchone(
+        "SELECT credential_ref FROM model_providers WHERE id=?", ("provider",)
+    )
+    assert rotated is not None
+    assert rotated["credential_ref"] == "env:NOVELFORGE_TEST_KEY"
+
+
+def test_credential_rotation_keeps_old_reference_when_later_configuration_fails(tmp_path):
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+
+    class TrackingCredentialStore(CredentialStore):
+        def __init__(self):
+            super().__init__(tmp_path)
+            self.counter = 0
+            self.removed = []
+
+        def store(self, secret):
+            self.counter += 1
+            return f"dpapi:{self.counter:032x}"
+
+        def remove(self, reference):
+            self.removed.append(reference)
+
+    credentials = TrackingCredentialStore()
+    repository = ModelRepository(database, credentials)
+    provider = {
+        "id": "provider",
+        "name": "Provider",
+        "providerType": "openai",
+        "baseUrl": "https://example.invalid/v1",
+    }
+    repository.save_configuration({
+        "providers": [{**provider, "apiKey": "first-key"}],
+        "models": [],
+        "routes": {},
+    })
+
+    with pytest.raises(ModelConfigurationError, match="route writer"):
+        repository.save_configuration({
+            "providers": [{**provider, "apiKey": "second-key"}],
+            "models": [{
+                "id": "model", "providerId": "provider", "name": "Model", "modelId": "model",
+            }],
+            "routes": {"writer": "missing-model"},
+        })
+
+    assert credentials.removed == ["dpapi:00000000000000000000000000000002"]
+    restored = database.fetchone(
+        "SELECT credential_ref FROM model_providers WHERE id=?", ("provider",)
+    )
+    assert restored is not None
+    assert restored["credential_ref"] == "dpapi:00000000000000000000000000000001"
+
+
 def test_invocation_records_generation_run_with_prompt_and_output_body(model_runtime):
     database, repository = model_runtime
 
@@ -177,6 +363,35 @@ def test_missing_credential_is_a_failed_generation_run(model_runtime, monkeypatc
     run = repository.runs_for_task(task["id"])[0]
     assert run["status"] == "failed"
     assert run["error_code"] == "MODEL_CREDENTIAL_UNAVAILABLE"
+
+
+def test_empty_provider_response_is_a_failed_generation_run(model_runtime):
+    database, repository = model_runtime
+
+    class EmptyGateway:
+        def register_provider(self, _name, _config):
+            pass
+
+        def chat(self, _name, _messages, _system, **_kwargs):
+            return LLMResponse(content="", model="test-model")
+
+    task = TaskRuntime(database).enqueue("write-next")
+    runtime = PersistentModelRuntime(repository, gateway=EmptyGateway())
+    with runtime.task_scope(task["id"]), pytest.raises(ModelConfigurationError) as error:
+        runtime.invoke("writer", [{"role": "user", "content": "write"}])
+
+    assert error.value.code == "PROVIDER_EMPTY_RESPONSE"
+    run = repository.runs_for_task(task["id"])[0]
+    assert run["status"] == "failed"
+    assert run["error_code"] == "PROVIDER_EMPTY_RESPONSE"
+    attempt = database.fetchone(
+        "SELECT status, error_code, response_artifact FROM generation_attempts WHERE task_id=?",
+        (task["id"],),
+    )
+    assert attempt is not None
+    assert attempt["status"] == "failed"
+    assert attempt["error_code"] == "PROVIDER_EMPTY_RESPONSE"
+    assert attempt["response_artifact"] is None
 
 
 def test_durable_provider_check_creates_a_generation_run(model_runtime, tmp_path):

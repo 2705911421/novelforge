@@ -151,6 +151,9 @@ class PersistentTaskWorker:
         """
         explicit_code = getattr(exc, "code", None)
         if isinstance(explicit_code, str) and explicit_code:
+            explicit_retryable = getattr(exc, "retryable", None)
+            if isinstance(explicit_retryable, bool):
+                return explicit_code, explicit_retryable
             return explicit_code, explicit_code in {"RATE_LIMIT", "NETWORK", "PROVIDER_TRANSIENT"}
         message = str(exc).lower()
         code_token = re.match(r"^\s*([A-Z][A-Z0-9_]+)\s*:", str(exc))

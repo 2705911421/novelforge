@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from typing import Any
+from collections.abc import Mapping
 
 from src.core.database import Database
 
@@ -73,7 +76,7 @@ class WorldSnapshotRepository:
         return snapshot
 
     @staticmethod
-    def _from_row(row: object) -> SimulationWorldSnapshot:
+    def _from_row(row: sqlite3.Row | Mapping[str, Any]) -> SimulationWorldSnapshot:
         return SimulationWorldSnapshot.from_record({
             "book_id": row["book_id"],
             "project_id": row["project_id"],

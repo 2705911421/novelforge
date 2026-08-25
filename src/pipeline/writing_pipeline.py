@@ -12,7 +12,7 @@ import hashlib
 import logging
 from copy import deepcopy
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 from src.core.database import Database
 from src.core.story_repository import StoryRepository
@@ -88,6 +88,25 @@ class WritingPipeline:
         self.runtime = task_runtime
         self.score_threshold = score_threshold
         self.max_revisions = max_revisions
+
+    @staticmethod
+    def _raise_model_failure(
+        exc: Exception,
+        fallback_code: str,
+        message: str,
+    ) -> NoReturn:
+        """Keep provider/runtime error codes visible at the pipeline boundary."""
+        if isinstance(exc, WritingPipelineError):
+            raise exc
+        code = getattr(exc, "code", None)
+        if isinstance(code, str) and code.strip():
+            normalized_code = code.strip()
+            raise WritingPipelineError(
+                normalized_code,
+                f"{message}: {exc}",
+                retryable=normalized_code in {"RATE_LIMIT", "NETWORK", "PROVIDER_TRANSIENT"},
+            ) from exc
+        raise WritingPipelineError(fallback_code, f"{message}: {exc}", retryable=True) from exc
 
     def execute(self, task: dict[str, Any]) -> dict[str, Any]:
         """Run or resume the pipeline from the last checkpoint."""
@@ -217,21 +236,53 @@ class WritingPipeline:
         fallback_system: str,
         fallback_user: str,
         **values: Any,
-    ) -> tuple[str, str, str, str]:
+    ) -> tuple[str, str, str, str, dict[str, Any]]:
         """Render the durable prompt registry and fail loudly on bad templates.
 
-        Returns (rendered, system, prompt_key, prompt_version) so callers can
-        forward prompt provenance to the model runtime.
+        Returns (rendered, system, prompt_key, prompt_version, provenance) so
+        callers can forward exact registry provenance to the model runtime.
         """
         task_data = task.get("data", {}) if isinstance(task, dict) else {}
         pinned_versions = task_data.get("prompt_policy_versions") if isinstance(task_data, dict) else None
         pinned_entry = pinned_versions.get(task_type) if isinstance(pinned_versions, dict) else None
         pinned_version = pinned_entry.get("version") if isinstance(pinned_entry, dict) else pinned_entry
+        pinned_id_version: int | None = None
+        if isinstance(pinned_entry, dict) and pinned_entry.get("id") and pinned_entry.get("version") is not None:
+            raw_id_version = pinned_entry.get("version")
+            if isinstance(raw_id_version, bool):
+                raise WritingPipelineError(
+                    "PROMPT_POLICY_VERSION_MISSING",
+                    f"invalid pinned prompt version: {task_type}={raw_id_version}",
+                )
+            if raw_id_version is None:
+                raise WritingPipelineError(
+                    "PROMPT_POLICY_VERSION_MISSING",
+                    f"invalid pinned prompt version: {task_type}={raw_id_version}",
+                )
+            try:
+                pinned_id_version = int(str(raw_id_version))
+            except (TypeError, ValueError) as exc:
+                raise WritingPipelineError(
+                    "PROMPT_POLICY_VERSION_MISSING",
+                    f"invalid pinned prompt version: {task_type}={raw_id_version}",
+                ) from exc
         if isinstance(pinned_entry, dict) and pinned_entry.get("id"):
             prompt = self.db.fetchone(
                 "SELECT * FROM prompt_templates WHERE id=? AND task_type=?",
                 (pinned_entry["id"], task_type),
             )
+            # A pinned registry id is an immutable project boundary.  A task
+            # resumed in another project must not be able to borrow a prompt
+            # template that happens to have the same task type.
+            if prompt and prompt.get("project_id") not in {None, project_id}:
+                prompt = None
+            if prompt and pinned_id_version is not None:
+                try:
+                    actual_version = int(prompt.get("version") or 0)
+                except (TypeError, ValueError):
+                    actual_version = -1
+                if actual_version != pinned_id_version:
+                    prompt = None
         elif pinned_version is not None:
             prompt = self.prompt_repo.get_prompt_version(task_type, pinned_version, project_id)
         else:
@@ -246,20 +297,27 @@ class WritingPipeline:
         template = registered_template or fallback_user
         prompt_key = prompt.get("task_type", task_type)
         prompt_version = str(prompt.get("version", 0))
+        prompt_provenance = {
+            "id": prompt.get("id"),
+            "task_type": prompt_key,
+            "version": int(prompt.get("version") or 0),
+            "project_id": prompt.get("project_id"),
+            "source": "prompt_templates" if prompt.get("id") else "builtin",
+        }
         # Fallback prompts at the call sites are already rendered f-strings.
         # Formatting them a second time interprets JSON/object braces in the
         # chapter plan as replacement fields (for example ``{"chapter_number":
         # 2}``), which breaks the legacy pipeline when no registry entry exists
         # for one of the new intermediate stages.
         if not registered_template:
-            return fallback_user, system, prompt_key, prompt_version
+            return fallback_user, system, prompt_key, prompt_version, prompt_provenance
         try:
             rendered = template.format(**values)
         except (KeyError, IndexError, ValueError) as exc:
             raise WritingPipelineError(
                 "PROMPT_RENDER_FAILED", f"invalid {task_type} prompt template: {exc}"
             ) from exc
-        return rendered, system, prompt_key, prompt_version
+        return rendered, system, prompt_key, prompt_version, prompt_provenance
 
     def _get_chapter_id(self, book_id: str, chapter_number: int) -> Optional[str]:
         """Get chapter_id from book_id and chapter_number."""
@@ -1573,12 +1631,29 @@ class WritingPipeline:
             sync_report = memory_retriever.sync_incremental(memory_book_id)
             memory_results = memory_retriever.query(memory_book_id, query, top_k=5)
             ctx["memory_projection_sync"] = sync_report
-            memory_chunks = [
-                {**item, "document_name": "Canonical Narrative Memory", "document_id": item.get("source_id")}
-                for item in memory_results.get("results", [])
-            ]
-            retriever = PersistentRAGRetriever(self.db)
-            document_results = retriever.query(project_id, query, top_k=5)
+            if embedder is not None:
+                # Reference chunks belong to the project/document ingestion
+                # boundary, but their durable vector projection belongs to
+                # the authoritative book.  Use the same retriever only when
+                # an embedding route is actually available; otherwise the
+                # existing persistent BM25 fallback remains read-only.
+                reference_sync = memory_retriever.sync_reference_chunks(
+                    memory_book_id, project_id
+                )
+                ctx["reference_projection_sync"] = reference_sync
+            if embedder is not None:
+                document_results = memory_retriever.query(memory_book_id, query, top_k=5)
+                # The durable query now contains both canonical memory and
+                # reference chunks; do not append the pre-sync memory query a
+                # second time.
+                memory_chunks = []
+            else:
+                memory_chunks = [
+                    {**item, "document_name": "Canonical Narrative Memory", "document_id": item.get("source_id")}
+                    for item in memory_results.get("results", [])
+                ]
+                retriever = PersistentRAGRetriever(self.db)
+                document_results = retriever.query(project_id, query, top_k=5)
             chunks = memory_chunks + document_results.get("results", [])
             if chunks:
                 chunk_lines = [f"- [{r.get('document_name') or r.get('source_type') or '?'}] {r.get('content', '')[:200]}" for r in chunks]
@@ -1614,7 +1689,7 @@ class WritingPipeline:
         chapter_number = ctx["chapter_number"]
         plan_text = json.dumps(ctx.get("chapter_plan", {}), ensure_ascii=False, indent=2)
         context_text = "\n\n".join(ctx.get("context_parts", []))[:12_000]
-        prompt, system, prompt_key, prompt_version = self._registered_prompt(
+        prompt, system, prompt_key, prompt_version, prompt_registry = self._registered_prompt(
             "plan-chapter",
             project_id,
             task=task,
@@ -1635,10 +1710,11 @@ class WritingPipeline:
                 task_type="plan-chapter",
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
+                prompt_registry=prompt_registry,
             )
             prompt_a1 = response.content.strip()
         except Exception as exc:
-            raise WritingPipelineError("PLANNER_ERROR", f"chapter planner failed: {exc}", retryable=True) from exc
+            self._raise_model_failure(exc, "PLANNER_ERROR", "chapter planner failed")
         if not prompt_a1:
             raise WritingPipelineError("PLANNER_OUTPUT_EMPTY", "planner returned an empty prompt A1", retryable=True)
         ctx["prompt_a1"] = prompt_a1
@@ -1653,7 +1729,7 @@ class WritingPipeline:
         """
         project_id = ctx["project_id"]
         source_text = "\n\n".join(ctx.get("context_parts", []))[:18_000]
-        prompt, system, prompt_key, prompt_version = self._registered_prompt(
+        prompt, system, prompt_key, prompt_version, prompt_registry = self._registered_prompt(
             "fact-extraction",
             project_id,
             task=task,
@@ -1684,10 +1760,13 @@ class WritingPipeline:
                 task_type="fact-extraction",
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
+                prompt_registry=prompt_registry,
             )
             prompt_a2 = response.content.strip()
         except Exception as exc:
-            raise WritingPipelineError("FACT_REQUIREMENTS_ERROR", f"fact extraction for prompt A2 failed: {exc}", retryable=True) from exc
+            self._raise_model_failure(
+                exc, "FACT_REQUIREMENTS_ERROR", "fact extraction for prompt A2 failed"
+            )
         if not prompt_a2:
             raise WritingPipelineError("FACT_REQUIREMENTS_EMPTY", "fact extraction returned an empty prompt A2", retryable=True)
         ctx["prompt_a2"] = prompt_a2
@@ -1700,7 +1779,7 @@ class WritingPipeline:
         plan_text = json.dumps(ctx.get("chapter_plan", {}), ensure_ascii=False, indent=2)
         prompt_a1 = ctx.get("prompt_a1", "")
         prompt_a2 = ctx.get("prompt_a2", "")
-        prompt, system, prompt_key, prompt_version = self._registered_prompt(
+        prompt, system, prompt_key, prompt_version, prompt_registry = self._registered_prompt(
             "compose-chapter",
             project_id,
             task=task,
@@ -1721,10 +1800,13 @@ class WritingPipeline:
                 task_type="compose-chapter",
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
+                prompt_registry=prompt_registry,
             )
             prompt_a = response.content.strip()
         except Exception as exc:
-            raise WritingPipelineError("PLANNER_COMPOSE_ERROR", f"planner prompt A composition failed: {exc}", retryable=True) from exc
+            self._raise_model_failure(
+                exc, "PLANNER_COMPOSE_ERROR", "planner prompt A composition failed"
+            )
         if not prompt_a:
             raise WritingPipelineError("PLANNER_COMPOSE_EMPTY", "planner returned an empty prompt A", retryable=True)
         ctx["prompt_a"] = prompt_a
@@ -1749,7 +1831,7 @@ class WritingPipeline:
             extra_parts.append(f"## 修订要求\n{revision_notes}")
         if task["data"].get("context"):
             extra_parts.append(f"## 额外指导\n{task['data']['context']}")
-        prompt, system, prompt_key, prompt_version = self._registered_prompt(
+        prompt, system, prompt_key, prompt_version, prompt_registry = self._registered_prompt(
             "write-next", project_id,
             task=task,
             fallback_system="你是一位专业的网络小说作家，擅长创作引人入胜的长篇小说。请直接输出章节正文，不要包含标题或元信息。",
@@ -1897,13 +1979,12 @@ class WritingPipeline:
                 task_type="write-next",
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
+                prompt_registry=prompt_registry,
                 context_manifest=context_manifest,
             )
             content = response.content.strip()
         except Exception as exc:
-            raise WritingPipelineError(
-                "MODEL_ERROR", f"draft generation failed: {exc}", retryable=True
-            ) from exc
+            self._raise_model_failure(exc, "MODEL_ERROR", "draft generation failed")
 
         if len(content) < 100:
             raise WritingPipelineError(
@@ -1950,7 +2031,7 @@ class WritingPipeline:
         rubric = ctx.get("review_rubric", REVIEW_RUBRIC)
 
         # Build review prompt.
-        review_prompt, review_system, prompt_key, prompt_version = self._registered_prompt(
+        review_prompt, review_system, prompt_key, prompt_version, prompt_registry = self._registered_prompt(
             "review", project_id,
             task=task,
             fallback_system="你是一位专业的小说审稿编辑，擅长从多个维度评估小说质量。",
@@ -1987,6 +2068,7 @@ class WritingPipeline:
                     task_type="review",
                     prompt_key=prompt_key,
                     prompt_version=prompt_version,
+                    prompt_registry=prompt_registry,
                 )
                 if "error" in review_data and "raw" in review_data:
                     # chat_json() returned a parse error; try manual recovery.
@@ -2001,6 +2083,7 @@ class WritingPipeline:
                     task_type="review",
                     prompt_key=prompt_key,
                     prompt_version=prompt_version,
+                    prompt_registry=prompt_registry,
                 )
                 review_text = response.content.strip()
                 if review_text.startswith("```"):
@@ -2011,9 +2094,7 @@ class WritingPipeline:
                 "REVIEW_OUTPUT_INVALID", f"review returned invalid JSON: {exc}"
             ) from exc
         except Exception as exc:
-            raise WritingPipelineError(
-                "REVIEW_ERROR", f"review failed: {exc}", retryable=True
-            ) from exc
+            self._raise_model_failure(exc, "REVIEW_ERROR", "review failed")
 
         self._validate_review_data(review_data)
 
@@ -2202,7 +2283,7 @@ class WritingPipeline:
             for i in review_issues[:10]  # Limit to top 10 issues.
         )
 
-        revision_prompt, revision_system, prompt_key, prompt_version = self._registered_prompt(
+        revision_prompt, revision_system, prompt_key, prompt_version, prompt_registry = self._registered_prompt(
             "revision", project_id,
             task=task,
             fallback_system="你是一位专业的小说修订编辑。请根据审稿意见改进章节质量。",
@@ -2240,12 +2321,11 @@ class WritingPipeline:
                 task_type="revision",
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
+                prompt_registry=prompt_registry,
             )
             revised_content = response.content.strip()
         except Exception as exc:
-            raise WritingPipelineError(
-                "REVISION_ERROR", f"revision failed: {exc}", retryable=True
-            ) from exc
+            self._raise_model_failure(exc, "REVISION_ERROR", "revision failed")
 
         # Save as a new ChapterVersion.
         new_version = self.story_repo.append_chapter_version(
@@ -2285,7 +2365,7 @@ class WritingPipeline:
 
         content = version["content"][:6000]  # Truncate for fact extraction.
 
-        extract_prompt, extract_system, prompt_key, prompt_version = self._registered_prompt(
+        extract_prompt, extract_system, prompt_key, prompt_version, prompt_registry = self._registered_prompt(
             "fact-extraction", project_id,
             task=task,
             fallback_system="你是一位专业的故事分析师，擅长从文本中提取结构化事实。",
@@ -2304,6 +2384,7 @@ class WritingPipeline:
                 task_type="fact-extraction",
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
+                prompt_registry=prompt_registry,
             )
             fact_text = response.content.strip()
             if fact_text.startswith("```"):
@@ -2320,9 +2401,7 @@ class WritingPipeline:
                 if not isinstance(fact.get("fact_type"), str) or not fact["fact_type"].strip():
                     fact["fact_type"] = "event"  # Default type if missing.
         except Exception as exc:
-            raise WritingPipelineError(
-                "FACT_EXTRACTION_FAILED", f"fact extraction failed: {exc}", retryable=True
-            ) from exc
+            self._raise_model_failure(exc, "FACT_EXTRACTION_FAILED", "fact extraction failed")
 
         ctx["extracted_facts"] = facts
         return {"next_stage": "CREATE_STORY_COMMIT", "context": ctx}

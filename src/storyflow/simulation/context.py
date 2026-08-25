@@ -222,30 +222,30 @@ class SimulationContextCompiler:
                     high = mid - 1
             return best
         if isinstance(value, Mapping):
-            result: dict[str, Any] = {}
+            mapped_result: dict[str, Any] = {}
             for key in sorted(value, key=str):
                 candidate_key = str(key)
-                remaining = max_chars - cls._size(result) - cls._size(candidate_key) - 4
+                remaining = max_chars - cls._size(mapped_result) - cls._size(candidate_key) - 4
                 if remaining <= 0:
                     break
                 candidate_value = cls._trim_value(value[key], remaining)
-                candidate = {**result, candidate_key: candidate_value}
+                candidate = {**mapped_result, candidate_key: candidate_value}
                 if cls._size(candidate) > max_chars:
                     break
-                result = candidate
-            return result
+                mapped_result = candidate
+            return mapped_result
         if isinstance(value, (list, tuple)):
-            result: list[Any] = []
+            list_result: list[Any] = []
             for item in value:
-                remaining = max_chars - cls._size(result) - 2
+                remaining = max_chars - cls._size(list_result) - 2
                 if remaining <= 0:
                     break
                 candidate_item = cls._trim_value(item, remaining)
-                candidate = [*result, candidate_item]
+                candidate = [*list_result, candidate_item]
                 if cls._size(candidate) > max_chars:
                     break
-                result = candidate
-            return result
+                list_result = candidate
+            return list_result
         if isinstance(value, (bool, int, float)) or value is None:
             return value if cls._size(value) <= max_chars else None
         return cls._trim_value(str(value), max_chars)

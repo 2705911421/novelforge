@@ -106,9 +106,21 @@ class PerceptionBuilder:
 
     @staticmethod
     def _scoped_map(value: Any, agent_id: str) -> Mapping[str, Any]:
+        """Return only the selected Agent's map.
+
+        A flat map is still accepted for legacy snapshots when its values are
+        scalar/list values.  A mapping whose values are themselves mappings is
+        treated as an explicitly Agent-scoped shape; a missing key therefore
+        returns an empty scope instead of falling back to sibling data.
+        """
         if not isinstance(value, Mapping):
             return {}
-        scoped = value.get(agent_id, value)
+        if agent_id in value:
+            scoped = value[agent_id]
+        elif value and all(isinstance(item, Mapping) for item in value.values()):
+            return {}
+        else:
+            scoped = value
         return dict(scoped) if isinstance(scoped, Mapping) else {}
 
     @staticmethod

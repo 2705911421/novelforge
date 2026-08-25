@@ -1,23 +1,30 @@
-"""
-NovelForge 任务系统
-提供持久化任务队列、状态机和检查点恢复
+"""Compatibility facade for the retired pre-lease task API.
+
+``TaskRuntime`` is the only task authority.  A few old library callers still
+import ``TaskManager`` and expect the original ``Task`` dataclasses and
+``pending`` spelling, so this module translates that API to the durable
+runtime instead of maintaining a second state machine or writing task rows
+directly.  New code must use :mod:`src.core.task_runtime`.
 """
 
-import json
+from __future__ import annotations
+
 import logging
-from datetime import datetime
-from typing import Optional, Dict, Any, List, Callable
-from enum import Enum
 from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 from threading import Lock
+from typing import Any, Callable, Dict, List, Optional
 
-from .database import get_db, generate_id
+from .database import Database, get_db
+from .task_runtime import TaskRuntime, TaskStateError
 
 logger = logging.getLogger(__name__)
 
 
 class TaskType(str, Enum):
-    """任务类型"""
+    """Legacy task type constants kept for source compatibility."""
+
     WRITE = "write"
     CONTINUOUS = "continuous"
     REVIEW = "review"
@@ -27,17 +34,27 @@ class TaskType(str, Enum):
 
 
 class TaskStatus(str, Enum):
-    """任务状态"""
+    """Legacy read-model status names.
+
+    ``PENDING`` translates to durable runtime status ``queued``.  The extra
+    states make newer durable outcomes visible to old readers instead of
+    silently converting an author decision into success or failure.
+    """
+
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
     PAUSED = "paused"
+    CANCELLING = "cancelling"
+    WAITING_ON_CHILD = "waiting_on_child"
+    NEEDS_AUTHOR_DECISION = "needs_author_decision"
 
 
 class ContinuousStage(str, Enum):
-    """连续创作阶段"""
+    """Legacy stage constants; durable checkpoints remain runtime-owned."""
+
     PREPARE = "prepare"
     WRITE_CHAPTER = "write_chapter"
     REVIEW_CHAPTER = "review_chapter"
@@ -51,27 +68,29 @@ class ContinuousStage(str, Enum):
 
 @dataclass
 class TaskCheckpoint:
-    """任务检查点"""
+    """Legacy checkpoint read model."""
+
     stage: str
     state: Dict[str, Any]
     chapter_number: int = 0
     timestamp: Optional[str] = None
-    
-    def __post_init__(self):
+
+    def __post_init__(self) -> None:
         if self.timestamp is None:
             self.timestamp = datetime.now().isoformat()
 
 
 @dataclass
 class Task:
-    """任务"""
+    """Legacy task read model backed by a durable ``tasks`` row."""
+
     id: str
     type: str
     status: str
     book_id: Optional[str] = None
     chapter_number: Optional[int] = None
-    data: Optional[Dict] = None
-    result: Optional[Dict] = None
+    data: Optional[Dict[str, Any]] = None
+    result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     progress: int = 0
     total_steps: int = 0
@@ -79,8 +98,8 @@ class Task:
     completed_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
-    
-    def __post_init__(self):
+
+    def __post_init__(self) -> None:
         if self.created_at is None:
             self.created_at = datetime.now().isoformat()
         if self.updated_at is None:
@@ -88,326 +107,403 @@ class Task:
 
 
 class TaskManager:
-    """任务管理器"""
-    
-    def __init__(self):
-        self.db = get_db()
+    """Deprecated adapter over :class:`TaskRuntime`.
+
+    The adapter owns no task state.  Callback registration is intentionally
+    limited to process-local notifications for legacy callers; durable state,
+    leases, events, retries, and checkpoints all go through ``TaskRuntime``.
+    """
+
+    _LEGACY_WORKER_ID = "legacy-task-manager"
+
+    def __init__(self, db: Optional[Database] = None):
+        self.runtime = TaskRuntime(db or get_db())
+        # Keep the attribute for callers that used TaskManager.db for reads;
+        # all task mutations still go through TaskRuntime.
+        self.db = self.runtime.db
         self._lock = Lock()
-        self._callbacks: Dict[str, List[Callable]] = {}
-    
+        self._callbacks: Dict[str, List[Callable[[str, Optional[str]], None]]] = {}
+
+    @staticmethod
+    def _task_type(task_type: TaskType | str) -> str:
+        return task_type.value if isinstance(task_type, TaskType) else str(task_type)
+
+    @staticmethod
+    def _runtime_status(status: TaskStatus | str) -> str:
+        value = status.value if isinstance(status, TaskStatus) else str(status)
+        return "queued" if value == TaskStatus.PENDING.value else value
+
+    @staticmethod
+    def _legacy_status(status: Optional[str]) -> str:
+        return TaskStatus.PENDING.value if status == "queued" else (status or "")
+
+    @staticmethod
+    def _chapter_from_data(data: Any) -> Optional[int]:
+        if not isinstance(data, dict):
+            return None
+        for key in ("chapter_number", "chapterNumber", "chapter", "current_chapter", "currentChapter"):
+            value = TaskManager._as_int(data.get(key))
+            if value > 0:
+                return value
+        return None
+
+    @staticmethod
+    def _as_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _to_task(cls, row: Optional[dict[str, Any]]) -> Optional[Task]:
+        if row is None:
+            return None
+        data = row.get("data") or {}
+        chapter_number = row.get("chapter_number") or cls._chapter_from_data(data)
+        return Task(
+            id=row["id"],
+            type=row.get("type", ""),
+            status=cls._legacy_status(row.get("status")),
+            book_id=row.get("book_id"),
+            chapter_number=chapter_number,
+            data=data,
+            result=row.get("result") or {},
+            error=row.get("error"),
+            progress=cls._as_int(row.get("progress")),
+            total_steps=cls._as_int(row.get("total_steps")),
+            started_at=row.get("started_at"),
+            completed_at=row.get("completed_at"),
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
+        )
+
     def create_task(
         self,
         task_type: TaskType,
         book_id: Optional[str] = None,
         chapter_number: Optional[int] = None,
-        data: Optional[Dict] = None
+        data: Optional[Dict[str, Any]] = None,
     ) -> Task:
-        """创建新任务"""
-        task_id = generate_id()
-        
-        task_data = {
-            'id': task_id,
-            'type': task_type.value if isinstance(task_type, TaskType) else task_type,
-            'status': TaskStatus.PENDING.value,
-            'book_id': book_id,
-            'chapter_number': chapter_number,
-            'data': json.dumps(data) if data else None,
-        }
-        
-        self.db.insert('tasks', task_data)
-        
-        task = Task(
-            id=task_id,
-            type=task_data['type'],
-            status=task_data['status'],
+        row = self.runtime.enqueue(
+            self._task_type(task_type),
             book_id=book_id,
             chapter_number=chapter_number,
             data=data,
         )
-        
-        logger.info(f"任务创建: {task_id} ({task_type})")
+        task = self._to_task(row)
+        assert task is not None
+        logger.warning(
+            "TaskManager is deprecated; task %s was created through TaskRuntime",
+            task.id,
+        )
         return task
-    
+
     def get_task(self, task_id: str) -> Optional[Task]:
-        """获取任务"""
-        row = self.db.get_by_id('tasks', task_id)
-        if row is None:
-            return None
-        
-        return Task(
-            id=row['id'],
-            type=row['type'],
-            status=row['status'],
-            book_id=row['book_id'],
-            chapter_number=row['chapter_number'],
-            data=json.loads(row['data']) if row['data'] else None,
-            result=json.loads(row['result']) if row['result'] else None,
-            error=row['error'],
-            progress=row['progress'],
-            total_steps=row['total_steps'],
-            started_at=row['started_at'],
-            completed_at=row['completed_at'],
-            created_at=row['created_at'],
-            updated_at=row['updated_at'],
-        )
-    
-    def update_task(self, task_id: str, **kwargs) -> bool:
-        """更新任务"""
-        with self._lock:
-            update_data = {}
-            
-            if 'status' in kwargs:
-                status = kwargs['status']
-                if isinstance(status, TaskStatus):
-                    status = status.value
-                update_data['status'] = status
-                
-                if status == TaskStatus.RUNNING.value and 'started_at' not in kwargs:
-                    update_data['started_at'] = datetime.now().isoformat()
-                elif status in [TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value]:
-                    update_data['completed_at'] = datetime.now().isoformat()
-            
-            if 'progress' in kwargs:
-                update_data['progress'] = kwargs['progress']
-            
-            if 'total_steps' in kwargs:
-                update_data['total_steps'] = kwargs['total_steps']
-            
-            if 'result' in kwargs:
-                update_data['result'] = json.dumps(kwargs['result'])
-            
-            if 'error' in kwargs:
-                update_data['error'] = kwargs['error']
-            
-            if 'chapter_number' in kwargs:
-                update_data['chapter_number'] = kwargs['chapter_number']
-            
-            if update_data:
-                self.db.update('tasks', update_data, 'id = ?', (task_id,))
-                
-                # 触发回调
-                self._trigger_callbacks(task_id, kwargs.get('status'))
-            
-            return True
-    
-    def start_task(self, task_id: str) -> bool:
-        """启动任务"""
-        task = self.get_task(task_id)
-        if task is None or task.status != TaskStatus.PENDING.value:
-            return False
-        
-        self.update_task(task_id, status=TaskStatus.RUNNING)
-        return True
-    
-    def complete_task(self, task_id: str, result: Optional[Dict] = None) -> bool:
-        """完成任务"""
-        self.update_task(
-            task_id,
-            status=TaskStatus.COMPLETED,
-            result=result or {}
-        )
-        return True
-    
-    def fail_task(self, task_id: str, error: str) -> bool:
-        """任务失败"""
-        self.update_task(
-            task_id,
-            status=TaskStatus.FAILED,
-            error=error
-        )
-        return True
-    
-    def cancel_task(self, task_id: str) -> bool:
-        """取消任务"""
-        task = self.get_task(task_id)
+        return self._to_task(self.runtime.get(task_id))
+
+    def _claim_running(self, task_id: str) -> Optional[dict[str, Any]]:
+        task = self.runtime.get(task_id)
         if task is None:
+            return None
+        if task.get("status") == "paused":
+            self.runtime.resume(task_id)
+            task = self.runtime.get(task_id)
+        if task and task.get("status") in {"queued", "pending"}:
+            return self.runtime.claim_by_id(
+                task_id,
+                self._LEGACY_WORKER_ID,
+                lease_seconds=3600,
+            )
+        return task if task and task.get("status") == "running" else None
+
+    def _apply_status(
+        self,
+        task_id: str,
+        target: str,
+        *,
+        result: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> dict[str, Any]:
+        current = self.runtime.get(task_id)
+        if current is None:
+            raise KeyError(f"task not found: {task_id}")
+        raw = current.get("status")
+        target = self._runtime_status(target)
+
+        if target == "queued":
+            if raw == "paused":
+                return self.runtime.resume(task_id)
+            if raw in {"failed", "needs_author_decision"}:
+                return self.runtime.retry(task_id)
+            if raw in {"queued", "pending"}:
+                return current
+            raise TaskStateError(f"cannot translate legacy status to queued: {raw}")
+
+        if target == "running":
+            running = self._claim_running(task_id)
+            if running is None:
+                raise TaskStateError(f"task is not runnable: {raw}")
+            return running
+
+        if target == "paused":
+            if raw in {"queued", "pending"}:
+                self._claim_running(task_id)
+            return self.runtime.pause(task_id)
+
+        if target == "completed":
+            if raw in {"queued", "pending"}:
+                self._claim_running(task_id)
+            if raw == "completed":
+                return current
+            return self.runtime.transition(task_id, "completed", result=result or {})
+
+        if target == "failed":
+            if raw in {"queued", "pending"}:
+                self._claim_running(task_id)
+            if raw == "failed":
+                return current
+            return self.runtime.fail(
+                task_id,
+                "LEGACY_TASK_MANAGER_FAILURE",
+                error or "legacy task failed",
+                retryable=False,
+            )
+
+        if target == "cancelled":
+            if raw == "cancelled":
+                return current
+            return self.runtime.cancel(task_id)
+
+        if target == "needs_author_decision":
+            if raw in {"queued", "pending"}:
+                self._claim_running(task_id)
+            if raw == "needs_author_decision":
+                return current
+            return self.runtime.transition(
+                task_id,
+                "needs_author_decision",
+                error_code="LEGACY_TASK_MANAGER_DECISION",
+                error=error,
+            )
+
+        return self.runtime.transition(task_id, target)
+
+    def update_task(self, task_id: str, **kwargs: Any) -> bool:
+        """Translate legacy updates into fenced durable runtime operations."""
+        current = self.runtime.get(task_id)
+        if current is None:
             return False
-        
-        if task.status in [TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value]:
-            return False
-        
-        self.update_task(task_id, status=TaskStatus.CANCELLED)
+        status = kwargs.get("status")
+        if status is not None:
+            self._apply_status(
+                task_id,
+                status,
+                result=kwargs.get("result"),
+                error=kwargs.get("error"),
+            )
+        elif kwargs.get("result") is not None or kwargs.get("error") is not None:
+            target = "completed" if kwargs.get("result") is not None else "failed"
+            self._apply_status(
+                task_id,
+                target,
+                result=kwargs.get("result"),
+                error=kwargs.get("error"),
+            )
+
+        metadata = {
+            key: kwargs[key]
+            for key in ("progress", "total_steps", "chapter_number")
+            if key in kwargs
+        }
+        if metadata:
+            self.runtime.update_metadata(task_id, **metadata)
+        # Do not call this while holding _lock: callback delivery takes a
+        # snapshot under the same lock and callbacks must never gate durable
+        # task transitions.
+        self._trigger_callbacks(task_id, kwargs.get("status"))
         return True
-    
+
+    def start_task(self, task_id: str) -> bool:
+        task = self.runtime.get(task_id)
+        if task is None or task.get("status") not in {"queued", "pending"}:
+            return False
+        claimed = self.runtime.claim_by_id(
+            task_id,
+            self._LEGACY_WORKER_ID,
+            lease_seconds=3600,
+        )
+        if claimed is None:
+            return False
+        self._trigger_callbacks(task_id, TaskStatus.RUNNING.value)
+        return True
+
+    def complete_task(self, task_id: str, result: Optional[Dict[str, Any]] = None) -> bool:
+        try:
+            self._apply_status(task_id, "completed", result=result or {})
+        except (KeyError, TaskStateError):
+            return False
+        self._trigger_callbacks(task_id, TaskStatus.COMPLETED.value)
+        return True
+
+    def fail_task(self, task_id: str, error: str) -> bool:
+        try:
+            self._apply_status(task_id, "failed", error=error)
+        except (KeyError, TaskStateError):
+            return False
+        self._trigger_callbacks(task_id, TaskStatus.FAILED.value)
+        return True
+
+    def cancel_task(self, task_id: str) -> bool:
+        task = self.runtime.get(task_id)
+        if task is None or task.get("status") in {"completed", "failed", "cancelled"}:
+            return False
+        try:
+            updated = self._apply_status(task_id, "cancelled")
+        except (KeyError, TaskStateError):
+            return False
+        self._trigger_callbacks(task_id, updated.get("status"))
+        return True
+
     def pause_task(self, task_id: str) -> bool:
-        """暂停任务"""
-        task = self.get_task(task_id)
-        if task is None or task.status != TaskStatus.RUNNING.value:
+        task = self.runtime.get(task_id)
+        if task is None or task.get("status") != "running":
             return False
-        
-        self.update_task(task_id, status=TaskStatus.PAUSED)
+        try:
+            self.runtime.pause(task_id)
+        except (KeyError, TaskStateError):
+            return False
+        self._trigger_callbacks(task_id, TaskStatus.PAUSED.value)
         return True
-    
+
     def resume_task(self, task_id: str) -> bool:
-        """恢复任务"""
-        task = self.get_task(task_id)
-        if task is None or task.status != TaskStatus.PAUSED.value:
+        task = self.runtime.get(task_id)
+        if task is None or task.get("status") != "paused":
             return False
-        
-        self.update_task(task_id, status=TaskStatus.RUNNING)
+        try:
+            claimed = self._claim_running(task_id)
+        except (KeyError, TaskStateError):
+            return False
+        if claimed is None:
+            return False
+        self._trigger_callbacks(task_id, TaskStatus.RUNNING.value)
         return True
-    
+
     def list_tasks(
         self,
         book_id: Optional[str] = None,
         task_type: Optional[TaskType] = None,
         status: Optional[TaskStatus] = None,
-        limit: int = 50
+        limit: int = 50,
     ) -> List[Task]:
-        """列出任务"""
-        conditions = []
-        params = []
-        
-        if book_id:
-            conditions.append("book_id = ?")
-            params.append(book_id)
-        
-        if task_type:
-            conditions.append("type = ?")
-            params.append(task_type.value if isinstance(task_type, TaskType) else task_type)
-        
-        if status:
-            conditions.append("status = ?")
-            params.append(status.value if isinstance(status, TaskStatus) else status)
-        
-        where = " AND ".join(conditions) if conditions else ""
-        
-        rows = self.db.fetchall(
-            f"SELECT * FROM tasks {'WHERE ' + where if where else ''} ORDER BY created_at DESC LIMIT ?",
-            tuple(params) + (limit,)
+        runtime_status = self._runtime_status(status) if status is not None else None
+        rows = self.runtime.list(
+            book_id=book_id,
+            task_type=self._task_type(task_type) if task_type is not None else None,
+            status=runtime_status,
+            limit=limit,
         )
-        
-        tasks = []
-        for row in rows:
-            tasks.append(Task(
-                id=row['id'],
-                type=row['type'],
-                status=row['status'],
-                book_id=row['book_id'],
-                chapter_number=row['chapter_number'],
-                data=json.loads(row['data']) if row['data'] else None,
-                result=json.loads(row['result']) if row['result'] else None,
-                error=row['error'],
-                progress=row['progress'],
-                total_steps=row['total_steps'],
-                started_at=row['started_at'],
-                completed_at=row['completed_at'],
-                created_at=row['created_at'],
-                updated_at=row['updated_at'],
-            ))
-        
-        return tasks
-    
+        return [task for row in rows if (task := self._to_task(row)) is not None]
+
     def get_running_tasks(self) -> List[Task]:
-        """获取正在运行的任务"""
         return self.list_tasks(status=TaskStatus.RUNNING)
-    
+
     def get_pending_tasks(self) -> List[Task]:
-        """获取待处理任务"""
         return self.list_tasks(status=TaskStatus.PENDING)
-    
+
     def get_unfinished_tasks(self) -> List[Task]:
-        """获取未完成任务（用于恢复）"""
-        return self.list_tasks(status=TaskStatus.PAUSED) + \
-               self.list_tasks(status=TaskStatus.RUNNING)
-    
-    # 检查点管理
-    
+        rows = self.runtime.list(limit=100000)
+        return [
+            task
+            for row in rows
+            if row.get("status") in {"paused", "running", "cancelling", "waiting_on_child"}
+            and (task := self._to_task(row)) is not None
+        ]
+
     def save_checkpoint(self, task_id: str, stage: str, state: Dict[str, Any]) -> str:
-        """保存检查点"""
-        checkpoint_id = generate_id()
-        
-        checkpoint_data = {
-            'id': checkpoint_id,
-            'task_id': task_id,
-            'stage': stage,
-            'state': json.dumps(state),
-        }
-        
-        self.db.insert('task_checkpoints', checkpoint_data)
-        logger.info(f"检查点保存: {task_id} @ {stage}")
-        return checkpoint_id
-    
-    def get_latest_checkpoint(self, task_id: str) -> Optional[TaskCheckpoint]:
-        """获取最新检查点"""
-        row = self.db.fetchone(
-            "SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
-            (task_id,)
-        )
-        
+        task = self.runtime.get(task_id)
+        if task is None:
+            raise KeyError(f"task not found: {task_id}")
+        temporary_claim = task.get("status") in {"queued", "pending"}
+        lease_owner: Optional[str] = None
+        if temporary_claim:
+            claimed = self.runtime.claim_by_id(
+                task_id,
+                self._LEGACY_WORKER_ID,
+                lease_seconds=3600,
+            )
+            if claimed is None:
+                raise TaskStateError("legacy task could not acquire a checkpoint lease")
+            lease_owner = self._LEGACY_WORKER_ID
+        elif task.get("status") not in {"running", "paused", "cancelling"}:
+            raise TaskStateError("a checkpoint requires an active task")
+
+        checkpoint = self.runtime.checkpoint(task_id, stage, state, lease_owner=lease_owner)
+        if temporary_claim:
+            self.runtime.pause(task_id)
+        logger.info("checkpoint saved through TaskRuntime: %s @ %s", task_id, stage)
+        return checkpoint["id"]
+
+    @staticmethod
+    def _checkpoint(row: Optional[dict[str, Any]]) -> Optional[TaskCheckpoint]:
         if row is None:
             return None
-        
+        state = row.get("state") or {}
+        chapter = state.get("chapter", 0) if isinstance(state, dict) else 0
+        try:
+            chapter_number = int(chapter)
+        except (TypeError, ValueError):
+            chapter_number = 0
         return TaskCheckpoint(
-            stage=row['stage'],
-            state=json.loads(row['state']),
-            timestamp=row['created_at']
+            stage=row.get("stage", ""),
+            state=state,
+            chapter_number=chapter_number,
+            timestamp=row.get("created_at"),
         )
-    
+
+    def get_latest_checkpoint(self, task_id: str) -> Optional[TaskCheckpoint]:
+        return self._checkpoint(self.runtime.latest_checkpoint(task_id))
+
     def get_checkpoints(self, task_id: str) -> List[TaskCheckpoint]:
-        """获取所有检查点"""
-        rows = self.db.fetchall(
-            "SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY created_at DESC",
-            (task_id,)
-        )
-        
-        checkpoints = []
-        for row in rows:
-            checkpoints.append(TaskCheckpoint(
-                stage=row['stage'],
-                state=json.loads(row['state']),
-                timestamp=row['created_at']
-            ))
-        
-        return checkpoints
-    
-    def clear_checkpoints(self, task_id: str):
-        """清除任务的所有检查点"""
-        self.db.delete('task_checkpoints', 'task_id = ?', (task_id,))
-    
-    # 回调管理
-    
-    def register_callback(self, task_id: str, callback: Callable):
-        """注册任务状态回调"""
-        if task_id not in self._callbacks:
-            self._callbacks[task_id] = []
-        self._callbacks[task_id].append(callback)
-    
-    def _trigger_callbacks(self, task_id: str, status: Optional[str]):
-        """触发回调"""
-        if task_id in self._callbacks:
-            for callback in self._callbacks[task_id]:
-                try:
-                    callback(task_id, status)
-                except Exception as e:
-                    logger.error(f"回调执行失败: {e}")
-    
-    # 统计
-    
+        return [
+            checkpoint
+            for row in self.runtime.list_checkpoints(task_id)
+            if (checkpoint := self._checkpoint(row)) is not None
+        ]
+
+    def clear_checkpoints(self, task_id: str) -> None:
+        self.runtime.clear_checkpoints(task_id)
+
+    def register_callback(self, task_id: str, callback: Callable[[str, Optional[str]], None]) -> None:
+        with self._lock:
+            self._callbacks.setdefault(task_id, []).append(callback)
+
+    def _trigger_callbacks(self, task_id: str, status: Optional[str]) -> None:
+        with self._lock:
+            callbacks = list(self._callbacks.get(task_id, []))
+        for callback in callbacks:
+            try:
+                callback(task_id, status)
+            except Exception as exc:  # pragma: no cover - compatibility boundary
+                logger.error("legacy task callback failed: %s", exc)
+
     def get_stats(self, book_id: Optional[str] = None) -> Dict[str, Any]:
-        """获取任务统计"""
-        where = "book_id = ?" if book_id else ""
-        params = (book_id,) if book_id else ()
-        
-        stats = {
-            'total': self.db.count('tasks', where, params),
-            'pending': self.db.count('tasks', f"status = 'pending' {'AND ' + where if where else ''}", params),
-            'running': self.db.count('tasks', f"status = 'running' {'AND ' + where if where else ''}", params),
-            'completed': self.db.count('tasks', f"status = 'completed' {'AND ' + where if where else ''}", params),
-            'failed': self.db.count('tasks', f"status = 'failed' {'AND ' + where if where else ''}", params),
-            'cancelled': self.db.count('tasks', f"status = 'cancelled' {'AND ' + where if where else ''}", params),
+        counts = self.runtime.status_counts(book_id=book_id)
+        return {
+            "total": sum(counts.values()),
+            "pending": counts["queued"],
+            "running": counts["running"] + counts["cancelling"] + counts["waiting_on_child"],
+            "completed": counts["completed"],
+            "failed": counts["failed"] + counts["needs_author_decision"],
+            "cancelled": counts["cancelled"],
         }
-        
-        return stats
 
 
-# 全局任务管理器实例（线程安全）
 _task_manager_lock = Lock()
 _task_manager: Optional[TaskManager] = None
 
 
 def get_task_manager() -> TaskManager:
-    """获取全局任务管理器"""
+    """Return the deprecated adapter, still backed by the current database."""
     global _task_manager
     if _task_manager is None:
         with _task_manager_lock:

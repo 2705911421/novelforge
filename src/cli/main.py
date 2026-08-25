@@ -15,6 +15,24 @@ from ..creation.continuous_service import ContinuousWritingService
 console = Console()
 
 
+def _print_server_banner(host: str, port: int) -> None:
+    """Print the Studio banner without making service startup encoding-bound."""
+    panel = Panel(
+        f"[bold green]🚀 NovelForge Studio 启动中[/]\n\n"
+        f"可视化界面: [cyan]http://{host}:{port}[/]\n"
+        "[dim]涵盖世界观向导 / 章节工作台 / 连续创作 / 双重门禁审查 /\n"
+        "联合审查 / 思维导图 / 时间轴 / 伏笔追踪 / 导出交付 等全部功能[/]",
+        border_style="green",
+    )
+    try:
+        console.print(panel)
+    except UnicodeEncodeError:
+        # Windows redirected/legacy consoles may advertise GBK and reject the
+        # emoji or other non-encodable glyphs.  The banner is optional; the
+        # HTTP service must still start and expose a machine-readable endpoint.
+        click.echo(f"NovelForge Studio starting: http://{host}:{port}")
+
+
 def get_managers(project_path=None):
     """获取管理器实例"""
     from ..core.config import Config
@@ -63,8 +81,11 @@ def init(ctx, name, genre, import_file):
         content = wizard.import_world_file(import_file)
         console.print(f"📄 已导入设定文件: {import_file}")
         console.print(f"[dim]{content[:200]}...[/]")
+        book = project_mgr.story_repository.book_for_project(project.id)
+        if not book:
+            raise click.ClickException("项目没有 authoritative book")
         task = TaskRuntime(project_mgr.story_repository.db).enqueue(
-            "world-bootstrap", project_id=project.id, book_id=project.id, data={"brief": content}
+            "world-bootstrap", project_id=project.id, book_id=book["id"], data={"brief": content}
         )
         console.print(f"✅ 世界观构建任务已排队 [dim](ID: {task['id']})[/]")
 
@@ -89,6 +110,9 @@ def ingest(ctx, project_id, file_path, doc_type):
 
     from ..core.task_runtime import TaskRuntime
     from ..ingestion.service import DEFAULT_MAX_BYTES, DocumentIngestionError, DocumentRepository
+    book = project_mgr.story_repository.book_for_project(project.id)
+    if not book:
+        raise click.ClickException("项目没有 authoritative book")
 
     try:
         if file_path.stat().st_size > DEFAULT_MAX_BYTES:
@@ -98,7 +122,7 @@ def ingest(ctx, project_id, file_path, doc_type):
             project.id, file_path.name, file_path.read_bytes(), doc_type=doc_type
         )
         task = TaskRuntime(project_mgr.story_repository.db).enqueue(
-            "ingest-document", project_id=project.id, book_id=project.id, data={"document_id": document["id"]},
+            "ingest-document", project_id=project.id, book_id=book["id"], data={"document_id": document["id"]},
             idempotency_key=f"ingest-document:{document['id']}:{document['source_fingerprint']}",
         )
         document_repository.mark_task(document["id"], task["id"])
@@ -171,8 +195,14 @@ def wizard(ctx, project_id, user_input):
         console.print("请描述你的小说设定（包括世界观、角色、势力、地图等）:")
         user_input = console.input("> ")
 
+    book = project_mgr.story_repository.book_for_project(project.id)
+    if not book:
+        raise click.ClickException(f"项目没有 authoritative book: {project.id}")
     task = TaskRuntime(project_mgr.story_repository.db).enqueue(
-        "world-bootstrap", project_id=project.id, book_id=project.id, data={"brief": user_input}
+        "world-bootstrap",
+        project_id=project.id,
+        book_id=book["id"],
+        data={"brief": user_input},
     )
     console.print(f"\n✅ 世界观构建任务已排队 [dim](ID: {task['id']})[/]")
     console.print("运行 [cyan]novelforge worker[/] 以执行任务；状态会保存在 SQLite 中。")
@@ -478,13 +508,7 @@ def bible_publish(ctx):
 def serve(ctx, host, port):
     """启动 Web Studio 可视化界面（对标 inkOS）"""
     import uvicorn
-    console.print(Panel(
-        f"[bold green]🚀 NovelForge Studio 启动中[/]\n\n"
-        f"可视化界面: [cyan]http://{host}:{port}[/]\n"
-        f"[dim]涵盖世界观向导 / 章节工作台 / 连续创作 / 双重门禁审查 /\n"
-        f"联合审查 / 思维导图 / 时间轴 / 伏笔追踪 / 导出交付 等全部功能[/]",
-        border_style="green"
-    ))
+    _print_server_banner(host, port)
     uvicorn.run("src.web.studio:app", host=host, port=port)
 
 

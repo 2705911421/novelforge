@@ -49,6 +49,7 @@ from src.planning.planning_synthesis import (
 )
 from src.creation.continuous_service import ContinuousWritingService
 from src.interactive_film.service import InteractiveFilmStore, normalize_graph
+from src.prompts.prompt_repository import PromptRepository
 
 
 class LegacyTaskHandlers:
@@ -821,23 +822,103 @@ class LegacyTaskHandlers:
         for step in bible["steps"]:
             if step["step_number"] < target_step_num and step["status"] == "confirmed":
                 confirmed_context[step["step_key"]] = step["draft"]
-        # Build prompt and invoke model.
-        prompt_parts = [f"你是一个专业的小说创作策划助手。当前正在为作品设计 Story Bible 的第 {target_step_num} 步：{step_key}。\n"]
-        if confirmed_context:
-            prompt_parts.append("已确认的前序设定：\n")
-            for key, value in confirmed_context.items():
-                prompt_parts.append(f"【{key}】{json.dumps(value, ensure_ascii=False)}\n")
-        prompt_parts.append(f"\n请为「{step_key}」生成详细、具体的设定内容。要求：")
-        if brief:
-            prompt_parts.append(f"\n用户的特别要求：{brief}")
-        prompt_parts.append("\n请直接返回 JSON 格式的设定内容。不要使用代码块标记。")
-        prompt = "".join(prompt_parts)
+        # Resolve the project-scoped registry entry before building the model
+        # input.  The old handler assembled an anonymous prompt here, which
+        # meant a saved Story Bible prompt never affected the worker call and
+        # its GenerationRun only carried the Agent route fallback.
+        prompt_repo = PromptRepository(self.project_manager.story_repository.db)
+        prompt_type = "story-bible-suggest"
+        prompt_policy = (task.get("data") or {}).get("prompt_policy_versions")
+        pinned = prompt_policy.get(prompt_type) if isinstance(prompt_policy, dict) else None
+        prompt_record: Optional[dict[str, Any]]
+        if isinstance(pinned, dict) and pinned.get("id"):
+            pinned_id_version = pinned.get("version")
+            if pinned_id_version is not None:
+                if isinstance(pinned_id_version, bool):
+                    raise ValueError(f"invalid pinned {prompt_type} prompt version")
+                try:
+                    pinned_id_version = int(str(pinned_id_version))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"invalid pinned {prompt_type} prompt version") from exc
+            prompt_record = self.project_manager.story_repository.db.fetchone(
+                """SELECT * FROM prompt_templates
+                   WHERE id=? AND task_type=? AND (project_id=? OR project_id IS NULL)""",
+                (pinned["id"], prompt_type, project_id),
+            )
+            if prompt_record is not None and pinned_id_version is not None:
+                try:
+                    actual_version = int(prompt_record.get("version") or 0)
+                except (TypeError, ValueError):
+                    actual_version = -1
+                if actual_version != pinned_id_version:
+                    prompt_record = None
+        elif pinned is not None:
+            pinned_version = pinned.get("version") if isinstance(pinned, dict) else pinned
+            if isinstance(pinned_version, bool):
+                raise ValueError(f"invalid pinned {prompt_type} prompt version")
+            if pinned_version is None:
+                raise ValueError(f"invalid pinned {prompt_type} prompt version")
+            try:
+                pinned_version_int = int(str(pinned_version))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid pinned {prompt_type} prompt version") from exc
+            prompt_record = prompt_repo.get_prompt_version(prompt_type, pinned_version_int, project_id)
+        else:
+            prompt_record = prompt_repo.get_prompt(prompt_type, project_id)
+        if prompt_record is None:
+            raise ValueError(f"pinned {prompt_type} prompt is unavailable")
+
+        confirmed_text = "\n".join(
+            f"【{key}】{json.dumps(value, ensure_ascii=False)}"
+            for key, value in confirmed_context.items()
+        ) or "无"
+        extra = (
+            f"用户的特别要求：{brief}\n" if brief else ""
+        ) + "请直接返回 JSON 格式的设定内容。不要使用代码块标记。"
+        fallback_prompt = (
+            f"请为「{step_key}」生成详细、具体的设定内容。\n\n"
+            f"## 已确认的前序设定\n{confirmed_text}\n\n{extra}"
+        )
+        template = prompt_record.get("user_template") or fallback_prompt
+        try:
+            prompt = template.format(
+                step_key=step_key,
+                context=confirmed_text,
+                extra=extra,
+                target_step=target_step_num,
+            )
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(f"invalid {prompt_type} prompt template: {exc}") from exc
         self.runtime.checkpoint(task["id"], "model-call", {"step_key": step_key})
-        system = "你是一个专业的小说创作策划助手，擅长设计长篇小说的世界观、角色、剧情等设定。请直接返回JSON格式的内容，不要使用代码块标记。"
+        prompt_key = str(prompt_record.get("task_type") or prompt_type)
+        prompt_version = str(prompt_record.get("version") or 0)
+        prompt_registry = {
+            "id": prompt_record.get("id"),
+            "task_type": prompt_key,
+            "version": int(prompt_record.get("version") or 0),
+            "project_id": prompt_record.get("project_id"),
+            "source": "prompt_templates" if prompt_record.get("id") else "builtin",
+        }
+        system = prompt_record.get("system_prompt") or (
+            "你是一个专业的小说创作策划助手，擅长设计长篇小说的世界观、角色、剧情等设定。"
+            "请直接返回JSON格式的内容，不要使用代码块标记。"
+        )
+        chat_kwargs: dict[str, Any] = {
+            "system": system,
+            "task_type": prompt_type,
+        }
+        # PersistentMultiModelManager is the production worker boundary. Keep
+        # the plain legacy client compatible for callers that do not expose
+        # durable GenerationRun support.
+        if hasattr(self.model_manager, "runtime"):
+            chat_kwargs.update({
+                "prompt_key": prompt_key,
+                "prompt_version": prompt_version,
+                "prompt_registry": prompt_registry,
+            })
         response = self.model_manager.chat(
             [{"role": "user", "content": prompt}],
-            system=system,
-            task_type="story-bible-suggest",
+            **chat_kwargs,
         )
         content = response.content.strip()
         # Try to parse JSON from response.

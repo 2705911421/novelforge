@@ -13,6 +13,7 @@ import logging
 import shutil
 import sqlite3
 import hashlib
+import json
 import threading as _threading
 from contextlib import closing
 from datetime import datetime
@@ -49,6 +50,94 @@ class BackupManager:
         return digest.hexdigest()
 
     @staticmethod
+    def _manifest_path(backup_path: Path) -> Path:
+        return backup_path.with_suffix(backup_path.suffix + ".manifest.json")
+
+    def _schema_version(self) -> int:
+        row = self.db.fetchone(
+            "SELECT MAX(version) AS version FROM schema_migrations"
+        ) if self.db.table_exists("schema_migrations") else None
+        if row and row.get("version") is not None:
+            return int(row["version"])
+        return int(self.db.get_version())
+
+    def _write_manifest(
+        self,
+        backup_path: Path,
+        *,
+        backup_id: str,
+        project_id: str,
+        backup_type: str,
+        created_at: str,
+        size_bytes: int,
+        backup_sha256: str,
+    ) -> Path:
+        """Write an atomic sidecar manifest for a newly created backup."""
+        manifest_path = self._manifest_path(backup_path)
+        payload = {
+            "manifest_version": 1,
+            "backup_id": backup_id,
+            "project_id": project_id,
+            "backup_type": backup_type,
+            "backup_file": backup_path.name,
+            "backup_sha256": backup_sha256,
+            "size_bytes": size_bytes,
+            "schema_version": self._schema_version(),
+            "created_at": created_at,
+        }
+        temporary_path = manifest_path.with_name(manifest_path.name + ".tmp")
+        try:
+            temporary_path.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+            temporary_path.replace(manifest_path)
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
+        return manifest_path
+
+    def _validate_manifest(self, backup: dict[str, Any], backup_path: Path) -> dict[str, Any]:
+        """Validate a new manifest, while retaining readable legacy backups."""
+        manifest_path = self._manifest_path(backup_path)
+        if not manifest_path.exists():
+            return {"status": "legacy_unmanifested", "path": str(manifest_path)}
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"备份清单无法读取: {manifest_path}: {exc}") from exc
+        if not isinstance(manifest, dict):
+            raise RuntimeError(f"备份清单格式无效: {manifest_path}")
+        if manifest.get("backup_id") != backup["id"]:
+            raise RuntimeError("备份清单 ID 与数据库目录不匹配")
+        if manifest.get("project_id") != backup["project_id"]:
+            raise RuntimeError("备份清单项目与数据库目录不匹配")
+        actual_size = backup_path.stat().st_size
+        if int(manifest.get("size_bytes", -1)) != actual_size:
+            raise RuntimeError("备份清单大小与文件不匹配")
+        actual_hash = self._hash_file(backup_path)
+        if manifest.get("backup_sha256") != actual_hash:
+            raise RuntimeError("备份清单 hash 与文件不匹配")
+        current_schema = self._schema_version()
+        manifest_schema = int(manifest.get("schema_version", -1))
+        if manifest_schema < 0 or manifest_schema > current_schema:
+            raise RuntimeError(
+                f"备份 schema 版本不兼容: backup={manifest_schema}, current={current_schema}"
+            )
+        return {"status": "valid", "path": str(manifest_path), "manifest": manifest}
+
+    def _manifest_read_model(self, backup: dict[str, Any], backup_path: Path) -> dict[str, Any]:
+        """Expose manifest health without making list/detail endpoints brittle."""
+        try:
+            return self._validate_manifest(backup, backup_path)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return {
+                "status": "invalid",
+                "path": str(self._manifest_path(backup_path)),
+                "error": str(exc),
+            }
+
+    @staticmethod
     def _checkpoint_or_raise(db_path: Path) -> None:
         """Quiesce SQLite WAL state and fail closed when it cannot be done."""
         try:
@@ -81,6 +170,27 @@ class BackupManager:
         if path.exists():
             raise RuntimeError(f"SQLite sidecar remains after removal: {path}")
 
+    def _active_tasks_for_project(self, project_id: str) -> list[dict[str, Any]]:
+        """Return tasks that could mutate the project while it is restored.
+
+        A restore replaces the authoritative database file.  Allowing a
+        running or queued writer to continue across that replacement can
+        apply a post-snapshot StoryCommit, checkpoint, or derived projection
+        to a database whose Canon has moved backwards.  The caller must stop
+        or cancel these tasks before the irreversible file replacement.
+        """
+        return self.db.fetchall(
+            """SELECT id, type, status, project_id, book_id
+               FROM tasks
+               WHERE status IN ('queued', 'running', 'waiting_on_child', 'paused', 'cancelling')
+                 AND (
+                   project_id=?
+                   OR book_id IN (SELECT id FROM books WHERE project_id=?)
+                 )
+               ORDER BY created_at, id""",
+            (project_id, project_id),
+        )
+
     def create_backup(
         self,
         project_id: str,
@@ -97,6 +207,12 @@ class BackupManager:
         Returns:
             备份信息字典
         """
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ValueError("项目ID不能为空")
+        if not self.db.fetchone("SELECT id FROM projects WHERE id=?", (project_id,)):
+            raise ValueError(f"项目不存在: {project_id}")
+        if backup_type not in {"manual", "auto", "chapter", "campaign", "pre-restore"}:
+            raise ValueError(f"不支持的备份类型: {backup_type}")
         backup_id = generate_id()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -124,6 +240,17 @@ class BackupManager:
 
             # 获取备份大小
             size_bytes = backup_path.stat().st_size
+            created_at = datetime.now().isoformat()
+            backup_sha256 = self._hash_file(backup_path)
+            manifest_path = self._write_manifest(
+                backup_path,
+                backup_id=backup_id,
+                project_id=project_id,
+                backup_type=backup_type,
+                created_at=created_at,
+                size_bytes=size_bytes,
+                backup_sha256=backup_sha256,
+            )
 
             # 记录备份元数据
             self.db.execute(
@@ -140,7 +267,9 @@ class BackupManager:
                 "size_bytes": size_bytes,
                 "description": description,
                 "integrity": integrity,
-                "created_at": datetime.now().isoformat(),
+                "sha256": backup_sha256,
+                "manifest_path": str(manifest_path),
+                "created_at": created_at,
             }
 
         except Exception as e:
@@ -150,6 +279,7 @@ class BackupManager:
             except PermissionError:
                 # Windows 上文件可能被锁定，忽略清理错误
                 pass
+            self._manifest_path(backup_path).unlink(missing_ok=True)
             raise RuntimeError(f"创建备份失败: {e}") from e
 
     def auto_backup_after_commit(self, project_id: str, chapter_id: str) -> Optional[dict[str, Any]]:
@@ -220,6 +350,9 @@ class BackupManager:
             backup_dict["exists"] = backup_path.exists()
             if backup_dict["exists"]:
                 backup_dict["current_size"] = backup_path.stat().st_size
+                backup_dict["manifest"] = self._manifest_read_model(
+                    backup_dict, backup_path
+                )
             result.append(backup_dict)
 
         return result
@@ -247,6 +380,9 @@ class BackupManager:
         if backup_dict["exists"]:
             backup_dict["current_size"] = backup_path.stat().st_size
             backup_dict["integrity"] = self._check_integrity(backup_path)
+            backup_dict["manifest"] = self._manifest_read_model(
+                backup_dict, backup_path
+            )
 
         return backup_dict
 
@@ -285,6 +421,19 @@ class BackupManager:
         integrity = self._check_integrity(backup_path)
         if integrity != "ok":
             raise RuntimeError(f"备份文件损坏: {integrity}")
+        manifest_status = self._validate_manifest(dict(backup), backup_path)
+
+        active_tasks = self._active_tasks_for_project(str(backup["project_id"]))
+        if active_tasks:
+            task_summary = ", ".join(
+                f"{row['id']}({row['type']}:{row['status']})" for row in active_tasks[:8]
+            )
+            if len(active_tasks) > 8:
+                task_summary += f", +{len(active_tasks) - 8} more"
+            raise RuntimeError(
+                "restore blocked while project has active durable tasks: "
+                f"{task_summary}"
+            )
 
         # 恢复前创建备份
         pre_restore_backup_id = None
@@ -329,6 +478,14 @@ class BackupManager:
             # 重新初始化数据库连接
             from .database import init_db
             self.db = init_db(str(db_path))
+
+            # A restored snapshot may contain a lease owned by a process that
+            # no longer exists. Treat every restored running lease as an
+            # expired process boundary; never leave it looking live merely
+            # because its old lease deadline has not elapsed yet.
+            from .task_runtime import TaskRuntime
+            recovered_tasks = TaskRuntime(self.db).recover_all_leases_for_restore()
+            self._checkpoint_or_raise(db_path)
 
             # Confirm the rebound connection exposes a valid journal mode
             # without swallowing an error. Database connections may switch
@@ -389,6 +546,15 @@ class BackupManager:
                 "restored_from": backup["created_at"],
                 "catalog_preserved": len(catalog_rows),
                 "projection_rebuild": projection_rebuild,
+                "recovered_tasks": [
+                    {
+                        "task_id": task["id"],
+                        "type": task["type"],
+                        "status": task["status"],
+                    }
+                    for task in recovered_tasks
+                ],
+                "manifest": manifest_status,
                 "canon_hash": canon_hash,
                 "restored_backup_sha256": self._hash_file(backup_path),
                 "rebound_database_sha256": rebound_hash,
@@ -421,18 +587,100 @@ class BackupManager:
         except ValueError:
             return False
 
-        # 删除备份文件
-        try:
-            if backup_path.exists():
-                backup_path.unlink()
-        except PermissionError:
-            # Windows 上文件可能被锁定
-            pass
+        project_backups = self.db.fetchall(
+            """SELECT id, file_path, created_at, project_id FROM backups
+               WHERE project_id=? ORDER BY created_at DESC""",
+            (backup["project_id"],),
+        )
+        verifiable_ids = self._verifiable_backup_ids(project_backups)
+        if backup_id in verifiable_ids and len(verifiable_ids) == 1:
+            raise RuntimeError(
+                "cannot delete the last verifiable backup; catalog row retained"
+            )
+
+        # Remove both artifacts before deleting the catalog row.  A locked
+        # Windows file must remain discoverable in SQLite; otherwise the UI
+        # loses the only durable pointer to an audit backup that still exists.
+        # ``_remove_backup_artifacts`` also verifies that a successful unlink
+        # actually removed the path, which covers antivirus/indexer races.
+        self._remove_backup_artifacts(backup_path)
 
         # 删除元数据
         self.db.execute("DELETE FROM backups WHERE id = ?", (backup_id,))
 
         return True
+
+    def _remove_backup_artifacts(self, backup_path: Path) -> None:
+        """Remove a backup and manifest, failing closed if either remains."""
+        manifest_path = self._manifest_path(backup_path)
+        manifest_bytes: bytes | None = None
+        manifest_removed = False
+
+        # Remove the small sidecar first.  If the database file is locked, the
+        # sidecar is restored from memory so the catalog continues to point at
+        # a complete, verifiable pair.  If the sidecar itself is locked, the
+        # main backup is never touched.
+        if manifest_path.exists():
+            try:
+                manifest_bytes = manifest_path.read_bytes()
+                manifest_path.unlink(missing_ok=True)
+                if manifest_path.exists():
+                    raise OSError("manifest remains after unlink")
+                manifest_removed = True
+            except OSError as exc:
+                raise RuntimeError(
+                    "backup artifacts could not be removed; catalog row retained: "
+                    f"{manifest_path}: {exc}"
+                ) from exc
+
+        try:
+            backup_path.unlink(missing_ok=True)
+            if backup_path.exists():
+                raise OSError("backup remains after unlink")
+        except OSError as exc:
+            if manifest_removed and manifest_bytes is not None:
+                temporary_path = manifest_path.with_name(
+                    manifest_path.name + ".restore.tmp"
+                )
+                try:
+                    temporary_path.write_bytes(manifest_bytes)
+                    temporary_path.replace(manifest_path)
+                except OSError as restore_exc:
+                    temporary_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        "backup artifacts could not be removed and manifest restoration failed; "
+                        f"catalog row retained: {restore_exc}"
+                    ) from restore_exc
+            raise RuntimeError(
+                "backup artifacts could not be removed; catalog row retained: "
+                f"{backup_path}: {exc}"
+            ) from exc
+
+    def _verifiable_backup_ids(self, backups: list[dict[str, Any]]) -> set[str]:
+        """Return catalog ids whose snapshot and manifest can be verified."""
+        verifiable: set[str] = set()
+        for backup in backups:
+            backup_path = Path(backup["file_path"]).resolve()
+            try:
+                backup_path.relative_to(self.backup_dir.resolve())
+            except ValueError:
+                continue
+            if not backup_path.is_file() or self._check_integrity(backup_path) != "ok":
+                continue
+            manifest = self._manifest_read_model(backup, backup_path)
+            if manifest["status"] in {"valid", "legacy_unmanifested"}:
+                verifiable.add(str(backup["id"]))
+        return verifiable
+
+    def _retention_protected_backup_id(self, backups: list[dict[str, Any]]) -> str | None:
+        """Select the newest verifiable backup that cleanup must retain."""
+        verifiable = self._verifiable_backup_ids(backups)
+        for backup in backups:
+            if str(backup["id"]) in verifiable:
+                return str(backup["id"])
+        # If every artifact is already degraded, retain the newest catalog row
+        # rather than deleting the only audit pointer.
+        return str(backups[0]["id"]) if backups else None
 
     def cleanup_old_backups(
         self,
@@ -452,18 +700,19 @@ class BackupManager:
         """
         # 获取所有备份
         backups = self.db.fetchall(
-            """SELECT id, file_path, created_at FROM backups
+            """SELECT id, file_path, created_at, project_id FROM backups
                WHERE project_id = ?
                ORDER BY created_at DESC""",
             (project_id,),
         )
+        protected_backup_id = self._retention_protected_backup_id(backups)
 
         deleted_count = 0
         kept_count = 0
 
         for i, backup in enumerate(backups):
             # 保留最近的 keep_count 个
-            if i < keep_count:
+            if i < keep_count or str(backup["id"]) == protected_backup_id:
                 kept_count += 1
                 continue
 
@@ -482,11 +731,14 @@ class BackupManager:
                     kept_count += 1
                     continue
                 try:
-                    if backup_path.exists():
-                        backup_path.unlink()
-                except PermissionError:
-                    # Windows 上文件可能被锁定
-                    pass
+                    self._remove_backup_artifacts(backup_path)
+                except RuntimeError as exc:
+                    # Keep the catalog row when a locked artifact cannot be
+                    # removed.  The next cleanup can retry it and the UI can
+                    # still locate the backup for manual recovery.
+                    logger.warning("Retaining backup after cleanup failure: %s", exc)
+                    kept_count += 1
+                    continue
                 self.db.execute("DELETE FROM backups WHERE id = ?", (backup["id"],))
                 deleted_count += 1
             else:

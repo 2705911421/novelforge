@@ -16,6 +16,11 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, default=str)
 
 
+def _mapping_or_empty(value: Any) -> Mapping[Any, Any]:
+    """Normalize optional state fragments before repeated ``.get`` access."""
+    return value if isinstance(value, Mapping) else {}
+
+
 @dataclass(frozen=True, slots=True)
 class SimulationGraphProjection:
     run_id: str
@@ -261,7 +266,7 @@ class SimulationGraphProjector:
                 source = node_ref(agent_id, "character")
                 if not source:
                     continue
-                character_state = value.get("state") if isinstance(value.get("state"), Mapping) else {}
+                character_state = _mapping_or_empty(value.get("state"))
                 location = value.get("location") or character_state.get("location")
                 target = node_ref(location, "location")
                 if target:
@@ -285,7 +290,7 @@ class SimulationGraphProjector:
                 source = node_ref(faction_id, "faction")
                 if not source:
                     continue
-                faction_state = value.get("state") if isinstance(value.get("state"), Mapping) else {}
+                faction_state = _mapping_or_empty(value.get("state"))
                 territory = value.get("territory") or faction_state.get("territory")
                 add_reference_edges(source, territory, type_hint="location", edge_type="controls",
                                     id_prefix="territory")
@@ -301,7 +306,7 @@ class SimulationGraphProjector:
                 location_node = node_ref(location_id, "location")
                 if not location_node:
                     continue
-                location_state = value.get("state") if isinstance(value.get("state"), Mapping) else {}
+                location_state = _mapping_or_empty(value.get("state"))
                 controller = value.get("controlling_faction") or location_state.get("controlling_faction")
                 controller_node = node_ref(controller, "faction")
                 if controller_node:

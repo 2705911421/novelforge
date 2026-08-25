@@ -112,6 +112,27 @@ class SimulationCapabilityRouter:
         self._run_id = run_id
         self._task_id = task_id
 
+    @staticmethod
+    def validate_assignment(model_manager: Any, assignment: SimulationProviderAssignment,
+                            capability: str) -> str:
+        """Validate one explicit Simulation capability without calling a model."""
+        role = _CAPABILITY_ROLES.get(capability)
+        if role is None:
+            raise ValueError(f"unsupported Simulation provider capability: {capability}")
+        provider_id = assignment.provider_for(capability)
+        if not provider_id:
+            raise ValueError(
+                f"SIMULATION_PROVIDER_ASSIGNMENT_REQUIRED: {capability}"
+            )
+        validator = getattr(model_manager, "validate_provider", None)
+        if callable(validator):
+            try:
+                validator(provider_id, role)
+            except Exception as exc:
+                code = str(getattr(exc, "code", "SIMULATION_PROVIDER_UNAVAILABLE"))
+                raise ValueError(f"{code}: {exc}") from exc
+        return provider_id
+
     def call_json(self, capability: str, *, payload: Mapping[str, Any], system: str,
                   stage: str, prompt_key: str,
                   context_manifest: Mapping[str, Any] | None = None,
@@ -119,9 +140,7 @@ class SimulationCapabilityRouter:
         role = _CAPABILITY_ROLES.get(capability)
         if role is None:
             raise ValueError(f"unsupported Simulation provider capability: {capability}")
-        provider_id = self._assignment.provider_for(capability)
-        if not provider_id:
-            raise ValueError(f"Simulation provider capability is not assigned: {capability}")
+        provider_id = self.validate_assignment(self._model_manager, self._assignment, capability)
         effective_task_id = task_id or self._task_id
         if not effective_task_id:
             raise ValueError(f"simulation {capability} provider call requires a durable task id")

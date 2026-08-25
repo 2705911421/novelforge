@@ -74,10 +74,27 @@ class JointReviewService:
         if pinned is not None:
             pinned_version = pinned.get("version") if isinstance(pinned, dict) else pinned
             if isinstance(pinned, dict) and pinned.get("id"):
+                pinned_id_version = pinned.get("version")
+                if pinned_id_version is not None:
+                    if isinstance(pinned_id_version, bool):
+                        raise ValueError("invalid pinned joint-review prompt version")
+                    try:
+                        pinned_id_version = int(str(pinned_id_version))
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("invalid pinned joint-review prompt version") from exc
                 prompt_record = self.db.fetchone(
-                    "SELECT * FROM prompt_templates WHERE id=? AND task_type='joint-review'",
-                    (pinned["id"],),
+                    """SELECT * FROM prompt_templates
+                       WHERE id=? AND task_type='joint-review'
+                         AND (project_id=? OR project_id IS NULL)""",
+                    (pinned["id"], project_id),
                 )
+                if prompt_record is not None and pinned_id_version is not None:
+                    try:
+                        actual_version = int(prompt_record.get("version") or 0)
+                    except (TypeError, ValueError):
+                        actual_version = -1
+                    if actual_version != pinned_id_version:
+                        prompt_record = None
             else:
                 version = pinned_version if isinstance(pinned_version, int) and not isinstance(pinned_version, bool) else None
                 prompt_record = (
@@ -91,6 +108,13 @@ class JointReviewService:
         prompt_key = prompt_record.get("task_type", prompt_key)
         prompt_version = str(prompt_record.get("version", 0))
         prompt_system = prompt_record.get("system_prompt") or prompt_system
+        prompt_registry = {
+            "id": prompt_record.get("id"),
+            "task_type": prompt_key,
+            "version": int(prompt_record.get("version") or 0),
+            "project_id": prompt_record.get("project_id"),
+            "source": "prompt_templates" if prompt_record.get("id") else "builtin",
+        }
 
         # Call model for joint review.
         prompt = f"""请对以下{len(chapters)}个章节进行联合审查，分析跨章节的一致性。
@@ -136,12 +160,20 @@ class JointReviewService:
             )
 
         try:
-            chat_kwargs = {
+            chat_kwargs: dict[str, Any] = {
                 "system": prompt_system,
                 "task_type": "joint-review",
             }
-            if prompt_policy_versions:
-                chat_kwargs.update({"prompt_key": prompt_key, "prompt_version": prompt_version})
+            # The persistent worker is the GenerationRun boundary.  Always
+            # forward the resolved registry record there, including the
+            # built-in version 0 when the caller did not pin a policy.  Plain
+            # legacy test/CLI clients do not necessarily accept these kwargs.
+            if hasattr(self.model_manager, "runtime"):
+                chat_kwargs.update({
+                    "prompt_key": prompt_key,
+                    "prompt_version": prompt_version,
+                    "prompt_registry": prompt_registry,
+                })
             response = self.model_manager.chat(
                 [{"role": "user", "content": prompt}],
                 **chat_kwargs,

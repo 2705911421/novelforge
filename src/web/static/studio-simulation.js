@@ -576,6 +576,10 @@
     }
     const run = detail.run;
     const transition = nextStatus(run);
+    const roundReady = run.status === 'RUNNING';
+    const roundGate = roundReady
+      ? ''
+      : `<p class="warn-banner" data-sim-round-gate>Round execution is available only while this run is RUNNING. ${transition ? `Use “${text(transition.label)}” first.` : 'Start or resume the run first.'}</p>`;
     const workspace = activeWorkspace();
     return `<section class="simulation-workspace-main" data-sim-active-workspace="${workspace}">
       <div class="simulation-run-header">
@@ -617,7 +621,8 @@
           </form>
         </section>
         <section class="simulation-panel" data-sim-workspaces="simulate history"><div class="simulation-panel-heading"><h4>Intervention history</h4><button class="btn btn-ghost btn-sm" data-sim-refresh>Refresh</button></div>${renderInterventions()}</section>
-        <section class="simulation-panel" data-sim-workspaces="agents simulate"><div class="simulation-panel-heading"><h4>Run next round</h4><small>Typed action · validator · append-only ledger</small></div>
+        <section class="simulation-panel" data-sim-workspaces="agents simulate"><div class="simulation-panel-heading"><h4>Run next round</h4><small>Typed action · validator · append-only ledger · durable queue recommended for recovery</small></div>
+          ${roundGate}
           <form data-sim-round class="simulation-form">
             <div class="simulation-form-grid"><label>Decision mode<select class="input" name="decisionMode"><option value="explicit" selected>Explicit author action</option><option value="provider">Provider Agent decision</option></select></label><label>Decision role<select class="input" name="decisionRole"><option value="planner" selected>Planner</option><option value="writer">Writer</option><option value="reviewer">Reviewer</option></select></label></div>
             <div class="simulation-form-grid"><label>Agent<select class="input" name="actorId" required>${(state.agents || []).map((agent) => `<option value="${text(agent.id)}" data-agent-type="${text(agent.type)}">${text(agent.name)} · ${text(agent.type)} · ${text(agent.id)}</option>`).join('')}</select></label><label>Action<select class="input" name="actionType">${renderActionOptions()}</select></label></div>
@@ -625,7 +630,7 @@
             <div class="simulation-agent-evidence" data-sim-agent-evidence>Select an Agent to inspect its local state.</div>
             <label>Intent<input class="input" name="intent" placeholder="What is this agent trying to do?"></label>
             <label>Effects (JSON)<textarea class="ta" name="effects" required>{}</textarea></label>
-            <div class="row row-wrap"><button class="btn btn-primary" type="submit" data-sim-round-mode="execute">Execute explicit round</button><button class="btn btn-secondary" type="submit" data-sim-round-mode="queue">Queue durable round</button></div>
+            <div class="row row-wrap"><button class="btn btn-secondary" type="submit" data-sim-round-mode="execute">Execute preview (not restart-safe)</button><button class="btn btn-primary" type="submit" data-sim-round-mode="queue">Queue durable round</button></div>
           </form>
         </section>
         <section class="simulation-panel" data-sim-workspaces="analyze history"><div class="simulation-panel-heading"><h4>Evidence analysis</h4><small>Deterministic ledger report</small></div>
@@ -769,13 +774,17 @@
     const form = document.querySelector('[data-sim-round]');
     if (!form) return;
     const provider = form.elements.decisionMode?.value === 'provider';
+    const roundReady = state.detail?.run?.status === 'RUNNING';
     const execute = form.querySelector('[data-sim-round-mode="execute"]');
     const queue = form.querySelector('[data-sim-round-mode="queue"]');
     if (execute) {
-      execute.disabled = provider;
-      execute.textContent = provider ? 'Provider requires durable task' : 'Execute explicit round';
+      execute.disabled = provider || !roundReady;
+      execute.textContent = provider ? 'Provider requires durable task' : (roundReady ? 'Execute preview (not restart-safe)' : 'Start run before executing');
     }
-    if (queue) queue.textContent = provider ? 'Queue provider round' : 'Queue durable round';
+    if (queue) {
+      queue.disabled = !roundReady;
+      queue.textContent = provider ? 'Queue provider round' : (roundReady ? 'Queue durable round' : 'Start run before queueing');
+    }
     const providerAgents = form.elements.providerAgentIds;
     if (providerAgents) providerAgents.disabled = !provider;
   }
@@ -978,6 +987,11 @@
     event.preventDefault();
     const form = event.currentTarget;
     const submitter = event.submitter;
+    const runStatus = String(state.detail?.run?.status || 'UNKNOWN');
+    if (runStatus !== 'RUNNING') {
+      toast(`Round execution requires RUNNING; current status is ${runStatus}.`, 'warning');
+      return;
+    }
     const decisionMode = form.decisionMode?.value || 'explicit';
     const decisionRole = form.decisionRole?.value || 'planner';
     let effects;

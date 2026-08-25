@@ -129,5 +129,14 @@ def test_delete_prompt(prompt_repo):
 
 def test_default_prompts_cover_all_task_types(prompt_repo):
     """Test that all expected task types have defaults."""
-    expected_types = {"write-next", "review", "revision", "fact-extraction", "story-bible-suggest", "joint-review"}
+    expected_types = {
+        "plan-chapter",
+        "compose-chapter",
+        "write-next",
+        "review",
+        "revision",
+        "fact-extraction",
+        "story-bible-suggest",
+        "joint-review",
+    }
     assert expected_types == set(DEFAULT_PROMPTS.keys())

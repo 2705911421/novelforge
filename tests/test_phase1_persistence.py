@@ -65,7 +65,7 @@ def _legacy_project(root, project_id="legacy", content="Markdown body"):
 
 
 def test_migration_engine_records_versions_and_rejects_checksum_tampering(phase_db):
-    assert phase_db.fetchone("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 45
+    assert phase_db.fetchone("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 46
     with phase_db.transaction() as conn:
         conn.execute("UPDATE schema_migrations SET checksum='tampered' WHERE version=2")
     with pytest.raises(MigrationError, match="checksum mismatch"):
@@ -108,7 +108,7 @@ def test_story_repository_appends_versions_and_commits_atomically(seeded_story):
         first["chapter_id"], facts=[{"fact_type": "event", "content": "The hero arrives"}],
         state_changes={"location": "town"}, chapter_version_id=second["version_id"],
     )
-    accepted = seeded_story.accept_story_commit(commit)
+    accepted = seeded_story.accept_story_commit_legacy(commit, reason="persistence fixture")
     assert accepted["state"] == {"location": "town"}
     assert seeded_story.db.count("story_facts", "commit_id = ?", (commit,)) == 1
     assert seeded_story.db.count("story_projections", "commit_id = ?", (commit,)) == 1
@@ -292,6 +292,8 @@ def test_cli_generation_commands_enqueue_tasks_for_the_separate_worker(tmp_path)
     database = Database(str(tmp_path / "projects" / "novelforge.db"))
     manager = ProjectManager(tmp_path, repository=StoryRepository(database))
     project = manager.create_project("CLI queue", "fantasy")
+    book = manager.story_repository.book_for_project(project.id)
+    assert book is not None
 
     commands = [
         ["wizard", project.id, "--input", "Build a cloud city"],
@@ -316,6 +318,7 @@ def test_cli_generation_commands_enqueue_tasks_for_the_separate_worker(tmp_path)
     queued = runtime.list(project_id=project.id)
     assert {task["type"] for task in queued} == {"world-bootstrap", "write-next", "continuous"}
     assert all(task["status"] == "queued" for task in queued)
+    assert all(task["book_id"] == book["id"] for task in queued)
 
 
 def test_explicit_legacy_migration_backups_preserves_db_only_and_imports_memory(tmp_path, phase_db):
@@ -391,6 +394,8 @@ def test_legacy_web_routes_enqueue_durable_tasks_without_running_a_worker(tmp_pa
     created = client.post("/api/projects", json={"name": "Compatibility queue", "genre": "fantasy"})
     assert created.status_code == 200
     project_id = created.json()["id"]
+    book = repository.book_for_project(project_id)
+    assert book is not None
 
     wizard = client.post(
         f"/api/projects/{project_id}/wizard",
@@ -413,6 +418,8 @@ def test_legacy_web_routes_enqueue_durable_tasks_without_running_a_worker(tmp_pa
         assert persisted is not None
         assert persisted["type"] == expected_type
         assert persisted["status"] == "queued"
+        assert persisted["project_id"] == project_id
+        assert persisted["book_id"] == book["id"]
         observed = client.get(f"/api/tasks/{task_id}")
         assert observed.status_code == 200
         assert observed.json()["id"] == task_id
@@ -424,6 +431,152 @@ def test_legacy_web_routes_enqueue_durable_tasks_without_running_a_worker(tmp_pa
     )
     assert invalid_count.status_code == 422
     assert [task["status"] for task in runtime.list(project_id=project_id)] == ["queued"] * 3
+
+
+@pytest.mark.integration
+def test_legacy_task_controls_share_the_durable_state_machine(tmp_path, phase_db, monkeypatch):
+    """The old UI can pause, resume, and cancel without a second task state model."""
+    legacy_web = importlib.import_module("src.web.app")
+    repository = StoryRepository(phase_db)
+    runtime = TaskRuntime(phase_db)
+    manager = ProjectManager(tmp_path, repository=repository)
+    monkeypatch.setattr(legacy_web, "story_repository", repository)
+    monkeypatch.setattr(legacy_web, "task_runtime", runtime)
+    monkeypatch.setattr(legacy_web, "project_mgr", manager)
+
+    project = manager.create_project("Compatibility controls", "fantasy")
+    book = repository.book_for_project(project.id)
+    assert book is not None
+    task = runtime.enqueue("write-next", project_id=project.id, book_id=book["id"])
+    claimed = runtime.claim("compatibility-worker")
+    assert claimed is not None and claimed["id"] == task["id"]
+    client = TestClient(legacy_web.app)
+
+    paused = client.post(f"/api/tasks/{task['id']}/pause")
+    assert paused.status_code == 200
+    assert paused.json()["status"] == "paused"
+
+    resumed = client.post(f"/api/tasks/{task['id']}/resume")
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "queued"
+
+    cancelled = client.post(f"/api/tasks/{task['id']}/cancel")
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    final_task = runtime.get(task["id"])
+    assert final_task is not None
+    assert final_task["status"] == "cancelled"
+
+    missing = client.post("/api/tasks/missing-task/cancel")
+    assert missing.status_code == 404
+
+
+def test_legacy_web_auth_matches_studio_fail_closed_boundary(monkeypatch):
+    from starlette.requests import Request
+    from starlette.responses import Response
+    legacy_web = importlib.import_module("src.web.app")
+
+    async def call_next(_request):
+        return Response("ok", status_code=200)
+
+    def dispatch(path="/api/projects", headers=(), query_string=b""):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": query_string,
+            "headers": list(headers),
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "client": ("testclient", 1),
+        })
+        return __import__("asyncio").run(
+            legacy_web.APIKeyMiddleware(legacy_web.app).dispatch(request, call_next)
+        )
+
+    monkeypatch.setattr(legacy_web, "_NOVELFORGE_AUTH_REQUIRED", True)
+    monkeypatch.setattr(legacy_web, "_NOVELFORGE_API_KEY", None)
+    missing = dispatch()
+    assert missing.status_code == 503
+    assert missing.body == b'{"error":"AUTH_CONFIGURATION_MISSING"}'
+    assert dispatch(path="/api/health").status_code == 200
+
+    monkeypatch.setattr(legacy_web, "_NOVELFORGE_API_KEY", "test-secret")
+    assert dispatch(query_string=b"api_key=test-secret").status_code == 401
+    assert dispatch(headers=[(b"authorization", b"Bearer test-secret")]).status_code == 200
+
+
+def test_studio_web_auth_exposes_only_minimal_liveness_without_a_key(monkeypatch):
+    from starlette.requests import Request
+    from starlette.responses import Response
+    from src.web import studio
+
+    async def call_next(_request):
+        return Response("ok", status_code=200)
+
+    def dispatch(path="/api/v1/health", headers=(), query_string=b""):
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": query_string,
+            "headers": list(headers),
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "client": ("testclient", 1),
+        })
+        return __import__("asyncio").run(
+            studio.APIKeyMiddleware(studio.app).dispatch(request, call_next)
+        )
+
+    monkeypatch.setattr(studio, "_NOVELFORGE_AUTH_REQUIRED", True)
+    monkeypatch.setattr(studio, "_NOVELFORGE_API_KEY", None)
+    assert dispatch().status_code == 503
+    assert dispatch(path="/api/health").status_code == 200
+
+    monkeypatch.setattr(studio, "_NOVELFORGE_API_KEY", "test-secret")
+    assert dispatch(query_string=b"api_key=test-secret").status_code == 401
+    assert dispatch(headers=[(b"authorization", b"Bearer test-secret")]).status_code == 200
+
+
+def test_legacy_web_lifespan_repairs_projection_freshness_before_serving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    legacy_web = importlib.import_module("src.web.app")
+    database = Database(str(tmp_path / "legacy-lifespan.db"))
+    repository = StoryRepository(database, workspace_root=tmp_path)
+    project_id = repository.create_native_project("Legacy lifespan", "fantasy")
+    book = database.fetchone("SELECT id FROM books WHERE project_id=?", (project_id,))
+    assert book is not None
+    version = repository.append_chapter_version(book["id"], 1, "A durable chapter")
+    commit_id = repository.create_story_commit(
+        version["chapter_id"], chapter_version_id=version["version_id"],
+        facts=[{"fact_type": "event", "content": "The lifespan repairs projections."}],
+        state_changes={"lifespan": "ready"},
+    )
+    repository.accept_story_commit_legacy(commit_id, reason="lifespan fixture")
+    database.execute("DELETE FROM narrative_memory WHERE book_id=?", (book["id"],))
+    database.execute("DELETE FROM story_facts WHERE book_id=?", (book["id"],))
+    database.execute("DELETE FROM story_projections WHERE book_id=?", (book["id"],))
+    database.execute("DELETE FROM projection_ledger WHERE book_id=?", (book["id"],))
+
+    monkeypatch.setattr(legacy_web, "story_repository", repository)
+    monkeypatch.setattr(legacy_web, "task_runtime", TaskRuntime(database))
+
+    with TestClient(legacy_web.app):
+        assert legacy_web.app.state.projection["status"] == "healthy"
+        assert database.count("narrative_memory", "book_id=?", (book["id"],)) >= 1
+        assert database.count("story_facts", "book_id=?", (book["id"],)) == 1
+        assert database.count("story_projections", "book_id=?", (book["id"],)) == 1
+
+    assert legacy_web.app.state.projection is None
+
+    with TestClient(legacy_web.app):
+        projection = legacy_web.app.state.projection
+        assert isinstance(projection, dict)
+        assert projection["repairedBookIds"] == []
 
 
 @pytest.mark.integration

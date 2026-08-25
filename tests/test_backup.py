@@ -1,11 +1,13 @@
 """Tests for backup system (BACKUP-001/002/003/004)."""
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from src.core.backup import BackupManager
 from src.core.database import Database, generate_id
+from src.core.task_runtime import TaskRuntime
 
 
 @pytest.fixture
@@ -57,6 +59,14 @@ def sample_book(db, sample_project):
 class TestBackupManager:
     """Test BackupManager functionality."""
 
+    def test_create_backup_rejects_unknown_project_before_snapshot(self, backup_manager):
+        with pytest.raises(ValueError, match="项目不存在"):
+            backup_manager.create_backup(project_id="missing-project")
+
+    def test_create_backup_rejects_unknown_backup_type(self, backup_manager, sample_project):
+        with pytest.raises(ValueError, match="不支持的备份类型"):
+            backup_manager.create_backup(project_id=sample_project, backup_type="user-input")
+
     def test_create_backup(self, backup_manager, sample_project):
         """Test creating a manual backup."""
         result = backup_manager.create_backup(
@@ -72,6 +82,27 @@ class TestBackupManager:
         assert result["integrity"] == "ok"
         assert result["size_bytes"] > 0
         assert Path(result["file_path"]).exists()
+        manifest_path = Path(result["manifest_path"])
+        assert manifest_path.exists()
+        assert result["sha256"]
+
+    def test_restore_rejects_tampered_backup_manifest(self, backup_manager, sample_project):
+        backup = backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="tamper manifest",
+        )
+        manifest_path = Path(backup["manifest_path"])
+        manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["backup_sha256"] = "0" * 64
+        manifest_path.write_text(
+            __import__("json").dumps(manifest), encoding="utf-8"
+        )
+
+        with pytest.raises(RuntimeError, match="备份清单 hash 与文件不匹配"):
+            backup_manager.restore_backup(
+                backup["backup_id"], create_pre_restore_backup=False
+            )
 
     def test_create_auto_backup(self, backup_manager, sample_project):
         """Test creating an auto backup."""
@@ -170,6 +201,7 @@ class TestBackupManager:
         assert detail["id"] == created["backup_id"]
         assert detail["exists"] is True
         assert detail["integrity"] == "ok"
+        assert detail["manifest"]["status"] == "valid"
 
     def test_get_backup_detail_not_found(self, backup_manager):
         """Test getting detail of non-existent backup."""
@@ -222,6 +254,63 @@ class TestBackupManager:
         assert result["success"] is True
         assert result["pre_restore_backup_id"] is None
 
+    def test_restore_blocks_active_project_tasks_before_file_replacement(
+        self, backup_manager, sample_project, sample_book, db
+    ):
+        backup = backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="restore active-task guard",
+        )
+        task = TaskRuntime(db).enqueue(
+            "write-next",
+            project_id=sample_project,
+            book_id=sample_book,
+            data={"chapter_number": 1},
+        )
+
+        with pytest.raises(RuntimeError, match="restore blocked while project has active durable tasks"):
+            backup_manager.restore_backup(backup["backup_id"], create_pre_restore_backup=False)
+
+        retained_task = TaskRuntime(db).get(task["id"])
+        assert retained_task is not None
+        assert retained_task["status"] == "queued"
+        assert Path(backup["file_path"]).exists()
+
+    def test_restore_reconciles_leases_captured_in_snapshot(
+        self, backup_manager, sample_project, sample_book, db
+    ):
+        runtime = TaskRuntime(db)
+        task = runtime.enqueue(
+            "write-next",
+            project_id=sample_project,
+            book_id=sample_book,
+            data={"chapter_number": 1},
+        )
+        assert runtime.claim("old-worker", lease_seconds=3600) is not None
+        backup = backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="restore lease recovery",
+        )
+
+        # Quiesce the current database so the restore guard permits the
+        # replacement; the selected snapshot still contains the running task.
+        runtime.cancel(task["id"])
+        runtime.transition(task["id"], "cancelled")
+
+        result = backup_manager.restore_backup(
+            backup["backup_id"], create_pre_restore_backup=False
+        )
+
+        restored = TaskRuntime(db).get(task["id"])
+        assert restored is not None
+        assert restored["status"] == "needs_author_decision"
+        assert result["recovered_tasks"] == [
+            {"task_id": task["id"], "type": "write-next", "status": "needs_author_decision"}
+        ]
+        assert restored["updated_at"] < datetime.now().isoformat()
+
     def test_restore_nonexistent_backup(self, backup_manager):
         """Test restoring non-existent backup."""
         with pytest.raises(ValueError, match="备份不存在"):
@@ -235,11 +324,18 @@ class TestBackupManager:
             backup_type="manual",
             description="Delete test",
         )
+        retained = backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="Retained delete test backup",
+        )
 
         # Verify it exists
         detail = backup_manager.get_backup_detail(backup["backup_id"])
         assert detail is not None
         assert detail["exists"] is True
+        manifest_path = Path(f"{backup['file_path']}.manifest.json")
+        assert manifest_path.exists()
 
         # Delete it
         success = backup_manager.delete_backup(backup["backup_id"])
@@ -248,11 +344,144 @@ class TestBackupManager:
         # Verify it's gone
         detail = backup_manager.get_backup_detail(backup["backup_id"])
         assert detail is None
+        assert not manifest_path.exists()
+        assert backup_manager.get_backup_detail(retained["backup_id"]) is not None
+
+    def test_delete_refuses_to_remove_last_verifiable_backup(
+        self, backup_manager, sample_project
+    ):
+        backup = backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="last verifiable backup guard",
+        )
+
+        with pytest.raises(RuntimeError, match="last verifiable backup"):
+            backup_manager.delete_backup(backup["backup_id"])
+
+        detail = backup_manager.get_backup_detail(backup["backup_id"])
+        assert detail is not None
+        assert detail["manifest"]["status"] == "valid"
 
     def test_delete_nonexistent_backup(self, backup_manager):
         """Test deleting non-existent backup."""
         success = backup_manager.delete_backup("non-existent-id")
         assert success is False
+
+    def test_delete_retains_catalog_when_backup_artifact_is_locked(
+        self, backup_manager, sample_project, monkeypatch
+    ):
+        backup = backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="locked delete guard",
+        )
+        backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="second delete guard backup",
+        )
+        original_unlink = Path.unlink
+
+        def refuse_database_unlink(path, *args, **kwargs):
+            if path == Path(backup["file_path"]):
+                raise PermissionError("simulated Windows file lock")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", refuse_database_unlink)
+
+        with pytest.raises(RuntimeError, match="catalog row retained"):
+            backup_manager.delete_backup(backup["backup_id"])
+
+        detail = backup_manager.get_backup_detail(backup["backup_id"])
+        assert detail is not None
+        assert detail["exists"] is True
+        assert detail["manifest"]["status"] == "valid"
+
+    def test_delete_retains_both_artifacts_when_manifest_is_locked(
+        self, backup_manager, sample_project, monkeypatch
+    ):
+        backup = backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="locked manifest guard",
+        )
+        backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="second manifest guard backup",
+        )
+        manifest_path = Path(f"{backup['file_path']}.manifest.json")
+        original_unlink = Path.unlink
+
+        def refuse_manifest_unlink(path, *args, **kwargs):
+            if path == manifest_path:
+                raise PermissionError("simulated manifest lock")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", refuse_manifest_unlink)
+
+        with pytest.raises(RuntimeError, match="catalog row retained"):
+            backup_manager.delete_backup(backup["backup_id"])
+
+        detail = backup_manager.get_backup_detail(backup["backup_id"])
+        assert detail is not None
+        assert Path(backup["file_path"]).exists()
+        assert manifest_path.exists()
+        assert detail["manifest"]["status"] == "valid"
+
+    def test_cleanup_retains_catalog_when_backup_artifact_is_locked(
+        self, backup_manager, sample_project, db, monkeypatch
+    ):
+        backup = backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="locked cleanup guard",
+        )
+        backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="newer cleanup guard backup",
+        )
+        db.execute(
+            "UPDATE backups SET created_at=? WHERE id=?",
+            ("2000-01-01T00:00:00", backup["backup_id"]),
+        )
+        original_unlink = Path.unlink
+
+        def refuse_database_unlink(path, *args, **kwargs):
+            if path == Path(backup["file_path"]):
+                raise PermissionError("simulated Windows file lock")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", refuse_database_unlink)
+
+        result = backup_manager.cleanup_old_backups(
+            project_id=sample_project,
+            keep_count=0,
+            keep_days=0,
+        )
+
+        assert result["deleted"] == 0
+        assert result["kept"] == 2
+        assert backup_manager.get_backup_detail(backup["backup_id"]) is not None
+
+    def test_cleanup_never_deletes_last_verifiable_backup(
+        self, backup_manager, sample_project
+    ):
+        backup = backup_manager.create_backup(
+            project_id=sample_project,
+            backup_type="manual",
+            description="retention floor guard",
+        )
+
+        result = backup_manager.cleanup_old_backups(
+            project_id=sample_project, keep_count=0, keep_days=0
+        )
+
+        assert result["deleted"] == 0
+        assert result["kept"] == 1
+        assert backup_manager.get_backup_detail(backup["backup_id"]) is not None
 
     def test_cleanup_old_backups(self, backup_manager, sample_project, db):
         """Test cleaning up old backups."""
@@ -330,7 +559,29 @@ class TestBackupManager:
         def mock_backup(*args, **kwargs):
             raise RuntimeError("Backup failed")
 
-        monkeypatch.setattr("sqlite3.connect", lambda *args, **kwargs: type("MockConn", (), {"backup": mock_backup, "__enter__": lambda s: s, "__exit__": lambda s, *args: None})())
+        class MockCursor:
+            def fetchone(self):
+                return {"id": sample_project}
+
+        class MockConn:
+            def execute(self, sql, *args):
+                if sql.startswith("SELECT id FROM projects"):
+                    return MockCursor()
+                return MockCursor()
+
+            def backup(self, *args, **kwargs):
+                return mock_backup(*args, **kwargs)
+
+            def close(self):
+                return None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+        monkeypatch.setattr("sqlite3.connect", lambda *args, **kwargs: MockConn())
 
         # Attempt to create backup
         with pytest.raises(RuntimeError, match="创建备份失败"):
@@ -368,7 +619,7 @@ class TestBackupIntegration:
         commit_id = story_repo.create_story_commit(chapter_id)
 
         # Accept the commit (should trigger auto backup)
-        result = story_repo.accept_story_commit(commit_id)
+        result = story_repo.accept_story_commit_legacy(commit_id, reason="backup fixture")
         assert result["accepted"] is True
 
         # Verify auto backup was created

@@ -137,6 +137,7 @@ class StoryFlowPlanningService:
         metadata: Optional[dict[str, Any]] = None,
         source: str = "author",
         expected_revision: Optional[int] = None,
+        node_id: Optional[str] = None,
         anchor_node_id: Optional[str] = None,
         anchor_edge_type: Optional[str] = None,
         anchor_label: str = "",
@@ -159,7 +160,7 @@ class StoryFlowPlanningService:
             raise StoryFlowPlanningError(
                 "ACCEPTED planning state can only be created by an accepted StoryCommit"
             )
-        node_id = f"planning:{uuid.uuid4().hex}"
+        node_id = _text(node_id) or f"planning:{uuid.uuid4().hex}"
         node = {
             "id": node_id,
             "kind": "planning-node",

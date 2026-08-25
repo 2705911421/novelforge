@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from .database import Database, generate_id, get_db
+from src.runtime.contracts import AgentTask
 
 
 class TaskStateError(ValueError):
@@ -35,6 +37,9 @@ WAITING_ON_CHILD = "waiting_on_child"
 RECOVERY_REQUIRES_AUTHOR = {"world-bootstrap", "write", "write-next"}
 TRANSITIONS = {
     "queued": {"running", "cancelled"},
+    # Databases created before the durable runtime used ``pending``. Treat it
+    # as queued at claim/cancel boundaries without rewriting the user's rows.
+    "pending": {"running", "cancelled"},
     "running": {"paused", "cancelling", "completed", "failed", "needs_author_decision", WAITING_ON_CHILD},
     "paused": {"queued", "cancelled"},
     "cancelling": {"cancelled", "needs_author_decision"},
@@ -125,7 +130,7 @@ class TaskRuntime:
         self.db = db or get_db()
 
     def enqueue(self, task_type: str, *, project_id: Optional[str] = None, book_id: Optional[str] = None,
-                data: Optional[dict[str, Any]] = None, stage: str = "queued",
+                chapter_number: Optional[int] = None, data: Optional[dict[str, Any]] = None, stage: str = "queued",
                 idempotency_key: Optional[str] = None) -> dict[str, Any]:
         task_id = generate_id()
         now = datetime.now().isoformat()
@@ -138,14 +143,83 @@ class TaskRuntime:
                 if previous:
                     return self._task_dict(previous)
             conn.execute(
-                """INSERT INTO tasks(id, type, status, project_id, book_id, stage, data, idempotency_key,
-                   created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
-                (task_id, task_type, project_id, book_id, stage, json.dumps(data or {}, ensure_ascii=False),
-                 idempotency_key, now, now),
+                """INSERT INTO tasks(id, type, status, project_id, book_id, chapter_number, stage, data,
+                   idempotency_key, created_at, updated_at)
+                   VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, task_type, project_id, book_id, chapter_number, stage,
+                 json.dumps(data or {}, ensure_ascii=False), idempotency_key, now, now),
             )
             self._append_event(conn, task_id, "queued", {"stage": stage, "type": task_type})
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return self._task_dict(row)
+
+    def enqueue_agent_task(
+        self,
+        agent_task: AgentTask,
+        *,
+        book_id: Optional[str] = None,
+        chapter_number: Optional[int] = None,
+        stage: str = "queued",
+        idempotency_key: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Atomically create a durable TaskRuntime row and its AgentTask envelope.
+
+        Existing ``enqueue`` callers remain unchanged.  This bridge makes the
+        vendor-independent AgentTask a first-class child of the durable task
+        state machine, so a process restart can recover the same work without
+        relying on a provider thread.
+        """
+        task_id = generate_id()
+        now = datetime.now().isoformat()
+        with self.db.transaction() as conn:
+            if idempotency_key:
+                previous = conn.execute(
+                    "SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
+                ).fetchone()
+                if previous:
+                    result = self._task_dict(previous)
+                    agent_row = conn.execute(
+                        "SELECT id FROM agent_tasks WHERE task_id=?", (previous["id"],)
+                    ).fetchone()
+                    if agent_row:
+                        result["agentTaskId"] = agent_row["id"]
+                    return result
+            conn.execute(
+                """INSERT INTO tasks(id, type, status, project_id, book_id, chapter_number,
+                   stage, data, idempotency_key, created_at, updated_at)
+                   VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    task_id, agent_task.task_type, agent_task.project_id, book_id,
+                    chapter_number, stage,
+                    json.dumps(agent_task.input_payload, ensure_ascii=False),
+                    idempotency_key, now, now,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO agent_tasks(
+                       id, task_id, task_type, role, project_id, chapter_id, intent_id,
+                       context_bundle_id, constraints, expected_output, input_payload,
+                       profile, parent_task_id, status, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?)""",
+                (
+                    agent_task.task_id, task_id, agent_task.task_type, agent_task.role,
+                    agent_task.project_id, agent_task.chapter_id, agent_task.intent_id,
+                    agent_task.context_bundle_id,
+                    json.dumps(agent_task.constraints, ensure_ascii=False),
+                    agent_task.expected_output,
+                    json.dumps(agent_task.input_payload, ensure_ascii=False),
+                    json.dumps(agent_task.profile.to_dict() if agent_task.profile else {}, ensure_ascii=False),
+                    agent_task.parent_task_id, now, now,
+                ),
+            )
+            self._append_event(conn, task_id, "queued", {
+                "stage": stage, "type": agent_task.task_type, "agent_task_id": agent_task.task_id,
+            })
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        result = self._task_dict(row)
+        result["agentTaskId"] = agent_task.task_id
+        result["agentTask"] = agent_task.to_dict()
+        return result
 
     def enqueue_continuous(
         self,
@@ -174,7 +248,7 @@ class TaskRuntime:
             existing = conn.execute(
                 """SELECT id FROM tasks
                    WHERE book_id=? AND type='continuous'
-                     AND status IN ('queued', 'running', 'waiting_on_child', 'paused', 'cancelling')
+                     AND status IN ('queued', 'pending', 'running', 'waiting_on_child', 'paused', 'cancelling')
                    ORDER BY created_at LIMIT 1""",
                 (book_id,),
             ).fetchone()
@@ -206,18 +280,48 @@ class TaskRuntime:
         row = self.db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
         return self._task_dict(row) if row else None
 
-    def list(self, *, project_id: Optional[str] = None, status: Optional[str] = None,
+    def list(self, *, project_id: Optional[str] = None, book_id: Optional[str] = None,
+             task_type: Optional[str] = None, status: Optional[str] = None,
              limit: int = 100) -> list[dict[str, Any]]:
         clauses, params = [], []
         if project_id:
             clauses.append("project_id = ?")
             params.append(project_id)
+        if book_id:
+            clauses.append("book_id = ?")
+            params.append(book_id)
+        if task_type:
+            clauses.append("type = ?")
+            params.append(task_type)
         if status:
-            clauses.append("status = ?")
-            params.append(status)
+            if status == "queued":
+                clauses.append("status IN ('queued', 'pending')")
+            else:
+                clauses.append("status = ?")
+                params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.db.fetchall(f"SELECT * FROM tasks {where} ORDER BY created_at DESC LIMIT ?", (*params, limit))
         return [self._task_dict(row) for row in rows]
+
+    def status_counts(self, *, book_id: Optional[str] = None) -> dict[str, int]:
+        """Return durable task counts for compatibility read models."""
+        clauses = ["1=1"]
+        params: list[Any] = []
+        if book_id:
+            clauses.append("book_id=?")
+            params.append(book_id)
+        rows = self.db.fetchall(
+            f"SELECT status, COUNT(*) AS count FROM tasks WHERE {' AND '.join(clauses)} GROUP BY status",
+            tuple(params),
+        )
+        counts = {status: 0 for status in (
+            "queued", "running", "paused", "completed", "failed", "cancelled",
+            "cancelling", "waiting_on_child", "needs_author_decision",
+        )}
+        for row in rows:
+            status = "queued" if row["status"] == "pending" else row["status"]
+            counts[status] = counts.get(status, 0) + int(row["count"])
+        return counts
 
     def claim(self, worker_id: str, *, lease_seconds: int = 60) -> Optional[dict[str, Any]]:
         """Atomically claim one runnable task for a worker lease.
@@ -231,7 +335,7 @@ class TaskRuntime:
         with self.db.transaction() as conn:
             row = conn.execute(
                 """SELECT t.* FROM tasks t WHERE
-                   ((t.status='queued' AND t.stage != 'blocked') OR
+                   ((t.status IN ('queued', 'pending') AND t.stage != 'blocked') OR
                     (t.status='waiting_on_child' AND t.waiting_for_task_id IS NOT NULL AND
                      EXISTS (SELECT 1 FROM tasks child
                             WHERE child.id=t.waiting_for_task_id
@@ -247,7 +351,7 @@ class TaskRuntime:
                    attempt=attempt+1, started_at=COALESCE(started_at, ?),
                    waiting_for_task_id=NULL, updated_at=?
                    WHERE id=? AND
-                     (status='queued' OR
+                     (status IN ('queued', 'pending') OR
                       (status='waiting_on_child' AND waiting_for_task_id IS NOT NULL AND
                        EXISTS (SELECT 1 FROM tasks child
                               WHERE child.id=tasks.waiting_for_task_id
@@ -256,6 +360,7 @@ class TaskRuntime:
             )
             if updated.rowcount != 1:
                 return None
+            self._sync_agent_task_status(conn, row["id"], "running")
             self._append_event(conn, row["id"], "claimed", {
                 "worker_id": worker_id,
                 "lease_expires_at": expires,
@@ -273,7 +378,7 @@ class TaskRuntime:
         now = datetime.now()
         with self.db.transaction() as conn:
             row = conn.execute(
-                """SELECT * FROM tasks WHERE id=? AND status='queued' AND
+                """SELECT * FROM tasks WHERE id=? AND status IN ('queued', 'pending') AND
                    (next_attempt_at IS NULL OR next_attempt_at <= ?)""",
                 (task_id, now.isoformat()),
             ).fetchone()
@@ -283,11 +388,12 @@ class TaskRuntime:
             updated = conn.execute(
                 """UPDATE tasks SET status='running', lease_owner=?, lease_expires_at=?,
                    attempt=attempt+1, started_at=COALESCE(started_at, ?), updated_at=?
-                   WHERE id=? AND status='queued'""",
+                   WHERE id=? AND status IN ('queued', 'pending')""",
                 (worker_id, expires, now.isoformat(), now.isoformat(), task_id),
             )
             if updated.rowcount != 1:
                 return None
+            self._sync_agent_task_status(conn, task_id, "running")
             self._append_event(conn, task_id, "claimed", {"worker_id": worker_id, "lease_expires_at": expires})
             claimed = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task_dict(claimed)
@@ -331,6 +437,7 @@ class TaskRuntime:
                 (target, error_code, error, json.dumps(result, ensure_ascii=False) if result is not None else None,
                  target, target, target, target, completed_at, now, task_id),
             )
+            self._sync_agent_task_status(conn, task_id, target)
             self._append_event(conn, task_id, target, detail or {"error_code": error_code, "error": error})
             updated_row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task_dict(updated_row)
@@ -419,7 +526,7 @@ class TaskRuntime:
             row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row is None:
                 raise KeyError(f"task not found: {task_id}")
-            if row["status"] not in {"queued", "paused", "needs_author_decision", WAITING_ON_CHILD, "running"}:
+            if row["status"] not in {"queued", "pending", "paused", "needs_author_decision", WAITING_ON_CHILD, "running"}:
                 raise TaskStateError("task data can only be updated at a safe boundary")
             if row["status"] == "running" and lease_owner is not None:
                 owner = conn.execute("SELECT lease_owner FROM tasks WHERE id=?", (task_id,)).fetchone()["lease_owner"]
@@ -445,6 +552,63 @@ class TaskRuntime:
         row["state"] = json.loads(row["state"])
         return row
 
+    def list_checkpoints(self, task_id: str) -> list[dict[str, Any]]:
+        """Return checkpoint history through the durable runtime boundary."""
+        rows = self.db.fetchall(
+            "SELECT * FROM task_checkpoints WHERE task_id=? ORDER BY created_at DESC, id DESC",
+            (task_id,),
+        )
+        for row in rows:
+            row["state"] = json.loads(row["state"])
+        return rows
+
+    def clear_checkpoints(self, task_id: str) -> None:
+        """Clear compatibility checkpoints without bypassing task ownership.
+
+        New workers never need to delete checkpoints.  This method exists only
+        for the legacy adapter and records the operation in the same durable
+        task event stream so the deletion is observable.
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            deleted = conn.execute(
+                "DELETE FROM task_checkpoints WHERE task_id=?", (task_id,)
+            ).rowcount
+            self._append_event(conn, task_id, "checkpoints_cleared", {"deleted": deleted})
+
+    def update_metadata(
+        self,
+        task_id: str,
+        *,
+        progress: Optional[int] = None,
+        total_steps: Optional[int] = None,
+        chapter_number: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Update the small compatibility read-model fields transactionally."""
+        updates: dict[str, Any] = {}
+        if progress is not None:
+            updates["progress"] = max(0, min(100, int(progress)))
+        if total_steps is not None:
+            updates["total_steps"] = max(0, int(total_steps))
+        if chapter_number is not None:
+            updates["chapter_number"] = int(chapter_number)
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            if updates:
+                now = datetime.now().isoformat()
+                assignments = ", ".join(f"{field}=?" for field in updates)
+                conn.execute(
+                    f"UPDATE tasks SET {assignments}, updated_at=? WHERE id=?",
+                    (*updates.values(), now, task_id),
+                )
+                self._append_event(conn, task_id, "metadata_updated", updates)
+            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task_dict(updated)
+
     def pause(self, task_id: str) -> dict[str, Any]:
         return self.transition(task_id, "paused")
 
@@ -459,7 +623,7 @@ class TaskRuntime:
             if row["status"] in {"completed", "cancelled", "failed"}:
                 raise TaskStateError("a terminal task cannot be cancelled")
             now = datetime.now().isoformat()
-            if row["status"] in {"queued", "paused", "needs_author_decision", WAITING_ON_CHILD}:
+            if row["status"] in {"queued", "pending", "paused", "needs_author_decision", WAITING_ON_CHILD}:
                 target = "cancelled"
                 conn.execute("UPDATE tasks SET status=?, cancel_requested=TRUE, waiting_for_task_id=NULL, completed_at=?, updated_at=? WHERE id=?",
                              (target, now, now, task_id))
@@ -493,7 +657,31 @@ class TaskRuntime:
         return self._task_dict(result)
 
     def retry(self, task_id: str) -> dict[str, Any]:
-        return self.transition(task_id, "queued", detail={"reason": "author_retry"})
+        """Requeue a stopped task with a clean active-task read model.
+
+        ``failed`` and ``needs_author_decision`` are terminal decision
+        boundaries, so retrying them starts a new execution attempt.  The
+        prior failure remains in ``task_events``; it must not remain in the
+        current task row as a stale completion timestamp, cancellation flag,
+        backoff deadline, or result from an earlier attempt.
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            if "queued" not in TRANSITIONS.get(row["status"], set()):
+                raise TaskStateError(f"illegal task transition: {row['status']} -> queued")
+            now = datetime.now().isoformat()
+            conn.execute(
+                """UPDATE tasks SET status='queued', error_code=NULL, error=NULL,
+                   result=NULL, cancel_requested=FALSE, next_attempt_at=NULL,
+                   completed_at=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                   updated_at=? WHERE id=?""",
+                (now, task_id),
+            )
+            self._append_event(conn, task_id, "queued", {"reason": "author_retry"})
+            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task_dict(updated)
 
     def fail(self, task_id: str, error_code: str, error: str, *, retryable: bool = False,
              max_attempts: int = 3, retry_delay_seconds: int = 5,
@@ -550,11 +738,31 @@ class TaskRuntime:
         return self._task_dict(result)
 
     def recover_expired_leases(self, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
-        now = now or datetime.now()
+        return self._recover_leases(now=now or datetime.now(), force_all=False)
+
+    def recover_all_leases_for_restore(self, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
+        """Reconcile every lease in a restored snapshot at the process boundary.
+
+        A restored database can contain a lease whose expiry is still in the
+        future even though the process that owned it no longer exists.  The
+        restore boundary therefore fences every running lease, but records
+        the recovery with the real current time rather than using a sentinel
+        timestamp that would corrupt the task read model.
+        """
+        return self._recover_leases(now=now or datetime.now(), force_all=True)
+
+    def _recover_leases(self, *, now: datetime, force_all: bool) -> list[dict[str, Any]]:
         recovered: list[dict[str, Any]] = []
         with self.db.transaction() as conn:
-            rows = conn.execute("SELECT * FROM tasks WHERE status IN ('running', 'cancelling') AND lease_expires_at < ?",
-                                (now.isoformat(),)).fetchall()
+            if force_all:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE status IN ('running', 'cancelling')"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE status IN ('running', 'cancelling') AND lease_expires_at < ?",
+                    (now.isoformat(),),
+                ).fetchall()
             for row in rows:
                 # Cancelling tasks must never be recovered to queued; they
                 # should be cancelled or escalated to author decision.
@@ -584,6 +792,34 @@ class TaskRuntime:
         sequence = conn.execute("SELECT event_sequence FROM tasks WHERE id=?", (task_id,)).fetchone()["event_sequence"]
         conn.execute("INSERT INTO task_events(task_id, sequence, event_type, payload) VALUES (?, ?, ?, ?)",
                      (task_id, sequence, event_type, json.dumps(payload, ensure_ascii=False)))
+
+    @staticmethod
+    def _sync_agent_task_status(conn, task_id: str, status: str) -> None:
+        """Mirror durable task lifecycle into the optional AgentTask row."""
+        mapped = {
+            "queued": "planned",
+            "pending": "planned",
+            "running": "running",
+            "paused": "paused",
+            "completed": "completed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "cancelling": "cancelling",
+            "waiting_on_child": "waiting_on_child",
+            "needs_author_decision": "needs_author_decision",
+        }.get(status, status)
+        try:
+            conn.execute(
+                "UPDATE agent_tasks SET status=?, updated_at=? WHERE task_id=?",
+                (mapped, datetime.now().isoformat(), task_id),
+            )
+        except sqlite3.OperationalError as exc:
+            # Compatibility with a database connection opened before the
+            # additive migration was applied.  Database initialization normally
+            # guarantees this table exists; the guard keeps legacy adapters
+            # readable during a rolling upgrade.
+            if "no such table" not in str(exc).lower():
+                raise
 
     def _task_dict(self, row) -> dict[str, Any]:
         task = dict(row)
@@ -653,6 +889,8 @@ class TaskRuntime:
             stored_total = max(0, int(persisted_total or 0))
         except (TypeError, ValueError):
             stored_total = 0
+        if status == "pending":
+            status = "queued"
         if status == "completed":
             return 100, max(stored_total, 1)
 
@@ -668,6 +906,12 @@ class TaskRuntime:
                 requested, completed = 0, 0
             if requested:
                 return min(100, round(completed / requested * 100)), requested
+
+        # A compatibility caller may update the persisted progress while a
+        # task is still at the queue boundary. Do not let the default queued
+        # stage erase that durable read-model value.
+        if stage in {"queued", "pending"} and stored_progress:
+            return stored_progress, max(stored_total, 1)
 
         stages = _TASK_PROGRESS.get(task_type)
         if stages:

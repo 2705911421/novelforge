@@ -2251,6 +2251,186 @@ def _apply_v45(conn: sqlite3.Connection) -> None:
     _execute_sql_script(conn, PHASE_45_STORYFLOW_HISTORY_DELETE_SQL)
 
 
+PHASE_46_AGENT_RUNTIME_COMPUTE_PLANE_SQL = """
+-- Control Plane: an immutable, versioned snapshot of the domain context sent
+-- to an AgentRun.  This is not a second Canon; canon_commit is provenance.
+CREATE TABLE IF NOT EXISTS context_bundles (
+    id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+    book_id TEXT REFERENCES books(id) ON DELETE SET NULL,
+    author_intent_snapshot JSON NOT NULL DEFAULT '{}',
+    story_bible_snapshot JSON NOT NULL DEFAULT '{}',
+    canon_commit TEXT,
+    planning_snapshot JSON NOT NULL DEFAULT '{}',
+    chapter_intent JSON NOT NULL DEFAULT '{}',
+    memory_evidence JSON NOT NULL DEFAULT '[]',
+    provenance JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, book_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_bundles_project_version
+    ON context_bundles(project_id, book_id, version DESC);
+
+-- AgentTask is the NovelForge-owned task envelope linked to the existing
+-- durable TaskRuntime row.  The link prevents vendor threads from becoming
+-- the recovery source of truth.
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+    task_type TEXT NOT NULL,
+    role TEXT NOT NULL,
+    project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+    chapter_id TEXT REFERENCES chapters(id) ON DELETE SET NULL,
+    intent_id TEXT,
+    context_bundle_id TEXT REFERENCES context_bundles(id) ON DELETE SET NULL,
+    constraints JSON NOT NULL DEFAULT '{}',
+    expected_output TEXT NOT NULL,
+    input_payload JSON NOT NULL DEFAULT '{}',
+    profile JSON NOT NULL DEFAULT '{}',
+    parent_task_id TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'planned',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_project_status
+    ON agent_tasks(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_parent
+    ON agent_tasks(parent_task_id);
+
+CREATE TABLE IF NOT EXISTS compute_plans (
+    id TEXT PRIMARY KEY,
+    agent_task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    plan JSON NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_compute_plans_task_created
+    ON compute_plans(agent_task_id, created_at DESC);
+
+-- AgentRun is distinct from the legacy GenerationRun.  GenerationRun remains
+-- a provider-call compatibility record; AgentRun is the lifecycle/provenance
+-- record for any runtime, including a multi-turn external runtime.
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id TEXT PRIMARY KEY,
+    agent_task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    runtime_type TEXT NOT NULL,
+    runtime_thread_id TEXT,
+    runtime_turn_id TEXT,
+    model_id TEXT NOT NULL,
+    reasoning TEXT NOT NULL,
+    prompt_version TEXT,
+    context_bundle_id TEXT REFERENCES context_bundles(id) ON DELETE SET NULL,
+    compute_plan JSON NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK(status IN ('created', 'running', 'paused', 'succeeded', 'failed', 'interrupted', 'cancelled')),
+    usage JSON NOT NULL DEFAULT '{}',
+    artifacts JSON NOT NULL DEFAULT '{}',
+    error_code TEXT,
+    error_detail TEXT,
+    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_task_started
+    ON agent_runs(task_id, started_at, id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_status
+    ON agent_runs(status);
+
+CREATE TABLE IF NOT EXISTS runtime_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_run_id TEXT REFERENCES agent_runs(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    runtime_type TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(agent_run_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_events_run_sequence
+    ON runtime_events(agent_run_id, sequence);
+
+CREATE TABLE IF NOT EXISTS domain_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_run_id TEXT REFERENCES agent_runs(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    payload JSON NOT NULL DEFAULT '{}',
+    ui_type TEXT NOT NULL,
+    ui_message TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(agent_run_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_domain_events_run_sequence
+    ON domain_events(agent_run_id, sequence);
+
+-- Runtime Plane registry.  Manifest metadata and observed installation state
+-- are separate so a discoverable runtime is never mistaken for a ready one.
+CREATE TABLE IF NOT EXISTS runtime_registry (
+    runtime_type TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    acquisition TEXT NOT NULL,
+    executable TEXT,
+    command JSON NOT NULL DEFAULT '[]',
+    capabilities JSON NOT NULL DEFAULT '{}',
+    models JSON NOT NULL DEFAULT '[]',
+    dependencies JSON NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL DEFAULT 'builtin',
+    signature TEXT,
+    minimum_host_version TEXT,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS runtime_installations (
+    runtime_type TEXT PRIMARY KEY REFERENCES runtime_registry(runtime_type) ON DELETE CASCADE,
+    state TEXT NOT NULL,
+    path TEXT,
+    version TEXT,
+    auth_status TEXT NOT NULL DEFAULT 'unknown',
+    account_label TEXT,
+    auth_detail TEXT NOT NULL DEFAULT '',
+    capability_verified INTEGER NOT NULL DEFAULT 0,
+    health TEXT NOT NULL DEFAULT 'unknown',
+    last_error TEXT,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS compute_budget_accounts (
+    scope TEXT PRIMARY KEY,
+    total REAL NOT NULL,
+    critical_reserve REAL NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS compute_budget_reservations (
+    id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL REFERENCES compute_budget_accounts(scope) ON DELETE CASCADE,
+    amount REAL NOT NULL,
+    critical INTEGER NOT NULL DEFAULT 0,
+    consumed REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'reserved'
+        CHECK(status IN ('reserved', 'released')),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    released_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_compute_budget_reservations_scope_status
+    ON compute_budget_reservations(scope, status);
+"""
+
+
+def _apply_v46(conn: sqlite3.Connection) -> None:
+    """Add the additive Control/Compute/Runtime Plane persistence boundary."""
+    _execute_sql_script(conn, PHASE_46_AGENT_RUNTIME_COMPUTE_PLANE_SQL)
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -2308,6 +2488,7 @@ _MIGRATIONS = (
     _Migration(43, "storyflow_adoption_provenance", _apply_v43, PHASE_43_STORYFLOW_ADOPTION_PROVENANCE_SQL),
     _Migration(44, "storyflow_run_lineage", _apply_v44, PHASE_44_STORYFLOW_RUN_LINEAGE_SQL),
     _Migration(45, "storyflow_history_soft_delete", _apply_v45, PHASE_45_STORYFLOW_HISTORY_DELETE_SQL),
+    _Migration(46, "agent_runtime_compute_plane", _apply_v46, PHASE_46_AGENT_RUNTIME_COMPUTE_PLANE_SQL),
 )
 
 _RUNTIME_EXTENSION_NAME = "narrative_runtime_v2"

@@ -256,6 +256,43 @@ def test_api_get_latest_review(studio_client):
     assert data["review"]["overall_score"] == 95
 
 
+def test_review_detail_endpoints_do_not_cross_project_boundaries(studio_client, review_deps):
+    client, _, project_id = studio_client
+    database = review_deps["db"]
+    repository = review_deps["repo"]
+    manager = review_deps["manager"]
+    review_repository = review_deps["review_repo"]
+
+    other_project = manager.create_project("Other review project", "fantasy")
+    other_book = database.fetchone("SELECT id FROM books WHERE project_id=?", (other_project.id,))
+    assert other_book is not None
+    version = repository.append_chapter_version(other_book["id"], 1, "Other project chapter")
+    other_review_id = review_repository.save_review(
+        other_project.id,
+        1,
+        {"overall_score": 99, "passed": True, "verdict": "pass", "issues": []},
+        chapter_version_id=version["version_id"],
+    )
+
+    review_response = client.get(f"/api/v1/books/{project_id}/reviews/{other_review_id}")
+    assert review_response.status_code == 404
+
+    database.execute(
+        """INSERT INTO joint_reviews(
+               id, project_id, book_id, start_chapter, end_chapter,
+               overall_score, verdict, summary
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "joint-review-other", other_project.id, other_book["id"],
+            1, 1, 99, "pass", "Other project joint review",
+        ),
+    )
+    joint_response = client.get(
+        f"/api/v1/books/{project_id}/joint-reviews/joint-review-other"
+    )
+    assert joint_response.status_code == 404
+
+
 def test_api_trigger_review(studio_client):
     """Test API endpoint to trigger a review task."""
     client, runtime, project_id = studio_client

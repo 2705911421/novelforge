@@ -48,11 +48,11 @@ class PersistentRAGRetriever:
 
     def __init__(self, database: Any):
         self.database = database
-        self._index_cache: dict[str, tuple[float, BM25Index, int]] = {}  # key -> (timestamp, index, row_count)
+        self._index_cache: dict[str, tuple[float, BM25Index, str]] = {}  # key -> (timestamp, index, content_signature)
 
     def clear(self) -> None:
-        """No-op: PersistentRAGRetriever is stateless (SQLite-backed, no in-memory index)."""
-        pass
+        """Drop the in-memory BM25 cache while retaining SQLite source data."""
+        self._index_cache.clear()
 
     def query(
         self,
@@ -66,9 +66,10 @@ class PersistentRAGRetriever:
         self._validate(project_id, query, top_k, doc_type)
         rows = self._rows(project_id, doc_type)
         cache_key = f"{project_id}:{doc_type or 'all'}"
+        content_signature = self._content_signature(rows)
         now = time.monotonic()
         cached = self._index_cache.get(cache_key)
-        if cached and cached[2] == len(rows) and now - cached[0] < self._CACHE_TTL:
+        if cached and cached[2] == content_signature and now - cached[0] < self._CACHE_TTL:
             index = cached[1]
         else:
             index = BM25Index()
@@ -78,7 +79,7 @@ class PersistentRAGRetriever:
                     row["content"],
                     self._metadata(row),
                 )
-            self._index_cache[cache_key] = (now, index, len(rows))
+            self._index_cache[cache_key] = (now, index, content_signature)
         results = index.search(query.strip(), top_k=top_k)
         # BM25Index's historical ordering is kept for compatibility, but IDs
         # provide a stable tie-breaker at this persistence boundary.
@@ -182,6 +183,14 @@ class PersistentRAGRetriever:
             "checksum": row.get("checksum"),
             "strategy": "bm25_fallback",
         }
+
+    @staticmethod
+    def _content_signature(rows: list[dict[str, Any]]) -> str:
+        payload = [
+            (str(row.get("chunk_id") or ""), str(row.get("checksum") or ""))
+            for row in rows
+        ]
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
     @staticmethod
     def _result_dict(result: SearchResult) -> dict[str, Any]:
@@ -350,6 +359,99 @@ class DurableHybridRetriever:
                 failed += 1
         return {"book_id": book_id, "source_count": len(rows), "ready": ready, "failed": failed}
 
+    def sync_reference_chunks(self, book_id: str, project_id: str) -> dict[str, Any]:
+        """Incrementally materialize indexed reference chunks for this book.
+
+        Reference documents are owned by ``project_id`` while durable
+        embedding projections are intentionally keyed by the authoritative
+        ``book_id``.  Keeping that translation here prevents the active
+        writing pipeline from silently using a second, file-backed vector
+        boundary.  Failed provider calls remain failed/degraded projections;
+        they never become successful retrieval evidence.
+        """
+        if not isinstance(book_id, str) or not book_id.strip():
+            raise ValueError("book_id is required")
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ValueError("project_id is required")
+        rows = self.database.fetchall(
+            """SELECT c.id, c.content, c.checksum, c.metadata,
+                      d.id AS document_id, d.name AS document_name, d.doc_type,
+                      d.source_fingerprint, d.metadata AS document_metadata
+               FROM document_chunks c
+               JOIN reference_documents d ON d.id=c.document_id
+               WHERE d.project_id=? AND d.status='indexed'
+               ORDER BY d.id, c.chunk_index""",
+            (project_id,),
+        )
+        changed = 0
+        ready = 0
+        degraded = 0
+        active_keys: set[tuple[str, str, str]] = set()
+        for row in rows:
+            content = str(row.get("content") or "")
+            checksum = str(row.get("checksum") or hashlib.sha256(content.encode("utf-8")).hexdigest())
+            source_id = str(row["id"])
+            source_type = "reference_chunk"
+            source_version = checksum
+            active_keys.add((source_type, source_id, source_version))
+            existing = self.database.fetchone(
+                """SELECT content_checksum, status FROM embedding_projections
+                   WHERE book_id=? AND source_type=? AND source_id=?
+                     AND source_version=? AND model_key=?""",
+                (book_id, source_type, source_id, source_version, self.model_key),
+            )
+            if existing and existing["content_checksum"] == checksum and existing["status"] in {"ready", "degraded"}:
+                if existing["status"] == "ready":
+                    ready += 1
+                else:
+                    degraded += 1
+                continue
+            changed += 1
+            provenance = {
+                "projectId": project_id,
+                "documentId": row["document_id"],
+                "documentName": row["document_name"],
+                "docType": row["doc_type"],
+                "sourceFingerprint": row["source_fingerprint"],
+                "chunkMetadata": self._json_object(row.get("metadata")),
+                "documentMetadata": self._json_object(row.get("document_metadata")),
+            }
+            result = self.upsert(
+                book_id, source_type, source_id, source_version, content, provenance
+            )
+            if result["status"] == "ready":
+                ready += 1
+            else:
+                degraded += 1
+
+        with self.database.transaction() as conn:
+            stale_rows = conn.execute(
+                """SELECT source_id, source_version FROM embedding_projections
+                   WHERE book_id=? AND source_type='reference_chunk' AND model_key=?
+                     AND status IN ('ready', 'degraded', 'failed')""",
+                (book_id, self.model_key),
+            ).fetchall()
+            for stale in stale_rows:
+                if ("reference_chunk", stale["source_id"], stale["source_version"]) not in active_keys:
+                    conn.execute(
+                        """UPDATE embedding_projections SET status='stale',
+                           provenance=json_set(COALESCE(provenance, '{}'), '$.staleReason', 'reference_chunk_not_indexed'),
+                           updated_at=CURRENT_TIMESTAMP
+                           WHERE book_id=? AND source_type='reference_chunk' AND source_id=?
+                             AND source_version=? AND model_key=?""",
+                        (book_id, stale["source_id"], stale["source_version"], self.model_key),
+                    )
+        return {
+            "book_id": book_id,
+            "project_id": project_id,
+            "source_count": len(rows),
+            "changed": changed,
+            "ready": ready,
+            "degraded": degraded,
+            "strategy": "incremental",
+            "projection_version": self.PROJECTION_VERSION,
+        }
+
     def sync_incremental(self, book_id: str) -> dict[str, Any]:
         """Synchronize only new or changed active memory rows.
 
@@ -395,7 +497,7 @@ class DurableHybridRetriever:
             stale_rows = conn.execute(
                 """SELECT source_id, source_version FROM embedding_projections
                    WHERE book_id=? AND source_type='narrative_memory' AND model_key=?
-                     AND status IN ('ready', 'degraded')""",
+                     AND status IN ('ready', 'degraded', 'failed')""",
                 (book_id, self.model_key),
             ).fetchall()
             for stale in stale_rows:
@@ -450,7 +552,7 @@ class DurableHybridRetriever:
             """SELECT id, source_type, source_id, source_version, content, content_checksum,
                       embedding, dimension, status, projection_version, provenance
                FROM embedding_projections
-               WHERE book_id=? AND model_key=? AND status IN ('ready', 'degraded')
+               WHERE book_id=? AND model_key=? AND status IN ('ready', 'degraded', 'failed')
                ORDER BY id""",
             (book_id, self.model_key),
         )
@@ -498,6 +600,7 @@ class DurableHybridRetriever:
                 vector_error = str(exc)
 
         ordered = sorted(results.values(), key=lambda item: (-item.score, item.id))[:top_k]
+        embedding_failure_count = sum(1 for row in rows if row.get("status") == "failed")
         return {
             "book_id": book_id,
             "query": query.strip(),
@@ -506,6 +609,7 @@ class DurableHybridRetriever:
             "embedding_available": vector_used,
             "error_code": "EMBEDDING_QUERY_FAILED" if vector_error else None,
             "error_detail": vector_error,
+            "embedding_failure_count": embedding_failure_count,
             "resultCount": len(ordered),
             "results": [self._result_dict(item, by_id[item.id]) for item in ordered],
             "projection_version": self.PROJECTION_VERSION,
@@ -550,6 +654,9 @@ class DurableHybridRetriever:
     @staticmethod
     def _result_dict(result: SearchResult, row: dict[str, Any]) -> dict[str, Any]:
         metadata = result.metadata or {}
+        provenance = metadata.get("provenance", {})
+        if not isinstance(provenance, dict):
+            provenance = {}
         return {
             "id": result.id,
             "source_type": row["source_type"],
@@ -561,7 +668,10 @@ class DurableHybridRetriever:
             "status": row["status"],
             "projection_version": row.get("projection_version") or DurableHybridRetriever.PROJECTION_VERSION,
             "retrieval_strategy": metadata.get("retrieval_strategy", "bm25_fallback"),
-            "provenance": metadata.get("provenance", {}),
+            "document_id": provenance.get("documentId"),
+            "document_name": provenance.get("documentName"),
+            "doc_type": provenance.get("docType"),
+            "provenance": provenance,
             "metadata": metadata,
         }
 

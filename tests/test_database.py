@@ -13,7 +13,7 @@ from src.core.database import Database
 from src.core.task_manager import TaskManager, TaskType, TaskStatus
 from src.core.dal import (
     ProjectDAL, BookDAL, ChapterDAL, CharacterDAL,
-    ForeshadowDAL, StoryFactDAL, ReviewDAL
+    ForeshadowDAL, StoryFactDAL, ReviewDAL, StoryCommitDAL
 )
 
 
@@ -502,6 +502,22 @@ class TestStoryFactDAL:
         facts = dal.list_by_book(book_id)
         assert len(facts) == 1
         assert facts[0]['content'] == 'Hero defeated the dragon'
+        assert facts[0]['source'] == 'legacy_dal'
+        assert facts[0]['verification_status'] == 'unverified'
+        assert facts[0]['commit_id'] is None
+
+        commit_dal = StoryCommitDAL()
+        commit_id = commit_dal.create({
+            'chapter_id': chapter_id,
+            'status': 'accepted',
+            'facts_extracted': [],
+            'state_changes': {},
+        })
+        commit = db.get_by_id('story_commits', commit_id)
+        assert commit is not None
+        assert commit['status'] == 'pending'
+        with pytest.raises(ValueError, match='StoryRepository'):
+            commit_dal.update(commit_id, {'status': 'accepted'})
 
 
 # ========== Review DAL 测试 ==========
