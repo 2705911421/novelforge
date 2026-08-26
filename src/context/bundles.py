@@ -14,6 +14,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _json_snapshot(value: Any, fallback: Any) -> Any:
+    """Return a JSON-safe detached copy for provenance snapshots."""
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return fallback
+
+
 @dataclass(frozen=True)
 class ContextBundle:
     bundle_id: str
@@ -30,7 +38,14 @@ class ContextBundle:
     created_at: str = field(default_factory=_now)
 
     def manifest(self) -> dict[str, Any]:
-        return {
+        # Keep the normalized fields stable while round-tripping the richer
+        # source manifest (compiled/excluded items, graph snapshots, writer
+        # input, hashes, and retrieval provenance) when it was supplied by a
+        # pipeline.  The source snapshot is provenance, never authority.
+        provenance = self.provenance if isinstance(self.provenance, Mapping) else {}
+        raw_manifest = provenance.get("manifestSnapshot")
+        manifest = dict(raw_manifest) if isinstance(raw_manifest, Mapping) else {}
+        manifest.update({
             "schemaVersion": 1,
             "bundleId": self.bundle_id,
             "version": self.version,
@@ -42,9 +57,19 @@ class ContextBundle:
             "planning": dict(self.planning_snapshot),
             "chapterIntent": dict(self.chapter_intent),
             "memoryEvidence": [dict(item) for item in self.memory_evidence],
-            "provenance": dict(self.provenance),
+            "provenance": dict(provenance),
             "createdAt": self.created_at,
-        }
+        })
+        if raw_manifest is not None:
+            manifest["sourceManifestSchemaVersion"] = (
+                raw_manifest.get("schemaVersion", 1)
+                if isinstance(raw_manifest, Mapping) else 1
+            )
+        return _json_snapshot(manifest, {
+            "schemaVersion": 1,
+            "bundleId": self.bundle_id,
+            "version": self.version,
+        })
 
 
 class ContextBundleStore:
@@ -108,6 +133,78 @@ class ContextBundleStore:
                 ),
             )
         return bundle
+
+    def create_from_manifest(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        project_id: str | None,
+        book_id: str | None = None,
+        source: str = "ContextEngine",
+        task_id: str | None = None,
+        role: str | None = None,
+    ) -> ContextBundle:
+        """Persist a NovelForge context manifest as an immutable bundle."""
+        manifest_snapshot = _json_snapshot(dict(manifest), {})
+        items = manifest.get("memoryEvidence")
+        if not isinstance(items, (list, tuple)):
+            items = manifest.get("items")
+        evidence = _json_snapshot(
+            [dict(item) for item in (items or ()) if isinstance(item, Mapping)],
+            [],
+        )
+        provenance = manifest.get("provenance")
+        provenance_payload = (
+            _json_snapshot(dict(provenance), {}) if isinstance(provenance, Mapping) else {}
+        )
+        provenance_payload.update({
+            "source": source,
+            "taskId": task_id,
+            "role": role,
+            "manifestSchemaVersion": manifest.get("schemaVersion", 1),
+            # This is deliberately nested under provenance so the normalized
+            # ContextBundle columns remain the queryable contract while the
+            # exact retrieval/compiler evidence remains auditable.
+            "manifestSnapshot": manifest_snapshot,
+        })
+        safe_project_id = self._existing_reference("projects", project_id)
+        safe_book_id = self._existing_reference("books", book_id)
+        if project_id and safe_project_id != project_id:
+            provenance_payload["requestedProjectId"] = str(project_id)
+        if book_id and safe_book_id != book_id:
+            provenance_payload["requestedBookId"] = str(book_id)
+        return self.create(
+            project_id=safe_project_id,
+            book_id=safe_book_id,
+            author_intent_snapshot=(
+                _json_snapshot(manifest.get("authorIntent"), {})
+                if isinstance(manifest.get("authorIntent"), Mapping) else {}
+            ),
+            story_bible_snapshot=(
+                _json_snapshot(manifest.get("storyBible"), {})
+                if isinstance(manifest.get("storyBible"), Mapping) else {}
+            ),
+            canon_commit=manifest.get("canonCommit"),
+            planning_snapshot=(
+                _json_snapshot(manifest.get("planning"), {})
+                if isinstance(manifest.get("planning"), Mapping) else {}
+            ),
+            chapter_intent=(
+                _json_snapshot(manifest.get("chapterIntent"), {})
+                if isinstance(manifest.get("chapterIntent"), Mapping) else {}
+            ),
+            memory_evidence=evidence,
+            provenance=provenance_payload,
+        )
+
+    def _existing_reference(self, table: str, value: str | None) -> str | None:
+        """Keep ContextBundle FKs valid without discarding requested scope."""
+        if not value:
+            return None
+        if table not in {"projects", "books"}:
+            raise ValueError(f"unsupported context reference table: {table}")
+        row = self.db.fetchone(f"SELECT id FROM {table} WHERE id=?", (value,))
+        return str(row["id"]) if row else None
 
     def get(self, bundle_id: str) -> ContextBundle | None:
         row = self.db.fetchone("SELECT * FROM context_bundles WHERE id=?", (bundle_id,))

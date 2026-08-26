@@ -11,6 +11,7 @@ from copy import deepcopy
 import io
 import json
 import hashlib
+import logging
 import os
 import posixpath
 import re
@@ -44,6 +45,7 @@ from src.core.database import Database
 from src.core.story_repository import ChapterStateError, ChapterVersionConflict, StoryRepository
 from src.core.narrative_health import NarrativeHealthService
 from src.core.task_runtime import TaskRuntime, TaskStateError
+from src.context.bundles import ContextBundleStore
 from src.core.task_worker import PersistentTaskWorker
 from src.creation.task_handlers import LegacyTaskHandlers
 from src.creation.continuous_service import ContinuousWritingService
@@ -112,13 +114,53 @@ from src.compute.scheduler import (
     ComputePolicy,
     ComputeScheduler,
 )
+from src.compute.telemetry import ComputeTelemetryStore
 from src.runtime.api_runtime import ApiModelRuntime
+from src.runtime.cli import ClaudeCodeRuntime
 from src.runtime.codex import CodexRuntime
-from src.runtime.persistence import AgentRunStore, AgentTaskStore, ComputePlanStore
-from src.runtime.registry import AcquisitionType, InstallerBroker, RuntimeManifest, RuntimeRegistry
+from src.runtime.approvals import ApprovalEngine
+from src.runtime.control_plane import (
+    ControlCommand,
+    ControlCommandInProgress,
+    ControlCommandRejected,
+    ControlCommandWorker,
+    ControlPlane,
+    EventBus,
+    TaskOrchestrator,
+)
+from src.runtime.persistence import AgentRunStore, AgentTaskStore, ComputePlanStore, ControlEventStore
+from src.runtime.registry import (
+    AcquisitionType,
+    InstallState,
+    InstallerBroker,
+    ManifestCatalog,
+    ManifestVerifier,
+    RuntimeManifest,
+    RuntimeRegistry,
+    RuntimeSource,
+)
+from src.runtime.errors import RuntimeUnavailable
 from src.runtime.router import RuntimeRouter
-from src.runtime.tool_gateway import ToolGateway
+from src.runtime.tool_gateway import PermissionEngine, ToolGateway
 from src.runtime.domain_tools import register_story_authority_tools
+
+logger = logging.getLogger(__name__)
+
+
+def _configured_runtime_catalog() -> ManifestCatalog:
+    """Build a catalog importer from the host's explicit trust-root config."""
+    raw_keys = os.environ.get("NOVELFORGE_RUNTIME_CATALOG_KEYS", "").strip()
+    if not raw_keys:
+        raise RuntimeUnavailable(
+            "trusted runtime catalog keys are not configured; refusing unsigned/untrusted catalog import"
+        )
+    try:
+        keys = json.loads(raw_keys)
+    except json.JSONDecodeError as exc:
+        raise RuntimeUnavailable("NOVELFORGE_RUNTIME_CATALOG_KEYS is not valid JSON") from exc
+    if not isinstance(keys, dict) or not keys:
+        raise RuntimeUnavailable("NOVELFORGE_RUNTIME_CATALOG_KEYS must be a non-empty key map")
+    return ManifestCatalog(ManifestVerifier(trusted_public_keys=keys))
 
 # ========== 全局实例 ==========
 # Tests and isolated deployments can point the complete Studio process at a
@@ -178,7 +220,8 @@ mcp_server_repository = MCPServerRepository(story_repository.db)
 draft_import_repository = DraftImportRepository(story_repository.db)
 canonical_import_service = CanonicalImportService(story_repository.db, story_repository)
 studio_daemon_state: dict[str, Any] = {
-    "task": None, "stop_event": None, "worker_id": None, "projection": None,
+    "task": None, "control_task": None, "stop_event": None,
+    "worker_id": None, "projection": None,
 }
 _runtime_plane_cache: dict[int, dict[str, Any]] = {}
 
@@ -195,11 +238,16 @@ async def app_lifespan(_app):
     if not disabled:
         stop_event = asyncio.Event()
         worker_id = f"studio-{os.getpid()}"
+        control_worker = get_runtime_plane().get("commandWorker")
         studio_daemon_state.update(
             stop_event=stop_event,
             worker_id=worker_id,
             task=asyncio.create_task(
                 task_worker.run_forever(worker_id=worker_id, stop_event=stop_event)
+            ),
+            control_task=(
+                asyncio.create_task(control_worker.run_forever(stop_event=stop_event))
+                if control_worker is not None else None
             ),
         )
     try:
@@ -215,7 +263,34 @@ async def app_lifespan(_app):
                 worker_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await worker_task
-        studio_daemon_state.update(task=None, stop_event=None, worker_id=None, projection=None)
+        control_task = studio_daemon_state.get("control_task")
+        if control_task is not None:
+            try:
+                await asyncio.wait_for(control_task, timeout=5)
+            except asyncio.TimeoutError:
+                control_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await control_task
+        # Runtime capability/auth probes may have started an App Server even
+        # when no task was executed.  Close every cached Host router at the
+        # application boundary so a browser read cannot leak a child process.
+        routers = [getattr(model_mgr, "_router", None)]
+        routers.extend(
+            plane.get("router")
+            for plane in tuple(_runtime_plane_cache.values())
+            if isinstance(plane, dict)
+        )
+        seen: set[int] = set()
+        for router in routers:
+            if router is None or id(router) in seen:
+                continue
+            seen.add(id(router))
+            with contextlib.suppress(Exception):
+                await router.shutdown()
+        _runtime_plane_cache.clear()
+        studio_daemon_state.update(
+            task=None, control_task=None, stop_event=None, worker_id=None, projection=None
+        )
 
 app = FastAPI(
     title="NovelForge Studio",
@@ -278,6 +353,22 @@ class BookCreateRequest(BaseModel):
     styleProfile: dict[str, Any] = Field(default_factory=dict)
     creationMode: Optional[str] = None
     requireProviderConfigured: bool = False
+
+
+class ControlCommandRequest(BaseModel):
+    """Authenticated Studio envelope for a host-owned domain command."""
+
+    name: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    actor: str = "studio"
+    commandId: Optional[str] = None
+    queue: bool = False
+
+
+class ControlQueryRequest(BaseModel):
+    """Read-only Control Plane query envelope."""
+
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 class WriteNextRequest(BaseModel):
     context: str = ""
@@ -992,19 +1083,47 @@ def get_runtime_plane() -> dict[str, Any]:
         acquisition=AcquisitionType.BUILTIN,
         capabilities={"generationRuns": True, "streaming": False, "sessions": False},
         source="novelforge",
+        source_kind=RuntimeSource.BUILTIN,
+        integration_grade="A",
+        platforms={"windows": {"mode": "native"}, "linux": {"mode": "native"}, "darwin": {"mode": "native"}},
+        verification={"type": "builtin"},
+        authentication={"type": "api-key-vault"},
+        compatibility={"minimumVersion": "1", "maximumTestedVersion": "1", "testedVersions": ["1"]},
     ))
     registry.register_manifest(RuntimeManifest(
         runtime_type="codex-app-server",
         display_name="Codex App Server",
-        version="1",
+        version="0.147.0",
         protocol="jsonrpc-stdio",
         acquisition=AcquisitionType.SYSTEM,
         executable="codex",
         command=("codex", "app-server"),
         capabilities={"streaming": True, "sessions": True, "tools": True, "approvals": True},
         source="openai",
+        source_kind=RuntimeSource.SYSTEM,
+        integration_grade="S",
+        platforms={"windows": {"mode": "native"}, "linux": {"mode": "native"}, "darwin": {"mode": "native"}},
+        verification={"type": "executable", "versionCommand": ["codex", "--version"]},
+        authentication={"type": "harness-managed", "protocol": "account/read"},
+        compatibility={"minimumVersion": "0.100.0", "maximumTestedVersion": "0.147.0", "testedVersions": ["0.147.0"]},
     ))
-    for runtime_type in ("api", "codex-app-server"):
+    registry.register_manifest(RuntimeManifest(
+        runtime_type="claude-code",
+        display_name="Claude Code",
+        version="2.1.237",
+        protocol="structured-cli",
+        acquisition=AcquisitionType.EXTERNAL,
+        executable="claude",
+        capabilities={"streaming": False, "sessions": False, "tools": False, "approvals": False},
+        source="anthropic",
+        source_kind=RuntimeSource.EXTERNAL,
+        integration_grade="C",
+        platforms={"windows": {"mode": "native"}, "linux": {"mode": "native"}, "darwin": {"mode": "native"}},
+        verification={"type": "executable", "versionCommand": ["claude", "--version"]},
+        authentication={"type": "vendor-managed", "command": ["claude", "auth", "status"]},
+        compatibility={"minimumVersion": "2.0.0", "maximumTestedVersion": "2.1.237", "testedVersions": ["2.1.237"]},
+    ))
+    for runtime_type in ("api", "codex-app-server", "claude-code"):
         installation = registry.get_installation(runtime_type)
         if installation is None or installation.state.value == "not_installed":
             registry.discover(runtime_type)
@@ -1012,10 +1131,45 @@ def get_runtime_plane() -> dict[str, Any]:
     runs = AgentRunStore(database)
     plans = ComputePlanStore(database)
     api_runtime = ApiModelRuntime(get_persistent_model_runtime(), runs)
-    codex_runtime = CodexRuntime(runs, cwd=workspace_root)
+    approval_engine = ApprovalEngine(db=database)
+    permission_engine = PermissionEngine()
+    tool_gateway = ToolGateway(
+        approval_engine=approval_engine,
+        permission_engine=permission_engine,
+    )
+    register_story_authority_tools(tool_gateway, story_repository)
+    codex_runtime = CodexRuntime(runs, cwd=workspace_root, tool_gateway=tool_gateway)
+    codex_installation = registry.get_installation("codex-app-server")
+    claude_installation = registry.get_installation("claude-code")
+    claude_runtime = None
+    if claude_installation is not None and claude_installation.state is not InstallState.NOT_INSTALLED:
+        claude_runtime = ClaudeCodeRuntime(
+            runs,
+            cwd=workspace_root,
+            executable=claude_installation.path or "claude",
+        )
     capabilities = CapabilityRegistry()
-    for model in codex_runtime._models:
-        capabilities.register_model(model, capability=CapabilityTier.C4, tags=("codex", "session"))
+    runtime_adapters: dict[str, Any] = {"api": api_runtime}
+    def capability_health(runtime_type: str) -> str:
+        installation = registry.get_installation(runtime_type)
+        if installation is not None and installation.state is InstallState.READY:
+            return "ready"
+        return "unavailable"
+
+    if codex_installation is not None and codex_installation.state is not InstallState.NOT_INSTALLED:
+        runtime_adapters["codex-app-server"] = codex_runtime
+        for model in codex_runtime._models:
+            capabilities.register_model(
+                model, capability=CapabilityTier.C4, health=capability_health("codex-app-server"),
+                tags=("codex", "session"),
+            )
+    if claude_runtime is not None:
+        runtime_adapters["claude-code"] = claude_runtime
+        for model in claude_runtime._models:
+            capabilities.register_model(
+                model, capability=CapabilityTier.C3, health=capability_health("claude-code"),
+                tags=("claude", "cli"),
+            )
     # API models are refreshed by the capabilities endpoint; the adapter still
     # exists when no provider has been configured, but no fake model is added.
     policy = ComputePolicy(
@@ -1030,11 +1184,36 @@ def get_runtime_plane() -> dict[str, Any]:
         policy=policy,
         budget=BudgetBroker(total=10_000, critical_reserve=1_000, db=database, scope="studio"),
     )
-    router = RuntimeRouter(scheduler, runs=runs, plans=plans)
-    router.register("api", api_runtime)
-    router.register("codex-app-server", codex_runtime)
-    tool_gateway = ToolGateway()
-    register_story_authority_tools(tool_gateway, story_repository)
+    events = EventBus(ControlEventStore(database))
+    router = RuntimeRouter(
+        scheduler,
+        runs=runs,
+        plans=plans,
+        event_bus=events,
+        runtime_readiness=registry.require_ready,
+    )
+    for runtime_type, runtime in runtime_adapters.items():
+        router.register(runtime_type, runtime)
+    # The legacy synchronous manager and the Control Plane must converge on
+    # one router for the active database.  Otherwise a worker call could use
+    # a second scheduler/runtime registry that the Studio audit endpoints do
+    # not observe.
+    if getattr(model_mgr, "runtime", None) is getattr(api_runtime, "runtime", None):
+        model_mgr.attach_runtime_router(router)
+    plane_task_runtime = TaskRuntime(database)
+    orchestrator = TaskOrchestrator(plane_task_runtime, router)
+    control_plane = ControlPlane(
+        plane_task_runtime,
+        events=events,
+        approvals=approval_engine,
+        permissions=permission_engine,
+        orchestrator=orchestrator,
+        tools=tool_gateway,
+    )
+    command_worker = ControlCommandWorker(
+        control_plane.commands,
+        worker_id=f"studio-control-{os.getpid()}",
+    )
     cached = {
         "db": database,
         "registry": registry,
@@ -1044,10 +1223,18 @@ def get_runtime_plane() -> dict[str, Any]:
         "plans": plans,
         "api": api_runtime,
         "codex": codex_runtime,
+        "claude": claude_runtime,
+        "runtimeAdapters": runtime_adapters,
         "capabilities": capabilities,
         "scheduler": scheduler,
         "router": router,
+        "orchestrator": orchestrator,
+        "controlPlane": control_plane,
+        "commandWorker": command_worker,
+        "events": events,
         "tools": tool_gateway,
+        "permissions": permission_engine,
+        "approvals": approval_engine,
     }
     _runtime_plane_cache[cache_key] = cached
     return cached
@@ -1056,24 +1243,49 @@ def get_runtime_plane() -> dict[str, Any]:
 async def refresh_runtime_capabilities(plane: dict[str, Any]) -> None:
     """Refresh discoverable API models without starting external processes."""
     for model in await plane["api"].get_models():
-        plane["capabilities"].register_model(model, capability=CapabilityTier.C2, tags=("api",))
-    for runtime_type, runtime in (("api", plane["api"]), ("codex-app-server", plane["codex"])):
+        installation = plane["registry"].get_installation("api")
+        health = "ready" if installation is not None and installation.state is InstallState.READY else "unavailable"
+        plane["capabilities"].register_model(
+            model, capability=CapabilityTier.C2, health=health, tags=("api",),
+        )
+    for runtime_type, runtime in plane["runtimeAdapters"].items():
         installation = plane["registry"].get_installation(runtime_type)
-        if installation is None or installation.state.value in {"not_installed", "broken", "incompatible"}:
+        if installation is None or installation.state.value in {
+            "not_installed", "broken", "incompatible", "needs_update", "installing", "repairing",
+        }:
+            plane["capabilities"].set_runtime_health(runtime_type, "unavailable")
             continue
         try:
+            verification = plane["installer"].installer(runtime_type).verify()
+            if not verification.verified:
+                plane["registry"].set_error(runtime_type, verification.reason or "runtime verification failed")
+                plane["capabilities"].set_runtime_health(runtime_type, "unavailable")
+                continue
+            plane["registry"].mark_verified(runtime_type, verification)
+            compatibility = plane["registry"].compatibility(runtime_type, verification.version)
+            if not compatibility.compatible:
+                plane["registry"].mark_incompatible(runtime_type, compatibility.reason or "runtime version is incompatible")
+                continue
             auth = await runtime.authenticate()
             plane["registry"].mark_authenticated(runtime_type, auth)
             if auth.status not in {"authenticated", "ready"}:
+                plane["capabilities"].set_runtime_health(runtime_type, "unavailable")
                 continue
             capability = await runtime.get_capabilities()
             plane["registry"].mark_capability_verified(runtime_type, capability)
             plane["registry"].mark_health(runtime_type, healthy=True)
+            plane["capabilities"].set_runtime_health(runtime_type, "ready")
         except Exception as exc:
+            plane["capabilities"].set_runtime_health(runtime_type, "unavailable")
             try:
                 plane["registry"].set_error(runtime_type, str(exc))
-            except Exception:
-                pass
+            except Exception as persistence_error:
+                logger.warning(
+                    "runtime capability refresh could not persist failure for %s: %s",
+                    runtime_type,
+                    persistence_error,
+                    exc_info=persistence_error,
+                )
 
 
 def get_planning_readiness(book_id: str, project: Optional[StoryProject] = None) -> dict[str, Any]:
@@ -3464,14 +3676,40 @@ async def runtime_registry_status():
     return {"runtimes": plane["registry"].list()}
 
 
+@app.post("/api/v1/runtime/catalog/import")
+async def import_runtime_catalog(body: dict[str, Any]):
+    """Import a fully signed catalog; transport and execution stay separate."""
+    plane = get_runtime_plane()
+    try:
+        manifests = _configured_runtime_catalog().import_into(plane["registry"], body)
+    except RuntimeUnavailable as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {
+        "count": len(manifests),
+        "runtimes": [manifest.to_dict() for manifest in manifests],
+    }
+
+
 @app.post("/api/v1/runtime/{runtime_type}/discover")
 async def discover_runtime(runtime_type: str):
     plane = get_runtime_plane()
     try:
-        installation = plane["registry"].discover(runtime_type)
+        installation = plane["installer"].discover(runtime_type)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     return {"runtimeType": runtime_type, "installation": installation.to_dict()}
+
+
+@app.get("/api/v1/runtime/{runtime_type}/diagnostics")
+async def runtime_diagnostics(runtime_type: str):
+    """Return manifest-safe plans and observed installer evidence."""
+    plane = get_runtime_plane()
+    try:
+        return plane["installer"].diagnostics(runtime_type)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @app.post("/api/v1/runtime/{runtime_type}/install")
@@ -3480,6 +3718,54 @@ async def install_runtime(runtime_type: str, body: dict[str, Any] | None = None)
     plane = get_runtime_plane()
     try:
         installation = plane["installer"].install(runtime_type, approved=bool((body or {}).get("approved")))
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"runtimeType": runtime_type, "installation": installation.to_dict()}
+
+
+@app.post("/api/v1/runtime/{runtime_type}/repair")
+async def repair_runtime(runtime_type: str, body: dict[str, Any] | None = None):
+    """Repair a registered runtime only after an explicit user approval."""
+    plane = get_runtime_plane()
+    try:
+        installation = plane["installer"].repair(
+            runtime_type,
+            approved=bool((body or {}).get("approved")),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"runtimeType": runtime_type, "installation": installation.to_dict()}
+
+
+@app.post("/api/v1/runtime/{runtime_type}/update")
+async def update_runtime(runtime_type: str, body: dict[str, Any] | None = None):
+    """Use the same supervised installer boundary for an available update."""
+    plane = get_runtime_plane()
+    try:
+        installation = plane["installer"].update(
+            runtime_type,
+            approved=bool((body or {}).get("approved")),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"runtimeType": runtime_type, "installation": installation.to_dict()}
+
+
+@app.post("/api/v1/runtime/{runtime_type}/uninstall")
+async def uninstall_runtime(runtime_type: str, body: dict[str, Any] | None = None):
+    """Remove a managed runtime registration only after explicit approval."""
+    plane = get_runtime_plane()
+    try:
+        installation = plane["installer"].uninstall(
+            runtime_type,
+            approved=bool((body or {}).get("approved")),
+        )
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except Exception as exc:
@@ -3515,6 +3801,68 @@ async def compute_policy():
     }
 
 
+@app.get("/api/v1/compute/telemetry")
+async def compute_telemetry(
+    limit: int = Query(200, ge=1, le=1000),
+    task_type: Optional[str] = Query(None, alias="taskType"),
+):
+    """Expose durable routing evidence without making it a scheduler authority."""
+    return ComputeTelemetryStore(get_runtime_plane()["db"]).snapshot(
+        limit=limit,
+        task_type=task_type.strip() if task_type and task_type.strip() else None,
+    )
+
+
+@app.post("/api/v1/control/commands")
+async def dispatch_control_command(req: ControlCommandRequest):
+    """Dispatch an authenticated host command without exposing provider APIs."""
+    if not req.name.strip():
+        raise HTTPException(422, "command name is required")
+    command_id = req.commandId.strip() if req.commandId else None
+    if req.commandId is not None and not command_id:
+        raise HTTPException(422, "commandId must not be empty")
+    command = ControlCommand(
+        name=req.name.strip(),
+        payload=req.payload,
+        actor=req.actor.strip() or "studio",
+        **({"command_id": command_id} if command_id else {}),
+    )
+    try:
+        control_plane = get_runtime_plane()["controlPlane"]
+        if req.queue:
+            result = control_plane.enqueue(command)
+            return {
+                "commandId": command.command_id,
+                "command": command.name,
+                "status": result.get("status"),
+                "receipt": result,
+            }
+        result = await control_plane.dispatch_async(command)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ControlCommandInProgress, ControlCommandRejected, TaskStateError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "commandId": command.command_id,
+        "command": command.name,
+        "result": result,
+    }
+
+
+@app.post("/api/v1/control/queries/{query_name:path}")
+async def dispatch_control_query(query_name: str, req: ControlQueryRequest):
+    """Execute a read-only Control Plane query through the same host seam."""
+    if not query_name.strip():
+        raise HTTPException(422, "query name is required")
+    try:
+        result = get_runtime_plane()["controlPlane"].queries.dispatch(query_name.strip(), req.payload)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"query": query_name.strip(), "result": result}
+
+
 @app.get("/api/v1/tasks/{task_id}/agent-task")
 async def task_agent_task(task_id: str):
     task = task_runtime.get(task_id)
@@ -3529,6 +3877,62 @@ async def task_agent_runs(task_id: str):
     if task_runtime.get(task_id) is None:
         raise HTTPException(404, "task not found")
     return {"runs": get_runtime_plane()["runs"].list_for_task(task_id)}
+
+
+@app.get("/api/v1/tasks/{task_id}/context-bundles")
+async def task_context_bundles(task_id: str):
+    """Return the immutable context snapshots used by this task's AgentRuns."""
+    if task_runtime.get(task_id) is None:
+        raise HTTPException(404, "task not found")
+    runs = get_runtime_plane()["runs"].list_for_task(task_id)
+    run_ids_by_bundle: dict[str, list[str]] = {}
+    for run in runs:
+        bundle_id = run.get("context_bundle_id")
+        if bundle_id:
+            run_ids_by_bundle.setdefault(str(bundle_id), []).append(str(run["id"]))
+    store = ContextBundleStore(get_runtime_plane()["db"])
+    bundles: list[dict[str, Any]] = []
+    for bundle_id, run_ids in run_ids_by_bundle.items():
+        bundle = store.get(bundle_id)
+        if bundle is None:
+            continue
+        manifest = bundle.manifest()
+        manifest["agentRunIds"] = run_ids
+        bundles.append(manifest)
+    return {"bundles": bundles}
+
+
+@app.get("/api/v1/agent-runs/{agent_run_id}/context-bundle")
+async def agent_run_context_bundle(agent_run_id: str):
+    """Read one AgentRun's exact ContextBundle for provenance inspection."""
+    run = get_runtime_plane()["runs"].get(agent_run_id)
+    if run is None:
+        raise HTTPException(404, "agent run not found")
+    bundle_id = run.get("context_bundle_id")
+    bundle = ContextBundleStore(get_runtime_plane()["db"]).get(str(bundle_id)) if bundle_id else None
+    return {
+        "agentRunId": agent_run_id,
+        "contextBundleId": bundle_id,
+        "bundle": bundle.manifest() if bundle else None,
+    }
+
+
+@app.get("/api/v1/agent-runs/{agent_run_id}/tool-calls")
+async def agent_run_tool_calls(agent_run_id: str):
+    """Read tool-call audit entries projected from the AgentRun event ledger."""
+    run = get_runtime_plane()["runs"].get(agent_run_id)
+    if run is None:
+        raise HTTPException(404, "agent run not found")
+    return {"agentRunId": agent_run_id, "toolCalls": run.get("toolCalls", [])}
+
+
+@app.get("/api/v1/agent-runs/{agent_run_id}/approvals")
+async def agent_run_approvals(agent_run_id: str):
+    """Read approval audit entries without exposing vendor approval logs."""
+    run = get_runtime_plane()["runs"].get(agent_run_id)
+    if run is None:
+        raise HTTPException(404, "agent run not found")
+    return {"agentRunId": agent_run_id, "approvals": run.get("approvals", [])}
 
 
 @app.get("/api/v1/tasks/{task_id}/domain-events")
@@ -3750,7 +4154,13 @@ async def resume_task(task_id: str):
 
 @app.post("/api/v1/tasks/{task_id}/cancel")
 async def cancel_task(task_id: str):
-    return _task_control(task_id, "cancel")
+    command = ControlCommand("task.cancel", {"taskId": task_id}, actor="studio")
+    try:
+        return await get_runtime_plane()["controlPlane"].dispatch_async(command)
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    except TaskStateError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 @app.post("/api/v1/tasks/{task_id}/retry")
 async def retry_task(task_id: str):
@@ -8102,6 +8512,45 @@ def _write_chat_session(book_id: str, session: dict[str, Any]) -> None:
     path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _invoke_chat_runtime(
+    manager: Any,
+    *,
+    role: str,
+    messages: list[dict[str, str]],
+    system: str,
+    task_type: str,
+    max_tokens: int,
+) -> Any:
+    """Use unified Runtime routing while retaining the legacy client seam.
+
+    The production ModelManager exposes ``chat`` and owns Runtime routing. A
+    small compatibility fallback keeps older integrations that only expose
+    ``get_client(role)`` working without making that client the new authority
+    boundary.
+    """
+    chat = getattr(manager, "chat", None)
+    if callable(chat):
+        return chat(
+            messages=messages,
+            system=system,
+            task_type=task_type,
+            max_tokens=max_tokens,
+        )
+    client_factory = getattr(manager, "get_client", None)
+    if not callable(client_factory):
+        raise RuntimeError("chat runtime manager exposes neither chat nor get_client")
+    client = client_factory(role)
+    client_chat = getattr(client, "chat", None)
+    if not callable(client_chat):
+        raise RuntimeError(f"chat client for role {role} exposes no chat method")
+    return client_chat(
+        messages=messages,
+        system=system,
+        task_type=task_type,
+        max_tokens=max_tokens,
+    )
+
+
 @app.get("/api/v1/chat/sessions")
 async def list_chat_sessions(bookId: str = Query("")):
     if bookId:
@@ -8223,8 +8672,9 @@ async def chat_with_ai(req: ChatRequest):
     # Chat is synchronous at the HTTP boundary, but the model call still
     # needs a durable task scope so the selected Agent route and GenerationRun
     # have the same audit semantics as queued creation workflows.
+    chat_task_type = "thought-clarify" if mode == "thought" else "chat"
     chat_task = task_runtime.enqueue(
-        "chat",
+        chat_task_type,
         project_id=req.bookId or None,
         data={"mode": mode, "skill_ids": req.skillIds, "session_id": session_id},
         stage="blocked",
@@ -8234,10 +8684,12 @@ async def chat_with_ai(req: ChatRequest):
         raise HTTPException(409, "chat task could not be claimed")
     try:
         with model_mgr.task_scope(chat_task["id"]):
-            client = model_mgr.get_client("planner" if mode == "thought" else "primary")
-            response = client.chat(
+            response = _invoke_chat_runtime(
+                model_mgr,
+                role="planner" if mode == "thought" else "writer",
                 messages=history,
                 system=system_prompt,
+                task_type=chat_task_type,
                 max_tokens=2000,
             )
         session["messages"].append({

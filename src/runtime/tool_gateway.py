@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from .contracts import AgentTask
 from .errors import DomainApprovalRequired, ToolPermissionDenied
+from .approvals import ApprovalEngine
 
 
 class ToolAuthority(str, Enum):
@@ -82,11 +83,92 @@ class ToolResult:
         }
 
 
+@dataclass(frozen=True)
+class PermissionDecision:
+    """Host-owned permission result, kept separate from approval state."""
+
+    allowed: bool
+    reason: str = ""
+    code: str = ""
+    requires_approval: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "allowed": self.allowed,
+            "reason": self.reason,
+            "code": self.code,
+            "requiresApproval": self.requires_approval,
+        }
+
+
+class PermissionEngine:
+    """Evaluate task/profile permissions before a tool can be invoked.
+
+    Approval is deliberately not part of this decision.  Permission answers
+    whether a task may use a tool at all; the separate ApprovalEngine grants a
+    one-shot effect token after that policy check has passed.
+    """
+
+    def evaluate(self, definition: ToolDefinition, task: AgentTask) -> PermissionDecision:
+        profile = task.profile
+        if profile and profile.forbidden_tools and definition.name in set(profile.forbidden_tools):
+            return PermissionDecision(
+                False,
+                reason=f"tool forbidden by task profile: {definition.name}",
+                code="TOOL_FORBIDDEN",
+            )
+        if profile and profile.allowed_tools and definition.name not in set(profile.allowed_tools):
+            return PermissionDecision(
+                False,
+                reason=f"tool not allowed by task profile: {definition.name}",
+                code="TOOL_NOT_ALLOWED",
+            )
+
+        authority = ToolAuthority(definition.authority)
+        if authority is ToolAuthority.AUTHORITY:
+            if not task.constraints.get("authority_tools", False):
+                return PermissionDecision(
+                    False,
+                    reason=f"task is not authorized for authority tool: {definition.name}",
+                    code="AUTHORITY_TOOL_NOT_ALLOWED",
+                )
+            if definition.domain in {"canon", "story-authority"} and not task.allows_canon_write:
+                return PermissionDecision(
+                    False,
+                    reason=f"Canon mutation requires an explicit Story Commit boundary: {definition.name}",
+                    code="CANON_WRITE_NOT_ALLOWED",
+                )
+        return PermissionDecision(
+            True,
+            requires_approval=definition.requires_approval,
+        )
+
+    def enforce(self, definition: ToolDefinition, task: AgentTask) -> PermissionDecision:
+        decision = self.evaluate(definition, task)
+        if not decision.allowed:
+            raise ToolPermissionDenied(
+                decision.reason,
+                details={
+                    "tool": definition.name,
+                    "taskId": task.task_id,
+                    "permissionCode": decision.code,
+                },
+            )
+        return decision
+
+
 class ToolGateway:
     """The single tool invocation seam exposed to runtime adapters."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        approval_engine: ApprovalEngine | None = None,
+        permission_engine: PermissionEngine | None = None,
+    ) -> None:
         self._definitions: dict[str, ToolDefinition] = {}
+        self.approval_engine = approval_engine
+        self.permission_engine = permission_engine or PermissionEngine()
 
     def register(self, definition: ToolDefinition) -> None:
         if definition.name in self._definitions:
@@ -119,23 +201,20 @@ class ToolGateway:
         context: ToolCallContext,
     ) -> ToolResult:
         definition = self.get(name)
-        self._check_task_policy(definition, context.task)
+        self.permission_engine.enforce(definition, context.task)
         authority = ToolAuthority(definition.authority)
-        if authority is ToolAuthority.AUTHORITY:
-            if not context.approved or not context.approval_id:
+        if definition.requires_approval:
+            if self.approval_engine is not None:
+                self.approval_engine.consume(
+                    context.task.task_id,
+                    name,
+                    domain=definition.domain,
+                    approval_id=context.approval_id,
+                )
+            elif not context.approved or not context.approval_id:
                 raise DomainApprovalRequired(
                     f"authority tool requires explicit approval: {name}",
                     details={"tool": name, "domain": definition.domain},
-                )
-            if not context.task.constraints.get("authority_tools", False):
-                raise ToolPermissionDenied(
-                    f"task is not authorized for authority tool: {name}",
-                    details={"tool": name, "taskId": context.task.task_id},
-                )
-            if definition.domain in {"canon", "story-authority"} and not context.task.allows_canon_write:
-                raise ToolPermissionDenied(
-                    f"Canon mutation requires an explicit Story Commit boundary: {name}",
-                    details={"tool": name, "taskId": context.task.task_id},
                 )
         result = definition.handler(dict(arguments or {}), context)
         if inspect.isawaitable(result):
@@ -150,8 +229,5 @@ class ToolGateway:
 
     @staticmethod
     def _check_task_policy(definition: ToolDefinition, task: AgentTask) -> None:
-        profile = task.profile
-        if profile and profile.forbidden_tools and definition.name in set(profile.forbidden_tools):
-            raise ToolPermissionDenied(f"tool forbidden by task profile: {definition.name}")
-        if profile and profile.allowed_tools and definition.name not in set(profile.allowed_tools):
-            raise ToolPermissionDenied(f"tool not allowed by task profile: {definition.name}")
+        """Compatibility hook for older callers; new calls use PermissionEngine."""
+        PermissionEngine().enforce(definition, task)

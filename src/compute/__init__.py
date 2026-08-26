@@ -15,6 +15,7 @@ from .scheduler import (
     TaskCapabilityProfile,
     TaskTier,
 )
+from .telemetry import ComputeTelemetryStore
 
 __all__ = [
     "BudgetBroker",
@@ -26,4 +27,5 @@ __all__ = [
     "DifficultyRiskEstimator",
     "TaskCapabilityProfile",
     "TaskTier",
+    "ComputeTelemetryStore",
 ]

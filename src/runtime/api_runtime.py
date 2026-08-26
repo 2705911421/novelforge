@@ -68,58 +68,88 @@ class ApiModelRuntime:
     async def execute(self, task: AgentTask, compute_plan: ComputePlan):
         link = self.runs.db.fetchone("SELECT task_id FROM agent_tasks WHERE id=?", (task.task_id,)) or {}
         durable_task_id = str(link.get("task_id") or task.input_payload.get("durableTaskId") or task.task_id)
+        context_manifest = task.input_payload.get("contextManifest")
+        context_bundle_id = self.runtime.ensure_context_bundle(
+            durable_task_id=durable_task_id,
+            agent_task=task,
+            context_manifest=context_manifest if isinstance(context_manifest, dict) else None,
+        )
         run = self.runs.create(
             task=task,
             durable_task_id=durable_task_id,
             compute_plan=compute_plan,
-            context_bundle_id=task.context_bundle_id,
+            context_bundle_id=context_bundle_id,
             prompt_version=str(task.input_payload.get("promptVersion") or "agent-runtime-1"),
         )
         run_id = str(run["id"])
-        yield RuntimeEvent(
-            runtime_type=self.runtime_type,
-            event_type="turn.started",
-            payload={"agentRunId": run_id, "modelId": compute_plan.model_id},
-            agent_run_id=run_id,
-        )
-        if task.task_id in self._cancelled:
-            self.runs.transition(run_id, AgentRunStatus.INTERRUPTED.value,
-                                 error_code="TASK_INTERRUPTED", error_detail="cancel requested before invocation")
-            raise TaskInterrupted("task was cancelled before API invocation")
         try:
-            response = await asyncio.to_thread(self._invoke, task, compute_plan, durable_task_id)
-        except Exception as exc:
-            code = str(getattr(exc, "code", None) or exc.__class__.__name__).upper()
-            self.runs.transition(run_id, AgentRunStatus.FAILED.value, error_code=code, error_detail=str(exc))
             yield RuntimeEvent(
                 runtime_type=self.runtime_type,
-                event_type="error",
-                payload={"agentRunId": run_id, "code": code, "detail": str(exc)},
+                event_type="turn.started",
+                payload={"agentRunId": run_id, "modelId": compute_plan.model_id},
                 agent_run_id=run_id,
             )
-            raise AgentRuntimeError("API runtime invocation failed", code=code, retryable=True) from exc
-        artifact = {
-            "content": response.content,
-            "contentType": "markdown",
-            "model": response.model,
-            "provider": response.provider,
-            "finishReason": response.finish_reason,
-        }
-        usage = {
-            "inputTokens": response.prompt_tokens,
-            "outputTokens": response.completion_tokens,
-            "totalTokens": response.tokens_used,
-            "latencyMs": response.latency_ms,
-        }
-        self.runs.transition(run_id, AgentRunStatus.SUCCEEDED.value, usage=usage, artifacts=artifact)
-        yield RuntimeEvent(
-            runtime_type=self.runtime_type,
-            event_type="turn.completed",
-            payload={"agentRunId": run_id, "artifact": artifact, "usage": usage},
-            agent_run_id=run_id,
-        )
+            if task.task_id in self._cancelled or durable_task_id in self._cancelled:
+                self.runs.transition(
+                    run_id,
+                    AgentRunStatus.INTERRUPTED.value,
+                    error_code="TASK_INTERRUPTED",
+                    error_detail="cancel requested before invocation",
+                )
+                raise TaskInterrupted("task was cancelled before API invocation")
+            try:
+                response = await asyncio.to_thread(self._invoke, task, compute_plan, durable_task_id, run_id)
+            except TaskInterrupted:
+                self.runs.transition(
+                    run_id,
+                    AgentRunStatus.INTERRUPTED.value,
+                    error_code="TASK_INTERRUPTED",
+                    error_detail="cancel requested during invocation",
+                )
+                raise
+            except Exception as exc:
+                code = str(getattr(exc, "code", None) or exc.__class__.__name__).upper()
+                self.runs.transition(run_id, AgentRunStatus.FAILED.value, error_code=code, error_detail=str(exc))
+                yield RuntimeEvent(
+                    runtime_type=self.runtime_type,
+                    event_type="error",
+                    payload={"agentRunId": run_id, "code": code, "detail": str(exc)},
+                    agent_run_id=run_id,
+                )
+                raise AgentRuntimeError("API runtime invocation failed", code=code, retryable=True) from exc
+            if task.task_id in self._cancelled or durable_task_id in self._cancelled:
+                self.runs.transition(
+                    run_id,
+                    AgentRunStatus.INTERRUPTED.value,
+                    error_code="TASK_INTERRUPTED",
+                    error_detail="cancel requested after invocation",
+                )
+                raise TaskInterrupted("task was cancelled after API invocation")
+            artifact = {
+                "content": response.content,
+                "contentType": "markdown",
+                "model": response.model,
+                "provider": response.provider,
+                "finishReason": response.finish_reason,
+            }
+            usage = {
+                "inputTokens": response.prompt_tokens,
+                "outputTokens": response.completion_tokens,
+                "totalTokens": response.tokens_used,
+                "latencyMs": response.latency_ms,
+            }
+            self.runs.transition(run_id, AgentRunStatus.SUCCEEDED.value, usage=usage, artifacts=artifact)
+            yield RuntimeEvent(
+                runtime_type=self.runtime_type,
+                event_type="turn.completed",
+                payload={"agentRunId": run_id, "artifact": artifact, "usage": usage},
+                agent_run_id=run_id,
+            )
+        finally:
+            self._cancelled.discard(task.task_id)
+            self._cancelled.discard(durable_task_id)
 
-    def _invoke(self, task: AgentTask, plan: ComputePlan, durable_task_id: str):
+    def _invoke(self, task: AgentTask, plan: ComputePlan, durable_task_id: str, run_id: str):
         payload = dict(task.input_payload)
         messages = payload.get("messages")
         if not isinstance(messages, list):
@@ -128,19 +158,29 @@ class ApiModelRuntime:
         system = str(payload.get("system") or "")
         provider_id = payload.get("providerId")
         context_manifest = payload.get("contextManifest")
+        runtime_options = dict(payload.get("runtimeOptions") or {})
+        runtime_options.pop("model_id", None)
+        runtime_options.pop("provider_id", None)
+        runtime_options.pop("prompt_version", None)
+        runtime_options.pop("context_manifest", None)
+        runtime_options.pop("task_stage", None)
+        runtime_options.pop("max_tokens", None)
+        runtime_options.pop("json_mode", None)
         with self.runtime.task_scope(durable_task_id):
-            return self.runtime.invoke(
-                task.role,
-                messages,
-                system,
-                json_mode=bool(payload.get("jsonMode", False)),
-                provider_id=str(provider_id) if provider_id else None,
-                model_id=plan.model_id,
-                task_stage=task.task_type,
-                prompt_version=str(payload.get("promptVersion") or "agent-runtime-1"),
-                context_manifest=context_manifest if isinstance(context_manifest, dict) else None,
-                max_tokens=plan.output_budget or None,
-            )
+            with self.runtime.managed_agent_run(run_id):
+                return self.runtime.invoke(
+                    task.role,
+                    messages,
+                    system,
+                    json_mode=bool(payload.get("jsonMode", False)),
+                    provider_id=str(provider_id) if provider_id else None,
+                    model_id=plan.model_id,
+                    task_stage=task.task_type,
+                    prompt_version=str(payload.get("promptVersion") or "agent-runtime-1"),
+                    context_manifest=context_manifest if isinstance(context_manifest, dict) else None,
+                    max_tokens=plan.output_budget or None,
+                    **runtime_options,
+                )
 
     async def pause(self, task_id: str) -> None:
         raise RuntimeUnavailable("API model runtime does not support pause/resume")
@@ -175,6 +215,11 @@ class ApiModelRuntime:
                 reasoning_levels=("medium", "high"),
                 context_window=128_000,
                 available=True,
+                capability_profile={
+                    "extraction": "C2", "planning": "C2", "writing": "C2",
+                    "review": "C2", "long_context": "C2", "tool_use": "C1",
+                    "structured_output": "C2", "revision": "C2", "consistency": "C2",
+                },
             )
             descriptors.append(descriptor)
         return descriptors

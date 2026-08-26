@@ -36,7 +36,15 @@ def register_story_authority_tools(gateway: ToolGateway, repository: StoryReposi
         authority=ToolAuthority.AUTHORITY,
         handler=accept_story_commit,
         description="Accept an exact reviewed StoryCommit at the Canon boundary.",
-        input_schema={"commitId": "string", "reviewId": "string"},
+        input_schema={
+            "type": "object",
+            "properties": {
+                "commitId": {"type": "string"},
+                "reviewId": {"type": "string"},
+            },
+            "required": ["commitId", "reviewId"],
+            "additionalProperties": False,
+        },
         requires_approval=True,
         domain="story-authority",
     ))

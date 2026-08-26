@@ -495,7 +495,9 @@ const modelWork = (() => {
     if (!taskId || String(taskId).startsWith('model-request-')) return;
     const item = items.get(taskId);
     try {
-      await api('POST', `/tasks/${encodeURIComponent(taskId)}/${action}`);
+      const commandName = { pause: 'task.pause', resume: 'task.resume', cancel: 'task.cancel', retry: 'task.retry' }[action];
+      if (commandName) await api('POST', '/control/commands', { name: commandName, payload: { taskId } });
+      else await api('POST', `/tasks/${encodeURIComponent(taskId)}/${action}`);
       const latest = await api('GET', `/tasks/${encodeURIComponent(taskId)}`);
       if (item) item.task = latest;
       render();
@@ -1395,7 +1397,7 @@ function stopContinuous(){
 }
 async function continuousTaskAction(action){
   if(!_contTask)return;
-  try{await api('POST','/tasks/'+_contTask+'/'+action);toast('任务状态已更新','success');pollTask(_contTask);}
+  try{const commandName={pause:'task.pause',resume:'task.resume',cancel:'task.cancel',retry:'task.retry'}[action];if(commandName)await api('POST','/control/commands',{name:commandName,payload:{taskId:_contTask}});else await api('POST','/tasks/'+_contTask+'/'+action);toast('任务状态已更新','success');pollTask(_contTask);}
   catch(e){toast(e.message,'error');}
 }
 function renderTaskActions(t){
@@ -2576,7 +2578,9 @@ function filterTasks(){
 }
 async function taskQueueAction(taskId,action){
   try{
-    await api('POST','/tasks/'+taskId+'/'+action);
+    const commandName={pause:'task.pause',resume:'task.resume',cancel:'task.cancel',retry:'task.retry'}[action];
+    if(commandName)await api('POST','/control/commands',{name:commandName,payload:{taskId}});
+    else await api('POST','/tasks/'+taskId+'/'+action);
     const labels={pause:'暂停',resume:'恢复',cancel:'取消',retry:'继续尝试'};
     toast('任务已提交“'+(labels[action]||'更新')+'”操作','success');
     await PAGES.tasks(document.getElementById('page'));
@@ -2595,13 +2599,33 @@ async function authorCandidateDecision(taskId,decision){
 async function showTaskDetail(taskId){
   try{
     const t=await api('GET','/tasks/'+taskId);
-    let events=[];try{const ev=await api('GET','/tasks/'+taskId+'/events');events=ev.events||[];}catch(_){}
     const checkpoint=t.checkpoint||{};
     const cpState=checkpoint.state||{};
     const cpContext=cpState.context||{};
     const canDecideBeta1=t.status==='needs_author_decision'&&['write-next','write'].includes(t.type)&&typeof cpContext.beta1_content==='string'&&cpContext.beta1_content.trim();
     const candidateDecisionHtml=canDecideBeta1?`<div class="warn-banner"><b>β1 等待作者决定</b><span>请阅读当前修订稿；确认后记作 β，退回后记作 βn 并重新进入审查。</span><div class="row row-wrap mt8"><button class="btn btn-sm btn-primary" onclick="authorCandidateDecision('${t.id}','accept')">确认 β1 为 β</button><button class="btn btn-sm btn-secondary" onclick="authorCandidateDecision('${t.id}','reject')">退回审查并记 βn</button></div></div>`:'';
-    let genRuns=[];try{const gr=await api('GET','/tasks/'+taskId+'/generation-runs');genRuns=gr.runs||gr||[];}catch(_){}
+    const readProjection=async(path,fallback)=>{try{return await api('GET',path);}catch(_){return fallback;}};
+    const [eventData,generationData,agentTaskData,agentRunData,domainData,planData,contextData]=await Promise.all([
+      readProjection('/tasks/'+taskId+'/events',{events:[]}),
+      readProjection('/tasks/'+taskId+'/generation-runs',{runs:[]}),
+      readProjection('/tasks/'+taskId+'/agent-task',{agentTask:null}),
+      readProjection('/tasks/'+taskId+'/agent-runs',{runs:[]}),
+      readProjection('/tasks/'+taskId+'/domain-events',{events:[]}),
+      readProjection('/tasks/'+taskId+'/compute-plans',{plans:[]}),
+      readProjection('/tasks/'+taskId+'/context-bundles',{bundles:[]})
+    ]);
+    const events=eventData.events||[];
+    const genRuns=generationData.runs||generationData||[];
+    const agentTask=agentTaskData.agentTask||null;
+    const agentRuns=agentRunData.runs||[];
+    const domainEvents=domainData.events||[];
+    const computePlans=planData.plans||[];
+    const contextBundles=contextData.bundles||[];
+    const runtimeRunRows=agentRuns.map(run=>`<div class="list-row"><span class="badge badge-muted">${esc(run.status||'unknown')}</span><span class="mono">${esc((run.id||run.agentRunId||'').slice(0,12))}</span><span>${esc(run.runtime_type||'runtime')} / ${esc(run.model_id||'未记录模型')}</span><span class="text-sm text-muted">reasoning ${esc(run.reasoning||'—')} · context ${esc(run.context_bundle_id||'—')} · tools ${esc(String((run.toolCalls||[]).length))} · approvals ${esc(String((run.approvals||[]).length))}</span></div>`).join('');
+    const domainRows=domainEvents.slice(-20).map(event=>`<div class="log-line"><span class="text-muted text-sm">${esc(event.created_at?new Date(event.created_at).toLocaleTimeString('zh-CN'):'')}</span> <b>${esc(event.ui_message||event.event_type||'状态更新')}</b> ${esc(taskValueText(event.payload||''))}</div>`).join('');
+    const planRows=computePlans.map(item=>{const plan=item.plan||{};return `<div class="list-row"><span class="badge badge-info">${esc(plan.taskTier||'—')}</span><span>${esc(plan.runtimeType||'runtime')} / ${esc(plan.modelId||'—')}</span><span>能力 ${esc(plan.capability||'—')} · ${esc(plan.reasoning||'—')}</span><span class="text-sm text-muted">${esc(plan.capabilityDimension||'—')} · ${esc(String(plan.estimatedCost??'—'))} NF_CU</span></div>`;}).join('');
+    const contextRows=contextBundles.map(bundle=>`<div class="list-row"><span class="badge badge-success">Context v${esc(String(bundle.version??'—'))}</span><span>${esc(bundle.bundleId||'—')}</span><span class="text-sm text-muted">${(bundle.items||[]).length} items · ${(bundle.compiledItems||[]).length} compiled · ${(bundle.excludedItems||[]).length} excluded</span><span class="text-sm text-muted">runs ${(bundle.agentRunIds||[]).length}</span></div>`).join('');
+    const runtimeProjection=(agentTask||agentRuns.length||domainEvents.length||computePlans.length||contextBundles.length)?`<div class="card"><h3>Runtime 执行投影</h3><p class="dim-note mb8">以下状态来自 NovelForge 持久化 Agent 生命周期与产品级事件，不把供应商技术日志当作任务事实。</p>${agentTask?`<div class="grid grid-2"><div class="kv"><span>AgentTask</span><b class="mono">${esc(agentTask.id||agentTask.agentTaskId||'—')}</b></div><div class="kv"><span>角色 / 状态</span><b>${esc(agentTask.role||'—')} · ${esc(agentTask.status||'—')}</b></div><div class="kv"><span>任务类型</span><b>${esc(agentTask.task_type||agentTask.taskType||'—')}</b></div><div class="kv"><span>ContextBundle</span><b class="mono">${esc(agentTask.context_bundle_id||'执行时绑定')}</b></div></div>`:''}${runtimeRunRows?`<div class="task-run-section"><div class="task-run-label">AgentRun</div>${runtimeRunRows}</div>`:''}${contextRows?`<div class="task-run-section"><div class="task-run-label">ContextBundle</div>${contextRows}</div>`:''}${planRows?`<div class="task-run-section"><div class="task-run-label">ComputePlan</div>${planRows}</div>`:''}${domainRows?`<div class="task-run-section"><div class="task-run-label">DomainEvent / UI 投影</div><div class="log-box">${domainRows}</div></div>`:''}</div>`:'';
     modal(`<div class="task-detail-modal"><div class="modal-header"><h3>任务详情</h3><button class="close-x" onclick="closeModal()">×</button></div>
       <div class="grid grid-2 mb16">
         <div><div class="kv"><span>任务 ID</span><b class="mono">${esc(t.id)}</b></div>
@@ -2616,6 +2640,7 @@ async function showTaskDetail(taskId){
       ${['failed','needs_author_decision'].includes(t.status)?`<div class="warn-banner"><b>${t.status==='needs_author_decision'?'任务已安全停在这里':'任务处理没有完成'}</b><span>${esc(taskErrorText(t))}</span><p class="dim-note mt8">你可以从最近一次检查点继续，也可以结束任务。</p></div>`:''}
       ${t.result?readableTaskResult(t.result,'执行结果'):''}
       ${Object.keys(cpState).length?readableTaskResult(cpState,'当前检查点'):''}
+      ${runtimeProjection}
       ${genRuns.length?`<div class="card"><h3>模型处理记录</h3><p class="dim-note mb8">以下内容来自持久化模型调用记录；输入提示词保留原始文本，输出按 Markdown 渲染。</p>${genRuns.map((r,index)=>renderGenerationRun(r,index)).join('')}</div>`:''}
       ${events.length?`<div class="card"><h3>处理记录（${events.length}）</h3><div class="log-box">${events.slice(-50).map(e=>`<div class="log-line"><span class="text-muted text-sm">${e.created_at?new Date(e.created_at).toLocaleTimeString('zh-CN'):''}</span> <b>${esc(taskEventLabel(e.event_type||e.type))}</b> ${esc(taskValueText(e.payload||''))}</div>`).join('')}</div></div>`:''}
       ${candidateDecisionHtml}

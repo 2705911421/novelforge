@@ -12,13 +12,28 @@ def test_runtime_and_compute_read_models_are_real_db_backed():
     assert registry.status_code == 200
     runtime_types = {item["manifest"]["runtimeType"] for item in registry.json()["runtimes"]}
     assert {"api", "codex-app-server"}.issubset(runtime_types)
+    diagnostics = client.get("/api/v1/runtime/api/diagnostics")
+    assert diagnostics.status_code == 200
+    assert diagnostics.json()["trust"]["trusted"] is True
+    assert "install" in diagnostics.json()["plans"]
     assert client.post("/api/v1/runtime/api/discover").json()["installation"]["state"] == "installed"
 
     capabilities = client.get("/api/v1/runtime/capabilities")
     assert capabilities.status_code == 200
-    assert {item["runtimeType"] for item in capabilities.json()["runtimes"]} == {
-        "api", "codex-app-server",
+    capability_types = {item["runtimeType"] for item in capabilities.json()["runtimes"]}
+    assert {"api", "codex-app-server"}.issubset(capability_types)
+    installed_types = {
+        item["manifest"]["runtimeType"]
+        for item in client.get("/api/v1/runtime/registry").json()["runtimes"]
+        if item["installation"]["state"] != "not_installed"
     }
+    assert capability_types == installed_types
+    refreshed = client.get("/api/v1/runtime/registry").json()["runtimes"]
+    assert all(
+        item["installation"]["verified"] is True
+        for item in refreshed
+        if item["installation"]["state"] != "not_installed"
+    )
     tools = client.get("/api/v1/runtime/tools")
     assert tools.status_code == 200
     assert tools.json()["tools"][0]["authority"] == "authority"

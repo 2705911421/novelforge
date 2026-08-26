@@ -24,6 +24,14 @@ class RuntimeUnavailable(AgentRuntimeError):
     retryable = True
 
 
+class RuntimeNotInstalled(RuntimeUnavailable):
+    code = "RUNTIME_NOT_INSTALLED"
+
+
+class RuntimeIncompatible(RuntimeUnavailable):
+    code = "RUNTIME_INCOMPATIBLE"
+
+
 class RuntimeCrashed(AgentRuntimeError):
     code = "RUNTIME_CRASHED"
     retryable = True
@@ -67,3 +75,10 @@ class CommitFailed(AgentRuntimeError):
 
 class TaskInterrupted(AgentRuntimeError):
     code = "TASK_INTERRUPTED"
+
+
+class ControlCommandLeaseLost(AgentRuntimeError):
+    """A queued command can no longer be completed by this worker lease."""
+
+    code = "CONTROL_COMMAND_LEASE_LOST"
+    retryable = True

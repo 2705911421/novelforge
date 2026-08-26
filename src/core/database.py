@@ -2431,6 +2431,135 @@ def _apply_v46(conn: sqlite3.Connection) -> None:
     _execute_sql_script(conn, PHASE_46_AGENT_RUNTIME_COMPUTE_PLANE_SQL)
 
 
+PHASE_47_RUNTIME_APPROVALS_SQL = """
+-- Approval grants are host-owned execution records.  They are separate from
+-- runtime/domain events so one-shot consumption can be fenced atomically.
+CREATE TABLE IF NOT EXISTS runtime_approvals (
+    id TEXT PRIMARY KEY,
+    agent_task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+    tool_name TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'requested'
+        CHECK(status IN ('requested', 'approved', 'rejected', 'revoked', 'consumed', 'expired')),
+    requested_by TEXT NOT NULL DEFAULT 'system',
+    approved_by TEXT,
+    reason TEXT NOT NULL DEFAULT '',
+    requested_at TIMESTAMP NOT NULL,
+    decided_at TIMESTAMP,
+    expires_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_approvals_task_tool
+    ON runtime_approvals(agent_task_id, tool_name, domain, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_approvals_status
+    ON runtime_approvals(status, expires_at);
+"""
+
+
+def _apply_v47(conn: sqlite3.Connection) -> None:
+    """Persist task/tool/domain-bound approval grants for restart recovery."""
+    _execute_sql_script(conn, PHASE_47_RUNTIME_APPROVALS_SQL)
+
+
+PHASE_48_CONTROL_PLANE_LEDGER_SQL = """
+-- Control commands/events are host protocol records, not narrative Canon.
+-- They make the process-local buses observable and replayable across a host
+-- restart without turning a provider thread into the source of truth.
+CREATE TABLE IF NOT EXISTS control_commands (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT 'system',
+    payload JSON NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'processing'
+        CHECK(status IN ('processing', 'accepted', 'rejected')),
+    result JSON NOT NULL DEFAULT 'null',
+    error TEXT,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    completed_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_control_commands_status_updated
+    ON control_commands(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS control_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    command_id TEXT,
+    payload JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_control_events_id
+    ON control_events(id);
+CREATE INDEX IF NOT EXISTS idx_control_events_name_id
+    ON control_events(name, id);
+"""
+
+
+def _apply_v48(conn: sqlite3.Connection) -> None:
+    """Persist Control Plane command receipts and observable events."""
+    _execute_sql_script(conn, PHASE_48_CONTROL_PLANE_LEDGER_SQL)
+
+
+PHASE_49_CONTROL_COMMAND_QUEUE_SQL = """
+-- Queue ownership is separate from the command receipt so existing inline
+-- dispatch remains compatible while another host process can claim queued
+-- work with a lease.  A command receipt remains the durable result record.
+CREATE TABLE IF NOT EXISTS control_command_queue (
+    command_id TEXT PRIMARY KEY REFERENCES control_commands(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued', 'processing', 'completed')),
+    worker_id TEXT,
+    lease_expires_at TIMESTAMP,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    enqueued_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_control_command_queue_status_lease
+    ON control_command_queue(status, lease_expires_at, enqueued_at);
+CREATE INDEX IF NOT EXISTS idx_control_command_queue_worker
+    ON control_command_queue(worker_id, status);
+"""
+
+
+def _apply_v49(conn: sqlite3.Connection) -> None:
+    """Persist claimable Control Plane command work and worker leases."""
+    _execute_sql_script(conn, PHASE_49_CONTROL_COMMAND_QUEUE_SQL)
+
+
+PHASE_50_RUNTIME_INSTALLER_SQL = """
+-- Runtime manifest metadata carries source, installer, compatibility, and
+-- platform declarations without changing the stable registry columns.
+ALTER TABLE runtime_registry ADD COLUMN metadata JSON NOT NULL DEFAULT '{}';
+ALTER TABLE runtime_installations ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'system';
+ALTER TABLE runtime_installations ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;
+
+-- Installer progress is an append-only operational ledger.  It is not Canon
+-- and must never be used as proof that a runtime is ready without verification.
+CREATE TABLE IF NOT EXISTS runtime_install_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    runtime_type TEXT NOT NULL REFERENCES runtime_registry(runtime_type) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT NOT NULL,
+    detail JSON NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_install_events_runtime_created
+    ON runtime_install_events(runtime_type, created_at DESC, id DESC);
+"""
+
+
+def _apply_v50(conn: sqlite3.Connection) -> None:
+    """Persist manifest-driven installer metadata and lifecycle evidence."""
+    _execute_sql_script(conn, PHASE_50_RUNTIME_INSTALLER_SQL)
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -2489,6 +2618,10 @@ _MIGRATIONS = (
     _Migration(44, "storyflow_run_lineage", _apply_v44, PHASE_44_STORYFLOW_RUN_LINEAGE_SQL),
     _Migration(45, "storyflow_history_soft_delete", _apply_v45, PHASE_45_STORYFLOW_HISTORY_DELETE_SQL),
     _Migration(46, "agent_runtime_compute_plane", _apply_v46, PHASE_46_AGENT_RUNTIME_COMPUTE_PLANE_SQL),
+    _Migration(47, "runtime_approval_ledger", _apply_v47, PHASE_47_RUNTIME_APPROVALS_SQL),
+    _Migration(48, "control_plane_command_event_ledger", _apply_v48, PHASE_48_CONTROL_PLANE_LEDGER_SQL),
+    _Migration(49, "control_plane_command_work_queue", _apply_v49, PHASE_49_CONTROL_COMMAND_QUEUE_SQL),
+    _Migration(50, "runtime_manifest_installer_lifecycle", _apply_v50, PHASE_50_RUNTIME_INSTALLER_SQL),
 )
 
 _RUNTIME_EXTENSION_NAME = "narrative_runtime_v2"

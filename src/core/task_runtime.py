@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .database import Database, generate_id, get_db
-from src.runtime.contracts import AgentTask
+from src.runtime.contracts import AgentTask, AgentTaskProfile, RuntimeEvent
+from src.runtime.events import RuntimeEventStore
 
 
 class TaskStateError(ValueError):
@@ -123,6 +124,81 @@ _TASK_PROGRESS = {
 }
 
 
+# These task types execute through a model/runtime adapter.  Keeping the
+# classification at the durable queue boundary means HTTP, CLI, and
+# continuous-writing callers all receive the same AgentTask envelope without
+# making each caller know about a provider-specific runtime.
+_AGENT_TASK_TYPES = {
+    "chat",
+    "continuous",
+    "write",
+    "write-next",
+    "draft-chapter",
+    "audit-chapter",
+    "review",
+    "revise-chapter",
+    "revise",
+    "rewrite-chapter",
+    "plan-chapter",
+    "compose-chapter",
+    "joint-review",
+    "world-bootstrap",
+    "planning-synthesis",
+    "planning-views-generate",
+    "forecast",
+    "storyflow-analyze",
+    "simulation-analyst-query",
+    "simulation-character-chat",
+    "simulation-survey",
+    "draft-import",
+    "draft-import-analysis",
+    "draft-import-adjustment-plan",
+    "fact-extraction",
+    "revision",
+    "story-bible-suggest",
+    "radar",
+    "translation",
+    "interactive-film",
+    "cover-brief",
+    "model-connection-test",
+    "model-discovery",
+    "thought-clarify",
+    "thought-framework",
+}
+
+_AGENT_TASK_ROLES = {
+    "audit-chapter": "reviewer",
+    "review": "reviewer",
+    "joint-review": "reviewer",
+    "revise-chapter": "reviser",
+    "revise": "reviser",
+    "rewrite-chapter": "reviser",
+    "plan-chapter": "planner",
+    "planning-synthesis": "planner",
+    "planning-views-generate": "planner",
+    "forecast": "planner",
+    "storyflow-analyze": "planner",
+    "simulation-analyst-query": "planner",
+    "simulation-survey": "planner",
+    "simulation-character-chat": "writer",
+    "compose-chapter": "context",
+    "draft-import": "reviewer",
+    "draft-import-analysis": "reviewer",
+    "draft-import-adjustment-plan": "reviewer",
+    "fact-extraction": "fact_extraction",
+    "revision": "reviser",
+    "story-bible-suggest": "planner",
+    "radar": "planner",
+    "translation": "writer",
+    "interactive-film": "planner",
+    "cover-brief": "planner",
+    "model-connection-test": "planner",
+    "model-discovery": "planner",
+    "thought-clarify": "planner",
+    "thought-framework": "planner",
+}
+
+
 class TaskRuntime:
     """The sole API for durable task state; never keeps task state in memory."""
 
@@ -134,6 +210,7 @@ class TaskRuntime:
                 idempotency_key: Optional[str] = None) -> dict[str, Any]:
         task_id = generate_id()
         now = datetime.now().isoformat()
+        task_data = dict(data or {})
         with self.db.transaction() as conn:
             # Idempotency check inside the transaction to prevent TOCTOU races.
             if idempotency_key:
@@ -141,17 +218,30 @@ class TaskRuntime:
                     "SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
                 ).fetchone()
                 if previous:
-                    return self._task_dict(previous)
+                    result = self._task_dict(previous)
+                    self._attach_agent_task_projection(conn, previous["id"], result)
+                    return result
             conn.execute(
                 """INSERT INTO tasks(id, type, status, project_id, book_id, chapter_number, stage, data,
                    idempotency_key, created_at, updated_at)
                    VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (task_id, task_type, project_id, book_id, chapter_number, stage,
-                 json.dumps(data or {}, ensure_ascii=False), idempotency_key, now, now),
+                 json.dumps(task_data, ensure_ascii=False), idempotency_key, now, now),
+            )
+            agent_task = self._maybe_create_agent_task(
+                conn,
+                durable_task_id=task_id,
+                task_type=task_type,
+                project_id=project_id,
+                task_data=task_data,
+                created_at=now,
             )
             self._append_event(conn, task_id, "queued", {"stage": stage, "type": task_type})
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        return self._task_dict(row)
+        result = self._task_dict(row)
+        if agent_task is not None:
+            result["agentTaskId"] = agent_task.task_id
+        return result
 
     def enqueue_agent_task(
         self,
@@ -195,23 +285,7 @@ class TaskRuntime:
                     idempotency_key, now, now,
                 ),
             )
-            conn.execute(
-                """INSERT INTO agent_tasks(
-                       id, task_id, task_type, role, project_id, chapter_id, intent_id,
-                       context_bundle_id, constraints, expected_output, input_payload,
-                       profile, parent_task_id, status, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?)""",
-                (
-                    agent_task.task_id, task_id, agent_task.task_type, agent_task.role,
-                    agent_task.project_id, agent_task.chapter_id, agent_task.intent_id,
-                    agent_task.context_bundle_id,
-                    json.dumps(agent_task.constraints, ensure_ascii=False),
-                    agent_task.expected_output,
-                    json.dumps(agent_task.input_payload, ensure_ascii=False),
-                    json.dumps(agent_task.profile.to_dict() if agent_task.profile else {}, ensure_ascii=False),
-                    agent_task.parent_task_id, now, now,
-                ),
-            )
+            self._insert_agent_task(conn, agent_task, task_id, now)
             self._append_event(conn, task_id, "queued", {
                 "stage": stage, "type": agent_task.task_type, "agent_task_id": agent_task.task_id,
             })
@@ -220,6 +294,128 @@ class TaskRuntime:
         result["agentTaskId"] = agent_task.task_id
         result["agentTask"] = agent_task.to_dict()
         return result
+
+    def _maybe_create_agent_task(
+        self,
+        conn,
+        *,
+        durable_task_id: str,
+        task_type: str,
+        project_id: Optional[str],
+        task_data: Mapping[str, Any],
+        created_at: str,
+    ) -> AgentTask | None:
+        if task_type not in _AGENT_TASK_TYPES:
+            return None
+
+        # ``tasks.project_id`` has historically been used as the project
+        # identifier by the API.  The AgentTask FK is stricter, so only carry a
+        # project value into the envelope when it is a real project row.
+        safe_project_id = project_id
+        if safe_project_id and conn.execute(
+            "SELECT 1 FROM projects WHERE id=?", (safe_project_id,)
+        ).fetchone() is None:
+            safe_project_id = None
+
+        raw_constraints = task_data.get("constraints")
+        constraints = dict(raw_constraints) if isinstance(raw_constraints, Mapping) else {}
+        for key in (
+            "critical", "irreversibility", "mutation_risk", "failure_cost",
+            "verifiability", "context_span", "output_size", "tool_depth",
+        ):
+            if key in task_data:
+                constraints[key] = task_data[key]
+
+        parent_task_id = task_data.get("parent_task_id") or task_data.get("parentTaskId")
+        parent_agent_task_id = None
+        if parent_task_id:
+            parent = conn.execute(
+                "SELECT id FROM agent_tasks WHERE task_id=?", (str(parent_task_id),)
+            ).fetchone()
+            parent_agent_task_id = parent["id"] if parent else None
+
+        chapter_id = task_data.get("chapter_id") or task_data.get("chapterId")
+        if chapter_id and conn.execute(
+            "SELECT 1 FROM chapters WHERE id=?", (chapter_id,)
+        ).fetchone() is None:
+            chapter_id = None
+
+        context_bundle_id = task_data.get("context_bundle_id") or task_data.get("contextBundleId")
+        if context_bundle_id and conn.execute(
+            "SELECT 1 FROM context_bundles WHERE id=?", (context_bundle_id,)
+        ).fetchone() is None:
+            context_bundle_id = None
+
+        role = _AGENT_TASK_ROLES.get(task_type, "writer")
+        raw_profile = task_data.get("profile")
+        if isinstance(raw_profile, Mapping):
+            profile = AgentTaskProfile(
+                role=str(raw_profile.get("role") or role),
+                task_type=str(raw_profile.get("task_type") or raw_profile.get("taskType") or task_type),
+                allowed_tools=tuple(raw_profile.get("allowed_tools") or raw_profile.get("allowedTools") or ()),
+                forbidden_tools=tuple(raw_profile.get("forbidden_tools") or raw_profile.get("forbiddenTools") or ()),
+                minimum_capability=str(raw_profile.get("minimum_capability") or raw_profile.get("minimumCapability") or "C1"),
+                preferred_capability=str(raw_profile.get("preferred_capability") or raw_profile.get("preferredCapability") or "C2"),
+                maximum_capability=str(raw_profile.get("maximum_capability") or raw_profile.get("maximumCapability") or "C3"),
+                minimum_reasoning=str(raw_profile.get("minimum_reasoning") or raw_profile.get("minimumReasoning") or "medium"),
+                preferred_reasoning=str(raw_profile.get("preferred_reasoning") or raw_profile.get("preferredReasoning") or "high"),
+                maximum_reasoning=str(raw_profile.get("maximum_reasoning") or raw_profile.get("maximumReasoning") or "xhigh"),
+            )
+        else:
+            profile = AgentTaskProfile(role=role, task_type=task_type)
+        input_payload = dict(task_data)
+        input_payload.setdefault("durableTaskId", durable_task_id)
+        agent_task = AgentTask(
+            task_id=f"agent-{durable_task_id}",
+            task_type=task_type,
+            role=role,
+            project_id=safe_project_id,
+            chapter_id=str(chapter_id) if chapter_id else None,
+            intent_id=str(task_data.get("intent_id") or task_data.get("intentId"))
+            if task_data.get("intent_id") or task_data.get("intentId") else None,
+            context_bundle_id=str(context_bundle_id) if context_bundle_id else None,
+            constraints=constraints,
+            expected_output=str(task_data.get("expected_output") or task_data.get("expectedOutput") or "AgentArtifact"),
+            input_payload=input_payload,
+            profile=profile,
+            parent_task_id=parent_agent_task_id,
+            created_at=created_at,
+        )
+        self._insert_agent_task(conn, agent_task, durable_task_id, created_at)
+        return agent_task
+
+    @staticmethod
+    def _insert_agent_task(conn, agent_task: AgentTask, durable_task_id: str, now: str) -> None:
+        conn.execute(
+            """INSERT INTO agent_tasks(
+                   id, task_id, task_type, role, project_id, chapter_id, intent_id,
+                   context_bundle_id, constraints, expected_output, input_payload,
+                   profile, parent_task_id, status, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?)""",
+            (
+                agent_task.task_id, durable_task_id, agent_task.task_type, agent_task.role,
+                agent_task.project_id, agent_task.chapter_id, agent_task.intent_id,
+                agent_task.context_bundle_id,
+                json.dumps(agent_task.constraints, ensure_ascii=False),
+                agent_task.expected_output,
+                json.dumps(agent_task.input_payload, ensure_ascii=False),
+                json.dumps(agent_task.profile.to_dict() if agent_task.profile else {}, ensure_ascii=False),
+                agent_task.parent_task_id, now, now,
+            ),
+        )
+
+    @staticmethod
+    def _attach_agent_task_projection(conn, durable_task_id: str, result: dict[str, Any]) -> None:
+        try:
+            row = conn.execute(
+                "SELECT id FROM agent_tasks WHERE task_id=?", (durable_task_id,)
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return
+            raise
+        if row:
+            result["agentTaskId"] = row["id"]
 
     def enqueue_continuous(
         self,
@@ -243,7 +439,9 @@ class TaskRuntime:
                 "SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
             ).fetchone()
             if previous:
-                return self._task_dict(previous)
+                result = self._task_dict(previous)
+                self._attach_agent_task_projection(conn, previous["id"], result)
+                return result
 
             existing = conn.execute(
                 """SELECT id FROM tasks
@@ -272,9 +470,20 @@ class TaskRuntime:
                     now,
                 ),
             )
+            agent_task = self._maybe_create_agent_task(
+                conn,
+                durable_task_id=task_id,
+                task_type="continuous",
+                project_id=project_id,
+                task_data=data,
+                created_at=now,
+            )
             self._append_event(conn, task_id, "queued", {"stage": "queued", "type": "continuous"})
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        return self._task_dict(row)
+        result = self._task_dict(row)
+        if agent_task is not None:
+            result["agentTaskId"] = agent_task.task_id
+        return result
 
     def get(self, task_id: str) -> Optional[dict[str, Any]]:
         row = self.db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
@@ -774,11 +983,67 @@ class TaskRuntime:
                     target = "queued"
                 conn.execute("UPDATE tasks SET status=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?",
                              (target, now.isoformat(), row["id"]))
+                self._interrupt_agent_runs_for_task(conn, row, now)
+                self._sync_agent_task_status(conn, row["id"], target)
                 self._append_event(conn, row["id"], target,
                                    {"reason": "expired_lease", "recoverable": target == "queued"})
                 result = conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
                 recovered.append(self._task_dict(result))
         return recovered
+
+    def _interrupt_agent_runs_for_task(self, conn, task_row, now: datetime) -> None:
+        """Fence provider runs when the durable task lease is recovered."""
+        try:
+            runs = conn.execute(
+                """SELECT ar.id, ar.agent_task_id, ar.runtime_type, at.task_type, at.role,
+                          at.project_id
+                   FROM agent_runs ar
+                   JOIN agent_tasks at ON at.id=ar.agent_task_id
+                   WHERE ar.task_id=? AND ar.status IN ('created', 'running', 'paused')""",
+                (task_row["id"],),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return
+            raise
+        if not runs:
+            return
+        event_store = RuntimeEventStore(self.db)
+        timestamp = now.isoformat()
+        for run in runs:
+            conn.execute(
+                """UPDATE agent_runs SET status='interrupted', error_code=?, error_detail=?,
+                   finished_at=? WHERE id=?""",
+                (
+                    "TASK_INTERRUPTED",
+                    "durable task lease recovered",
+                    timestamp,
+                    run["id"],
+                ),
+            )
+            # ``RuntimeEventStore.append_in_transaction`` only needs its
+            # translator here; the db handle is intentionally not used.
+            task = AgentTask(
+                task_id=run["agent_task_id"],
+                task_type=run["task_type"],
+                role=run["role"],
+                project_id=run["project_id"],
+            )
+            event_store.append_in_transaction(
+                conn,
+                RuntimeEvent(
+                    runtime_type=run["runtime_type"],
+                    event_type="error",
+                    payload={
+                        "code": "TASK_INTERRUPTED",
+                        "detail": "durable task lease recovered",
+                        "reason": "expired_lease",
+                    },
+                    agent_run_id=run["id"],
+                    timestamp=timestamp,
+                ),
+                task,
+            )
 
     def events(self, task_id: str, *, after_id: int = 0) -> list[dict[str, Any]]:
         rows = self.db.fetchall("SELECT * FROM task_events WHERE task_id=? AND id>? ORDER BY id", (task_id, after_id))

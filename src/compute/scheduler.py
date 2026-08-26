@@ -8,7 +8,7 @@ separate signals before the scheduler chooses a capability tier.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from math import ceil
 from typing import Any, Iterable, Mapping
@@ -175,6 +175,12 @@ class RegisteredCapability:
     cost_multiplier: float = 1.0
     health: str = "ready"
     tags: tuple[str, ...] = ()
+    capability_profile: Mapping[str, CapabilityTier] = field(default_factory=dict)
+
+    def capability_for(self, dimension: str | None) -> CapabilityTier:
+        if dimension and dimension in self.capability_profile:
+            return self.capability_profile[dimension]
+        return self.capability
 
 
 class CapabilityRegistry:
@@ -192,13 +198,22 @@ class CapabilityRegistry:
         cost_multiplier: float = 1.0,
         health: str = "ready",
         tags: Iterable[str] = (),
+        capability_profile: Mapping[str, str | int | CapabilityTier] | None = None,
     ) -> RegisteredCapability:
+        normalized_profile = {
+            str(dimension).strip(): _tier(value)
+            for dimension, value in (
+                capability_profile if capability_profile is not None else descriptor.capability_profile
+            ).items()
+            if str(dimension).strip()
+        }
         registered = RegisteredCapability(
             descriptor=descriptor,
             capability=_tier(capability),
             cost_multiplier=max(0.0, float(cost_multiplier)),
             health=health,
             tags=tuple(tags),
+            capability_profile=normalized_profile,
         )
         with self._lock:
             self._models[(descriptor.runtime_type, descriptor.model_id)] = registered
@@ -207,6 +222,18 @@ class CapabilityRegistry:
     def remove_model(self, runtime_type: str, model_id: str) -> None:
         with self._lock:
             self._models.pop((runtime_type, model_id), None)
+
+    def set_runtime_health(self, runtime_type: str, health: str) -> int:
+        """Synchronize all models for a runtime with its host health gate."""
+        normalized = str(health or "unknown").strip().lower() or "unknown"
+        updated = 0
+        with self._lock:
+            for key, item in tuple(self._models.items()):
+                if item.descriptor.runtime_type != runtime_type or item.health == normalized:
+                    continue
+                self._models[key] = replace(item, health=normalized)
+                updated += 1
+        return updated
 
     def candidates(self, *, minimum: CapabilityTier = CapabilityTier.C0,
                    maximum: CapabilityTier = CapabilityTier.C5) -> tuple[RegisteredCapability, ...]:
@@ -225,6 +252,10 @@ class CapabilityRegistry:
                 "costMultiplier": item.cost_multiplier,
                 "health": item.health,
                 "tags": list(item.tags),
+                "capabilityProfile": {
+                    dimension: f"C{int(capability)}"
+                    for dimension, capability in item.capability_profile.items()
+                },
             }
             for item in self.candidates()
         ]
@@ -332,26 +363,35 @@ class BudgetBroker:
 
     def consume(self, reservation_id: str, amount: float) -> float:
         with self._lock:
-            reservation = self._get_active(reservation_id)
             amount = max(0.0, float(amount))
-            if amount > reservation.remaining + 1e-9:
-                raise ComputeBudgetExceeded("consumption exceeds reservation")
             if self.db is not None:
                 with self.db.transaction() as conn:
                     row = conn.execute(
-                        "SELECT amount, consumed, status FROM compute_budget_reservations WHERE id=? AND scope=?",
+                        "SELECT amount, critical, consumed, status FROM compute_budget_reservations WHERE id=? AND scope=?",
                         (reservation_id, self.scope),
                     ).fetchone()
                     if row is None or row["status"] != "reserved":
                         raise KeyError(f"budget reservation not active: {reservation_id}")
-                    if amount > float(row["amount"] - row["consumed"]) + 1e-9:
+                    remaining = float(row["amount"] - row["consumed"])
+                    if amount > remaining + 1e-9:
                         raise ComputeBudgetExceeded("consumption exceeds reservation")
                     conn.execute(
-                        "UPDATE compute_budget_reservations SET consumed=consumed+? WHERE id=?",
-                        (amount, reservation_id),
+                        "UPDATE compute_budget_reservations SET consumed=consumed+? WHERE id=? AND scope=?",
+                        (amount, reservation_id, self.scope),
                     )
-                reservation.consumed += amount
+                reservation = self._reservations.get(reservation_id)
+                if reservation is None:
+                    reservation = BudgetReservation(
+                        reservation_id,
+                        float(row["amount"]),
+                        bool(row["critical"]),
+                    )
+                    self._reservations[reservation_id] = reservation
+                reservation.consumed = float(row["consumed"]) + amount
                 return reservation.consumed
+            reservation = self._get_active(reservation_id)
+            if amount > reservation.remaining + 1e-9:
+                raise ComputeBudgetExceeded("consumption exceeds reservation")
             reservation.consumed += amount
             self._consumed += amount
             if reservation.critical:
@@ -360,16 +400,100 @@ class BudgetBroker:
                 self._normal_reserved -= amount
             return reservation.consumed
 
+    def extend(self, reservation_id: str, amount: float) -> BudgetReservation:
+        """Atomically extend an active reservation for an approved escalation."""
+        amount = max(0.0, float(amount))
+        with self._lock:
+            if self.db is not None:
+                with self.db.transaction() as conn:
+                    account = conn.execute(
+                        "SELECT total, critical_reserve FROM compute_budget_accounts WHERE scope=?",
+                        (self.scope,),
+                    ).fetchone()
+                    row = conn.execute(
+                        "SELECT amount, critical, consumed, status FROM compute_budget_reservations "
+                        "WHERE id=? AND scope=?",
+                        (reservation_id, self.scope),
+                    ).fetchone()
+                    if account is None or row is None or row["status"] != "reserved":
+                        raise KeyError(f"budget reservation not active: {reservation_id}")
+                    consumed = float(conn.execute(
+                        "SELECT COALESCE(SUM(consumed), 0) AS value "
+                        "FROM compute_budget_reservations WHERE scope=?",
+                        (self.scope,),
+                    ).fetchone()["value"] or 0)
+                    reserved = float(conn.execute(
+                        "SELECT COALESCE(SUM(amount - consumed), 0) AS value "
+                        "FROM compute_budget_reservations WHERE scope=? AND status='reserved'",
+                        (self.scope,),
+                    ).fetchone()["value"] or 0)
+                    available = float(account["total"]) - consumed - reserved
+                    if not bool(row["critical"]):
+                        available -= float(account["critical_reserve"])
+                    if amount > available + 1e-9:
+                        raise ComputeBudgetExceeded(
+                            f"insufficient compute budget for escalation of {amount:.3f} NF_CU",
+                            details={"requested": amount, "available": max(0.0, available)},
+                        )
+                    conn.execute(
+                        "UPDATE compute_budget_reservations SET amount=amount+? WHERE id=? AND scope=?",
+                        (amount, reservation_id, self.scope),
+                    )
+                reservation = self._reservations.get(reservation_id)
+                if reservation is None:
+                    reservation = BudgetReservation(
+                        reservation_id,
+                        float(row["amount"]),
+                        bool(row["critical"]),
+                        consumed=float(row["consumed"]),
+                    )
+                    self._reservations[reservation_id] = reservation
+                reservation.amount += amount
+                return reservation
+            reservation = self._get_active(reservation_id)
+            available = self.total - self._normal_reserved - self._critical_reserved - self._consumed
+            if not reservation.critical:
+                available -= self.critical_reserve
+            if amount > available + 1e-9:
+                raise ComputeBudgetExceeded(
+                    f"insufficient compute budget for escalation of {amount:.3f} NF_CU",
+                    details={"requested": amount, "available": max(0.0, available)},
+                )
+            reservation.amount += amount
+            if reservation.critical:
+                self._critical_reserved += amount
+            else:
+                self._normal_reserved += amount
+            return reservation
+
     def release(self, reservation_id: str) -> None:
         with self._lock:
-            reservation = self._get_active(reservation_id)
             if self.db is not None:
-                self.db.execute(
-                    "UPDATE compute_budget_reservations SET status='released', released_at=CURRENT_TIMESTAMP WHERE id=? AND scope=?",
-                    (reservation_id, self.scope),
-                )
+                with self.db.transaction() as conn:
+                    row = conn.execute(
+                        "SELECT amount, critical, consumed, status FROM compute_budget_reservations WHERE id=? AND scope=?",
+                        (reservation_id, self.scope),
+                    ).fetchone()
+                    if row is None or row["status"] != "reserved":
+                        raise KeyError(f"budget reservation not active: {reservation_id}")
+                    conn.execute(
+                        """UPDATE compute_budget_reservations
+                           SET status='released', released_at=CURRENT_TIMESTAMP
+                           WHERE id=? AND scope=? AND status='reserved'""",
+                        (reservation_id, self.scope),
+                    )
+                reservation = self._reservations.get(reservation_id)
+                if reservation is None:
+                    reservation = BudgetReservation(
+                        reservation_id,
+                        float(row["amount"]),
+                        bool(row["critical"]),
+                    )
+                    self._reservations[reservation_id] = reservation
+                reservation.consumed = float(row["consumed"])
                 reservation.released = True
                 return
+            reservation = self._get_active(reservation_id)
             remaining = reservation.remaining
             if reservation.critical:
                 self._critical_reserved -= remaining
@@ -391,6 +515,18 @@ class BudgetBroker:
                 reserved = self.db.fetchone(
                     """SELECT COALESCE(SUM(amount - consumed), 0) AS value
                        FROM compute_budget_reservations WHERE scope=? AND status='reserved'""",
+                       (self.scope,),
+                   ) or {"value": 0}
+                normal_reserved = self.db.fetchone(
+                    """SELECT COALESCE(SUM(amount - consumed), 0) AS value
+                       FROM compute_budget_reservations
+                       WHERE scope=? AND status='reserved' AND critical=0""",
+                    (self.scope,),
+                ) or {"value": 0}
+                critical_reserved = self.db.fetchone(
+                    """SELECT COALESCE(SUM(amount - consumed), 0) AS value
+                       FROM compute_budget_reservations
+                       WHERE scope=? AND status='reserved' AND critical=1""",
                     (self.scope,),
                 ) or {"value": 0}
                 total = float(account.get("total") or 0)
@@ -398,8 +534,8 @@ class BudgetBroker:
                 return {
                     "total": total,
                     "criticalReserve": critical_reserve,
-                    "normalReserved": float(reserved.get("value") or 0),
-                    "criticalReserved": 0.0,
+                    "normalReserved": float(normal_reserved.get("value") or 0),
+                    "criticalReserved": float(critical_reserved.get("value") or 0),
                     "consumed": float(consumed.get("value") or 0),
                     "available": max(0.0, total - float(reserved.get("value") or 0) - float(consumed.get("value") or 0)),
                 }
@@ -417,6 +553,28 @@ class BudgetBroker:
         if reservation is None or reservation.released:
             raise KeyError(f"budget reservation not active: {reservation_id}")
         return reservation
+
+
+def _capability_dimension(task: AgentTask) -> str:
+    """Select the capability dimension that best describes the task."""
+    text = f"{task.task_type} {task.role}".lower()
+    if any(token in text for token in ("revise", "rewrite")):
+        return "revision"
+    if any(token in text for token in ("review", "audit")):
+        return "review"
+    if any(token in text for token in ("extract", "fact", "import")):
+        return "extraction"
+    if any(token in text for token in ("plan", "forecast", "planning", "framework")):
+        return "planning"
+    if any(token in text for token in ("compose", "context")):
+        return "long_context"
+    if "tool" in text:
+        return "tool_use"
+    if any(token in text for token in ("json", "structured")):
+        return "structured_output"
+    if "consisten" in text:
+        return "consistency"
+    return "writing"
 
 
 class ComputeScheduler:
@@ -441,6 +599,7 @@ class ComputeScheduler:
         *,
         capability_profile: TaskCapabilityProfile | None = None,
         candidates: Iterable[RegisteredCapability] | None = None,
+        reserve_budget: bool = True,
     ) -> ComputePlan:
         profile = capability_profile or TaskCapabilityProfile.from_mapping(
             task.input_payload.get("capabilityProfile")
@@ -453,16 +612,38 @@ class ComputeScheduler:
         ceiling = min(_tier(task_profile.maximum_capability), self.policy.default_ceiling)
         if estimate.risk >= .8:
             floor = max(floor, self.policy.critical_floor)
+        mutation_class = str(
+            task.constraints.get("canonMutationType")
+            or task.constraints.get("mutationClass")
+            or ""
+        ).strip().lower()
+        if mutation_class in {"author_intent", "author-intent", "intent"}:
+            raise CapabilityUnavailable(
+                "Author Intent changes require an explicit human/workflow decision",
+                details={"taskId": task.task_id, "mutationClass": mutation_class},
+            )
+        if mutation_class in {"structural", "world_rule", "world-rule", "world_rule_change"}:
+            floor = max(floor, CapabilityTier.C4)
+        elif bool(task.constraints.get("canon_write")) or mutation_class in {"normal", "canon", "canonical"}:
+            # Canon authority is never allowed to inherit a cheap task's
+            # default floor.  The policy may raise this floor further.
+            floor = max(floor, self.policy.critical_floor)
+        preferred = max(preferred, floor)
         if floor > ceiling:
             raise CapabilityUnavailable(
                 f"task requires C{int(floor)} but policy ceiling is C{int(ceiling)}",
                 details={"floor": f"C{int(floor)}", "ceiling": f"C{int(ceiling)}", "taskId": task.task_id},
             )
 
-        available = tuple(candidates) if candidates is not None else self.registry.candidates(minimum=floor, maximum=ceiling)
+        dimension = _capability_dimension(task)
+        available = tuple(candidates) if candidates is not None else self.registry.candidates(
+            # The selected dimension, rather than an unrelated aggregate
+            # score, is the authority for the floor/ceiling check below.
+            minimum=CapabilityTier.C0, maximum=CapabilityTier.C5
+        )
         eligible = [
             candidate for candidate in available
-            if floor <= candidate.capability <= ceiling
+            if floor <= candidate.capability_for(dimension) <= ceiling
             and candidate.descriptor.available
             and candidate.health == "ready"
         ]
@@ -474,13 +655,14 @@ class ComputeScheduler:
         chosen = min(
             eligible,
             key=lambda item: (
-                abs(int(item.capability) - int(preferred)),
-                abs(int(item.capability) - int(floor)),
+                abs(int(item.capability_for(dimension)) - int(preferred)),
+                abs(int(item.capability_for(dimension)) - int(floor)),
                 item.cost_multiplier,
                 item.descriptor.runtime_type,
                 item.descriptor.model_id,
             ),
         )
+        selected_capability = chosen.capability_for(dimension)
         reasoning = self._select_reasoning(task_profile, chosen.descriptor.reasoning_levels)
         context_budget = max(1024, int(max(0.0, profile.context_span) * 100_000))
         output_budget = max(512, int(max(0.0, profile.output_size) * 20_000))
@@ -489,18 +671,25 @@ class ComputeScheduler:
         estimate_cost = round(
             chosen.cost_multiplier * (1.0 + context_budget / 100_000 + output_budget / 20_000 + tool_budget / 20), 4
         )
-        critical = estimate.risk >= .8 or bool(task.constraints.get("critical", False))
-        if self.budget is not None:
+        critical = (
+            estimate.risk >= .8
+            or bool(task.constraints.get("critical", False))
+            or floor >= self.policy.critical_floor
+        )
+        plan_id = generate_id()
+        reservation_id = None
+        if self.budget is not None and reserve_budget:
             reservation = self.budget.reserve(estimate_cost, critical=critical)
+            reservation_id = reservation.reservation_id
             rationale = (*estimate.rationale, f"budgetReservation={reservation.reservation_id}")
         else:
             rationale = estimate.rationale
         return ComputePlan(
-            plan_id=generate_id(),
+            plan_id=plan_id,
             runtime_type=chosen.descriptor.runtime_type,
             model_id=chosen.descriptor.model_id,
             reasoning=reasoning,
-            capability=f"C{int(chosen.capability)}",
+            capability=f"C{int(selected_capability)}",
             context_budget=context_budget,
             output_budget=output_budget,
             tool_budget=tool_budget,
@@ -513,6 +702,10 @@ class ComputeScheduler:
             budget_unit=self.policy.budget_unit,
             critical_floor=critical,
             rationale=rationale,
+            capability_dimension=dimension,
+            budget_reservation_id=reservation_id,
+            task_tier=f"T{int(estimate.required_tier)}",
+            maximum_reasoning=task_profile.maximum_reasoning,
         )
 
     def request_escalation(
@@ -520,13 +713,25 @@ class ComputeScheduler:
         plan: ComputePlan,
         requested_capability: str | int | CapabilityTier,
         *,
+        requested_reasoning: str | None = None,
         actor: str = "agent",
         approved: bool = False,
     ) -> ComputePlan:
         requested = _tier(requested_capability)
         current = _tier(plan.capability)
         ceiling = _tier(plan.maximum_escalation or plan.capability)
-        if requested <= current:
+        current_reasoning = _reasoning(plan.reasoning)
+        target_reasoning = str(requested_reasoning or plan.reasoning).strip().lower()
+        if target_reasoning not in _REASONING_ORDER:
+            raise ComputeEscalationDenied(f"unsupported requested reasoning: {requested_reasoning}")
+        maximum_reasoning = _reasoning(plan.maximum_reasoning or plan.reasoning)
+        requested_reasoning_level = _reasoning(target_reasoning)
+        if requested_reasoning_level < current_reasoning:
+            target_reasoning = plan.reasoning
+            requested_reasoning_level = current_reasoning
+        capability_upgrade = requested > current
+        reasoning_upgrade = requested_reasoning_level > current_reasoning
+        if not capability_upgrade and not reasoning_upgrade:
             return plan
         if actor == "agent" and (not approved or not self.policy.allow_agent_escalation):
             raise ComputeEscalationDenied("agent cannot self-elevate compute capability")
@@ -534,11 +739,39 @@ class ComputeScheduler:
             raise ComputeEscalationDenied(
                 f"requested C{int(requested)} exceeds task ceiling C{int(ceiling)}"
             )
+        if requested_reasoning_level > maximum_reasoning:
+            raise ComputeEscalationDenied(
+                f"requested reasoning {target_reasoning} exceeds task ceiling "
+                f"{plan.maximum_reasoning or plan.reasoning}"
+            )
+        base_cost = max(float(plan.estimated_cost), 1.0)
+        additional_cost = base_cost * (
+            0.25 * max(0, int(requested) - int(current))
+            + 0.10 * max(0, requested_reasoning_level - current_reasoning)
+        )
+        reservation_id = plan.budget_reservation_id
+        if additional_cost > 0 and self.budget is not None:
+            if reservation_id:
+                self.budget.extend(reservation_id, additional_cost)
+            else:
+                reservation_id = self.budget.reserve(
+                    additional_cost,
+                    critical=plan.critical_floor,
+                ).reservation_id
+        rationale = list(plan.rationale)
+        if capability_upgrade:
+            rationale.append(f"escalatedTo=C{int(requested)}")
+        if reasoning_upgrade:
+            rationale.append(f"escalatedReasoning={target_reasoning}")
+        selected_capability = max(current, requested)
         return ComputePlan(
             **{
                 **plan.__dict__,
-                "capability": f"C{int(requested)}",
-                "rationale": (*plan.rationale, f"escalatedTo=C{int(requested)}"),
+                "capability": f"C{int(selected_capability)}",
+                "reasoning": target_reasoning,
+                "estimated_cost": round(float(plan.estimated_cost) + additional_cost, 4),
+                "budget_reservation_id": reservation_id,
+                "rationale": tuple(rationale),
             }
         )
 

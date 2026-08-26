@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import ctypes
+import asyncio
 from copy import deepcopy
 import hashlib
 import json
 import os
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, ContextManager, Iterator, Optional
@@ -24,7 +27,14 @@ from src.core.generation_attempts import (
     response_from_artifact,
     stable_hash,
 )
-from src.runtime.contracts import AgentTask, AgentTaskProfile, AgentRunStatus, ComputePlan, RuntimeEvent
+from src.runtime.contracts import (
+    AgentTask,
+    AgentTaskProfile,
+    AgentRunStatus,
+    ComputePlan,
+    ModelDescriptor,
+    RuntimeEvent,
+)
 from src.runtime.persistence import AgentRunStore
 from src.context.bundles import ContextBundleStore
 
@@ -831,6 +841,9 @@ class PersistentModelRuntime:
         self._task_id: ContextVar[Optional[str]] = ContextVar("novelforge_model_task_id", default=None)
         self._last_run_id: ContextVar[Optional[str]] = ContextVar("novelforge_model_last_run_id", default=None)
         self._last_agent_run_id: ContextVar[Optional[str]] = ContextVar("novelforge_agent_last_run_id", default=None)
+        self._managed_agent_run_id: ContextVar[Optional[str]] = ContextVar(
+            "novelforge_managed_agent_run_id", default=None
+        )
 
     def validate_provider(self, provider_id: str, role: str) -> dict[str, Any]:
         """Validate an explicit provider without invoking the external gateway."""
@@ -844,13 +857,30 @@ class PersistentModelRuntime:
         finally:
             self._task_id.reset(token)
 
+    def current_task_id(self) -> str | None:
+        return self._task_id.get()
+
+    @contextmanager
+    def managed_agent_run(self, run_id: str) -> Iterator[None]:
+        """Mark the invocation as owned by the common RuntimeRouter.
+
+        The legacy provider runtime still owns GenerationRun and retry audit
+        records, but it must not create a second AgentRun when an adapter is
+        executing under the Control Plane.
+        """
+        token = self._managed_agent_run_id.set(run_id)
+        try:
+            yield
+        finally:
+            self._managed_agent_run_id.reset(token)
+
     def last_generation_run_id(self) -> str | None:
         """Return the latest GenerationRun created/recovered in this task context."""
         return self._last_run_id.get()
 
     def last_agent_run_id(self) -> str | None:
         """Return the outer AgentRun for the latest provider invocation."""
-        return self._last_agent_run_id.get()
+        return self._managed_agent_run_id.get() or self._last_agent_run_id.get()
 
     @staticmethod
     def _build_prompt_layout(
@@ -1061,32 +1091,11 @@ class PersistentModelRuntime:
         output_budget: int,
     ) -> tuple[AgentRunStore, str]:
         store = AgentRunStore(self.repository.db)
-        context_bundle_id = None
-        if isinstance(context_manifest, dict):
-            candidate = context_manifest.get("bundleId") or context_manifest.get("contextBundleId")
-            if candidate and self.repository.db.fetchone("SELECT id FROM context_bundles WHERE id=?", (candidate,)):
-                context_bundle_id = str(candidate)
-            if context_bundle_id is None:
-                task_row = self.repository.db.fetchone(
-                    "SELECT project_id, book_id FROM tasks WHERE id=?", (durable_task_id,)
-                ) or {}
-                bundle = ContextBundleStore(self.repository.db).create(
-                    project_id=context_manifest.get("projectId") or task_row.get("project_id"),
-                    book_id=context_manifest.get("bookId") or task_row.get("book_id"),
-                    author_intent_snapshot=context_manifest.get("authorIntent") if isinstance(context_manifest.get("authorIntent"), dict) else {},
-                    story_bible_snapshot=context_manifest.get("storyBible") if isinstance(context_manifest.get("storyBible"), dict) else {},
-                    canon_commit=context_manifest.get("canonCommit"),
-                    planning_snapshot=context_manifest.get("planning") if isinstance(context_manifest.get("planning"), dict) else {},
-                    chapter_intent=context_manifest.get("chapterIntent") if isinstance(context_manifest.get("chapterIntent"), dict) else {},
-                    memory_evidence=[item for item in context_manifest.get("items", []) if isinstance(item, dict)],
-                    provenance={
-                        "source": "PersistentModelRuntime",
-                        "taskId": durable_task_id,
-                        "role": agent_task.role,
-                        "manifestSchemaVersion": context_manifest.get("schemaVersion", 1),
-                    },
-                )
-                context_bundle_id = bundle.bundle_id
+        context_bundle_id = self.ensure_context_bundle(
+            durable_task_id=durable_task_id,
+            agent_task=agent_task,
+            context_manifest=context_manifest,
+        )
         plan = ComputePlan(
             plan_id=generate_id(),
             runtime_type="api",
@@ -1096,6 +1105,7 @@ class PersistentModelRuntime:
             context_budget=max(0, len(json.dumps(context_manifest or {}, ensure_ascii=False)) * 2),
             output_budget=max(0, int(output_budget or 0)),
             maximum_escalation="C3",
+            maximum_reasoning="xhigh",
             rationale=("legacy PersistentModelRuntime compatibility adapter",),
         )
         run = store.create(
@@ -1111,6 +1121,44 @@ class PersistentModelRuntime:
             RuntimeEvent("api", "turn.started", {"generationRunId": None}, agent_run_id=run_id),
         )
         return store, run_id
+
+    def ensure_context_bundle(
+        self,
+        *,
+        durable_task_id: str,
+        agent_task: AgentTask,
+        context_manifest: dict[str, Any] | None,
+    ) -> str | None:
+        """Bind a task to an immutable context snapshot before an AgentRun."""
+        if not isinstance(context_manifest, dict):
+            return agent_task.context_bundle_id
+        candidate = context_manifest.get("bundleId") or context_manifest.get("contextBundleId")
+        context_bundle_id = None
+        if candidate and self.repository.db.fetchone("SELECT id FROM context_bundles WHERE id=?", (candidate,)):
+            context_bundle_id = str(candidate)
+        if context_bundle_id is None:
+            task_row = self.repository.db.fetchone(
+                "SELECT project_id, book_id FROM tasks WHERE id=?", (durable_task_id,)
+            ) or {}
+            bundle = ContextBundleStore(self.repository.db).create_from_manifest(
+                context_manifest,
+                project_id=(
+                    context_manifest.get("projectId")
+                    or task_row.get("project_id")
+                    or agent_task.project_id
+                ),
+                book_id=context_manifest.get("bookId") or task_row.get("book_id"),
+                source="PersistentModelRuntime",
+                task_id=durable_task_id,
+                role=agent_task.role,
+            )
+            context_bundle_id = bundle.bundle_id
+        self.repository.db.execute(
+            "UPDATE agent_tasks SET context_bundle_id=COALESCE(context_bundle_id, ?), "
+            "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (context_bundle_id, agent_task.task_id),
+        )
+        return context_bundle_id
 
     @staticmethod
     def _agent_run_failed(store: AgentRunStore, run_id: str, task: AgentTask, code: str, detail: str) -> None:
@@ -1223,7 +1271,7 @@ class PersistentModelRuntime:
                 "SELECT id FROM agent_runs WHERE task_id=? AND status IN ('running', 'paused') ORDER BY started_at DESC LIMIT 1",
                 (task_id,),
             )
-            if recovered_agent:
+            if recovered_agent and not self._managed_agent_run_id.get():
                 recovered_task = self._ensure_agent_task(task_id, task_stage, role)
                 recovered_store = AgentRunStore(self.repository.db)
                 self._last_agent_run_id.set(str(recovered_agent["id"]))
@@ -1276,22 +1324,24 @@ class PersistentModelRuntime:
         if runtime_context_manifest is not None:
             self.repository.attach_context_manifest(run_id, runtime_context_manifest)
         agent_task = self._ensure_agent_task(task_id, task_stage, role)
-        agent_store, agent_run_id = self._start_agent_run(
-            agent_task=agent_task,
-            durable_task_id=task_id,
-            resolved=resolved,
-            prompt_version=str(prompt_version),
-            context_manifest=runtime_context_manifest,
-            reasoning=reasoning,
-            output_budget=int(kwargs.get("max_tokens") or 0),
-        )
-        self._last_agent_run_id.set(agent_run_id)
+        if not self._managed_agent_run_id.get():
+            agent_store, agent_run_id = self._start_agent_run(
+                agent_task=agent_task,
+                durable_task_id=task_id,
+                resolved=resolved,
+                prompt_version=str(prompt_version),
+                context_manifest=runtime_context_manifest,
+                reasoning=reasoning,
+                output_budget=int(kwargs.get("max_tokens") or 0),
+            )
+            self._last_agent_run_id.set(agent_run_id)
         try:
             secret = self.repository.credentials.resolve(resolved.get("credential_ref"))
         except CredentialError as exc:
             attempts.fail(attempt["id"], exc.code, str(exc))
             self.repository.fail_run(run_id, exc.code)
-            self._agent_run_failed(agent_store, agent_run_id, agent_task, exc.code, str(exc))
+            if agent_store is not None and agent_run_id is not None:
+                self._agent_run_failed(agent_store, agent_run_id, agent_task, exc.code, str(exc))
             raise
         try:
             model_config = json.loads(resolved.get("config") or "{}")
@@ -1308,7 +1358,8 @@ class PersistentModelRuntime:
         except Exception as exc:
             attempts.fail(attempt["id"], "MODEL_CONFIGURATION", str(exc))
             self.repository.fail_run(run_id, "MODEL_CONFIGURATION")
-            self._agent_run_failed(agent_store, agent_run_id, agent_task, "MODEL_CONFIGURATION", str(exc))
+            if agent_store is not None and agent_run_id is not None:
+                self._agent_run_failed(agent_store, agent_run_id, agent_task, "MODEL_CONFIGURATION", str(exc))
             raise ModelConfigurationError("MODEL_CONFIGURATION", "model configuration error") from exc
         try:
             attempts.mark_requesting(attempt["id"])
@@ -1325,11 +1376,13 @@ class PersistentModelRuntime:
             code = getattr(exc, "code", None) or self._error_code(exc)
             attempts.fail(attempt["id"], code, str(exc))
             self.repository.fail_run(run_id, code)
-            self._agent_run_failed(agent_store, agent_run_id, agent_task, code, str(exc))
+            if agent_store is not None and agent_run_id is not None:
+                self._agent_run_failed(agent_store, agent_run_id, agent_task, code, str(exc))
             raise ModelConfigurationError(code, "model provider invocation failed") from exc
         attempts.persist_response(attempt["id"], response)
         self.repository.finish_run(run_id, response)
-        self._agent_run_succeeded(agent_store, agent_run_id, agent_task, response)
+        if agent_store is not None and agent_run_id is not None:
+            self._agent_run_succeeded(agent_store, agent_run_id, agent_task, response)
         attempts.consume(attempt["id"])
         return response
 
@@ -1466,15 +1519,27 @@ class PersistentModelRuntime:
 class PersistentModelClient:
     """LLMClient-compatible surface backed by a persisted role route."""
 
-    def __init__(self, runtime: PersistentModelRuntime, role: str):
+    def __init__(self, runtime: PersistentModelRuntime, role: str, *, manager: Any | None = None):
         self.runtime = runtime
         self.role = role
+        self.manager = manager
 
     def chat(self, messages: list[dict[str, Any]], system: str = "", **kwargs: Any) -> LLMResponse:
+        if self.manager is not None and self.manager._router is not None and self.runtime.current_task_id():
+            task_type = str(kwargs.pop("task_type", self.role) or self.role)
+            return self.manager._router_chat(
+                messages, system, role=self.role, task_type=task_type, json_mode=False, kwargs=kwargs
+            )
         return self.runtime.invoke(self.role, messages, system, **kwargs)
 
     def chat_json(self, messages: list[dict[str, Any]], system: str = "", **kwargs: Any) -> dict[str, Any]:
-        response = self.runtime.invoke(self.role, messages, system, json_mode=True, **kwargs)
+        if self.manager is not None and self.manager._router is not None and self.runtime.current_task_id():
+            task_type = str(kwargs.pop("task_type", self.role) or self.role)
+            response = self.manager._router_chat(
+                messages, system, role=self.role, task_type=task_type, json_mode=True, kwargs=kwargs
+            )
+        else:
+            response = self.runtime.invoke(self.role, messages, system, json_mode=True, **kwargs)
         try:
             text = response.content.strip()
             if text.startswith("```"):
@@ -1490,10 +1555,15 @@ class PersistentMultiModelManager:
     _legacy_roles = {"primary": "writer", "review": "reviewer", "extractor": "fact_extraction"}
     _task_roles = {
         "write-next": "writer",
+        "draft-chapter": "writer",
         "plan-chapter": "planner",
-        "compose-chapter": "planner",
+        "compose-chapter": "context",
+        "world-bootstrap": "planner",
         "review": "reviewer",
+        "audit-chapter": "reviewer",
         "revision": "reviser",
+        "revise-chapter": "reviser",
+        "rewrite-chapter": "reviser",
         "fact-extraction": "fact_extraction",
         "story-bible-suggest": "planner",
         "thought-clarify": "planner",
@@ -1501,6 +1571,13 @@ class PersistentMultiModelManager:
         "joint-review": "reviewer",
         "draft-import-analysis": "reviewer",
         "draft-import-adjustment-plan": "reviewer",
+        "planning-synthesis": "planner",
+        "planning-views-generate": "planner",
+        "model-connection-test": "planner",
+        "model-discovery": "planner",
+        "simulation-analyst-query": "planner",
+        "simulation-character-chat": "writer",
+        "simulation-survey": "planner",
         "forecast": "planner",
         "storyflow-analyze": "planner",
         "radar": "planner",
@@ -1512,6 +1589,11 @@ class PersistentMultiModelManager:
     def __init__(self, runtime: PersistentModelRuntime):
         self.runtime = runtime
         self._clients: dict[str, PersistentModelClient] = {}
+        self._router: Any | None = None
+
+    def attach_runtime_router(self, router: Any) -> None:
+        """Attach the host-owned router used by synchronous legacy callers."""
+        self._router = router
 
     def task_scope(self, task_id: str) -> ContextManager[None]:
         return self.runtime.task_scope(task_id)
@@ -1528,7 +1610,7 @@ class PersistentMultiModelManager:
         if resolved_role not in MODEL_ROLES:
             resolved_role = "writer"
         if resolved_role not in self._clients:
-            self._clients[resolved_role] = PersistentModelClient(self.runtime, resolved_role)
+            self._clients[resolved_role] = PersistentModelClient(self.runtime, resolved_role, manager=self)
         return self._clients[resolved_role]
 
     def get_writer(self) -> PersistentModelClient:
@@ -1545,6 +1627,9 @@ class PersistentMultiModelManager:
         """Route the pipeline's legacy ``chat`` call through a durable agent role."""
         role = self._task_roles.get(task_type or "", "writer")
         kwargs.setdefault("task_stage", task_type or role)
+        if self._router is not None and self.runtime.current_task_id():
+            return self._router_chat(messages, system, role=role, task_type=task_type or role,
+                                     json_mode=False, kwargs=kwargs)
         return self.get_client(role).chat(messages, system, **kwargs)
 
     def chat_json(self, messages: list[dict[str, Any]], system: str = "", *, task_type: Optional[str] = None,
@@ -1552,7 +1637,93 @@ class PersistentMultiModelManager:
         """Provide the same durable routing for JSON-constrained pipeline stages."""
         role = self._task_roles.get(task_type or "", "writer")
         kwargs.setdefault("task_stage", task_type or role)
+        if self._router is not None and self.runtime.current_task_id():
+            response = self._router_chat(messages, system, role=role, task_type=task_type or role,
+                                         json_mode=True, kwargs=kwargs)
+            try:
+                text = response.content.strip()
+                if text.startswith("```"):
+                    text = "\n".join(text.splitlines()[1:-1])
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"raw": response.content, "error": "JSON parsing failed"}
         return self.get_client(role).chat_json(messages, system, **kwargs)
+
+    def _router_chat(
+        self,
+        messages: list[dict[str, Any]],
+        system: str,
+        *,
+        role: str,
+        task_type: str,
+        json_mode: bool,
+        kwargs: dict[str, Any],
+    ) -> LLMResponse:
+        if self._router is None:
+            raise ModelConfigurationError("MODEL_RUNTIME_ROUTER_UNAVAILABLE", "runtime router is not attached")
+        durable_task_id = self.runtime.current_task_id()
+        if not durable_task_id:
+            raise ModelConfigurationError("MODEL_TASK_CONTEXT_REQUIRED", "model invocation requires a durable task")
+        row = self.runtime.repository.db.fetchone(
+            "SELECT * FROM agent_tasks WHERE task_id=?", (durable_task_id,)
+        )
+        if row is None:
+            base_task = self.runtime._ensure_agent_task(durable_task_id, task_type, role)
+        else:
+            base_task = self.runtime._agent_task_from_row(dict(row), role=role, task_type=task_type)
+        payload = dict(base_task.input_payload)
+        payload.update({
+            "messages": messages,
+            "system": system,
+            "jsonMode": json_mode,
+            "runtimeOptions": dict(kwargs),
+        })
+        context_manifest = kwargs.get("context_manifest")
+        if isinstance(context_manifest, dict):
+            payload["contextManifest"] = dict(context_manifest)
+        if kwargs.get("prompt_version"):
+            payload["promptVersion"] = str(kwargs["prompt_version"])
+        provider_id = kwargs.get("provider_id")
+        if provider_id:
+            payload["providerId"] = provider_id
+        task = replace(base_task, input_payload=payload)
+
+        async def collect():
+            terminal = None
+            async for event in self._router.execute(task):
+                if event.event_type in {"turn.completed", "turn.complete"}:
+                    terminal = event
+            return terminal
+
+        # Legacy callers are synchronous, but Studio's HTTP boundary is an
+        # async function and can still enter this compatibility facade while
+        # an event loop is already running.  ``asyncio.run`` cannot nest in
+        # that case; isolate the synchronous bridge in one short-lived worker
+        # thread while keeping the same durable task scope and router plan.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            terminal = asyncio.run(collect())
+        else:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="novelforge-runtime-bridge") as executor:
+                terminal = executor.submit(asyncio.run, collect()).result()
+        if terminal is None or not isinstance(terminal.payload, dict):
+            raise ModelConfigurationError("MODEL_RUNTIME_NO_ARTIFACT", "runtime completed without an artifact")
+        artifact = terminal.payload.get("artifact")
+        if not isinstance(artifact, dict):
+            artifact = terminal.payload
+        usage = terminal.payload.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        return LLMResponse(
+            content=str(artifact.get("content") or artifact.get("text") or ""),
+            model=str(artifact.get("model") or ""),
+            provider=str(artifact.get("provider") or ""),
+            finish_reason=str(artifact.get("finishReason") or ""),
+            prompt_tokens=int(usage.get("inputTokens") or 0),
+            completion_tokens=int(usage.get("outputTokens") or 0),
+            tokens_used=int(usage.get("totalTokens") or 0),
+            latency_ms=int(usage.get("latencyMs") or 0),
+        )
 
     def test_provider(self, provider_id: str) -> LLMResponse:
         return self.runtime.test_provider(provider_id)
@@ -1575,4 +1746,77 @@ class PersistentMultiModelManager:
 def build_model_runtime(db: Database, workspace_root: Path) -> tuple[ModelRepository, PersistentModelRuntime, PersistentMultiModelManager]:
     repository = ModelRepository(db, CredentialStore(workspace_root))
     runtime = PersistentModelRuntime(repository)
-    return repository, runtime, PersistentMultiModelManager(runtime)
+    manager = PersistentMultiModelManager(runtime)
+
+    # The worker-facing manager is synchronous for historical reasons, while
+    # the Host contract is async.  Build the bridge once here: normal task
+    # handlers enter the common RuntimeRouter, and the API adapter delegates
+    # the actual provider call back to this persisted runtime without creating
+    # a second AgentRun.
+    from src.compute.scheduler import BudgetBroker, CapabilityRegistry, ComputeScheduler
+    from src.runtime.api_runtime import ApiModelRuntime
+    from src.runtime.codex import CodexRuntime
+    from src.runtime.persistence import AgentRunStore
+    from src.runtime.router import RuntimeRouter
+
+    capabilities = CapabilityRegistry()
+    rows = db.fetchall(
+        """SELECT m.model_id, m.name, m.capabilities
+           FROM models m JOIN model_providers p ON p.id=m.provider_id
+           WHERE m.enabled=TRUE AND p.enabled=TRUE
+           ORDER BY m.created_at, m.id"""
+    )
+    for row in rows:
+        try:
+            raw_capabilities = json.loads(row.get("capabilities") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raw_capabilities = []
+        if isinstance(raw_capabilities, dict):
+            model_capabilities = {str(key): str(value) for key, value in raw_capabilities.items()}
+        else:
+            model_capabilities = {
+                str(value): "available" for value in raw_capabilities if isinstance(value, str)
+            }
+        descriptor = ModelDescriptor(
+            runtime_type="api",
+            model_id=str(row["model_id"]),
+            display_name=str(row["name"] or row["model_id"]),
+            capabilities=model_capabilities,
+            reasoning_levels=("medium", "high"),
+            context_window=128_000,
+            capability_profile={
+                "extraction": "C2", "planning": "C2", "writing": "C2",
+                "review": "C2", "long_context": "C2", "tool_use": "C1",
+                "structured_output": "C2", "revision": "C2", "consistency": "C2",
+            },
+        )
+        capabilities.register_model(
+            descriptor,
+            capability="C2",
+            capability_profile={
+                "extraction": "C2",
+                "planning": "C2",
+                "writing": "C2",
+                "review": "C2",
+                "long_context": "C2",
+                "tool_use": "C1",
+                "structured_output": "C2",
+                "revision": "C2",
+                "consistency": "C2",
+            },
+        )
+    agent_runs = AgentRunStore(db)
+    codex_runtime = CodexRuntime(agent_runs, cwd=workspace_root)
+    for model in codex_runtime._models:
+        capabilities.register_model(model, capability="C4", tags=("codex", "session"))
+    router = RuntimeRouter(
+        ComputeScheduler(
+            capabilities,
+            budget=BudgetBroker(total=10_000, critical_reserve=1_000, db=db, scope="runtime"),
+        ),
+        runs=agent_runs,
+    )
+    router.register("api", ApiModelRuntime(runtime, agent_runs))
+    router.register("codex-app-server", codex_runtime)
+    manager.attach_runtime_router(router)
+    return repository, runtime, manager

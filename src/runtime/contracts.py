@@ -21,6 +21,10 @@ def _copy_mapping(value: Mapping[str, Any] | None) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+_CAPABILITY_ORDER = {f"C{index}": index for index in range(6)}
+_REASONING_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
+
+
 class AgentRunStatus(str, Enum):
     CREATED = "created"
     RUNNING = "running"
@@ -52,6 +56,22 @@ class AgentTaskProfile:
                 raise ValueError(f"{name} is required")
         if set(self.allowed_tools) & set(self.forbidden_tools):
             raise ValueError("a tool cannot be both allowed and forbidden")
+        capabilities = []
+        for name in ("minimum_capability", "preferred_capability", "maximum_capability"):
+            value = str(getattr(self, name)).strip().upper()
+            if value not in _CAPABILITY_ORDER:
+                raise ValueError(f"{name} must be one of C0..C5")
+            capabilities.append(_CAPABILITY_ORDER[value])
+        if capabilities != sorted(capabilities):
+            raise ValueError("capability bounds must satisfy minimum <= preferred <= maximum")
+        reasoning = []
+        for name in ("minimum_reasoning", "preferred_reasoning", "maximum_reasoning"):
+            value = str(getattr(self, name)).strip().lower()
+            if value not in _REASONING_ORDER:
+                raise ValueError(f"{name} has an unsupported reasoning level")
+            reasoning.append(_REASONING_ORDER[value])
+        if reasoning != sorted(reasoning):
+            raise ValueError("reasoning bounds must satisfy minimum <= preferred <= maximum")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +183,10 @@ class ComputePlan:
     budget_unit: str = "NF_CU"
     critical_floor: bool = False
     rationale: tuple[str, ...] = ()
+    capability_dimension: str | None = None
+    budget_reservation_id: str | None = None
+    task_tier: str | None = None
+    maximum_reasoning: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("plan_id", "runtime_type", "model_id", "reasoning", "capability"):
@@ -193,6 +217,10 @@ class ComputePlan:
             "budgetUnit": self.budget_unit,
             "criticalFloor": self.critical_floor,
             "rationale": list(self.rationale),
+            "capabilityDimension": self.capability_dimension,
+            "budgetReservationId": self.budget_reservation_id,
+            "taskTier": self.task_tier,
+            "maximumReasoning": self.maximum_reasoning,
         }
 
 
@@ -205,6 +233,7 @@ class ModelDescriptor:
     reasoning_levels: tuple[str, ...] = ("medium", "high")
     context_window: int = 0
     available: bool = True
+    capability_profile: Mapping[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -215,6 +244,7 @@ class ModelDescriptor:
             "reasoningLevels": list(self.reasoning_levels),
             "contextWindow": self.context_window,
             "available": self.available,
+            "capabilityProfile": dict(self.capability_profile),
         }
 
 
@@ -276,6 +306,36 @@ class DomainEvent:
     ui_message: str = "正在执行任务"
     agent_run_id: str | None = None
     sequence: int = 0
+
+    def to_ui_event(self) -> "UIEvent":
+        """Project a product event into the user-facing event vocabulary."""
+        return UIEvent(
+            ui_type=self.ui_type,
+            message=self.ui_message,
+            payload=dict(self.payload),
+            agent_run_id=self.agent_run_id,
+            sequence=self.sequence,
+        )
+
+
+@dataclass(frozen=True)
+class UIEvent:
+    """A display event derived from a persisted DomainEvent."""
+
+    ui_type: str
+    message: str
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    agent_run_id: str | None = None
+    sequence: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "uiType": self.ui_type,
+            "message": self.message,
+            "payload": dict(self.payload),
+            "agentRunId": self.agent_run_id,
+            "sequence": self.sequence,
+        }
 
 
 class IAgentRuntime(Protocol):

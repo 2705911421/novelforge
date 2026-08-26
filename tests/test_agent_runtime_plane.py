@@ -28,13 +28,14 @@ from src.runtime.contracts import (
     RuntimeCapabilities,
     RuntimeEvent,
 )
-from src.runtime.errors import ComputeEscalationDenied, DomainApprovalRequired, ToolPermissionDenied
+from src.runtime.errors import ComputeEscalationDenied, DomainApprovalRequired, RuntimeUnavailable, ToolPermissionDenied
 from src.runtime.persistence import AgentRunStore
 from src.runtime.registry import (
     AcquisitionType,
     InstallState,
     RuntimeManifest,
     RuntimeRegistry,
+    VerificationResult,
 )
 from src.runtime.tool_gateway import ToolAuthority, ToolCallContext, ToolDefinition, ToolGateway
 from src.context.bundles import ContextBundleStore
@@ -230,6 +231,11 @@ def test_runtime_registry_distinguishes_discovery_auth_capability_and_ready(tmp_
         registry.get_installation(manifest.runtime_type),
         state=InstallState.INSTALLED,
         path="C:/fake/codex.exe",
+    ))
+    with pytest.raises(RuntimeUnavailable):
+        registry.mark_authenticated(manifest.runtime_type, AuthState("authenticated"))
+    registry.mark_verified(manifest.runtime_type, VerificationResult(
+        True, path="C:/fake/codex.exe", version="1.0.0",
     ))
     registry.mark_authenticated(manifest.runtime_type, AuthState("authenticated"))
     registry.mark_capability_verified(manifest.runtime_type, RuntimeCapabilities("codex-app-server"))
