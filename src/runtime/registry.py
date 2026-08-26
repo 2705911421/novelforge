@@ -383,11 +383,7 @@ class RuntimeInstallation:
             "state": self.state.value,
             "path": self.path,
             "version": self.version,
-            "auth": {
-                "status": self.auth.status,
-                "accountLabel": self.auth.account_label,
-                "detail": self.auth.detail,
-            },
+            "auth": self.auth.to_dict(),
             "capabilityVerified": self.capability_verified,
             "health": self.health,
             "lastError": self.last_error,
@@ -813,6 +809,11 @@ class ArtifactDownloader:
                     f"runtime artifact fetch failed: {exc}",
                     details={"url": normalized_url},
                 ) from exc
+            if response is None:
+                raise RuntimeUnavailable(
+                    "runtime artifact fetch returned no response",
+                    details={"url": normalized_url},
+                )
 
             final_url = getattr(response, "geturl", lambda: normalized_url)()
             self._validate_url(str(final_url or normalized_url))
@@ -1829,9 +1830,16 @@ class RuntimeManager:
     separately through the runtime contract.
     """
 
-    def __init__(self, registry: RuntimeRegistry, broker: InstallerBroker | None = None) -> None:
+    def __init__(
+        self,
+        registry: RuntimeRegistry,
+        broker: InstallerBroker | None = None,
+        *,
+        runtime_adapters: Mapping[str, Any] | None = None,
+    ) -> None:
         self.registry = registry
         self.broker = broker or InstallerBroker(registry)
+        self.runtime_adapters = dict(runtime_adapters or {})
 
     def list(self) -> list[dict[str, Any]]:
         return self.registry.list()
@@ -1844,6 +1852,12 @@ class RuntimeManager:
 
     def installer(self, runtime_type: str) -> ManifestPluginInstaller:
         return self.broker.installer(runtime_type)
+
+    def bind_runtime(self, runtime_type: str, runtime: Any) -> None:
+        """Bind a Host-owned adapter for reconnect/authentication probes."""
+        if not str(runtime_type).strip():
+            raise ValueError("runtime_type is required")
+        self.runtime_adapters[str(runtime_type)] = runtime
 
     def discover(self, runtime_type: str) -> RuntimeInstallation:
         return self.broker.discover(runtime_type)
@@ -1865,3 +1879,77 @@ class RuntimeManager:
 
     def uninstall(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
         return self.broker.uninstall(runtime_type, approved=approved)
+
+    async def reconnect(self, runtime_type: str) -> dict[str, Any]:
+        """Reconnect an observed installation and re-run its official probes.
+
+        Reconnect is observational: it never installs a package or reads
+        vendor credentials.  The adapter owns the official authentication and
+        capability probes; this Host facade owns the durable Registry state.
+        """
+        return await self._connect(runtime_type, action="reconnect")
+
+    async def reauthenticate(self, runtime_type: str) -> dict[str, Any]:
+        """Re-run the adapter's official authentication probe.
+
+        Vendors differ in whether their CLI can launch an interactive login.
+        The current contract intentionally does not scrape credentials or
+        invent an undocumented login command.  A vendor adapter may expose an
+        official auth flow later; until then this action truthfully reports the
+        result of the supported auth check.
+        """
+        return await self._connect(runtime_type, action="reauthenticate")
+
+    async def _connect(self, runtime_type: str, *, action: str) -> dict[str, Any]:
+        try:
+            runtime = self.runtime_adapters[runtime_type]
+        except KeyError:
+            raise RuntimeUnavailable(
+                f"runtime adapter is not registered: {runtime_type}"
+            ) from None
+
+        installation = self.discover(runtime_type)
+        if installation.state is InstallState.NOT_INSTALLED:
+            raise RuntimeNotInstalled(f"runtime is not installed: {runtime_type}")
+
+        try:
+            initialized = await runtime.initialize()
+            auth = await runtime.authenticate()
+            installation = self.registry.mark_authenticated(runtime_type, auth)
+            result: dict[str, Any] = {
+                "runtimeType": runtime_type,
+                "action": action,
+                "installation": installation.to_dict(),
+                "auth": auth.to_dict(),
+                "capabilities": None,
+                "ready": False,
+            }
+            if auth.status not in {"authenticated", "ready"}:
+                return result
+
+            capabilities = (
+                initialized
+                if isinstance(initialized, RuntimeCapabilities)
+                else await runtime.get_capabilities()
+            )
+            if not isinstance(capabilities, RuntimeCapabilities):
+                raise RuntimeUnavailable(
+                    f"runtime capability probe returned an invalid result: {runtime_type}"
+                )
+            installation = self.registry.mark_capability_verified(runtime_type, capabilities)
+            installation = self.registry.mark_health(runtime_type, healthy=True)
+            result.update({
+                "installation": installation.to_dict(),
+                "capabilities": capabilities.to_dict(),
+                "ready": installation.state is InstallState.READY,
+            })
+            return result
+        except Exception as exc:
+            try:
+                self.registry.set_error(runtime_type, str(exc))
+            except Exception:
+                # Preserve the original connection failure.  Registry state
+                # is best effort here because an illegal transition must not
+                # hide the adapter's authoritative error.
+                pass
+            raise

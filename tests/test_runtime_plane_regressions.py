@@ -10,6 +10,7 @@ import threading
 from datetime import datetime, timedelta
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -161,7 +162,9 @@ def test_codex_authentication_uses_official_account_read(tmp_path):
 
     assert state.status == "authenticated"
     assert state.account_label == "author@example.test"
-    writes = [json.loads(line) for line in process.process.stdin.getvalue().splitlines()]
+    auth_child = process.process
+    assert auth_child is not None and auth_child.stdin is not None
+    writes = [json.loads(line) for line in auth_child.stdin.getvalue().splitlines()]
     account_read = next(item for item in writes if item.get("method") == "account/read")
     assert account_read["params"] == {"refreshToken": False}
 
@@ -197,7 +200,7 @@ def test_codex_runtime_cancellation_closes_blocking_reader_and_recovers_run(tmp_
         def close(self):
             self.released.set()
 
-    process = _BlockingProcess()
+    process: Any = _BlockingProcess()
     runtime = CodexRuntime(AgentRunStore(db), process=process)
     stream = runtime.execute(task, ComputePlan(
         "codex-cancel-reader-plan", runtime.runtime_type, "codex-default", "low", "C4",
@@ -255,9 +258,15 @@ def test_codex_runtime_crash_marks_created_run_and_supervises_restart(tmp_path):
         (first_durable["id"],),
     )
     assert first_run == {"status": "interrupted", "error_code": "RUNTIME_CRASHED"}
-    assert db.fetchone("SELECT status FROM agent_runs WHERE task_id=?", (second_durable["id"],))["status"] == "succeeded"
-    assert db.fetchone("SELECT COUNT(*) AS count FROM story_commits")["count"] == 0
-    assert db.fetchone("SELECT COUNT(*) AS count FROM narrative_events")["count"] == 0
+    second_run = db.fetchone("SELECT status FROM agent_runs WHERE task_id=?", (second_durable["id"],))
+    assert second_run is not None
+    assert second_run["status"] == "succeeded"
+    commit_count = db.fetchone("SELECT COUNT(*) AS count FROM story_commits")
+    assert commit_count is not None
+    assert commit_count["count"] == 0
+    event_count = db.fetchone("SELECT COUNT(*) AS count FROM narrative_events")
+    assert event_count is not None
+    assert event_count["count"] == 0
     asyncio.run(runtime.shutdown())
 
 
@@ -322,11 +331,16 @@ def test_claude_cli_runtime_is_structured_host_supervised_and_redacts_prompt(tmp
         "SELECT status, artifacts, usage FROM agent_runs WHERE task_id=?",
         (durable["id"],),
     )
+    assert run is not None
     assert run["status"] == "succeeded"
     assert json.loads(run["artifacts"])["content"] == "READY"
     assert json.loads(run["usage"])["costUsd"] == 0.01
-    assert db.fetchone("SELECT COUNT(*) AS count FROM story_commits")["count"] == 0
-    assert db.fetchone("SELECT COUNT(*) AS count FROM narrative_events")["count"] == 0
+    cli_commit_count = db.fetchone("SELECT COUNT(*) AS count FROM story_commits")
+    assert cli_commit_count is not None
+    assert cli_commit_count["count"] == 0
+    cli_event_count = db.fetchone("SELECT COUNT(*) AS count FROM narrative_events")
+    assert cli_event_count is not None
+    assert cli_event_count["count"] == 0
 
 
 def test_codex_dynamic_tool_call_crosses_the_host_tool_gateway(tmp_path):
@@ -383,7 +397,9 @@ def test_codex_dynamic_tool_call_crosses_the_host_tool_gateway(tmp_path):
     assert [event.event_type for event in events] == [
         "thread.started", "turn.started", "tool.call.completed", "turn.completed",
     ]
-    writes = [json.loads(line) for line in process.process.stdin.getvalue().splitlines()]
+    tool_child = process.process
+    assert tool_child is not None and tool_child.stdin is not None
+    writes = [json.loads(line) for line in tool_child.stdin.getvalue().splitlines()]
     thread_start = next(item for item in writes if item.get("method") == "thread/start")
     assert thread_start["params"]["sandbox"] == "read-only"
     assert thread_start["params"]["approvalPolicy"] == "never"
@@ -393,7 +409,9 @@ def test_codex_dynamic_tool_call_crosses_the_host_tool_gateway(tmp_path):
     assert json.loads(tool_response["result"]["contentItems"][0]["text"]) == {
         "chapter": 7, "source": "host",
     }
-    assert db.fetchone("SELECT status FROM agent_runs WHERE task_id=?", (durable["id"],))["status"] == "succeeded"
+    tool_run = db.fetchone("SELECT status FROM agent_runs WHERE task_id=?", (durable["id"],))
+    assert tool_run is not None
+    assert tool_run["status"] == "succeeded"
 
 
 def test_codex_dynamic_tool_call_cannot_self_approve_authority(tmp_path):
@@ -451,7 +469,9 @@ def test_codex_dynamic_tool_call_cannot_self_approve_authority(tmp_path):
     events = asyncio.run(consume())
     assert events[-2].event_type == "tool.call.failed"
     assert calls == []
-    writes = [json.loads(line) for line in process.process.stdin.getvalue().splitlines()]
+    authority_child = process.process
+    assert authority_child is not None and authority_child.stdin is not None
+    writes = [json.loads(line) for line in authority_child.stdin.getvalue().splitlines()]
     tool_response = next(item for item in writes if item.get("id") == 4)
     assert tool_response["result"]["success"] is False
     assert "approval" in tool_response["result"]["contentItems"][0]["text"].lower()
@@ -479,6 +499,7 @@ def test_model_backed_queue_entry_gets_agent_task_at_enqueue_boundary(tmp_path):
     queued = runtime.enqueue("write-next", data={"chapter_number": 3})
     envelope = db.fetchone("SELECT * FROM agent_tasks WHERE task_id=?", (queued["id"],))
 
+    assert envelope is not None
     assert queued["agentTaskId"] == envelope["id"]
     assert envelope["task_type"] == "write-next"
     assert json.loads(envelope["input_payload"])["durableTaskId"] == queued["id"]
@@ -512,12 +533,14 @@ def test_expired_task_lease_interrupts_agent_run_and_projects_error(tmp_path):
 
     assert recovered and recovered[0]["status"] == "needs_author_decision"
     stored = db.fetchone("SELECT status, error_code FROM agent_runs WHERE id=?", (run["id"],))
+    assert stored is not None
     assert stored["status"] == "interrupted"
     assert stored["error_code"] == "TASK_INTERRUPTED"
     event = db.fetchone(
         "SELECT event_type FROM domain_events WHERE agent_run_id=? ORDER BY sequence DESC LIMIT 1",
         (run["id"],),
     )
+    assert event is not None
     assert event["event_type"] == "agent.runtime.error"
 
 
@@ -580,7 +603,7 @@ def test_runtime_router_settles_reserved_compute_units(tmp_path):
                 {"usage": {"computeUnits": 0.25}},
             )
 
-    router.register("fake", _Runtime())
+    router.register("fake", cast(Any, _Runtime()))
 
     async def collect():
         return [event async for event in router.execute(task)]
@@ -590,10 +613,14 @@ def test_runtime_router_settles_reserved_compute_units(tmp_path):
     assert events[0].event_type == "turn.completed"
     assert budget.snapshot()["consumed"] == 0.25
     assert budget.snapshot()["normalReserved"] == 0
-    assert db.fetchone(
+    plan_count = db.fetchone(
         "SELECT COUNT(*) AS count FROM compute_plans WHERE agent_task_id=?", (task.task_id,)
-    )["count"] == 1
-    assert db.fetchone("SELECT task_id FROM agent_tasks WHERE id=?", (task.task_id,))["task_id"] == durable["id"]
+    )
+    assert plan_count is not None
+    assert plan_count["count"] == 1
+    agent_link = db.fetchone("SELECT task_id FROM agent_tasks WHERE id=?", (task.task_id,))
+    assert agent_link is not None
+    assert agent_link["task_id"] == durable["id"]
 
 
 def test_runtime_router_requires_persisted_ready_runtime_before_planning(tmp_path):
@@ -622,7 +649,9 @@ def test_runtime_router_requires_persisted_ready_runtime_before_planning(tmp_pat
 
     with pytest.raises(RuntimeUnavailable, match="not installed"):
         router.plan(_agent_task("runtime-readiness-gate"), reserve_budget=False)
-    assert db.fetchone("SELECT COUNT(*) AS count FROM compute_plans")["count"] == 0
+    unready_plan_count = db.fetchone("SELECT COUNT(*) AS count FROM compute_plans")
+    assert unready_plan_count is not None
+    assert unready_plan_count["count"] == 0
 
 
 def test_worker_model_manager_uses_one_router_owned_agent_run(tmp_path, monkeypatch):
@@ -676,14 +705,23 @@ def test_worker_model_manager_uses_one_router_owned_agent_run(tmp_path, monkeypa
         )
 
     assert response.content == "router-owned response"
-    assert db.fetchone("SELECT COUNT(*) AS count FROM agent_runs WHERE task_id=?", (task["id"],))["count"] == 1
-    assert db.fetchone("SELECT COUNT(*) AS count FROM compute_plans WHERE agent_task_id=?", (task["agentTaskId"],))["count"] == 1
-    assert db.fetchone("SELECT COUNT(*) AS count FROM generation_runs WHERE task_id=?", (task["id"],))["count"] == 1
+    outer_run_count = db.fetchone("SELECT COUNT(*) AS count FROM agent_runs WHERE task_id=?", (task["id"],))
+    assert outer_run_count is not None
+    assert outer_run_count["count"] == 1
+    router_plan_count = db.fetchone("SELECT COUNT(*) AS count FROM compute_plans WHERE agent_task_id=?", (task["agentTaskId"],))
+    assert router_plan_count is not None
+    assert router_plan_count["count"] == 1
+    generation_count = db.fetchone("SELECT COUNT(*) AS count FROM generation_runs WHERE task_id=?", (task["id"],))
+    assert generation_count is not None
+    assert generation_count["count"] == 1
     outer_run = db.fetchone("SELECT context_bundle_id FROM agent_runs WHERE task_id=?", (task["id"],))
+    assert outer_run is not None
     assert outer_run["context_bundle_id"]
-    assert db.fetchone(
+    outer_task = db.fetchone(
         "SELECT context_bundle_id FROM agent_tasks WHERE id=?", (task["agentTaskId"],)
-    )["context_bundle_id"] == outer_run["context_bundle_id"]
+    )
+    assert outer_task is not None
+    assert outer_task["context_bundle_id"] == outer_run["context_bundle_id"]
 
 
 def test_legacy_role_client_is_also_fenced_by_attached_router(tmp_path, monkeypatch):
@@ -724,8 +762,12 @@ def test_legacy_role_client_is_also_fenced_by_attached_router(tmp_path, monkeypa
         )
 
     assert response.content == "client-routed response"
-    assert db.fetchone("SELECT COUNT(*) AS count FROM agent_runs WHERE task_id=?", (task["id"],))["count"] == 1
-    assert db.fetchone("SELECT COUNT(*) AS count FROM compute_plans WHERE agent_task_id=?", (task["agentTaskId"],))["count"] == 1
+    client_run_count = db.fetchone("SELECT COUNT(*) AS count FROM agent_runs WHERE task_id=?", (task["id"],))
+    assert client_run_count is not None
+    assert client_run_count["count"] == 1
+    client_plan_count = db.fetchone("SELECT COUNT(*) AS count FROM compute_plans WHERE agent_task_id=?", (task["agentTaskId"],))
+    assert client_plan_count is not None
+    assert client_plan_count["count"] == 1
 
 
 def test_router_bridge_is_safe_when_called_inside_an_async_http_boundary(tmp_path, monkeypatch):
@@ -767,7 +809,9 @@ def test_router_bridge_is_safe_when_called_inside_an_async_http_boundary(tmp_pat
     response = asyncio.run(invoke_from_http_context())
 
     assert response.content == "async-safe response"
-    assert db.fetchone("SELECT COUNT(*) AS count FROM agent_runs WHERE task_id=?", (task["id"],))["count"] == 1
+    async_run_count = db.fetchone("SELECT COUNT(*) AS count FROM agent_runs WHERE task_id=?", (task["id"],))
+    assert async_run_count is not None
+    assert async_run_count["count"] == 1
 
 
 def test_control_plane_dispatches_durable_task_and_queries_projection(tmp_path):
@@ -820,9 +864,11 @@ def test_control_plane_receipt_is_idempotent_and_events_survive_reopen(tmp_path)
     replay = control.commands.dispatch(command)
 
     assert replay == first
-    assert control.task_runtime.db.fetchone(
+    replay_task_count = control.task_runtime.db.fetchone(
         "SELECT COUNT(*) AS count FROM tasks WHERE id=?", (first["id"],)
-    )["count"] == 1
+    )
+    assert replay_task_count is not None
+    assert replay_task_count["count"] == 1
     receipts = control.queries.dispatch(
         "control.command-receipts", {"status": "accepted"}
     )
@@ -873,7 +919,9 @@ def test_control_command_worker_claims_async_and_recovers_stale_lease(tmp_path):
     assert cancelled is not None
     assert cancelled["status"] == "accepted"
     assert cancelled["queue"]["status"] == "completed"
-    assert task_runtime.get(async_task["id"])["status"] == "cancelled"
+    cancelled_task = task_runtime.get(async_task["id"])
+    assert cancelled_task is not None
+    assert cancelled_task["status"] == "cancelled"
 
     stale_command = ControlCommand(
         "task.enqueue",
@@ -1150,7 +1198,7 @@ def test_task_orchestrator_routes_agent_task_and_closes_durable_state(tmp_path):
         async def cancel(self, _task_id):
             return None
 
-    router.register("fake", _Runtime())
+    router.register("fake", cast(Any, _Runtime()))
     orchestrator = TaskOrchestrator(TaskRuntime(db), router)
 
     result = asyncio.run(orchestrator.execute(durable["id"], worker_id="orchestrator-test"))
@@ -1159,7 +1207,9 @@ def test_task_orchestrator_routes_agent_task_and_closes_durable_state(tmp_path):
     assert result["status"] == "completed"
     assert result["result"]["eventCount"] == 2
     assert result["result"]["agentRunIds"]
-    assert runs.get(result["result"]["agentRunIds"][0])["status"] == "succeeded"
+    orchestrated_run = runs.get(result["result"]["agentRunIds"][0])
+    assert orchestrated_run is not None
+    assert orchestrated_run["status"] == "succeeded"
 
 
 def test_async_control_cancel_forwards_to_active_runtime_from_persisted_run(tmp_path):
@@ -1181,7 +1231,7 @@ def test_async_control_cancel_forwards_to_active_runtime_from_persisted_run(tmp_
             calls.append(task_id)
 
     router = RuntimeRouter(ComputeScheduler(CapabilityRegistry()), runs=runs)
-    router.register("fake", _Runtime())
+    router.register("fake", cast(Any, _Runtime()))
     control = ControlPlane(
         task_runtime,
         orchestrator=TaskOrchestrator(task_runtime, router),
@@ -1212,13 +1262,13 @@ def test_runtime_adapters_honor_durable_task_id_for_prestart_cancel(tmp_path):
             return None
 
     async def exercise():
-        api = ApiModelRuntime(_LegacyRuntime(), AgentRunStore(db))
+        api = ApiModelRuntime(cast(Any, _LegacyRuntime()), AgentRunStore(db))
         await api.cancel(durable["id"])
         with pytest.raises(TaskInterrupted):
             async for _event in api.execute(task, plan):
                 pass
 
-        codex = CodexRuntime(AgentRunStore(db), process=object())
+        codex = CodexRuntime(AgentRunStore(db), process=cast(Any, object()))
         await codex.cancel(durable["id"])
         with pytest.raises(TaskInterrupted):
             async for _event in codex.execute(task, ComputePlan(
@@ -1252,7 +1302,9 @@ def test_runtime_lifecycle_approval_does_not_mutate_and_builtin_cannot_uninstall
 
     with pytest.raises(RuntimeUnavailable):
         broker.repair("managed-runtime")
-    assert registry.get_installation("managed-runtime").state is InstallState.NOT_INSTALLED
+    managed_installation = registry.get_installation("managed-runtime")
+    assert managed_installation is not None
+    assert managed_installation.state is InstallState.NOT_INSTALLED
 
     registry.register_manifest(RuntimeManifest(
         runtime_type="builtin-runtime",
@@ -1264,7 +1316,9 @@ def test_runtime_lifecycle_approval_does_not_mutate_and_builtin_cannot_uninstall
     registry.discover("builtin-runtime")
     with pytest.raises(RuntimeUnavailable):
         broker.uninstall("builtin-runtime", approved=True)
-    assert registry.get_installation("builtin-runtime").state is InstallState.INSTALLED
+    builtin_installation = registry.get_installation("builtin-runtime")
+    assert builtin_installation is not None
+    assert builtin_installation.state is InstallState.INSTALLED
 
 
 def test_runtime_discovery_persists_observed_path_without_resetting_state(tmp_path):
@@ -1295,7 +1349,9 @@ def test_runtime_discovery_persists_observed_path_without_resetting_state(tmp_pa
     assert discovered.path == str(second_path)
 
     reopened = RuntimeRegistry(Database(str(db_path)))
-    assert reopened.get_installation("external-runtime").path == str(second_path)
+    reopened_installation = reopened.get_installation("external-runtime")
+    assert reopened_installation is not None
+    assert reopened_installation.path == str(second_path)
 
     second_path.unlink()
     broken = reopened.discover("external-runtime")
@@ -1360,7 +1416,9 @@ def test_manifest_installer_is_explicit_argv_only_and_reopenable(tmp_path):
     assert manifest is not None
     assert manifest.source_kind is RuntimeSource.CUSTOM
     assert manifest.compatibility["maximumTestedVersion"] == "2.2.0"
-    assert reopened.get_installation("custom-runtime").verified is True
+    custom_installation = reopened.get_installation("custom-runtime")
+    assert custom_installation is not None
+    assert custom_installation.verified is True
 
 
 def test_manifest_digest_is_verified_and_version_probe_cannot_run_arbitrary_argv(tmp_path):
@@ -1390,8 +1448,10 @@ def test_manifest_digest_is_verified_and_version_probe_cannot_run_arbitrary_argv
         runtime_type="unsafe-version-probe",
         verification={"versionCommand": [sys.executable, "-c", "raise SystemExit(9)"]},
     ))
+    probe_installation = registry.get_installation("unsafe-version-probe")
+    assert probe_installation is not None
     registry._set_installation(registry._replace(
-        registry.get_installation("unsafe-version-probe"),
+        probe_installation,
         state=InstallState.INSTALLED,
         path=sys.executable,
     ))
@@ -1401,6 +1461,7 @@ def test_manifest_digest_is_verified_and_version_probe_cannot_run_arbitrary_argv
         runner=lambda command: calls.append(tuple(command)),
     ).installer("unsafe-version-probe").verify()
     assert result.verified is False
+    assert result.reason is not None
     assert "read-only version argument" in result.reason
     assert calls == []
 
@@ -1481,7 +1542,9 @@ def test_signed_manifest_catalog_is_verified_before_registry_import(tmp_path):
 
     assert [manifest.runtime_type for manifest in imported] == ["catalog-runtime"]
     assert registry.get_manifest("catalog-runtime") is not None
-    assert registry.get_installation("catalog-runtime").state is InstallState.NOT_INSTALLED
+    catalog_installation = registry.get_installation("catalog-runtime")
+    assert catalog_installation is not None
+    assert catalog_installation.state is InstallState.NOT_INSTALLED
 
     tampered = dict(catalog)
     tampered["manifests"] = [{**catalog["manifests"][0], "displayName": "Tampered"}]

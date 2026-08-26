@@ -68,13 +68,19 @@ def test_agent_task_is_atomically_linked_to_durable_task(tmp_path):
     created = runtime.enqueue_agent_task(task, idempotency_key="agent-task-once")
     assert created["agentTaskId"] == task.task_id
     assert created["status"] == "queued"
-    assert db.fetchone("SELECT task_id FROM agent_tasks WHERE id=?", (task.task_id,))["task_id"] == created["id"]
+    agent_row = db.fetchone("SELECT task_id FROM agent_tasks WHERE id=?", (task.task_id,))
+    assert agent_row is not None
+    assert agent_row["task_id"] == created["id"]
 
     claimed = runtime.claim_by_id(created["id"], "focused-test-worker")
     assert claimed is not None
-    assert db.fetchone("SELECT status FROM agent_tasks WHERE id=?", (task.task_id,))["status"] == "running"
+    running_row = db.fetchone("SELECT status FROM agent_tasks WHERE id=?", (task.task_id,))
+    assert running_row is not None
+    assert running_row["status"] == "running"
     runtime.transition(created["id"], "completed", result={"artifact": "proposal"})
-    assert db.fetchone("SELECT status FROM agent_tasks WHERE id=?", (task.task_id,))["status"] == "completed"
+    completed_row = db.fetchone("SELECT status FROM agent_tasks WHERE id=?", (task.task_id,))
+    assert completed_row is not None
+    assert completed_row["status"] == "completed"
 
     same = runtime.enqueue_agent_task(_task("different-id"), idempotency_key="agent-task-once")
     assert same["id"] == created["id"]
@@ -227,8 +233,10 @@ def test_runtime_registry_distinguishes_discovery_auth_capability_and_ready(tmp_
     )
     registry.register_manifest(manifest)
     assert registry.discover(manifest.runtime_type).state is InstallState.NOT_INSTALLED
+    installation = registry.get_installation(manifest.runtime_type)
+    assert installation is not None
     registry._set_installation(registry._replace(
-        registry.get_installation(manifest.runtime_type),
+        installation,
         state=InstallState.INSTALLED,
         path="C:/fake/codex.exe",
     ))
@@ -241,7 +249,9 @@ def test_runtime_registry_distinguishes_discovery_auth_capability_and_ready(tmp_
     registry.mark_capability_verified(manifest.runtime_type, RuntimeCapabilities("codex-app-server"))
     assert registry.mark_health(manifest.runtime_type, healthy=True).state is InstallState.READY
     reopened = RuntimeRegistry(Database(str(tmp_path / "registry.sqlite3")))
-    assert reopened.get_installation(manifest.runtime_type).state is InstallState.READY
+    reopened_installation = reopened.get_installation(manifest.runtime_type)
+    assert reopened_installation is not None
+    assert reopened_installation.state is InstallState.READY
 
 
 class _FakeProcess:
@@ -288,8 +298,13 @@ def test_codex_app_server_adapter_uses_jsonl_and_keeps_agent_run_separate(tmp_pa
     events = asyncio.run(consume())
     assert [event.event_type for event in events] == ["thread.started", "turn.started", "turn.completed"]
     run = db.fetchone("SELECT status, runtime_thread_id, runtime_turn_id FROM agent_runs WHERE task_id=?", (durable["id"],))
+    assert run is not None
     assert run["status"] == "succeeded"
     assert run["runtime_thread_id"] == "thread-1"
     assert run["runtime_turn_id"] == "turn-1"
-    assert db.fetchone("SELECT COUNT(*) AS count FROM story_commits")["count"] == 0
-    assert json.loads(process.process.stdin.getvalue().splitlines()[0])["method"] == "initialize"
+    count_row = db.fetchone("SELECT COUNT(*) AS count FROM story_commits")
+    assert count_row is not None
+    assert count_row["count"] == 0
+    child = process.process
+    assert child is not None and child.stdin is not None
+    assert json.loads(child.stdin.getvalue().splitlines()[0])["method"] == "initialize"
