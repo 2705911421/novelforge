@@ -217,27 +217,26 @@ def test_thought_chat_claims_planner_route_and_completes_durable_task(tmp_path, 
     monkeypatch.setattr(studio, "story_repository", StoryRepository(db))
     monkeypatch.setattr(studio, "task_runtime", TaskRuntime(db))
     monkeypatch.setattr(studio, "skill_repository", SkillRepository(db))
-    seen_roles = []
-
-    class Client:
-        def chat(self, **_kwargs):
-            return LLMResponse(content="规划师提问", model="fake-planner", tokens_used=1)
+    chat_calls: list[dict] = []
 
     class Manager:
         @contextmanager
         def task_scope(self, _task_id):
             yield
 
-        def get_client(self, role):
-            seen_roles.append(role)
-            return Client()
+        def chat(self, *, messages, system, task_type=None, **_kwargs):
+            chat_calls.append({"messages": messages, "system": system, "task_type": task_type})
+            return LLMResponse(content="规划师提问", model="fake-planner", tokens_used=1)
 
     monkeypatch.setattr(studio, "model_mgr", Manager())
     client = TestClient(studio.app)
     response = client.post("/api/v1/chat", json={"message": "一个关于记忆的念头", "mode": "thought"})
     assert response.status_code == 200
     assert response.json()["reply"] == "规划师提问"
-    assert seen_roles == ["planner"]
+    # The endpoint routes thought mode through the durable task-type seam; the
+    # model manager resolves that task type to the planner role.
+    assert [call["task_type"] for call in chat_calls] == ["thought-clarify"]
+    assert PersistentMultiModelManager._task_roles["thought-clarify"] == "planner"
     task = TaskRuntime(db).get(response.json()["taskId"])
     assert task is not None
     assert task["status"] == "completed"
