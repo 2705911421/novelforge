@@ -592,7 +592,10 @@ class CodexRuntime:
         run_id: str,
     ) -> RuntimeEvent:
         """Handle App Server callbacks without confusing them with events."""
-        request_id = message.get("id")
+        raw_id = message.get("id")
+        # JSON-RPC responses require the exact request id; a malformed message
+        # without a usable id still gets a response so the child never wedges.
+        request_id: str | int = raw_id if isinstance(raw_id, (str, int)) else "unknown"
         method = str(message.get("method") or "")
         params = message.get("params")
         params = params if isinstance(params, Mapping) else {}

@@ -382,9 +382,10 @@ class ControlCommandWorker:
         )
         if claimed is None:
             return None
+        payload_raw = claimed.get("payload")
         command = ControlCommand(
             name=str(claimed["name"]),
-            payload=claimed.get("payload") if isinstance(claimed.get("payload"), Mapping) else {},
+            payload=payload_raw if isinstance(payload_raw, Mapping) else {},
             actor=str(claimed.get("actor") or "system"),
             command_id=str(claimed["commandId"]),
         )

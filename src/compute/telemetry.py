@@ -63,7 +63,7 @@ class ComputeTelemetryStore:
         query += " ORDER BY ar.started_at DESC, ar.id DESC LIMIT ?"
         params.append(bounded_limit)
         try:
-            rows = self.db.fetchall(query, params)
+            rows = self.db.fetchall(query, tuple(params))
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
                 return []
@@ -164,7 +164,8 @@ class ComputeTelemetryStore:
         )
         if gate is None:
             gate = _first(artifacts, "gateStatus", "gate_status", "qualityGate", "quality_gate", "gate")
-        rationale = plan.get("rationale") if isinstance(plan.get("rationale"), list) else []
+        raw_rationale = plan.get("rationale")
+        rationale = raw_rationale if isinstance(raw_rationale, list) else []
         escalated = any(str(item).lower().startswith("escalated") for item in rationale)
         return {
             "agentRunId": row.get("id"),

@@ -1659,7 +1659,8 @@ class PersistentMultiModelManager:
         json_mode: bool,
         kwargs: dict[str, Any],
     ) -> LLMResponse:
-        if self._router is None:
+        router = self._router
+        if router is None:
             raise ModelConfigurationError("MODEL_RUNTIME_ROUTER_UNAVAILABLE", "runtime router is not attached")
         durable_task_id = self.runtime.current_task_id()
         if not durable_task_id:
@@ -1690,7 +1691,7 @@ class PersistentMultiModelManager:
 
         async def collect():
             terminal = None
-            async for event in self._router.execute(task):
+            async for event in router.execute(task):
                 if event.event_type in {"turn.completed", "turn.complete"}:
                     terminal = event
             return terminal

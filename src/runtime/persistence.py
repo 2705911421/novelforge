@@ -456,6 +456,8 @@ class AgentTaskStore:
                 preferred_reasoning=str(profile_data.get("preferredReasoning") or profile_data.get("preferred_reasoning") or "high"),
                 maximum_reasoning=str(profile_data.get("maximumReasoning") or profile_data.get("maximum_reasoning") or "xhigh"),
             )
+        constraints_raw = row.get("constraints")
+        input_payload_raw = row.get("input_payload")
         return AgentTask(
             task_id=str(row["id"]),
             task_type=str(row.get("task_type") or "agent"),
@@ -464,9 +466,9 @@ class AgentTaskStore:
             chapter_id=str(row["chapter_id"]) if row.get("chapter_id") else None,
             intent_id=str(row["intent_id"]) if row.get("intent_id") else None,
             context_bundle_id=str(row["context_bundle_id"]) if row.get("context_bundle_id") else None,
-            constraints=row.get("constraints") if isinstance(row.get("constraints"), Mapping) else {},
+            constraints=constraints_raw if isinstance(constraints_raw, Mapping) else {},
             expected_output=str(row.get("expected_output") or "AgentArtifact"),
-            input_payload=row.get("input_payload") if isinstance(row.get("input_payload"), Mapping) else {},
+            input_payload=input_payload_raw if isinstance(input_payload_raw, Mapping) else {},
             profile=profile,
             parent_task_id=str(row["parent_task_id"]) if row.get("parent_task_id") else None,
             created_at=str(row.get("created_at") or _now()),

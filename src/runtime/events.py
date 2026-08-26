@@ -177,13 +177,16 @@ class RuntimeEventStore:
 
     def ui_events(self, agent_run_id: str, *, after_sequence: int = 0) -> list[dict[str, Any]]:
         """Read the UI projection without exposing vendor-shaped events."""
-        return [
-            UIEvent(
-                ui_type=str(row.get("ui_type") or "agent.progress"),
-                message=str(row.get("ui_message") or "正在执行任务"),
-                payload=row.get("payload") if isinstance(row.get("payload"), dict) else {},
-                agent_run_id=agent_run_id,
-                sequence=int(row.get("sequence") or 0),
-            ).to_dict()
-            for row in self.domain_events(agent_run_id, after_sequence=after_sequence)
-        ]
+        events: list[dict[str, Any]] = []
+        for row in self.domain_events(agent_run_id, after_sequence=after_sequence):
+            payload = row.get("payload")
+            events.append(
+                UIEvent(
+                    ui_type=str(row.get("ui_type") or "agent.progress"),
+                    message=str(row.get("ui_message") or "正在执行任务"),
+                    payload=payload if isinstance(payload, dict) else {},
+                    agent_run_id=agent_run_id,
+                    sequence=int(row.get("sequence") or 0),
+                ).to_dict()
+            )
+        return events

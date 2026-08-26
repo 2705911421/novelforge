@@ -12,16 +12,20 @@ import json
 import hashlib
 import base64
 import hmac
+import os
 import platform
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from src.core.database import Database
 
@@ -140,6 +144,9 @@ class InstallerPlan:
     shell: bool = False
     risk: str = "low"
     explanation: str = ""
+    artifact_url: str | None = None
+    artifact_path: str | None = None
+    artifact_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -154,6 +161,9 @@ class InstallerPlan:
             "shell": self.shell,
             "risk": self.risk,
             "explanation": self.explanation,
+            "artifactUrl": self.artifact_url,
+            "artifactPath": self.artifact_path,
+            "artifactSha256": self.artifact_sha256,
         }
 
 
@@ -300,7 +310,11 @@ class RuntimeManifest:
         if any(not isinstance(item, (str, int, float, bool)) for item in command):
             raise ValueError("manifest command entries must be scalar argv values")
         source = str(payload.get("source") or "").strip()
-        source_kind = payload.get("sourceKind") or RuntimeSource.EXTERNAL.value
+        raw_source_kind = str(payload.get("sourceKind") or RuntimeSource.EXTERNAL.value)
+        try:
+            source_kind = RuntimeSource(raw_source_kind)
+        except ValueError:
+            source_kind = RuntimeSource.EXTERNAL
         return cls(
             runtime_type=required("runtimeType", "id"),
             display_name=required("displayName", "name", "id"),
@@ -735,6 +749,162 @@ class ArtifactVerifier:
         return VerificationResult(True, path=str(artifact), checks=tuple(checks))
 
 
+class ArtifactDownloader:
+    """Download a declared binary into a verified, atomically replaced path.
+
+    This is intentionally a byte transport primitive.  It never executes the
+    result and it requires a manifest SHA-256 before replacing the target.
+    Install approval is enforced by :class:`ManifestPluginInstaller`; this
+    class additionally bounds the response and rejects insecure URLs.
+    """
+
+    DEFAULT_MAX_BYTES = 256 * 1024 * 1024
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 60.0,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        opener: Callable[..., Any] | None = None,
+        allow_loopback_http: bool = False,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        self.timeout_seconds = float(timeout_seconds)
+        self.max_bytes = int(max_bytes)
+        self.opener = opener or urlopen
+        self.allow_loopback_http = bool(allow_loopback_http)
+
+    def download(
+        self,
+        url: str,
+        target: str | Path,
+        expected_sha256: str,
+    ) -> VerificationResult:
+        normalized_url = str(url or "").strip()
+        self._validate_url(normalized_url)
+        expected = str(expected_sha256 or "").strip().lower().removeprefix("sha256:")
+        if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+            raise RuntimeUnavailable("downloaded binaries require a valid manifest SHA-256")
+        target_text = str(target or "").strip()
+        if not target_text:
+            raise RuntimeUnavailable("downloaded binaries require an explicit target path")
+        target_path = Path(target_text).expanduser()
+        if not target_path.name or target_path.is_dir():
+            raise RuntimeUnavailable("download target must be a file path")
+
+        request = Request(
+            normalized_url,
+            headers={
+                "Accept": "application/octet-stream",
+                "User-Agent": "NovelForge-RuntimeArtifact/1",
+            },
+            method="GET",
+        )
+        response: Any | None = None
+        temporary_path: Path | None = None
+        try:
+            try:
+                response = self.opener(request, timeout=self.timeout_seconds)
+            except Exception as exc:
+                raise RuntimeUnavailable(
+                    f"runtime artifact fetch failed: {exc}",
+                    details={"url": normalized_url},
+                ) from exc
+
+            final_url = getattr(response, "geturl", lambda: normalized_url)()
+            self._validate_url(str(final_url or normalized_url))
+            status = getattr(response, "status", None)
+            if status is None:
+                status = getattr(response, "code", 200)
+            if isinstance(status, int) and status >= 400:
+                raise RuntimeUnavailable(
+                    f"runtime artifact returned HTTP {status}",
+                    details={"url": normalized_url, "status": status},
+                )
+            headers = getattr(response, "headers", None)
+            content_length = headers.get("Content-Length") if headers is not None else None
+            if content_length is not None:
+                try:
+                    if int(content_length) > self.max_bytes:
+                        raise RuntimeUnavailable("runtime artifact exceeds the maximum size")
+                except ValueError as exc:
+                    raise RuntimeUnavailable("runtime artifact Content-Length is invalid") from exc
+
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{target_path.name}.", suffix=".download", dir=str(target_path.parent)
+            )
+            temporary_path = Path(temporary_name)
+            digest = hashlib.sha256()
+            total = 0
+            with os.fdopen(descriptor, "wb") as stream:
+                while True:
+                    chunk = response.read(min(1024 * 1024, self.max_bytes - total + 1))
+                    if not chunk:
+                        break
+                    if not isinstance(chunk, (bytes, bytearray)):
+                        raise RuntimeUnavailable("runtime artifact response was not bytes")
+                    total += len(chunk)
+                    if total > self.max_bytes:
+                        raise RuntimeUnavailable("runtime artifact exceeds the maximum size")
+                    stream.write(chunk)
+                    digest.update(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            if not hmac.compare_digest(digest.hexdigest().lower(), expected):
+                raise RuntimeUnavailable("downloaded artifact SHA-256 does not match manifest")
+            os.replace(temporary_path, target_path)
+            temporary_path = None
+            return VerificationResult(
+                True,
+                path=str(target_path),
+                checks=("download", "sha256", "atomic-install"),
+            )
+        except RuntimeUnavailable:
+            raise
+        except Exception as exc:
+            raise RuntimeUnavailable(
+                f"runtime artifact could not be installed: {exc}",
+                details={"url": normalized_url, "target": str(target_path)},
+            ) from exc
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _validate_url(self, url: str) -> None:
+        if self.url_allowed(url, allow_loopback_http=self.allow_loopback_http):
+            return
+        parsed = urlparse(url)
+        if parsed.username or parsed.password:
+            raise RuntimeUnavailable("runtime artifact URL must not contain userinfo")
+        if not parsed.netloc:
+            raise RuntimeUnavailable("runtime artifact URL must include a host")
+        raise RuntimeUnavailable("runtime artifact transport requires HTTPS")
+
+    @staticmethod
+    def url_allowed(url: str, *, allow_loopback_http: bool = False) -> bool:
+        parsed = urlparse(str(url or "").strip())
+        if parsed.username or parsed.password or not parsed.netloc:
+            return False
+        if parsed.scheme == "https":
+            return True
+        return bool(
+            allow_loopback_http
+            and parsed.scheme == "http"
+            and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        )
+
+
 class TrustedInstallationPolicy:
     """Host policy preventing silent arbitrary shell execution."""
 
@@ -759,15 +929,37 @@ class TrustedInstallationPolicy:
         if bool(manifest.installer.get("shell")):
             return ManifestTrust(False, False, "shell installers are not allowed through the runtime broker")
         if manifest.acquisition is AcquisitionType.DOWNLOAD_BINARY:
-            expected_hash = manifest.verification.get("sha256") if isinstance(manifest.verification, Mapping) else None
-            if not str(expected_hash or "").strip():
-                return ManifestTrust(False, False, "downloaded binaries require a manifest SHA-256")
+            if action is not InstallAction.UNINSTALL:
+                download_url, target_path, expected_hash = self.download_spec(manifest)
+                if not download_url:
+                    return ManifestTrust(False, False, "downloaded binaries require an installer downloadUrl")
+                if not target_path:
+                    return ManifestTrust(False, False, "downloaded binaries require an installer resultPath")
+                if command:
+                    return ManifestTrust(False, False, "downloaded binaries cannot use an installer command")
+                if not ArtifactDownloader.url_allowed(download_url):
+                    return ManifestTrust(False, False, "downloaded binaries require an HTTPS downloadUrl")
+                normalized_hash = str(expected_hash or "").strip().lower().removeprefix("sha256:")
+                if len(normalized_hash) != 64 or any(char not in "0123456789abcdef" for char in normalized_hash):
+                    return ManifestTrust(False, False, "downloaded binaries require a valid manifest SHA-256")
         executable = Path(command[0]).name.lower()
         if manifest.acquisition is AcquisitionType.PACKAGE_MANAGER and executable not in self._PACKAGE_MANAGERS:
             return ManifestTrust(False, False, f"package manager is not allowlisted: {executable}")
         if not trust.allowed:
             return trust
         return trust
+
+    @staticmethod
+    def download_spec(manifest: RuntimeManifest) -> tuple[str | None, str | None, str | None]:
+        installer = manifest.installer if isinstance(manifest.installer, Mapping) else {}
+        download_url = installer.get("downloadUrl") or installer.get("url")
+        target_path = installer.get("resultPath") or installer.get("targetPath") or installer.get("downloadPath")
+        expected_hash = manifest.verification.get("sha256") if isinstance(manifest.verification, Mapping) else None
+        return (
+            str(download_url).strip() if download_url is not None and str(download_url).strip() else None,
+            str(target_path).strip() if target_path is not None and str(target_path).strip() else None,
+            str(expected_hash).strip() if expected_hash is not None and str(expected_hash).strip() else None,
+        )
 
     @staticmethod
     def command_for(manifest: RuntimeManifest, action: InstallAction) -> tuple[str, ...]:
@@ -804,7 +996,10 @@ class TrustedInstallationPolicy:
     @staticmethod
     def _executable_key(value: str | Path) -> str:
         name = Path(str(value)).name.casefold()
-        return name[:-4] if name.endswith(".exe") else name
+        for suffix in (".exe", ".cmd", ".bat", ".ps1", ".com"):
+            if name.endswith(suffix):
+                return name[: -len(suffix)]
+        return name
 
 
 class RuntimeRegistry:
@@ -1239,6 +1434,7 @@ class ManifestPluginInstaller:
         dependency_resolver: DependencyResolver | None = None,
         policy: TrustedInstallationPolicy | None = None,
         artifact_verifier: ArtifactVerifier | None = None,
+        artifact_downloader: ArtifactDownloader | None = None,
         executor: Callable[[RuntimeManifest], str] | None = None,
         runner: Callable[[Sequence[str]], Any] | None = None,
     ) -> None:
@@ -1247,6 +1443,7 @@ class ManifestPluginInstaller:
         self.dependency_resolver = dependency_resolver or DependencyResolver()
         self.policy = policy or TrustedInstallationPolicy()
         self.artifact_verifier = artifact_verifier or ArtifactVerifier()
+        self.artifact_downloader = artifact_downloader or ArtifactDownloader()
         self.executor = executor
         self.runner = runner or self._run_process
 
@@ -1268,14 +1465,16 @@ class ManifestPluginInstaller:
         manifest = self.registry._require_manifest(self.runtime_type)
         trust = self.policy.evaluate(manifest, action)
         command = self.policy.command_for(manifest, action)
+        artifact_url, artifact_path, artifact_sha256 = self.policy.download_spec(manifest)
         write_action = action in {InstallAction.INSTALL, InstallAction.UPDATE, InstallAction.REPAIR, InstallAction.UNINSTALL}
         # Every mutating lifecycle action is an explicit user decision, even
         # when it only connects an existing system executable.  Discovery is
         # the read-only path for a no-confirmation probe.
         requires_approval = write_action
-        risk = "high" if command else ("medium" if write_action else "low")
+        risk = "high" if command or artifact_url else ("medium" if write_action else "low")
         explanation = trust.reason or (
             "connect the detected executable" if action is InstallAction.INSTALL and not command
+            else "download and verify the declared binary" if artifact_url and action is not InstallAction.UNINSTALL
             else "no installer command declared"
         )
         return InstallerPlan(
@@ -1290,6 +1489,9 @@ class ManifestPluginInstaller:
             shell=bool(manifest.installer.get("shell")) if isinstance(manifest.installer, Mapping) else False,
             risk=risk,
             explanation=explanation,
+            artifact_url=artifact_url,
+            artifact_path=artifact_path,
+            artifact_sha256=artifact_sha256,
         )
 
     def verify(self) -> VerificationResult:
@@ -1326,7 +1528,11 @@ class ManifestPluginInstaller:
             # Bind the read-only probe to the path that was actually verified;
             # re-resolving a bare command through PATH could otherwise probe a
             # different executable than the artifact whose hash was checked.
-            result = self.runner((artifact.path, *command[1:]))
+            verified_path = artifact.path
+            if verified_path is None:
+                return VerificationResult(False, checks=tuple(checks),
+                                          reason="verified artifact has no executable path")
+            result = self.runner((verified_path, *command[1:]))
             return_code = getattr(result, "returncode", None)
             if return_code is None and isinstance(result, tuple):
                 return_code = result[0]
@@ -1387,7 +1593,7 @@ class ManifestPluginInstaller:
                 current = self.registry._transition(current, target_state)
             self._emit(action, "installation", "started", f"{action.value} started", {"plan": plan.to_dict()})
             try:
-                path = self._run_install_command(manifest, plan)
+                path = self._run_install_command(manifest, plan, action=action, current=current)
                 if path:
                     current = self.registry._replace(current, path=path)
                     self.registry._set_installation(current)
@@ -1438,7 +1644,7 @@ class ManifestPluginInstaller:
                 raise RuntimeUnavailable(f"built-in runtime cannot be uninstalled: {self.runtime_type}")
             self._emit(action, "uninstallation", "started", "Uninstall started", {"plan": plan.to_dict()})
             try:
-                self._run_install_command(manifest, plan)
+                self._run_install_command(manifest, plan, action=action, current=current)
                 result = self.registry._transition(
                     current, InstallState.NOT_INSTALLED, path=None, capability_verified=False,
                     health="unknown", last_error=None, verified=False,
@@ -1452,7 +1658,37 @@ class ManifestPluginInstaller:
                 raise
         raise ValueError(f"unsupported installer action: {action.value}")
 
-    def _run_install_command(self, manifest: RuntimeManifest, plan: InstallerPlan) -> str | None:
+    def _run_install_command(
+        self,
+        manifest: RuntimeManifest,
+        plan: InstallerPlan,
+        *,
+        action: InstallAction,
+        current: RuntimeInstallation | None = None,
+    ) -> str | None:
+        if manifest.acquisition is AcquisitionType.DOWNLOAD_BINARY:
+            download_url, target_path, expected_hash = self.policy.download_spec(manifest)
+            if action is InstallAction.UNINSTALL and not plan.command:
+                if not current or not current.path:
+                    return None
+                if not target_path or self._path_key(current.path) != self._path_key(target_path):
+                    raise RuntimeUnavailable(
+                        "refusing to remove a downloaded artifact outside its declared resultPath"
+                    )
+                Path(current.path).unlink(missing_ok=True)
+                return None
+            if not download_url or not target_path or not expected_hash:
+                raise RuntimeUnavailable("downloaded binary installer metadata is incomplete")
+            self._emit(
+                action,
+                "download",
+                "started",
+                "Downloading declared runtime artifact",
+                {"url": download_url, "target": target_path, "sha256": expected_hash},
+            )
+            result = self.artifact_downloader.download(download_url, target_path, expected_hash)
+            self._emit(action, "download", "completed", "Runtime artifact downloaded and verified", result.to_dict())
+            return result.path
         if self.executor is not None:
             return self.executor(manifest)
         if not plan.command:
@@ -1465,6 +1701,10 @@ class ManifestPluginInstaller:
             raise RuntimeUnavailable(f"installer command failed with exit code {return_code}")
         configured_path = manifest.installer.get("resultPath") if isinstance(manifest.installer, Mapping) else None
         return str(configured_path) if configured_path else None
+
+    @staticmethod
+    def _path_key(value: str | Path) -> str:
+        return os.path.normcase(os.path.abspath(str(Path(value).expanduser())))
 
     @staticmethod
     def _run_process(command: Sequence[str]) -> Any:
@@ -1520,12 +1760,14 @@ class InstallerBroker:
         runner: Callable[[Sequence[str]], Any] | None = None,
         dependency_resolver: DependencyResolver | None = None,
         policy: TrustedInstallationPolicy | None = None,
+        artifact_downloader: ArtifactDownloader | None = None,
     ) -> None:
         self.registry = registry
         self.executor = executor
         self.runner = runner
         self.dependency_resolver = dependency_resolver or DependencyResolver()
         self.policy = policy or TrustedInstallationPolicy()
+        self.artifact_downloader = artifact_downloader or ArtifactDownloader()
         self._installers: dict[str, ManifestPluginInstaller] = {}
 
     def installer(self, runtime_type: str) -> ManifestPluginInstaller:
@@ -1535,6 +1777,7 @@ class InstallerBroker:
                 self.registry, runtime_type,
                 dependency_resolver=self.dependency_resolver,
                 policy=self.policy,
+                artifact_downloader=self.artifact_downloader,
                 executor=self.executor,
                 runner=self.runner,
             )
@@ -1574,3 +1817,51 @@ class InstallerBroker:
 
     def uninstall(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
         return self.installer(runtime_type).uninstall(approved=approved)
+
+
+class RuntimeManager:
+    """Host-owned Runtime Plane facade over Registry and InstallerBroker.
+
+    The manager is the stable lifecycle entrypoint for Studio integrations.
+    It keeps manifest/discovery/installation concerns together without making
+    vendor adapters or Marketplace payloads responsible for Registry writes.
+    Authentication and capability probes remain adapter-owned and are exposed
+    separately through the runtime contract.
+    """
+
+    def __init__(self, registry: RuntimeRegistry, broker: InstallerBroker | None = None) -> None:
+        self.registry = registry
+        self.broker = broker or InstallerBroker(registry)
+
+    def list(self) -> list[dict[str, Any]]:
+        return self.registry.list()
+
+    def manifest(self, runtime_type: str) -> RuntimeManifest:
+        return self.registry._require_manifest(runtime_type)
+
+    def installation(self, runtime_type: str) -> RuntimeInstallation:
+        return self.registry._require_installation(runtime_type)
+
+    def installer(self, runtime_type: str) -> ManifestPluginInstaller:
+        return self.broker.installer(runtime_type)
+
+    def discover(self, runtime_type: str) -> RuntimeInstallation:
+        return self.broker.discover(runtime_type)
+
+    def plan(self, runtime_type: str, action: InstallAction = InstallAction.INSTALL) -> InstallerPlan:
+        return self.broker.plan(runtime_type, action)
+
+    def diagnostics(self, runtime_type: str) -> dict[str, Any]:
+        return self.broker.diagnostics(runtime_type)
+
+    def install(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
+        return self.broker.install(runtime_type, approved=approved)
+
+    def update(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
+        return self.broker.update(runtime_type, approved=approved)
+
+    def repair(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
+        return self.broker.repair(runtime_type, approved=approved)
+
+    def uninstall(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
+        return self.broker.uninstall(runtime_type, approved=approved)

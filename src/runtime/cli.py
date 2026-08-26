@@ -389,7 +389,7 @@ class StructuredCliRuntime:
             poll = getattr(process, "poll", None)
             if callable(poll):
                 value = poll()
-        return value
+        return value if isinstance(value, int) else None
 
     def _command(self, task: AgentTask, plan: ComputePlan) -> tuple[str, ...]:
         raise NotImplementedError
@@ -434,6 +434,7 @@ class StructuredCliRuntime:
         return any(task_id in self._cancelled for task_id in task_ids)
 
     def _artifact(self, payload: Any, stdout: str, stderr: str) -> dict[str, Any]:
+        artifact: dict[str, Any]
         if isinstance(payload, Mapping):
             result = payload.get("result")
             content = result if isinstance(result, str) else payload.get("content")
@@ -503,7 +504,7 @@ class StructuredCliRuntime:
 
 
 class ClaudeCodeRuntime(StructuredCliRuntime):
-    """Claude Code ``--print --output-format json`` adapter."""
+    """Claude Code ``-p --output-format json`` adapter."""
 
     runtime_type = "claude-code"
     executable = "claude"
@@ -536,8 +537,12 @@ class ClaudeCodeRuntime(StructuredCliRuntime):
         return (self.executable, "auth", "status")
 
     def _parse_auth_result(self, returncode: int | None, output: str, error: str) -> AuthState:
-        if returncode not in (0, None):
-            return AuthState("not_authenticated", detail=error or "Claude auth status failed")
+        diagnostic = str(error or "").strip()
+        if returncode not in (0, None) or diagnostic:
+            return AuthState(
+                "not_authenticated",
+                detail=diagnostic or "Claude auth status failed",
+            )
         try:
             payload = json.loads(output or "{}")
         except json.JSONDecodeError:
@@ -550,6 +555,64 @@ class ClaudeCodeRuntime(StructuredCliRuntime):
             account_label=str(account) if account else None,
             detail="claude auth status",
         )
+
+
+class GeminiCliRuntime(StructuredCliRuntime):
+    """Gemini CLI adapter using its read-only plan and JSON output modes."""
+
+    runtime_type = "gemini-cli"
+    executable = "gemini"
+    integration_grade = "C"
+    default_model_id = "default"
+
+    def _command(self, task: AgentTask, plan: ComputePlan) -> tuple[str, ...]:
+        command: list[str] = [
+            self.executable,
+            "-p",
+            self._prompt(task),
+            "--output-format",
+            "json",
+            "--approval-mode",
+            "plan",
+        ]
+        if plan.model_id and plan.model_id not in {"default", "gemini-default"}:
+            command.extend(("--model", plan.model_id))
+        return tuple(command)
+
+    def _auth_command(self) -> tuple[str, ...]:
+        # Gemini CLI owns its login state.  Listing sessions is read-only and
+        # returns the vendor's actual authentication error when unavailable.
+        return (self.executable, "--list-sessions")
+
+    def _parse_auth_result(self, returncode: int | None, output: str, error: str) -> AuthState:
+        diagnostic = str(error or "").strip()
+        if returncode not in (0, None) or diagnostic:
+            return AuthState(
+                "not_authenticated",
+                detail=diagnostic or output or "Gemini CLI session probe failed",
+            )
+        return AuthState("authenticated", detail="gemini session probe")
+
+
+class LocalCliRuntime(StructuredCliRuntime):
+    """Explicitly configured local CLI adapter; no vendor auth is assumed."""
+
+    runtime_type = "local-runtime"
+    integration_grade = "C"
+    default_model_id = "default"
+
+    def __init__(self, runs: AgentRunStore, *, command_prefix: Sequence[str], **kwargs: Any) -> None:
+        self.command_prefix = tuple(str(item) for item in command_prefix if str(item).strip())
+        if not self.command_prefix:
+            raise ValueError("local runtime command_prefix is required")
+        super().__init__(runs, executable=self.command_prefix[0], **kwargs)
+
+    def _command(self, task: AgentTask, plan: ComputePlan) -> tuple[str, ...]:
+        del plan
+        return (*self.command_prefix, self._prompt(task))
+
+    async def authenticate(self) -> AuthState:
+        return AuthState("authenticated", detail="local runtime does not require vendor authentication")
 
 
 class _CompletedProbe:

@@ -386,7 +386,9 @@ class ApprovalEngine:
             exception_type, message, details = failure
             if exception_type is KeyError:
                 raise KeyError(message)
-            raise exception_type(message, details=details)
+            if issubclass(exception_type, DomainApprovalRequired):
+                raise DomainApprovalRequired(message, details=details)
+            raise exception_type(message)
         assert updated is not None
         return updated
 
