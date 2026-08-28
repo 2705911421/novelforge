@@ -1,9 +1,32 @@
-"""LLM统一客户端 - 支持OpenAI兼容接口"""
+"""Deprecated direct LLM client kept only for explicit development compatibility.
+
+Production calls must enter ``PersistentModelRuntime`` and the Host-owned
+``RuntimeRouter`` so task ownership, ContextBundle provenance, budgets, and
+AgentRun recovery cannot be bypassed by a config-only HTTP client.
+"""
 
 import json
+import os
 import httpx
 from dataclasses import dataclass
 from typing import Optional
+
+
+_LEGACY_LLM_CLIENT_OPT_IN = "NOVELFORGE_ENABLE_LEGACY_LLM_CLIENT"
+
+
+def require_legacy_llm_client(operation: str) -> None:
+    """Prevent the config-only provider path from becoming a production seam."""
+    enabled = os.environ.get(_LEGACY_LLM_CLIENT_OPT_IN, "").strip().lower() in {
+        "1", "true", "yes",
+    }
+    deployment = os.environ.get("NOVELFORGE_ENV", "development").strip().lower()
+    if not enabled or deployment in {"production", "prod", "staging"}:
+        raise RuntimeError(
+            "LEGACY_LLM_CLIENT_DISABLED: "
+            f"{operation} is deprecated and bypasses the durable RuntimeRouter; "
+            f"set {_LEGACY_LLM_CLIENT_OPT_IN}=1 only for development compatibility."
+        )
 
 
 @dataclass
@@ -29,6 +52,7 @@ class LLMClient:
     def chat(self, messages: list, system: str = "", temperature: Optional[float] = None,
              max_tokens: Optional[int] = None, json_mode: bool = False) -> LLMResponse:
         """同步聊天接口"""
+        require_legacy_llm_client("LLMClient.chat")
         headers = {
             "Content-Type": "application/json",
         }

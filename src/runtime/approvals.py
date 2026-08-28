@@ -36,6 +36,29 @@ class ApprovalStatus(str, Enum):
     EXPIRED = "expired"
 
 
+# Approval is a Host decision.  Keep the accepted actor vocabulary narrow so
+# a provider/runtime label cannot be promoted to an authority credential by
+# simply being copied into a task or control payload.
+HOST_APPROVAL_ACTORS = frozenset({"author", "studio", "user", "human", "operator", "system"})
+AUTHOR_APPROVAL_ACTORS = frozenset({"author", "studio", "user", "human", "operator"})
+UNTRUSTED_APPROVAL_ACTORS = frozenset({
+    "agent", "assistant", "provider", "runtime", "model", "codex", "claude", "gemini",
+    "codex-app-server", "claude-code", "gemini-cli",
+})
+
+
+def _actor_key(actor: str | None) -> str:
+    return str(actor or "").strip().lower()
+
+
+def is_host_approval_actor(actor: str | None) -> bool:
+    return _actor_key(actor) in HOST_APPROVAL_ACTORS
+
+
+def is_author_approval_actor(actor: str | None) -> bool:
+    return _actor_key(actor) in AUTHOR_APPROVAL_ACTORS
+
+
 @dataclass(frozen=True)
 class Approval:
     approval_id: str
@@ -162,12 +185,15 @@ class ApprovalEngine:
         return self._from_row(row)
 
     def approve(self, approval_id: str, *, approved_by: str = "system", reason: str = "") -> Approval:
+        self._require_host_actor(approved_by)
         return self._decide(approval_id, ApprovalStatus.APPROVED, actor=approved_by, reason=reason)
 
     def reject(self, approval_id: str, *, rejected_by: str = "system", reason: str = "") -> Approval:
+        self._require_host_actor(rejected_by)
         return self._decide(approval_id, ApprovalStatus.REJECTED, actor=rejected_by, reason=reason)
 
     def revoke(self, approval_id: str, *, revoked_by: str = "system", reason: str = "") -> Approval:
+        self._require_host_actor(revoked_by)
         return self._decide(
             approval_id,
             ApprovalStatus.REVOKED,
@@ -175,6 +201,17 @@ class ApprovalEngine:
             reason=reason,
             allowed={ApprovalStatus.REQUESTED, ApprovalStatus.APPROVED},
         )
+
+    @staticmethod
+    def _require_host_actor(actor: str | None) -> str:
+        """Keep every approval decision behind the Host actor boundary."""
+        actor_key = _actor_key(actor)
+        if actor_key in UNTRUSTED_APPROVAL_ACTORS or actor_key not in HOST_APPROVAL_ACTORS:
+            raise DomainApprovalRequired(
+                "provider/runtime actors cannot decide Host approvals",
+                details={"actor": actor_key or None, "approvalCode": "HOST_ACTOR_REQUIRED"},
+            )
+        return actor_key
 
     def consume(
         self,
@@ -461,4 +498,8 @@ class ApprovalEngine:
             return True
 
 
-__all__ = ["Approval", "ApprovalEngine", "ApprovalStatus"]
+__all__ = [
+    "Approval", "ApprovalEngine", "ApprovalStatus", "AUTHOR_APPROVAL_ACTORS",
+    "HOST_APPROVAL_ACTORS", "UNTRUSTED_APPROVAL_ACTORS", "is_author_approval_actor",
+    "is_host_approval_actor",
+]

@@ -2,15 +2,32 @@
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from ..core.models import (
     StoryProject, WorldSetting, Character, Faction,
     Location, Foreshadowing, Volume, Arc
 )
 from ..core.project import ProjectManager
+from ..creation.legacy_modes import require_legacy_creation_mode
 from ..llm.client import MultiModelManager
 from ..llm.prompts import PromptManager
+
+
+_WORLD_PROPOSAL_LIST_FIELDS = (
+    "characters",
+    "factions",
+    "locations",
+    "volumes",
+    "timeline",
+    "foreshadowing",
+)
+_WORLD_PROPOSAL_REQUIRED_FIELDS = (
+    "world",
+    *_WORLD_PROPOSAL_LIST_FIELDS,
+    "writing_style",
+    "author_intent",
+)
 
 
 class WorldWizard:
@@ -22,19 +39,49 @@ class WorldWizard:
         self.prompts = PromptManager()
 
     def build_world(self, user_input: str, project: StoryProject,
-                    existing_data: Optional[dict] = None) -> dict:
-        """构建完整世界观设定
+                    existing_data: Optional[dict] = None, *, apply: bool = False) -> dict[str, Any]:
+        """Generate a world proposal without mutating the project by default.
 
         Args:
             user_input: 用户提供的初始设定描述（可以是txt/md/docx导入的内容）
             project: 项目对象
             existing_data: 已有的设定数据（用于增量构建）
+            apply: Explicitly apply the proposal through the deprecated
+                file-backed compatibility path.  Production callers must use
+                the Story Bible author-confirmation and publish flow instead.
 
         Returns:
-            完整的世界观设定字典
+            可供作者审阅的世界观设定提案
         """
-        client = self.models.get_writer()
+        response = self.generate_world_proposal(
+            user_input,
+            project=project,
+            existing_data=existing_data,
+        )
+        if apply and "error" not in response:
+            require_legacy_creation_mode("WorldWizard.build_world(apply=True)")
+            self._apply_world_data(project, response)
+        return response
 
+    def generate_world_proposal(
+        self,
+        user_input: str,
+        *,
+        project: Optional[StoryProject] = None,
+        existing_data: Optional[dict] = None,
+    ) -> dict[str, Any]:
+        """Generate a durable-task-safe proposal and never mutate Canon.
+
+        ``project`` is accepted for compatibility and for callers that want
+        to supply it as a future context source; the current prompt only uses
+        the explicit ``existing_data`` snapshot.  The returned mapping is an
+        AI artifact, not an authoritative project update.
+        """
+        del project
+        return self._request_world_json(user_input, existing_data=existing_data)
+
+    def _request_world_json(self, user_input: str, *, existing_data: Optional[dict] = None) -> dict[str, Any]:
+        """Call the task-aware planner route and return its JSON artifact."""
         system_prompt = self.prompts.load("world_wizard")
 
         messages = [
@@ -63,13 +110,16 @@ class WorldWizard:
 """}
         ]
 
-        response = client.chat_json(messages, system_prompt)
-
-        # 解析并应用到项目
-        if "error" not in response:
-            self._apply_world_data(project, response)
-
-        return response
+        manager_chat_json = getattr(self.models, "chat_json", None)
+        if callable(manager_chat_json):
+            response = manager_chat_json(
+                messages,
+                system_prompt,
+                task_type="world-bootstrap",
+            )
+        else:
+            response = self.models.get_writer().chat_json(messages, system_prompt)
+        return self._validate_world_proposal(response, operation="world bootstrap")
 
     def import_world_file(self, file_path: str) -> str:
         """导入世界设定文件"""
@@ -100,9 +150,8 @@ class WorldWizard:
         except ImportError:
             raise ImportError("需要安装 python-docx: pip install python-docx")
 
-    def refine_world(self, project: StoryProject, feedback: str) -> dict:
-        """根据用户反馈精炼世界观"""
-        client = self.models.get_writer()
+    def refine_world(self, project: StoryProject, feedback: str, *, apply: bool = False) -> dict[str, Any]:
+        """Generate a refinement proposal without mutating the project by default."""
         system_prompt = self.prompts.load("world_wizard")
 
         current_world = project.to_dict()
@@ -119,9 +168,61 @@ class WorldWizard:
 """}
         ]
 
-        response = client.chat_json(messages, system_prompt)
-        if "error" not in response:
+        manager_chat_json = getattr(self.models, "chat_json", None)
+        if callable(manager_chat_json):
+            response = manager_chat_json(
+                messages,
+                system_prompt,
+                task_type="world-bootstrap",
+            )
+        else:
+            response = self.models.get_writer().chat_json(messages, system_prompt)
+        response = self._validate_world_proposal(response, operation="world refinement")
+        if apply:
+            require_legacy_creation_mode("WorldWizard.refine_world(apply=True)")
             self._apply_world_data(project, response)
+
+        return response
+
+    @staticmethod
+    def _validate_world_proposal(response: Any, *, operation: str) -> dict[str, Any]:
+        """Reject incomplete model artifacts before they become proposals.
+
+        A world proposal is still non-canonical until the author confirms it,
+        but an empty or error-shaped object must not reach the durable
+        ``proposal-ready`` checkpoint.  The contract is intentionally
+        structural: individual list entries remain author-reviewable rather
+        than being silently filled with invented defaults.
+        """
+        if not isinstance(response, dict):
+            raise TypeError(f"{operation} provider returned a non-object proposal")
+        if "error" in response:
+            raise ValueError(f"{operation} provider returned an error artifact")
+
+        missing = [key for key in _WORLD_PROPOSAL_REQUIRED_FIELDS if key not in response]
+        if missing:
+            raise ValueError(
+                f"{operation} proposal is incomplete; missing fields: {', '.join(missing)}"
+            )
+
+        world = response["world"]
+        if not isinstance(world, dict) or not str(world.get("name") or "").strip():
+            raise ValueError(f"{operation} proposal has no world name")
+
+        for field in _WORLD_PROPOSAL_LIST_FIELDS:
+            if not isinstance(response[field], list):
+                raise ValueError(f"{operation} proposal field {field} must be an array")
+
+        for field in ("writing_style", "author_intent"):
+            value = response[field]
+            if isinstance(value, str):
+                valid = bool(value.strip())
+            elif isinstance(value, (dict, list)):
+                valid = bool(value)
+            else:
+                valid = False
+            if not valid:
+                raise ValueError(f"{operation} proposal field {field} is empty")
 
         return response
 

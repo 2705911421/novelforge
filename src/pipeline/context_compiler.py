@@ -52,31 +52,96 @@ class ContextCompiler:
     """Select context without silently dropping author constraints."""
 
     DEFAULT_BUDGET_TOKENS = 24_000
-    HARD_TYPES = {"constraints", "style", "story_bible", "planning_node", "chapter_intent"}
+    PRIORITY_VALUES = {"P0": 400, "P1": 300, "P2": 200, "P3": 100}
+    P0_TYPES = {
+        "author_intent", "constraints", "style", "world_rule",
+        "world_rules", "story_bible", "planning_node", "chapter_intent",
+        "chapter_plan", "story_fact", "story_facts", "canonical_fact",
+        "narrative_memory", "canonical_memory", "story_state", "current_canon",
+        "canon",
+    }
+    HARD_TYPES = P0_TYPES
+    PRIORITY_BY_TYPE = {
+        **{source_type: 400 for source_type in P0_TYPES},
+        "character_state": 300,
+        "character": 300,
+        "location": 300,
+        "faction": 300,
+        "relationship": 300,
+        "foreshadow": 300,
+        "foreshadowing": 300,
+        "active_foreshadowing": 300,
+        "arc": 300,
+        "plot_arc": 300,
+        "chapter_summary": 200,
+        "planning_source": 200,
+        "rag_chunk": 200,
+        "story_graph": 200,
+        "story_graph_node": 200,
+        "style_sample": 100,
+        "background": 100,
+        "assembled_context": 100,
+        "planner_output": 100,
+        "revision_instruction": 100,
+        "extra_guidance": 100,
+    }
     AUTHORITY = {
         "constraints": "author_constraint",
+        "author_intent": "author_constraint",
         "style": "author_constraint",
         "story_bible": "published_canon_plan",
+        "world_rule": "published_canon_plan",
+        "world_rules": "published_canon_plan",
         "planning_node": "author_planning_overlay",
         "chapter_intent": "author_planning_overlay",
+        "chapter_plan": "author_planning_overlay",
         "story_fact": "canonical_fact_projection",
+        "story_facts": "canonical_fact_projection",
+        "canonical_fact": "canonical_fact_projection",
         "narrative_memory": "canonical_memory_projection",
+        "canonical_memory": "canonical_memory_projection",
+        "story_state": "canonical_state_projection",
+        "current_canon": "canonical_state_projection",
+        "canon": "canonical_state_projection",
         "chapter_summary": "canonical_chapter_projection",
         "rag_chunk": "retrieval_projection",
         "story_graph": "read_model_projection",
         "story_graph_node": "read_model_projection",
     }
 
+    @staticmethod
+    def _normalize_source_type(value: Any) -> str:
+        return str(value or "assembled_context").strip().lower().replace("-", "_").replace(" ", "_")
+
+    @classmethod
+    def _default_priority(cls, source_type: str, *, hard: bool = False) -> int:
+        normalized = cls._normalize_source_type(source_type)
+        if normalized in cls.PRIORITY_BY_TYPE:
+            return cls.PRIORITY_BY_TYPE[normalized]
+        return cls.PRIORITY_VALUES["P0"] if hard else cls.PRIORITY_VALUES["P3"]
+
+    @classmethod
+    def _parse_priority(cls, value: Any, default: int) -> int:
+        if value is None:
+            return default
+        text = str(value).strip().upper()
+        if text in cls.PRIORITY_VALUES:
+            return cls.PRIORITY_VALUES[text]
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
     @classmethod
     def from_manifest(cls, content: str, item: dict[str, Any]) -> ContextSection:
         source_type = str(item.get("sourceType") or "assembled_context")
-        hard = bool(item.get("hardConstraint")) or source_type in cls.HARD_TYPES
-        authority = str(item.get("authorityClass") or cls.AUTHORITY.get(source_type, "derived"))
-        priority = item.get("priority", 100 if hard else 50)
-        try:
-            priority = int(priority)
-        except (TypeError, ValueError):
-            priority = 50
+        normalized_source_type = cls._normalize_source_type(source_type)
+        hard = bool(item.get("hardConstraint")) or normalized_source_type in cls.HARD_TYPES
+        authority = str(item.get("authorityClass") or cls.AUTHORITY.get(normalized_source_type, "derived"))
+        default_priority = cls._default_priority(normalized_source_type, hard=hard)
+        priority = cls._parse_priority(item.get("priority"), default_priority)
+        if normalized_source_type in cls.P0_TYPES:
+            priority = max(priority, cls.PRIORITY_VALUES["P0"])
         return ContextSection(
             content=content,
             source_type=source_type,
@@ -109,6 +174,14 @@ class ContextCompiler:
             if checksum in seen:
                 continue
             seen.add(checksum)
+            normalized_source_type = cls._normalize_source_type(section.source_type)
+            hard = bool(section.hard_constraint) or normalized_source_type in cls.HARD_TYPES
+            priority = cls._parse_priority(
+                section.priority,
+                cls._default_priority(normalized_source_type, hard=hard),
+            )
+            if normalized_source_type in cls.P0_TYPES:
+                priority = max(priority, cls.PRIORITY_VALUES["P0"])
             candidates.append({
                 "index": index,
                 "content": content,
@@ -116,8 +189,8 @@ class ContextCompiler:
                 "sourceId": section.source_id,
                 "sourceVersion": section.source_version,
                 "authorityClass": section.authority_class,
-                "priority": section.priority,
-                "hardConstraint": section.hard_constraint,
+                "priority": priority,
+                "hardConstraint": hard,
                 "provenance": section.provenance or {},
                 "selectionReason": section.selection_reason,
                 "checksum": checksum,
@@ -208,11 +281,16 @@ class ContextCompiler:
     @classmethod
     def decorate_manifest_item(cls, item: dict[str, Any]) -> dict[str, Any]:
         source_type = str(item.get("sourceType") or "assembled_context")
-        hard = bool(item.get("hardConstraint")) or source_type in cls.HARD_TYPES
+        normalized_source_type = cls._normalize_source_type(source_type)
+        hard = bool(item.get("hardConstraint")) or normalized_source_type in cls.HARD_TYPES
         item.setdefault("sourceVersion", str(item.get("sourceVersionId") or ""))
-        item.setdefault("authorityClass", cls.AUTHORITY.get(source_type, "derived"))
-        item.setdefault("priority", 100 if hard else 50)
-        item.setdefault("hardConstraint", hard)
+        item.setdefault("authorityClass", cls.AUTHORITY.get(normalized_source_type, "derived"))
+        default_priority = cls._default_priority(normalized_source_type, hard=hard)
+        priority = cls._parse_priority(item.get("priority"), default_priority)
+        if normalized_source_type in cls.P0_TYPES:
+            priority = max(priority, cls.PRIORITY_VALUES["P0"])
+        item["priority"] = priority
+        item["hardConstraint"] = hard
         item.setdefault("included", True)
         item.setdefault("excludedReason", "")
         item.setdefault("selectionReason", item.get("reason") or "candidate assembled by Context Compiler")

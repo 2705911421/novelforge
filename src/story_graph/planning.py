@@ -12,12 +12,16 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from copy import deepcopy
 from datetime import datetime
+import hashlib
 import json
 import uuid
 from typing import Any, Iterable, Optional
 
 from src.core.database import Database
+from src.core.task_runtime import TaskRuntime
 from src.planning.plot_workspace import PlotRevisionConflict, PlotWorkspaceError, PlotWorkspaceRepository
+from src.runtime.approvals import is_author_approval_actor
+from src.runtime.persistence import ProposalStore
 
 from .service import (
     EDGE_TYPES,
@@ -114,10 +118,11 @@ def _edge_type(edge: dict[str, Any]) -> str:
 class StoryFlowPlanningService:
     """Persist and validate author/AI planning overlays."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, *, task_runtime: TaskRuntime | None = None):
         self.db = db
         self.workspace = PlotWorkspaceRepository(db)
         self.projector = StoryGraphProjector(db)
+        self.task_runtime = task_runtime or TaskRuntime(db)
 
     def load(self, book_id: str) -> tuple[dict[str, Any], int]:
         self._require_book(book_id)
@@ -126,7 +131,460 @@ class StoryFlowPlanningService:
         except PlotWorkspaceError as exc:
             raise StoryFlowPlanningError(str(exc)) from exc
 
-    def add_node(
+    def preview_delta(
+        self,
+        book_id: str,
+        delta: dict[str, Any],
+        expected_revision: Optional[int] = None,
+        *,
+        persist: bool = False,
+        initiated_by: str = "author",
+    ) -> dict[str, Any]:
+        """Build a read-only StoryFlow proposal and impact preview.
+
+        The returned graph is an in-memory projection of the requested
+        planning change.  The default service call does not initialize or
+        reconcile the persisted workspace, increment its revision, or write
+        any Canon table.  The HTTP Host may opt into ``persist`` to record the
+        preview as a task-linked Proposal; that still does not modify the
+        planning overlay or Canon until :meth:`apply_proposal` is called.
+        """
+        self._require_book(book_id)
+        try:
+            current, preview, revision, workspace_initialized = self.workspace.preview_delta(
+                book_id,
+                delta,
+                expected_revision=expected_revision,
+            )
+        except PlotRevisionConflict:
+            # Preserve optimistic-concurrency semantics for the HTTP Host.
+            # A revision conflict is a client-visible 409, not a generic
+            # planning validation failure.
+            raise
+        except PlotWorkspaceError as exc:
+            raise StoryFlowPlanningError(str(exc)) from exc
+
+        if isinstance(delta.get("graph"), dict):
+            self._validate_full_graph_delta(delta["graph"])
+        else:
+            operations = delta.get("operations", [])
+            if not isinstance(operations, list):
+                raise StoryFlowPlanningError("plot operations must be an array")
+            self._validate_lifecycle_operations(book_id, operations, graph=current)
+
+        diff = self._graph_diff(current, preview)
+        impact = self._preview_impact(book_id, current, preview, diff)
+        serialized = json.dumps(
+            {"bookId": book_id, "revision": revision, "delta": delta},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        proposal_id = f"storyflow-preview:{hashlib.sha256(serialized.encode('utf-8')).hexdigest()}"
+        response = {
+            "proposal": {
+                "proposalId": proposal_id,
+                "proposalType": "storyflow_planning_change",
+                "status": "PROPOSED",
+                "bookId": book_id,
+                "revision": revision,
+                "workspaceInitialized": workspace_initialized,
+                "requiresAuthorConfirmation": True,
+                "canonicalMutation": False,
+            },
+            "revision": revision,
+            "graph": preview,
+            "previewDiff": diff,
+            "impactAnalysis": impact,
+            "canonicalMutation": False,
+            "nextAction": "confirm_planning_update",
+        }
+        if persist:
+            proposal_record, task_record = self._persist_preview_proposal(
+                book_id,
+                proposal_id,
+                delta,
+                revision,
+                diff,
+                impact,
+                initiated_by=initiated_by,
+            )
+            response["proposal"] = {
+                **response["proposal"],
+                "taskId": proposal_record.get("task_id"),
+                "agentTaskId": proposal_record.get("agent_task_id"),
+            }
+            response["proposalRecord"] = proposal_record
+            response["task"] = task_record
+        return response
+
+    def _persist_preview_proposal(
+        self,
+        book_id: str,
+        proposal_id: str,
+        delta: dict[str, Any],
+        revision: int,
+        diff: dict[str, Any],
+        impact: dict[str, Any],
+        *,
+        initiated_by: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Persist one idempotent, author-decision StoryFlow proposal."""
+        store = ProposalStore(self.db)
+        existing = store.get(proposal_id)
+        if existing is not None:
+            task = self.task_runtime.get(str(existing.get("task_id"))) if existing.get("task_id") else None
+            return existing, task or {}
+
+        book = self.db.fetchone("SELECT project_id FROM books WHERE id=?", (book_id,))
+        if not book:
+            raise StoryFlowPlanningError(f"book not found: {book_id}")
+        project_id = str(book.get("project_id") or "").strip() or None
+        payload = {
+            "schemaVersion": 1,
+            "proposalId": proposal_id,
+            "proposalType": "storyflow_planning_change",
+            "bookId": book_id,
+            "expectedRevision": revision,
+            "delta": deepcopy(delta),
+            "previewDiff": deepcopy(diff),
+            "impactAnalysis": deepcopy(impact),
+            "requiresAuthorConfirmation": True,
+            "canonicalMutation": False,
+        }
+        task_data = {
+            "proposalId": proposal_id,
+            "proposalType": "storyflow_planning_change",
+            "bookId": book_id,
+            "expectedRevision": revision,
+            "delta": deepcopy(delta),
+            "constraints": {
+                "canon_write": False,
+                "planning_write": False,
+                "requires_author_confirmation": True,
+            },
+            "expectedOutput": "StoryFlowPlanningProposal",
+            "initiatedBy": str(initiated_by or "author").strip() or "author",
+        }
+        task = self.task_runtime.enqueue(
+            "storyflow-planning-change",
+            project_id=project_id,
+            book_id=book_id,
+            stage="awaiting_author_confirmation",
+            data=task_data,
+            idempotency_key=f"storyflow-planning:{proposal_id}",
+            initiated_by=initiated_by,
+            initial_status="needs_author_decision",
+        )
+        record = store.create(
+            proposal_id=proposal_id,
+            proposal_type="storyflow_planning_change",
+            payload=payload,
+            durable_task_id=str(task["id"]),
+            project_id=project_id,
+            book_id=book_id,
+        )
+        return record, task
+
+    def apply_proposal(
+        self,
+        book_id: str,
+        proposal_id: str,
+        *,
+        expected_revision: Optional[int] = None,
+        decided_by: str = "author",
+    ) -> dict[str, Any]:
+        """Apply an author-confirmed StoryFlow proposal atomically.
+
+        The stored Proposal payload, optimistic revision, overlay revision
+        history, Proposal decision, and non-executing AgentTask completion are
+        all fenced by the same Host transaction.  No StoryCommit, Canon fact,
+        or Narrative Event is created by this planning operation.
+        """
+        if not is_author_approval_actor(decided_by):
+            raise StoryFlowPlanningError(
+                "StoryFlow planning changes require an author-facing Host actor"
+            )
+        self._require_book(book_id)
+        store = ProposalStore(self.db)
+        proposal = store.get(proposal_id)
+        if proposal is None:
+            raise StoryFlowPlanningError(f"planning proposal not found: {proposal_id}")
+        if proposal.get("proposal_type") != "storyflow_planning_change":
+            raise StoryFlowPlanningError("proposal is not a StoryFlow planning change")
+        if str(proposal.get("book_id") or "") != str(book_id):
+            raise StoryFlowPlanningError("planning proposal is outside the book scope")
+        status = str(proposal.get("status") or "").upper()
+        if status == "ACCEPTED":
+            task = self.task_runtime.get(str(proposal.get("task_id"))) if proposal.get("task_id") else None
+            result = task.get("result") if isinstance(task, dict) else None
+            result = result if isinstance(result, dict) else {}
+            if result.get("graph"):
+                return {
+                    **result,
+                    "proposal": proposal,
+                    "task": task or {},
+                    "alreadyApplied": True,
+                    "canonicalMutation": False,
+                }
+            graph, revision = self.load(book_id)
+            return {
+                "graph": graph,
+                "revision": revision,
+                "proposal": proposal,
+                "task": task or {},
+                "alreadyApplied": True,
+                "canonicalMutation": False,
+            }
+        if status != "PROPOSED":
+            raise StoryFlowPlanningError(f"planning proposal is not pending: {status}")
+        payload = proposal.get("payload")
+        if not isinstance(payload, dict) or not isinstance(payload.get("delta"), dict):
+            raise StoryFlowPlanningError("planning proposal payload is invalid")
+        delta = deepcopy(payload["delta"])
+        recorded_revision = payload.get("expectedRevision")
+        try:
+            recorded_revision = int(recorded_revision)
+        except (TypeError, ValueError) as exc:
+            raise StoryFlowPlanningError("planning proposal revision is invalid") from exc
+        if expected_revision is not None and int(expected_revision) != recorded_revision:
+            raise StoryFlowPlanningError(
+                f"planning proposal revision conflict: expected {expected_revision}, "
+                f"proposal {recorded_revision}"
+            )
+        task_id = str(proposal.get("task_id") or "").strip()
+        if not task_id:
+            raise StoryFlowPlanningError("planning proposal is missing its durable task")
+        task = self.task_runtime.get(task_id)
+        if task is None or str(task.get("book_id") or task.get("bookId") or "") != str(book_id):
+            raise StoryFlowPlanningError("planning proposal task is outside the book scope")
+
+        # The preview may have observed an uninitialised workspace.  Seeding
+        # that rebuildable projection is safe, but it must happen before the
+        # atomic revision/decision transaction because the generic workspace
+        # updater intentionally requires an existing row.
+        if self.db.fetchone("SELECT id FROM plot_workspaces WHERE book_id=?", (book_id,)) is None:
+            self.load(book_id)
+        self.validate_delta(book_id, delta)
+        with self.db.transaction() as conn:
+            current = conn.execute(
+                "SELECT status, book_id, task_id FROM agent_proposals WHERE id=?",
+                (proposal_id,),
+            ).fetchone()
+            if current is None or str(current["status"]).upper() != "PROPOSED":
+                raise StoryFlowPlanningError("planning proposal was changed by another Host")
+            if str(current["book_id"] or "") != str(book_id) or str(current["task_id"] or "") != task_id:
+                raise StoryFlowPlanningError("planning proposal scope changed")
+            graph, revision = self.workspace.apply_delta(
+                book_id,
+                delta,
+                expected_revision=recorded_revision,
+                _connection=conn,
+            )
+            result = {
+                "completed": True,
+                "applied": True,
+                "proposalId": proposal_id,
+                "graph": graph,
+                "revision": revision,
+                "canonicalMutation": False,
+                "nextAction": "planning_overlay_updated",
+            }
+            proposal = store.transition(
+                proposal_id,
+                "ACCEPTED",
+                decided_by=decided_by,
+                reason="author confirmed StoryFlow planning preview",
+                _connection=conn,
+            )
+            self.task_runtime.complete_author_decision_task(
+                task_id,
+                result,
+                actor=decided_by,
+                _connection=conn,
+            )
+        return {
+            **result,
+            "proposal": proposal,
+            "task": self.task_runtime.get(task_id) or {},
+        }
+
+    @staticmethod
+    def _validate_full_graph_delta(graph: dict[str, Any]) -> None:
+        """Validate the status boundary without loading or writing a workspace."""
+        for node in graph.get("nodes", []):
+            if isinstance(node, dict) and _text(node.get("status")).lower() == "accepted":
+                raise StoryFlowPlanningError(
+                    "legacy plot canvas cannot create ACCEPTED planning state"
+                )
+        for edge in graph.get("edges", []):
+            if isinstance(edge, dict) and _text(edge.get("status")).lower() == "accepted":
+                raise StoryFlowPlanningError(
+                    "legacy plot canvas cannot create ACCEPTED planning edge"
+                )
+
+    @staticmethod
+    def _graph_diff(
+        current: dict[str, Any],
+        preview: dict[str, Any],
+        *,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Return bounded, structured node/edge changes for author review."""
+        def index(items: Any) -> dict[str, dict[str, Any]]:
+            return {
+                str(item["id"]): item
+                for item in items
+                if isinstance(item, dict) and item.get("id")
+            }
+
+        def stable(value: Any) -> str:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+
+        def changes(kind: str) -> dict[str, Any]:
+            before = index(current.get(kind, []))
+            after = index(preview.get(kind, []))
+            added_ids = sorted(set(after) - set(before))
+            removed_ids = sorted(set(before) - set(after))
+            changed_ids = sorted(
+                item_id
+                for item_id in set(before) & set(after)
+                if stable(before[item_id]) != stable(after[item_id])
+            )
+            changed = [
+                {
+                    "id": item_id,
+                    "before": deepcopy(before[item_id]),
+                    "after": deepcopy(after[item_id]),
+                }
+                for item_id in changed_ids[:limit]
+            ]
+            return {
+                "added": [deepcopy(after[item_id]) for item_id in added_ids[:limit]],
+                "removed": [deepcopy(before[item_id]) for item_id in removed_ids[:limit]],
+                "changed": changed,
+                "counts": {
+                    "added": len(added_ids),
+                    "removed": len(removed_ids),
+                    "changed": len(changed_ids),
+                },
+                "truncated": any(
+                    count > limit
+                    for count in (len(added_ids), len(removed_ids), len(changed_ids))
+                ),
+            }
+
+        nodes = changes("nodes")
+        edges = changes("edges")
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "hasChanges": any(
+                section["counts"][key] > 0
+                for section in (nodes, edges)
+                for key in ("added", "removed", "changed")
+            ),
+            "bounded": {"limit": limit},
+        }
+
+    def _preview_impact(
+        self,
+        book_id: str,
+        current: dict[str, Any],
+        preview: dict[str, Any],
+        diff: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attach recorded semantic impact to the preview without inference."""
+        before_nodes = {
+            str(node["id"]): node
+            for node in current.get("nodes", [])
+            if isinstance(node, dict) and node.get("id")
+        }
+        after_nodes = {
+            str(node["id"]): node
+            for node in preview.get("nodes", [])
+            if isinstance(node, dict) and node.get("id")
+        }
+        affected_ids: set[str] = {
+            str(item["id"])
+            for section in (diff["nodes"]["added"], diff["nodes"]["removed"])
+            for item in section
+            if isinstance(item, dict) and item.get("id")
+        }
+        affected_ids.update(
+            str(item["id"])
+            for item in diff["nodes"]["changed"]
+            if isinstance(item, dict) and item.get("id")
+        )
+        for section_name in ("added", "removed"):
+            for edge in diff["edges"][section_name]:
+                if isinstance(edge, dict):
+                    affected_ids.update(
+                        str(edge[key])
+                        for key in ("source", "target")
+                        if edge.get(key)
+                    )
+        for change in diff["edges"]["changed"]:
+            for side in ("before", "after"):
+                edge = change.get(side)
+                if isinstance(edge, dict):
+                    affected_ids.update(
+                        str(edge[key])
+                        for key in ("source", "target")
+                        if edge.get(key)
+                    )
+
+        evidence: list[dict[str, Any]] = []
+        for node_id in sorted(affected_ids):
+            node = after_nodes.get(node_id) or before_nodes.get(node_id)
+            if node is None:
+                continue
+            source = _text(node.get("source"))
+            if source in {"author", "ai", "storyflow"} or node_id.startswith("planning:"):
+                evidence.append({
+                    "nodeId": node_id,
+                    "status": "planning_overlay_only",
+                    "impactBoundary": "PLANNED",
+                    "canonicalMutation": False,
+                })
+                continue
+            try:
+                report = self.projector.impact(book_id, node_id, depth=2, limit=120)
+            except StoryGraphError as exc:
+                evidence.append({
+                    "nodeId": node_id,
+                    "status": "unavailable",
+                    "errorType": type(exc).__name__,
+                    "message": str(exc),
+                    "canonicalMutation": False,
+                })
+                continue
+            evidence.append({
+                "nodeId": node_id,
+                "status": "available",
+                "impactBoundary": "CANON",
+                "report": report,
+                "canonicalMutation": False,
+            })
+
+        unavailable = sum(1 for item in evidence if item["status"] == "unavailable")
+        return {
+            "status": "partial" if unavailable else "available",
+            "affectedNodeIds": sorted(affected_ids),
+            "evidence": evidence,
+            "unavailableCount": unavailable,
+            "canonicalMutation": False,
+            "evidenceBoundary": "recorded SQLite semantic edges and planning overlay; no AI inference",
+        }
+
+    def preview_node(
         self,
         book_id: str,
         *,
@@ -140,16 +598,78 @@ class StoryFlowPlanningService:
         node_id: Optional[str] = None,
         anchor_node_id: Optional[str] = None,
         anchor_edge_type: Optional[str] = None,
+        anchor_edge_id: Optional[str] = None,
         anchor_label: str = "",
         anchor_source_port: Optional[str] = None,
         anchor_target_port: Optional[str] = None,
         anchor_metadata: Optional[dict[str, Any]] = None,
-    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        persist: bool = False,
+        initiated_by: str = "author",
+    ) -> dict[str, Any]:
+        """Preview a typed planning node without mutating the overlay."""
         self._require_book(book_id)
-        # ``apply_delta`` intentionally refuses an uninitialised workspace;
-        # initializing through ``load`` keeps the existing revision contract
-        # and seeds it from authoritative SQLite facts.
-        graph, _ = self.load(book_id)
+        current, _, _, _ = self.workspace.preview_delta(
+            book_id,
+            {"operations": []},
+            expected_revision=expected_revision,
+        )
+        operations, node = self._build_node_operations(
+            book_id,
+            current,
+            title=title,
+            summary=summary,
+            subtype=subtype,
+            status=status,
+            metadata=metadata,
+            source=source,
+            node_id=node_id,
+            anchor_node_id=anchor_node_id,
+            anchor_edge_type=anchor_edge_type,
+            anchor_edge_id=anchor_edge_id,
+            anchor_label=anchor_label,
+            anchor_source_port=anchor_source_port,
+            anchor_target_port=anchor_target_port,
+            anchor_metadata=anchor_metadata,
+        )
+        response = self.preview_delta(
+            book_id,
+            {"operations": operations},
+            expected_revision=expected_revision,
+            persist=persist,
+            initiated_by=initiated_by,
+        )
+        response["node"] = node
+        response["anchorEdge"] = next(
+            (
+                operation.get("edge")
+                for operation in operations
+                if operation.get("op") == "add_edge"
+                and isinstance(operation.get("edge"), dict)
+            ),
+            None,
+        )
+        return response
+
+    def _build_node_operations(
+        self,
+        book_id: str,
+        graph: dict[str, Any],
+        *,
+        title: str,
+        summary: str = "",
+        subtype: str = "flow",
+        status: str = "PLANNED",
+        metadata: Optional[dict[str, Any]] = None,
+        source: str = "author",
+        node_id: Optional[str] = None,
+        anchor_node_id: Optional[str] = None,
+        anchor_edge_type: Optional[str] = None,
+        anchor_edge_id: Optional[str] = None,
+        anchor_label: str = "",
+        anchor_source_port: Optional[str] = None,
+        anchor_target_port: Optional[str] = None,
+        anchor_metadata: Optional[dict[str, Any]] = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         normalized_title = _text(title)
         if not normalized_title:
             raise StoryFlowPlanningError("planning node title is required")
@@ -238,7 +758,7 @@ class StoryFlowPlanningService:
             operations.append({
                 "op": "add_edge",
                 "edge": {
-                    "id": f"planning-edge:{uuid.uuid4().hex}",
+                    "id": _text(anchor_edge_id) or f"planning-edge:{uuid.uuid4().hex}",
                     "source": node_id,
                     "target": normalized_anchor_id,
                     "type": relation,
@@ -254,6 +774,51 @@ class StoryFlowPlanningService:
                     "metadata": edge_metadata,
                 },
             })
+        return operations, node
+
+    def add_node(
+        self,
+        book_id: str,
+        *,
+        title: str,
+        summary: str = "",
+        subtype: str = "flow",
+        status: str = "PLANNED",
+        metadata: Optional[dict[str, Any]] = None,
+        source: str = "author",
+        expected_revision: Optional[int] = None,
+        node_id: Optional[str] = None,
+        anchor_node_id: Optional[str] = None,
+        anchor_edge_type: Optional[str] = None,
+        anchor_edge_id: Optional[str] = None,
+        anchor_label: str = "",
+        anchor_source_port: Optional[str] = None,
+        anchor_target_port: Optional[str] = None,
+        anchor_metadata: Optional[dict[str, Any]] = None,
+    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        self._require_book(book_id)
+        # ``apply_delta`` intentionally refuses an uninitialised workspace;
+        # initializing through ``load`` keeps the existing revision contract
+        # and seeds it from authoritative SQLite facts.
+        graph, _ = self.load(book_id)
+        operations, node = self._build_node_operations(
+            book_id,
+            graph,
+            title=title,
+            summary=summary,
+            subtype=subtype,
+            status=status,
+            metadata=metadata,
+            source=source,
+            node_id=node_id,
+            anchor_node_id=anchor_node_id,
+            anchor_edge_type=anchor_edge_type,
+            anchor_edge_id=anchor_edge_id,
+            anchor_label=anchor_label,
+            anchor_source_port=anchor_source_port,
+            anchor_target_port=anchor_target_port,
+            anchor_metadata=anchor_metadata,
+        )
         graph, revision = self._apply(
             book_id,
             operations,
@@ -261,7 +826,7 @@ class StoryFlowPlanningService:
         )
         return graph, revision, node
 
-    def add_edge(
+    def preview_edge(
         self,
         book_id: str,
         *,
@@ -276,9 +841,59 @@ class StoryFlowPlanningService:
         target_port: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
         expected_revision: Optional[int] = None,
-    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        edge_id: Optional[str] = None,
+        persist: bool = False,
+        initiated_by: str = "author",
+    ) -> dict[str, Any]:
+        """Preview a typed planning edge without mutating the overlay."""
         self._require_book(book_id)
-        graph, _ = self.load(book_id)
+        current, _, _, _ = self.workspace.preview_delta(
+            book_id,
+            {"operations": []},
+            expected_revision=expected_revision,
+        )
+        edge = self._build_edge(
+            book_id,
+            current,
+            source_node_id=source_node_id,
+            target_node_id=target_node_id,
+            edge_type=edge_type,
+            label=label,
+            status=status,
+            weight=weight,
+            confidence=confidence,
+            source_port=source_port,
+            target_port=target_port,
+            metadata=metadata,
+            edge_id=edge_id,
+        )
+        response = self.preview_delta(
+            book_id,
+            {"operations": [{"op": "add_edge", "edge": edge}]},
+            expected_revision=expected_revision,
+            persist=persist,
+            initiated_by=initiated_by,
+        )
+        response["edge"] = edge
+        return response
+
+    def _build_edge(
+        self,
+        book_id: str,
+        graph: dict[str, Any],
+        *,
+        source_node_id: str,
+        target_node_id: str,
+        edge_type: str,
+        label: str = "",
+        status: str = "PLANNED",
+        weight: float = 1.0,
+        confidence: float = 1.0,
+        source_port: Optional[str] = None,
+        target_port: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        edge_id: Optional[str] = None,
+    ) -> dict[str, Any]:
         nodes = {str(node.get("id")): node for node in graph.get("nodes", []) if node.get("id")}
         source = self._resolve_node_type(book_id, source_node_id, nodes)
         target = self._resolve_node_type(book_id, target_node_id, nodes)
@@ -305,8 +920,8 @@ class StoryFlowPlanningService:
             raise StoryFlowPlanningError(
                 "ACCEPTED planning edge can only be created by StoryFlow commit fulfillment"
             )
-        edge = {
-            "id": f"planning-edge:{uuid.uuid4().hex}",
+        return {
+            "id": _text(edge_id) or f"planning-edge:{uuid.uuid4().hex}",
             "source": source_node_id,
             "target": target_node_id,
             "type": relation,
@@ -329,6 +944,41 @@ class StoryFlowPlanningService:
                 }],
             },
         }
+
+    def add_edge(
+        self,
+        book_id: str,
+        *,
+        source_node_id: str,
+        target_node_id: str,
+        edge_type: str,
+        label: str = "",
+        status: str = "PLANNED",
+        weight: float = 1.0,
+        confidence: float = 1.0,
+        source_port: Optional[str] = None,
+        target_port: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        expected_revision: Optional[int] = None,
+        edge_id: Optional[str] = None,
+    ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        self._require_book(book_id)
+        graph, _ = self.load(book_id)
+        edge = self._build_edge(
+            book_id,
+            graph,
+            source_node_id=source_node_id,
+            target_node_id=target_node_id,
+            edge_type=edge_type,
+            label=label,
+            status=status,
+            weight=weight,
+            confidence=confidence,
+            source_port=source_port,
+            target_port=target_port,
+            metadata=metadata,
+            edge_id=edge_id,
+        )
         graph, revision = self._apply(book_id, [{"op": "add_edge", "edge": edge}], expected_revision)
         return graph, revision, edge
 
@@ -1677,7 +2327,9 @@ class StoryFlowPlanningService:
         )
         try:
             return self.workspace.apply_delta(book_id, {"operations": operations}, expected_revision)
-        except (PlotWorkspaceError, PlotRevisionConflict) as exc:
+        except PlotRevisionConflict:
+            raise
+        except PlotWorkspaceError as exc:
             raise StoryFlowPlanningError(str(exc)) from exc
 
     def validate_delta(self, book_id: str, delta: dict[str, Any]) -> None:
@@ -1692,25 +2344,7 @@ class StoryFlowPlanningService:
         if not isinstance(delta, dict):
             raise StoryFlowPlanningError("plot delta must be an object")
         if isinstance(delta.get("graph"), dict):
-            graph = delta["graph"]
-            for node in graph.get("nodes", []):
-                if not isinstance(node, dict):
-                    continue
-                # Full-graph compatibility writes may contain canonical
-                # statuses from the legacy renderer.  Only an explicit
-                # planning ACCEPTED value is a forbidden fabrication here;
-                # the repository still owns the actual revisioned write.
-                if _text(node.get("status")).lower() == "accepted":
-                    raise StoryFlowPlanningError(
-                        "legacy plot canvas cannot create ACCEPTED planning state"
-                    )
-            for edge in graph.get("edges", []):
-                if not isinstance(edge, dict):
-                    continue
-                if _text(edge.get("status")).lower() == "accepted":
-                    raise StoryFlowPlanningError(
-                        "legacy plot canvas cannot create ACCEPTED planning edge"
-                    )
+            self._validate_full_graph_delta(delta["graph"])
             return
         operations = delta.get("operations", [])
         if not isinstance(operations, list):
@@ -1723,6 +2357,7 @@ class StoryFlowPlanningService:
         operations: list[dict[str, Any]],
         *,
         allow_story_commit_acceptance: bool = False,
+        graph: Optional[dict[str, Any]] = None,
     ) -> None:
         """Preflight planning status writes before the revisioned workspace write.
 
@@ -1732,7 +2367,8 @@ class StoryFlowPlanningService:
         accepted-state fabrication without moving canonical facts into the
         planning database.
         """
-        graph, _ = self.load(book_id)
+        if graph is None:
+            graph, _ = self.load(book_id)
         statuses = {
             str(node.get("id")): _raw_status(node.get("status"), "planned")
             for node in graph.get("nodes", [])

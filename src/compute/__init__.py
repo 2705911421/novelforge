@@ -9,11 +9,16 @@ from .scheduler import (
     BudgetReservation,
     CapabilityRegistry,
     CapabilityTier,
+    COMPUTE_STRATEGIES,
     ComputePolicy,
+    ComputePolicyStore,
     ComputeScheduler,
+    TaskCapabilityAssessment,
     DifficultyRiskEstimator,
     TaskCapabilityProfile,
+    TaskCapabilityProfiler,
     TaskTier,
+    normalize_compute_strategy,
 )
 from .telemetry import ComputeTelemetryStore
 
@@ -22,10 +27,15 @@ __all__ = [
     "BudgetReservation",
     "CapabilityRegistry",
     "CapabilityTier",
+    "COMPUTE_STRATEGIES",
     "ComputePolicy",
+    "ComputePolicyStore",
     "ComputeScheduler",
+    "TaskCapabilityAssessment",
     "DifficultyRiskEstimator",
     "TaskCapabilityProfile",
+    "TaskCapabilityProfiler",
     "TaskTier",
+    "normalize_compute_strategy",
     "ComputeTelemetryStore",
 ]

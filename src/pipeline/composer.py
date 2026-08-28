@@ -139,6 +139,10 @@ class Composer:
         system = "你是一位专业的章节意图规划师，擅长为长篇小说制定精确的章节目标。"
 
         response = client.chat_json(messages, system)
+        if not isinstance(response, dict):
+            raise ValueError("CHAPTER_INTENT_OUTPUT_INVALID: expected a JSON object")
+        if "error" in response:
+            raise ValueError("CHAPTER_INTENT_OUTPUT_INVALID: model returned invalid JSON")
 
         # 构建ChapterIntent
         intent = ChapterIntent(

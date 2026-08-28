@@ -276,9 +276,14 @@ class BackupManager:
             # 清理失败的备份文件
             try:
                 backup_path.unlink(missing_ok=True)
-            except PermissionError:
-                # Windows 上文件可能被锁定，忽略清理错误
-                pass
+            except PermissionError as cleanup_error:
+                # Windows 上文件可能被锁定；保留主错误，但记录清理失败，
+                # 让恢复/人工清理路径仍然可观测。
+                logger.warning(
+                    "Could not remove incomplete backup after creation failure: %s (%s)",
+                    backup_path,
+                    cleanup_error,
+                )
             self._manifest_path(backup_path).unlink(missing_ok=True)
             raise RuntimeError(f"创建备份失败: {e}") from e
 

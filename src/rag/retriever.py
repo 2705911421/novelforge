@@ -16,6 +16,9 @@ from collections import Counter
 logger = logging.getLogger(__name__)
 
 
+_NO_PRECOMPUTED_EMBEDDING = object()
+
+
 class RAGQueryError(ValueError):
     """A retrieval request is invalid before it reaches the index."""
 
@@ -232,6 +235,7 @@ class DurableHybridRetriever:
     """
 
     MAX_TOP_K = 50
+    EMBEDDING_BATCH_SIZE = 32
     PROJECTION_VERSION = "durable-rag-v2"
 
     def __init__(
@@ -262,6 +266,8 @@ class DurableHybridRetriever:
         source_version: str,
         content: str,
         provenance: Optional[dict[str, Any]] = None,
+        *,
+        precomputed_embedding: Any = _NO_PRECOMPUTED_EMBEDDING,
     ) -> dict[str, Any]:
         if not all(isinstance(value, str) and value.strip() for value in (book_id, source_type, source_id, content)):
             raise ValueError("book_id, source_type, source_id and content are required")
@@ -271,14 +277,19 @@ class DurableHybridRetriever:
         status = "degraded"
         error_code: Optional[str] = None
         error_detail: Optional[str] = None
-        if self.embedder is not None:
+        candidate: Any = _NO_PRECOMPUTED_EMBEDDING
+        if precomputed_embedding is not _NO_PRECOMPUTED_EMBEDDING:
+            candidate = precomputed_embedding
+        elif self.embedder is not None:
             try:
                 candidate = self.embedder(content)
-                if isinstance(candidate, (str, bytes)):
-                    raise ValueError("embedding must be a numeric sequence")
-                embedding = [float(value) for value in candidate]
-                if not embedding or any(not math.isfinite(value) for value in embedding):
-                    raise ValueError("embedding must contain finite values")
+            except Exception as exc:
+                status = "failed"
+                error_code = "EMBEDDING_FAILED"
+                error_detail = str(exc)
+        if candidate is not _NO_PRECOMPUTED_EMBEDDING and status != "failed":
+            try:
+                embedding = self._coerce_embedding(candidate)
                 status = "ready"
             except Exception as exc:
                 status = "failed"
@@ -337,6 +348,71 @@ class DurableHybridRetriever:
             result["error_detail"] = error_detail
         return result
 
+    @staticmethod
+    def _coerce_embedding(candidate: Any) -> list[float]:
+        if isinstance(candidate, (str, bytes)):
+            raise ValueError("embedding must be a numeric sequence")
+        values = [float(value) for value in candidate]
+        if not values or any(not math.isfinite(value) for value in values):
+            raise ValueError("embedding must contain finite values")
+        return values
+
+    def _materialize_pending(
+        self,
+        book_id: str,
+        pending: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        """Persist pending rows using bounded batches with scalar fallback."""
+        if not pending:
+            return 0, 0
+        embed_many = getattr(self.embedder, "embed_many", None)
+        ready = 0
+        degraded = 0
+        for offset in range(0, len(pending), self.EMBEDDING_BATCH_SIZE):
+            batch = pending[offset:offset + self.EMBEDDING_BATCH_SIZE]
+            vectors: list[list[float]] | None = None
+            if callable(embed_many):
+                try:
+                    raw_vectors = embed_many([str(item["content"]) for item in batch])
+                    if not isinstance(raw_vectors, list) or len(raw_vectors) != len(batch):
+                        raise ValueError("embedding batch returned an unexpected vector count")
+                    vectors = [self._coerce_embedding(vector) for vector in raw_vectors]
+                    dimension = len(vectors[0])
+                    if any(len(vector) != dimension for vector in vectors):
+                        raise ValueError("embedding batch returned inconsistent dimensions")
+                except Exception as exc:
+                    # A provider outage must remain visible in the per-row
+                    # projection status.  Scalar fallback preserves the old
+                    # recoverable behavior while keeping batch limits local.
+                    logger.warning(
+                        "embedding batch failed; falling back to scalar projections",
+                        extra={
+                            "book_id": book_id,
+                            "batch_offset": offset,
+                            "batch_size": len(batch),
+                            "error": str(exc),
+                        },
+                        exc_info=exc,
+                    )
+            for index, item in enumerate(batch):
+                kwargs: dict[str, Any] = {}
+                if vectors is not None:
+                    kwargs["precomputed_embedding"] = vectors[index]
+                result = self.upsert(
+                    book_id,
+                    str(item["source_type"]),
+                    str(item["source_id"]),
+                    str(item["source_version"]),
+                    str(item["content"]),
+                    item.get("provenance"),
+                    **kwargs,
+                )
+                if result["status"] == "ready":
+                    ready += 1
+                else:
+                    degraded += 1
+        return ready, degraded
+
     def rebuild_from_memory(self, book_id: str) -> dict[str, Any]:
         """Materialize active canonical Narrative Memory into durable vectors."""
         rows = self.database.fetchall(
@@ -344,19 +420,21 @@ class DurableHybridRetriever:
                FROM narrative_memory WHERE book_id=? AND status='active' ORDER BY id""",
             (book_id,),
         )
-        ready = 0
-        failed = 0
+        pending: list[dict[str, Any]] = []
         for row in rows:
             provenance = self._json_object(row.get("provenance"))
-            result = self.upsert(
-                book_id, "narrative_memory", row["id"],
-                str(row.get("source_version_id") or provenance.get("eventId") or "unknown"),
-                row["content"], provenance,
+            pending.append(
+                {
+                    "source_type": "narrative_memory",
+                    "source_id": row["id"],
+                    "source_version": str(
+                        row.get("source_version_id") or provenance.get("eventId") or "unknown"
+                    ),
+                    "content": row["content"],
+                    "provenance": provenance,
+                }
             )
-            if result["status"] == "ready":
-                ready += 1
-            else:
-                failed += 1
+        ready, failed = self._materialize_pending(book_id, pending)
         return {"book_id": book_id, "source_count": len(rows), "ready": ready, "failed": failed}
 
     def sync_reference_chunks(self, book_id: str, project_id: str) -> dict[str, Any]:
@@ -387,6 +465,7 @@ class DurableHybridRetriever:
         ready = 0
         degraded = 0
         active_keys: set[tuple[str, str, str]] = set()
+        pending: list[dict[str, Any]] = []
         for row in rows:
             content = str(row.get("content") or "")
             checksum = str(row.get("checksum") or hashlib.sha256(content.encode("utf-8")).hexdigest())
@@ -416,13 +495,19 @@ class DurableHybridRetriever:
                 "chunkMetadata": self._json_object(row.get("metadata")),
                 "documentMetadata": self._json_object(row.get("document_metadata")),
             }
-            result = self.upsert(
-                book_id, source_type, source_id, source_version, content, provenance
+            pending.append(
+                {
+                    "source_type": source_type,
+                    "source_id": source_id,
+                    "source_version": source_version,
+                    "content": content,
+                    "provenance": provenance,
+                }
             )
-            if result["status"] == "ready":
-                ready += 1
-            else:
-                degraded += 1
+
+        pending_ready, pending_degraded = self._materialize_pending(book_id, pending)
+        ready += pending_ready
+        degraded += pending_degraded
 
         with self.database.transaction() as conn:
             stale_rows = conn.execute(
@@ -468,6 +553,7 @@ class DurableHybridRetriever:
         ready = 0
         degraded = 0
         active_keys: set[tuple[str, str, str]] = set()
+        pending: list[dict[str, Any]] = []
         for row in rows:
             provenance = self._json_object(row.get("provenance"))
             version = str(row.get("source_version_id") or provenance.get("eventId") or "unknown")
@@ -486,13 +572,19 @@ class DurableHybridRetriever:
                     degraded += 1
                 continue
             changed += 1
-            result = self.upsert(
-                book_id, "narrative_memory", row["id"], version, row["content"], provenance
+            pending.append(
+                {
+                    "source_type": "narrative_memory",
+                    "source_id": row["id"],
+                    "source_version": version,
+                    "content": row["content"],
+                    "provenance": provenance,
+                }
             )
-            if result["status"] == "ready":
-                ready += 1
-            else:
-                degraded += 1
+
+        pending_ready, pending_degraded = self._materialize_pending(book_id, pending)
+        ready += pending_ready
+        degraded += pending_degraded
         with self.database.transaction() as conn:
             stale_rows = conn.execute(
                 """SELECT source_id, source_version FROM embedding_projections

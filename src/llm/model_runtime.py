@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import ctypes
 import asyncio
+import base64
 from copy import deepcopy
 import hashlib
 import json
+import logging
+import math
 import os
 import re
 import uuid
@@ -34,9 +37,11 @@ from src.runtime.contracts import (
     ComputePlan,
     ModelDescriptor,
     RuntimeEvent,
+    default_agent_task_profile,
 )
-from src.runtime.persistence import AgentRunStore
+from src.runtime.persistence import AgentRunStore, AgentTaskStore
 from src.context.bundles import ContextBundleStore
+from src.runtime.errors import RuntimeUnavailable
 
 from .gateway import ImageResponse, LLMConfig, LLMResponse, ModelGateway, ProviderType
 from .agent_prompts import (
@@ -44,6 +49,9 @@ from .agent_prompts import (
     compose_agent_prompt,
     is_structured_agent_contract,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 MODEL_ROLES = (
@@ -369,10 +377,16 @@ class ModelRepository:
             for reference in retired:
                 try:
                     self.credentials.remove(reference)
-                except Exception:
+                except Exception as exc:
                     # Credential cleanup is best-effort after the durable
                     # pointer has moved; a stale file must not make a
                     # successful configuration update look like a failure.
+                    logger.warning(
+                        "retired model credential cleanup failed for %s: %s",
+                        reference,
+                        exc,
+                        exc_info=exc,
+                    )
                     continue
         finally:
             _STAGED_CREDENTIALS.reset(token)
@@ -835,6 +849,8 @@ class ModelRepository:
 class PersistentModelRuntime:
     """Resolve a persisted route and record every gateway invocation."""
 
+    MAX_EMBEDDING_BATCH_SIZE = 64
+
     def __init__(self, repository: ModelRepository, gateway: Optional[Any] = None):
         self.repository = repository
         self.gateway = gateway or ModelGateway()
@@ -1016,26 +1032,95 @@ class PersistentModelRuntime:
         durable = db.fetchone("SELECT * FROM tasks WHERE id=?", (task_id,))
         if durable is None:
             raise ModelConfigurationError("MODEL_TASK_NOT_FOUND", "durable task does not exist")
+        # Older durable rows may reach this compatibility bridge before their
+        # enqueue-time AgentTask projection exists.  Keep the durable task
+        # type as the domain identity; the call-site stage remains provider
+        # telemetry, not a replacement for the NovelForge task contract.
+        durable_task_type = str(durable.get("type") or "").strip()
+        effective_task_type = durable_task_type or task_type
         project_id = durable.get("project_id")
         if project_id and not db.fetchone("SELECT id FROM projects WHERE id=?", (project_id,)):
             project_id = None
+        try:
+            raw_data = durable.get("data")
+            durable_data = json.loads(raw_data or "{}") if isinstance(raw_data, str) else raw_data
+        except (TypeError, json.JSONDecodeError):
+            durable_data = {}
+        if not isinstance(durable_data, dict):
+            durable_data = {}
+
+        # This path exists for legacy task rows created before the AgentTask
+        # projection was added.  Keep the durable task's domain envelope
+        # intact so compatibility recovery does not lose initiator, policy,
+        # or lineage metadata at the adapter boundary.
+        input_payload = dict(durable_data)
+        input_payload.setdefault("durableTaskId", task_id)
+        initiated_by = str(
+            input_payload.get("initiatedBy")
+            or input_payload.get("initiated_by")
+            or input_payload.get("source")
+            or "system"
+        ).strip() or "system"
+        input_payload.setdefault("initiatedBy", initiated_by)
+        constraints = durable_data.get("constraints")
+        if not isinstance(constraints, dict):
+            constraints = {}
+        expected_output = str(
+            durable_data.get("expected_output")
+            or durable_data.get("expectedOutput")
+            or "AgentArtifact"
+        )
+
+        chapter_id = durable_data.get("chapter_id") or durable_data.get("chapterId")
+        if chapter_id and not db.fetchone("SELECT id FROM chapters WHERE id=?", (chapter_id,)):
+            chapter_id = None
+        intent_id = durable_data.get("intent_id") or durable_data.get("intentId")
+        context_bundle_id = durable_data.get("context_bundle_id") or durable_data.get("contextBundleId")
+        if context_bundle_id and not db.fetchone(
+            "SELECT id FROM context_bundles WHERE id=?", (context_bundle_id,)
+        ):
+            context_bundle_id = None
+        parent_task_id = durable_data.get("parent_task_id") or durable_data.get("parentTaskId")
+        parent_agent_task_id = None
+        if parent_task_id:
+            parent_row = db.fetchone("SELECT id FROM agent_tasks WHERE task_id=?", (str(parent_task_id),))
+            parent_agent_task_id = parent_row["id"] if parent_row else None
         agent_task_id = f"agent-{task_id}"
-        profile = AgentTaskProfile(role=role, task_type=task_type)
+        profile = default_agent_task_profile(role, effective_task_type)
         now = datetime.now().isoformat()
         with db.transaction() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO agent_tasks(
-                       id, task_id, task_type, role, project_id, constraints,
-                       expected_output, input_payload, profile, status, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, '{}', 'AgentArtifact', ?, ?, 'planned', ?, ?)""",
+                    id, task_id, task_type, role, project_id, chapter_id,
+                       intent_id, context_bundle_id, constraints, expected_output,
+                       input_payload, profile, parent_task_id, status, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?)""",
                 (
-                    agent_task_id, task_id, task_type, role, project_id,
-                    json.dumps({"durableTaskId": task_id}, ensure_ascii=False),
-                    json.dumps(profile.to_dict(), ensure_ascii=False), now, now,
+                    agent_task_id, task_id, effective_task_type, role, project_id,
+                    chapter_id, intent_id, context_bundle_id,
+                    json.dumps(constraints, ensure_ascii=False), expected_output,
+                    json.dumps(input_payload, ensure_ascii=False),
+                    json.dumps(profile.to_dict(), ensure_ascii=False), parent_agent_task_id,
+                    now, now,
                 ),
             )
             row = conn.execute("SELECT * FROM agent_tasks WHERE task_id=?", (task_id,)).fetchone()
-        return self._agent_task_from_row(dict(row), role=role, task_type=task_type)
+        return self._agent_task_from_row(dict(row), role=role, task_type=effective_task_type)
+
+    def _context_manifest_for_task(
+        self,
+        task_id: str,
+        *,
+        task_stage: str,
+        role: str,
+    ) -> dict[str, Any]:
+        """Return an explicit context snapshot when a legacy caller omitted one."""
+        return ContextBundleStore(self.repository.db).manifest_for_task(
+            durable_task_id=task_id,
+            task_stage=task_stage,
+            role=role,
+            source="compatibility-runtime-bridge",
+        )
 
     @staticmethod
     def _agent_task_from_row(row: dict[str, Any], *, role: str, task_type: str) -> AgentTask:
@@ -1049,20 +1134,64 @@ class PersistentModelRuntime:
         profile_data = decode("profile", {})
         if not isinstance(profile_data, dict):
             profile_data = {}
+        default_profile = default_agent_task_profile(
+            str(row.get("role") or role),
+            str(row.get("task_type") or task_type),
+        )
+        compute_profile_keys = ("allowedComputeTools", "allowed_compute_tools")
+        compute_default = (
+            ()
+            if any(key in profile_data for key in compute_profile_keys)
+            else default_profile.allowed_compute_tools
+        )
+        legacy_empty_narrative_profile = AgentTaskStore._is_legacy_empty_narrative_profile(
+            profile_data
+        )
+
+        def profile_tuple(
+            *names: str,
+            default: tuple[str, ...],
+            default_on_empty: bool = False,
+        ) -> tuple[str, ...]:
+            value = next((profile_data[name] for name in names if name in profile_data), default)
+            if not isinstance(value, (list, tuple)):
+                return ()
+            normalized = tuple(str(item) for item in value if str(item).strip())
+            return default if not normalized and default_on_empty else normalized
+
         profile = AgentTaskProfile(
             role=str(profile_data.get("role") or row.get("role") or role),
             task_type=str(profile_data.get("taskType") or row.get("task_type") or task_type),
-            allowed_tools=tuple(profile_data.get("allowedTools") or ()),
-            forbidden_tools=tuple(profile_data.get("forbiddenTools") or ()),
-            minimum_capability=str(profile_data.get("minimumCapability") or "C1"),
-            preferred_capability=str(profile_data.get("preferredCapability") or "C2"),
-            maximum_capability=str(profile_data.get("maximumCapability") or "C3"),
-            minimum_reasoning=str(profile_data.get("minimumReasoning") or "medium"),
-            preferred_reasoning=str(profile_data.get("preferredReasoning") or "high"),
-            maximum_reasoning=str(profile_data.get("maximumReasoning") or "xhigh"),
+            allowed_tools=profile_tuple(
+                "allowedTools",
+                "allowed_tools",
+                default=default_profile.allowed_tools,
+                default_on_empty=legacy_empty_narrative_profile,
+            ),
+            forbidden_tools=profile_tuple(
+                "forbiddenTools",
+                "forbidden_tools",
+                default=default_profile.forbidden_tools,
+                default_on_empty=legacy_empty_narrative_profile,
+            ),
+            allowed_compute_tools=profile_tuple(
+                "allowedComputeTools", "allowed_compute_tools", default=compute_default,
+            ),
+            minimum_capability=str(profile_data.get("minimumCapability") or default_profile.minimum_capability),
+            preferred_capability=str(profile_data.get("preferredCapability") or default_profile.preferred_capability),
+            maximum_capability=str(profile_data.get("maximumCapability") or default_profile.maximum_capability),
+            minimum_reasoning=str(profile_data.get("minimumReasoning") or default_profile.minimum_reasoning),
+            preferred_reasoning=str(profile_data.get("preferredReasoning") or default_profile.preferred_reasoning),
+            maximum_reasoning=str(profile_data.get("maximumReasoning") or default_profile.maximum_reasoning),
         )
         constraints = decode("constraints", {})
         input_payload = decode("input_payload", {})
+        initiated_by = str(
+            input_payload.get("initiatedBy")
+            or input_payload.get("initiated_by")
+            or input_payload.get("source")
+            or "system"
+        ).strip() or "system" if isinstance(input_payload, dict) else "system"
         return AgentTask(
             task_id=str(row["id"]),
             task_type=str(row.get("task_type") or task_type),
@@ -1077,6 +1206,7 @@ class PersistentModelRuntime:
             profile=profile,
             parent_task_id=row.get("parent_task_id"),
             created_at=str(row.get("created_at") or datetime.now().isoformat()),
+            initiated_by=initiated_by,
         )
 
     def _start_agent_run(
@@ -1107,6 +1237,7 @@ class PersistentModelRuntime:
             maximum_escalation="C3",
             maximum_reasoning="xhigh",
             rationale=("legacy PersistentModelRuntime compatibility adapter",),
+            provider_id=str(resolved.get("provider_id") or "").strip() or None,
         )
         run = store.create(
             task=agent_task,
@@ -1131,26 +1262,60 @@ class PersistentModelRuntime:
     ) -> str | None:
         """Bind a task to an immutable context snapshot before an AgentRun."""
         if not isinstance(context_manifest, dict):
-            return agent_task.context_bundle_id
+            if agent_task.context_bundle_id:
+                return agent_task.context_bundle_id
+            context_manifest = self._context_manifest_for_task(
+                durable_task_id,
+                task_stage=agent_task.task_type,
+                role=agent_task.role,
+            )
+        task_row = self.repository.db.fetchone(
+            "SELECT project_id, book_id FROM tasks WHERE id=?", (durable_task_id,)
+        ) or {}
+        task_project_id = task_row.get("project_id")
+        task_book_id = task_row.get("book_id")
+        bound_row = self.repository.db.fetchone(
+            "SELECT context_bundle_id, project_id FROM agent_tasks WHERE id=?",
+            (agent_task.task_id,),
+        ) or {}
+        task_project_id = task_project_id or bound_row.get("project_id")
+        bound_context_id = str(bound_row.get("context_bundle_id") or "").strip() or None
         candidate = context_manifest.get("bundleId") or context_manifest.get("contextBundleId")
         context_bundle_id = None
-        if candidate and self.repository.db.fetchone("SELECT id FROM context_bundles WHERE id=?", (candidate,)):
+        if candidate and self.repository.db.fetchone(
+            "SELECT id FROM context_bundles WHERE id=?", (candidate,)
+        ):
             context_bundle_id = str(candidate)
+            if bound_context_id is not None and context_bundle_id != bound_context_id:
+                raise ValueError("context bundle does not match the persisted AgentTask")
+            self._validate_context_bundle_scope(
+                context_bundle_id,
+                project_id=task_project_id,
+                book_id=task_book_id,
+            )
+        elif bound_context_id is not None:
+            # Do not create a new unbound snapshot and then return it while
+            # COALESCE keeps the AgentTask pointing at the older one.  The
+            # recorded context must be the same context the adapter uses.
+            context_bundle_id = bound_context_id
+            self._validate_context_bundle_scope(
+                context_bundle_id,
+                project_id=task_project_id,
+                book_id=task_book_id,
+            )
         if context_bundle_id is None:
-            task_row = self.repository.db.fetchone(
-                "SELECT project_id, book_id FROM tasks WHERE id=?", (durable_task_id,)
-            ) or {}
             bundle = ContextBundleStore(self.repository.db).create_from_manifest(
                 context_manifest,
                 project_id=(
                     context_manifest.get("projectId")
-                    or task_row.get("project_id")
-                    or agent_task.project_id
+                    or task_project_id
                 ),
-                book_id=context_manifest.get("bookId") or task_row.get("book_id"),
+                book_id=context_manifest.get("bookId") or task_book_id,
                 source="PersistentModelRuntime",
                 task_id=durable_task_id,
                 role=agent_task.role,
+                expected_project_id=task_project_id,
+                expected_book_id=task_book_id,
             )
             context_bundle_id = bundle.bundle_id
         self.repository.db.execute(
@@ -1159,6 +1324,21 @@ class PersistentModelRuntime:
             (context_bundle_id, agent_task.task_id),
         )
         return context_bundle_id
+
+    def _validate_context_bundle_scope(
+        self,
+        bundle_id: str,
+        *,
+        project_id: str | None,
+        book_id: str | None,
+    ) -> None:
+        bundle = ContextBundleStore(self.repository.db).get(bundle_id)
+        if bundle is None:
+            raise ValueError("context bundle does not exist")
+        if project_id and bundle.project_id and str(project_id) != str(bundle.project_id):
+            raise ValueError("context bundle is outside the project scope")
+        if book_id and bundle.book_id and str(book_id) != str(bundle.book_id):
+            raise ValueError("context bundle is outside the book scope")
 
     @staticmethod
     def _agent_run_failed(store: AgentRunStore, run_id: str, task: AgentTask, code: str, detail: str) -> None:
@@ -1215,9 +1395,30 @@ class PersistentModelRuntime:
             prompt_version = str(configured_version) if configured_version else "builtin-1"
         prompt_sha256 = hashlib.sha256(effective_system.encode("utf-8")).hexdigest()
         persisted_prompt, prompt_layout = self._build_prompt_layout(effective_system, messages)
-        runtime_context_manifest = deepcopy(context_manifest) if isinstance(context_manifest, dict) else None
-        if runtime_context_manifest is not None:
-            self._bind_context_manifest_to_prompt_layout(runtime_context_manifest, prompt_layout)
+        runtime_context_manifest = (
+            deepcopy(context_manifest)
+            if isinstance(context_manifest, dict)
+            else self._context_manifest_for_task(task_id, task_stage=task_stage, role=role)
+        )
+        self._bind_context_manifest_to_prompt_layout(runtime_context_manifest, prompt_layout)
+        # Bind the compatibility invocation to one immutable Host-owned
+        # ContextBundle before deriving the generation idempotency key.  The
+        # first call used to hash the metadata-only fallback, while a retry
+        # after AgentTask/ContextBundle creation hashed the same snapshot with
+        # ``bundleId`` attached.  That made a worker re-call the provider after
+        # its response had already been persisted.  Canonicalising the bundle
+        # first keeps retries on the exact same request identity.
+        agent_task = self._ensure_agent_task(task_id, task_stage, role)
+        context_bundle_id = self.ensure_context_bundle(
+            durable_task_id=task_id,
+            agent_task=agent_task,
+            context_manifest=runtime_context_manifest,
+        )
+        if context_bundle_id:
+            bundle = ContextBundleStore(self.repository.db).get(context_bundle_id)
+            if bundle is not None:
+                runtime_context_manifest = bundle.manifest()
+                self._bind_context_manifest_to_prompt_layout(runtime_context_manifest, prompt_layout)
         input_reference = {
             # Keep the complete prompt alongside its audit metadata. The
             # Studio task detail view must show the exact model input.
@@ -1254,7 +1455,6 @@ class PersistentModelRuntime:
         })
         base_idempotency_key = f"{task_id}:{task_stage}:{request_hash}"
         attempts = GenerationAttemptStore(self.repository.db)
-        agent_task: AgentTask | None = None
         agent_store: AgentRunStore | None = None
         agent_run_id: str | None = None
 
@@ -1323,7 +1523,6 @@ class PersistentModelRuntime:
             return recover(attempt)
         if runtime_context_manifest is not None:
             self.repository.attach_context_manifest(run_id, runtime_context_manifest)
-        agent_task = self._ensure_agent_task(task_id, task_stage, role)
         if not self._managed_agent_run_id.get():
             agent_store, agent_run_id = self._start_agent_run(
                 agent_task=agent_task,
@@ -1390,6 +1589,182 @@ class PersistentModelRuntime:
         return self.invoke("writer", [{"role": "user", "content": "Connection check"}], provider_id=provider_id,
                            max_tokens=10)
 
+    def embed(
+        self,
+        text: str,
+        *,
+        provider_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> list[float]:
+        """Invoke the persisted embedding route inside the model-runtime seam.
+
+        Embeddings are a derived RAG projection rather than narrative output,
+        so they do not use the chat ``GenerationRun`` response contract.  They
+        still require the same durable-task context as every production model
+        call, resolve credentials through the Host-owned repository, and keep
+        provider-specific HTTP out of the RAG layer.
+        """
+        return self._embed_request(
+            [text],
+            provider_id=provider_id,
+            model_id=model_id,
+            scalar_input=True,
+        )[0]
+
+    def embed_many(
+        self,
+        texts: list[str],
+        *,
+        provider_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> list[list[float]]:
+        """Invoke a bounded embedding batch through the persisted route.
+
+        The limit is deliberately enforced at the provider boundary so a
+        caller cannot turn a RAG rebuild into an unbounded request even if it
+        skips the higher-level chunking policy.
+        """
+        return self._embed_request(
+            texts,
+            provider_id=provider_id,
+            model_id=model_id,
+            scalar_input=False,
+        )
+
+    def _embed_request(
+        self,
+        texts: list[str],
+        *,
+        provider_id: Optional[str],
+        model_id: Optional[str],
+        scalar_input: bool,
+    ) -> list[list[float]]:
+        task_id = self._task_id.get()
+        if not task_id:
+            raise ModelConfigurationError(
+                "MODEL_TASK_CONTEXT_REQUIRED",
+                "embedding invocation requires a durable task",
+            )
+        if (
+            not isinstance(texts, list)
+            or not texts
+            or len(texts) > self.MAX_EMBEDDING_BATCH_SIZE
+            or any(not isinstance(text, str) or not text.strip() for text in texts)
+        ):
+            raise ModelConfigurationError(
+                "MODEL_INPUT_INVALID",
+                f"embedding input must contain 1..{self.MAX_EMBEDDING_BATCH_SIZE} non-empty texts",
+            )
+        resolved = self.repository.resolve(
+            "embedding",
+            provider_id=provider_id,
+            model_id=model_id,
+        )
+        try:
+            secret = self.repository.credentials.resolve(resolved.get("credential_ref"))
+        except CredentialError:
+            raise
+        base_url = str(resolved.get("base_url") or "").rstrip("/")
+        if not base_url:
+            raise ModelConfigurationError("MODEL_CONFIGURATION", "embedding provider base URL is missing")
+        try:
+            provider_config = json.loads(resolved.get("provider_config") or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ModelConfigurationError("MODEL_CONFIGURATION", "embedding provider config is invalid") from exc
+        if not isinstance(provider_config, dict):
+            provider_config = {}
+        try:
+            timeout = max(1, min(int(provider_config.get("timeout", 60)), 300))
+        except (TypeError, ValueError):
+            timeout = 60
+        auth_mode = str(
+            provider_config.get("authHeader")
+            or provider_config.get("auth_header")
+            or "bearer"
+        ).lower()
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if normalize_provider_type(resolved.get("provider_type")) == ProviderType.GEMINI.value:
+            headers["x-goog-api-key"] = secret
+        elif auth_mode in {"api-key", "api_key", "x-api-key"}:
+            headers["api-key" if auth_mode == "api-key" else "x-api-key"] = secret
+        else:
+            headers["Authorization"] = f"Bearer {secret}"
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                response = client.post(
+                    f"{base_url}/embeddings",
+                    headers=headers,
+                    json={
+                        "model": resolved.get("model_id"),
+                        "input": texts[0] if scalar_input else texts,
+                    },
+                )
+                response.raise_for_status()
+                body = response.json()
+        except Exception as exc:
+            code = self._error_code(exc)
+            raise ModelConfigurationError(code, "embedding provider invocation failed") from exc
+        entries = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(entries, list) or len(entries) != len(texts):
+            raise ModelConfigurationError(
+                "PROVIDER_INVALID_RESPONSE",
+                "embedding provider returned an unexpected vector count",
+            )
+        indexed_entries: list[dict[str, Any] | None] = [None] * len(texts)
+        has_indexes = all(
+            isinstance(entry, dict)
+            and isinstance(entry.get("index"), int)
+            and not isinstance(entry.get("index"), bool)
+            for entry in entries
+        )
+        if has_indexes:
+            for entry in entries:
+                index = int(entry["index"])
+                if index < 0 or index >= len(texts) or indexed_entries[index] is not None:
+                    raise ModelConfigurationError(
+                        "PROVIDER_INVALID_RESPONSE",
+                        "embedding provider returned invalid vector indexes",
+                    )
+                indexed_entries[index] = entry
+        else:
+            indexed_entries = [entry if isinstance(entry, dict) else None for entry in entries]
+        if any(entry is None for entry in indexed_entries):
+            raise ModelConfigurationError(
+                "PROVIDER_INVALID_RESPONSE",
+                "embedding provider returned incomplete vectors",
+            )
+
+        vectors: list[list[float]] = []
+        dimension: int | None = None
+        for entry in indexed_entries:
+            vector = entry.get("embedding") if entry is not None else None
+            if not isinstance(vector, list) or not vector:
+                raise ModelConfigurationError(
+                    "PROVIDER_INVALID_RESPONSE",
+                    "embedding provider returned no vector",
+                )
+            try:
+                values = [float(value) for value in vector]
+            except (TypeError, ValueError) as exc:
+                raise ModelConfigurationError(
+                    "PROVIDER_INVALID_RESPONSE",
+                    "embedding provider returned a non-numeric vector",
+                ) from exc
+            if not values or any(not math.isfinite(value) for value in values):
+                raise ModelConfigurationError(
+                    "PROVIDER_INVALID_RESPONSE",
+                    "embedding provider returned a non-finite vector",
+                )
+            if dimension is None:
+                dimension = len(values)
+            elif len(values) != dimension:
+                raise ModelConfigurationError(
+                    "PROVIDER_INVALID_RESPONSE",
+                    "embedding provider returned inconsistent vector dimensions",
+                )
+            vectors.append(values)
+        return vectors
+
     def discover_models(self, provider_id: str) -> dict[str, Any]:
         """Fetch and persist a provider model catalog from a durable task."""
         provider = self.repository.provider(provider_id)
@@ -1451,12 +1826,23 @@ class PersistentModelRuntime:
         models = self.repository.save_discovered_models(provider_id, candidates)
         return {"providerId": provider_id, "models": models, "count": len(models)}
 
-    def generate_image(self, prompt: str, *, size: str = "1024x1024", quality: str = "", style: str = "") -> ImageResponse:
+    def generate_image(
+        self,
+        prompt: str,
+        *,
+        size: str = "1024x1024",
+        quality: str = "",
+        style: str = "",
+        provider_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> ImageResponse:
         """Invoke the configured image route and keep it inside a durable task."""
         task_id = self._task_id.get()
         if not task_id:
             raise ModelConfigurationError("MODEL_TASK_CONTEXT_REQUIRED", "model invocation requires a durable task")
-        resolved = self.repository.resolve("image")
+        if not str(prompt or "").strip():
+            raise ModelConfigurationError("MODEL_INPUT_INVALID", "image prompt is required")
+        resolved = self.repository.resolve("image", provider_id=provider_id, model_id=model_id)
         run_id = self.repository.create_run(
             task_id=task_id,
             role="image",
@@ -1561,6 +1947,7 @@ class PersistentMultiModelManager:
         "world-bootstrap": "planner",
         "review": "reviewer",
         "audit-chapter": "reviewer",
+        "review-chapter": "reviewer",
         "revision": "reviser",
         "revise-chapter": "reviser",
         "rewrite-chapter": "reviser",
@@ -1569,10 +1956,12 @@ class PersistentMultiModelManager:
         "thought-clarify": "planner",
         "thought-framework": "planner",
         "joint-review": "reviewer",
+        "dialogue-write": "writer",
         "draft-import-analysis": "reviewer",
         "draft-import-adjustment-plan": "reviewer",
         "planning-synthesis": "planner",
         "planning-views-generate": "planner",
+        "planning-views": "planner",
         "model-connection-test": "planner",
         "model-discovery": "planner",
         "simulation-analyst-query": "planner",
@@ -1581,9 +1970,15 @@ class PersistentMultiModelManager:
         "forecast": "planner",
         "storyflow-analyze": "planner",
         "radar": "planner",
+        "radar-scan": "planner",
         "translation": "writer",
+        "translation-run": "writer",
         "interactive-film": "planner",
+        "interactive-film-generate": "planner",
         "cover-brief": "planner",
+        "interactive-film-node-image": "image",
+        "cover-image-generate": "image",
+        "simulation-round": "planner",
     }
 
     def __init__(self, runtime: PersistentModelRuntime):
@@ -1621,6 +2016,61 @@ class PersistentMultiModelManager:
 
     def get_planner(self) -> PersistentModelClient:
         return self.get_client("planner")
+
+    def embed(
+        self,
+        text: str,
+        *,
+        provider_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> list[float]:
+        """Route a derived embedding operation through the Host Runtime."""
+        if self._router is not None and self.runtime.current_task_id():
+            return self._router_embedding(
+                text,
+                provider_id=provider_id,
+                model_id=model_id,
+            )
+        return self.runtime.embed(text, provider_id=provider_id, model_id=model_id)
+
+    def embed_many(
+        self,
+        texts: list[str],
+        *,
+        provider_id: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> list[list[float]]:
+        """Route a bounded derived-embedding batch through the Host Runtime."""
+        max_batch = PersistentModelRuntime.MAX_EMBEDDING_BATCH_SIZE
+        if (
+            not isinstance(texts, list)
+            or not texts
+            or len(texts) > max_batch
+            or any(not isinstance(text, str) or not text.strip() for text in texts)
+        ):
+            raise ModelConfigurationError(
+                "MODEL_INPUT_INVALID",
+                f"embedding input must contain 1..{max_batch} non-empty texts",
+            )
+        if self._router is not None and self.runtime.current_task_id():
+            return self._router_embedding_batch(
+                texts,
+                provider_id=provider_id,
+                model_id=model_id,
+            )
+        embed_many = getattr(self.runtime, "embed_many", None)
+        if callable(embed_many):
+            return embed_many(texts, provider_id=provider_id, model_id=model_id)
+        embed = getattr(self.runtime, "embed", None)
+        if not callable(embed):
+            raise ModelConfigurationError(
+                "MODEL_RUNTIME_UNAVAILABLE",
+                "embedding runtime does not support batch or scalar invocation",
+            )
+        return [
+            embed(text, provider_id=provider_id, model_id=model_id)
+            for text in texts
+        ]
 
     def chat(self, messages: list[dict[str, Any]], system: str = "", *, task_type: Optional[str] = None,
              **kwargs: Any) -> LLMResponse:
@@ -1673,41 +2123,66 @@ class PersistentMultiModelManager:
         else:
             base_task = self.runtime._agent_task_from_row(dict(row), role=role, task_type=task_type)
         payload = dict(base_task.input_payload)
+        # A single durable chapter task can contain several role-specific
+        # calls.  Give multi-turn runtimes an explicit Host-owned conversation
+        # scope so a Reviewer/Revision call cannot accidentally reuse the
+        # Writer's provider thread.  Identical requests keep the same scope,
+        # which preserves retry/recovery idempotency; callers that genuinely
+        # need a continuing conversation may provide ``runtime_session_key``.
+        context_manifest = kwargs.get("context_manifest")
+        if not isinstance(context_manifest, dict):
+            context_manifest = payload.get("contextManifest") or payload.get("context_manifest")
+        if not isinstance(context_manifest, dict):
+            context_manifest = self.runtime._context_manifest_for_task(
+                durable_task_id,
+                task_stage=task_type,
+                role=role,
+            )
+        session_scope = kwargs.get("runtime_session_key") or payload.get("runtimeSessionKey")
+        if not isinstance(session_scope, str) or not session_scope.strip():
+            session_signature = stable_hash({
+                "messages": messages,
+                "system": system,
+                "contextManifest": context_manifest,
+            })[:24]
+            session_scope = f"{role}:{task_type}:{session_signature}"
+        payload["runtimeSessionKey"] = str(session_scope).strip()
         payload.update({
             "messages": messages,
             "system": system,
             "jsonMode": json_mode,
             "runtimeOptions": dict(kwargs),
         })
-        context_manifest = kwargs.get("context_manifest")
-        if isinstance(context_manifest, dict):
-            payload["contextManifest"] = dict(context_manifest)
+        payload["contextManifest"] = deepcopy(context_manifest)
         if kwargs.get("prompt_version"):
             payload["promptVersion"] = str(kwargs["prompt_version"])
         provider_id = kwargs.get("provider_id")
         if provider_id:
             payload["providerId"] = provider_id
-        task = replace(base_task, input_payload=payload)
-
-        async def collect():
-            terminal = None
-            async for event in router.execute(task):
-                if event.event_type in {"turn.completed", "turn.complete"}:
-                    terminal = event
-            return terminal
-
-        # Legacy callers are synchronous, but Studio's HTTP boundary is an
-        # async function and can still enter this compatibility facade while
-        # an event loop is already running.  ``asyncio.run`` cannot nest in
-        # that case; isolate the synchronous bridge in one short-lived worker
-        # thread while keeping the same durable task scope and router plan.
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            terminal = asyncio.run(collect())
-        else:
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="novelforge-runtime-bridge") as executor:
-                terminal = executor.submit(asyncio.run, collect()).result()
+            base_task = replace(
+                base_task,
+                constraints={**base_task.constraints, "runtime_type": "api"},
+            )
+        runtime_profile = base_task.profile
+        if (
+            runtime_profile is None
+            or base_task.role != role
+            or base_task.task_type != task_type
+        ):
+            runtime_profile = default_agent_task_profile(role, task_type)
+        # The durable AgentTask row is the compatibility envelope for the
+        # chapter workflow.  Each model call still receives the Host-owned
+        # role/profile for its actual stage, so a Reviewer cannot inherit the
+        # Writer's dynamic tools merely because both calls share one durable
+        # queue task.
+        task = replace(
+            base_task,
+            role=role,
+            task_type=task_type,
+            profile=runtime_profile,
+            input_payload=payload,
+        )
+        terminal = self._run_router_task(task)
         if terminal is None or not isinstance(terminal.payload, dict):
             raise ModelConfigurationError("MODEL_RUNTIME_NO_ARTIFACT", "runtime completed without an artifact")
         artifact = terminal.payload.get("artifact")
@@ -1726,11 +2201,296 @@ class PersistentMultiModelManager:
             latency_ms=int(usage.get("latencyMs") or 0),
         )
 
+    def _router_embedding(
+        self,
+        text: str,
+        *,
+        provider_id: Optional[str],
+        model_id: Optional[str],
+    ) -> list[float]:
+        if not isinstance(text, str) or not text.strip():
+            raise ModelConfigurationError("MODEL_INPUT_INVALID", "embedding input is empty")
+        durable_task_id = self.runtime.current_task_id()
+        if not durable_task_id:
+            raise ModelConfigurationError("MODEL_TASK_CONTEXT_REQUIRED", "embedding requires a durable task")
+        db = self.runtime.repository.db
+        row = db.fetchone("SELECT * FROM agent_tasks WHERE task_id=?", (durable_task_id,))
+        if row is None:
+            base_task = self.runtime._ensure_agent_task(durable_task_id, "embedding", "embedding")
+        else:
+            base_task = self.runtime._agent_task_from_row(
+                dict(row), role="embedding", task_type="embedding"
+            )
+        payload = dict(base_task.input_payload)
+        payload.update({"operation": "embedding", "embeddingInput": text})
+        constraints = {**base_task.constraints, "runtime_type": "api"}
+        if model_id:
+            resolved = self.runtime.repository.resolve(
+                "embedding",
+                provider_id=provider_id,
+                model_id=model_id,
+            )
+            constraints["model_id"] = str(resolved.get("model_id") or "").strip()
+            constraints["provider_id"] = str(resolved.get("provider_id") or "").strip()
+            payload["providerId"] = str(resolved.get("provider_id") or "").strip()
+        elif provider_id:
+            payload["providerId"] = provider_id
+            constraints["provider_id"] = provider_id
+        task = replace(
+            base_task,
+            role="embedding",
+            task_type="embedding",
+            profile=default_agent_task_profile("embedding", "embedding"),
+            constraints=constraints,
+            input_payload=payload,
+        )
+        terminal = self._run_router_task(task)
+        if terminal is None or not isinstance(terminal.payload, dict):
+            raise ModelConfigurationError("MODEL_RUNTIME_NO_ARTIFACT", "runtime completed without an embedding artifact")
+        artifact = terminal.payload.get("artifact")
+        if not isinstance(artifact, dict):
+            artifact = terminal.payload
+        vector = artifact.get("embedding")
+        if not isinstance(vector, list) or not vector:
+            raise ModelConfigurationError("MODEL_RUNTIME_NO_ARTIFACT", "runtime completed without an embedding vector")
+        try:
+            values = [float(value) for value in vector]
+        except (TypeError, ValueError) as exc:
+            raise ModelConfigurationError("MODEL_RUNTIME_INVALID_ARTIFACT", "runtime returned a non-numeric embedding") from exc
+        return values
+
+    def _router_embedding_batch(
+        self,
+        texts: list[str],
+        *,
+        provider_id: Optional[str],
+        model_id: Optional[str],
+    ) -> list[list[float]]:
+        max_batch = PersistentModelRuntime.MAX_EMBEDDING_BATCH_SIZE
+        if not texts or len(texts) > max_batch:
+            raise ModelConfigurationError(
+                "MODEL_INPUT_INVALID",
+                f"embedding batch must contain 1..{max_batch} texts",
+            )
+        durable_task_id = self.runtime.current_task_id()
+        if not durable_task_id:
+            raise ModelConfigurationError("MODEL_TASK_CONTEXT_REQUIRED", "embedding requires a durable task")
+        db = self.runtime.repository.db
+        row = db.fetchone("SELECT * FROM agent_tasks WHERE task_id=?", (durable_task_id,))
+        if row is None:
+            base_task = self.runtime._ensure_agent_task(durable_task_id, "embedding-batch", "embedding")
+        else:
+            base_task = self.runtime._agent_task_from_row(
+                dict(row), role="embedding", task_type="embedding-batch"
+            )
+        payload = dict(base_task.input_payload)
+        payload.update({"operation": "embedding_batch", "embeddingInputs": list(texts)})
+        constraints = {**base_task.constraints, "runtime_type": "api"}
+        if model_id:
+            resolved = self.runtime.repository.resolve(
+                "embedding",
+                provider_id=provider_id,
+                model_id=model_id,
+            )
+            constraints["model_id"] = str(resolved.get("model_id") or "").strip()
+            constraints["provider_id"] = str(resolved.get("provider_id") or "").strip()
+            payload["providerId"] = str(resolved.get("provider_id") or "").strip()
+        elif provider_id:
+            payload["providerId"] = provider_id
+            constraints["provider_id"] = provider_id
+        task = replace(
+            base_task,
+            role="embedding",
+            task_type="embedding-batch",
+            profile=default_agent_task_profile("embedding", "embedding-batch"),
+            constraints=constraints,
+            input_payload=payload,
+        )
+        terminal = self._run_router_task(task)
+        if terminal is None or not isinstance(terminal.payload, dict):
+            raise ModelConfigurationError("MODEL_RUNTIME_NO_ARTIFACT", "runtime completed without an embedding artifact")
+        artifact = terminal.payload.get("artifact")
+        if not isinstance(artifact, dict):
+            artifact = terminal.payload
+        vectors = artifact.get("embeddings")
+        if not isinstance(vectors, list) or len(vectors) != len(texts):
+            raise ModelConfigurationError("MODEL_RUNTIME_NO_ARTIFACT", "runtime completed without a complete embedding batch")
+        normalized: list[list[float]] = []
+        dimension: int | None = None
+        for vector in vectors:
+            if not isinstance(vector, list) or not vector:
+                raise ModelConfigurationError("MODEL_RUNTIME_INVALID_ARTIFACT", "runtime returned an invalid embedding batch")
+            try:
+                values = [float(value) for value in vector]
+            except (TypeError, ValueError) as exc:
+                raise ModelConfigurationError("MODEL_RUNTIME_INVALID_ARTIFACT", "runtime returned a non-numeric embedding batch") from exc
+            if any(not math.isfinite(value) for value in values):
+                raise ModelConfigurationError("MODEL_RUNTIME_INVALID_ARTIFACT", "runtime returned a non-finite embedding batch")
+            if dimension is None:
+                dimension = len(values)
+            elif len(values) != dimension:
+                raise ModelConfigurationError("MODEL_RUNTIME_INVALID_ARTIFACT", "runtime returned inconsistent embedding dimensions")
+            normalized.append(values)
+        return normalized
+
+    def _router_image(
+        self,
+        prompt: str,
+        *,
+        size: str,
+        quality: str,
+        style: str,
+    ) -> ImageResponse:
+        router = self._router
+        if router is None:
+            raise ModelConfigurationError("MODEL_RUNTIME_ROUTER_UNAVAILABLE", "runtime router is not attached")
+        durable_task_id = self.runtime.current_task_id()
+        if not durable_task_id:
+            raise ModelConfigurationError("MODEL_TASK_CONTEXT_REQUIRED", "model invocation requires a durable task")
+        db = self.runtime.repository.db
+        row = db.fetchone("SELECT * FROM agent_tasks WHERE task_id=?", (durable_task_id,))
+        if row is None:
+            durable = db.fetchone("SELECT type FROM tasks WHERE id=?", (durable_task_id,)) or {}
+            task_type = str(durable.get("type") or "image-generation")
+            base_task = self.runtime._ensure_agent_task(durable_task_id, task_type, "image")
+        else:
+            base_task = self.runtime._agent_task_from_row(dict(row), role="image", task_type="image-generation")
+        payload = dict(base_task.input_payload)
+        payload.update({
+            "operation": "image",
+            "imagePrompt": prompt,
+            "imageOptions": {
+                "size": size,
+                "quality": quality,
+                "style": style,
+            },
+        })
+        task = replace(
+            base_task,
+            constraints={**base_task.constraints, "runtime_type": "api"},
+            input_payload=payload,
+        )
+        terminal = self._run_router_task(task)
+        if terminal is None or not isinstance(terminal.payload, dict):
+            raise ModelConfigurationError("MODEL_RUNTIME_NO_ARTIFACT", "runtime completed without an image artifact")
+        artifact = terminal.payload.get("artifact")
+        if not isinstance(artifact, dict):
+            artifact = terminal.payload
+        encoded = artifact.get("dataBase64")
+        if not isinstance(encoded, str) or not encoded:
+            raise ModelConfigurationError("MODEL_RUNTIME_NO_ARTIFACT", "runtime completed without image data")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            raise ModelConfigurationError("MODEL_RUNTIME_INVALID_ARTIFACT", "runtime returned invalid image data") from None
+        if not data:
+            raise ModelConfigurationError("MODEL_RUNTIME_INVALID_ARTIFACT", "runtime returned empty image data")
+        return ImageResponse(
+            data=data,
+            mime_type=str(artifact.get("mimeType") or artifact.get("contentType") or "image/png"),
+            model=str(artifact.get("model") or ""),
+            provider=str(artifact.get("provider") or ""),
+        )
+
+    def _run_router_task(self, task: AgentTask):
+        router = self._router
+        if router is None:
+            raise ModelConfigurationError("MODEL_RUNTIME_ROUTER_UNAVAILABLE", "runtime router is not attached")
+
+        async def collect():
+            terminal = None
+            # Compatibility callers still enter through the synchronous
+            # manager, but the Host Router remains the single execution
+            # entrypoint.  Use its explicit fallback seam as well so a
+            # transient pre-output provider failure cannot silently bypass
+            # the same-quality retry policy used by TaskOrchestrator.
+            async for event in router.execute_with_fallback(task):
+                if event.event_type in {"turn.completed", "turn.complete"}:
+                    terminal = event
+            return terminal
+
+        # Legacy callers are synchronous, but Studio's HTTP boundary is an
+        # async function and can still enter this compatibility facade while
+        # an event loop is already running.  ``asyncio.run`` cannot nest in
+        # that case; isolate the synchronous bridge in one short-lived worker
+        # thread while keeping the same durable task scope and router plan.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(collect())
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="novelforge-runtime-bridge") as executor:
+            return executor.submit(asyncio.run, collect()).result()
+
     def test_provider(self, provider_id: str) -> LLMResponse:
+        if self._router is not None and self.runtime.current_task_id():
+            return self._router_chat(
+                [{"role": "user", "content": "Connection check"}],
+                "",
+                role="planner",
+                task_type="model-connection-test",
+                json_mode=False,
+                kwargs={"provider_id": provider_id, "max_tokens": 10},
+            )
         return self.runtime.test_provider(provider_id)
 
     def discover_models(self, provider_id: str) -> dict[str, Any]:
-        return self.runtime.discover_models(provider_id)
+        discovered = self.runtime.discover_models(provider_id)
+        # Model discovery is a durable worker operation.  Keep the scheduler
+        # in the same long-lived process synchronized with the catalog it just
+        # persisted; otherwise a worker would require a restart before a
+        # newly discovered model could be selected.  The method is a no-op for
+        # isolated compatibility managers whose router has no API adapter.
+        self.refresh_api_capabilities()
+        return discovered
+
+    def refresh_api_capabilities(self) -> int:
+        """Replace the attached Host scheduler's API catalog from persistence.
+
+        Configuration updates and model discovery share the same persisted
+        catalog.  Keeping this operation on the manager makes both paths
+        update the long-lived Host scheduler instead of leaving stale
+        candidates until a process restart or a UI capability request.
+        """
+        router = self._router
+        scheduler = getattr(router, "scheduler", None)
+        registry = getattr(scheduler, "registry", None)
+        if router is None or registry is None:
+            return 0
+        try:
+            api_runtime = getattr(router, "get", lambda _runtime_type: None)("api")
+        except Exception as exc:
+            # Capability refresh is an observational synchronization seam.  A
+            # compatibility router may reject an absent adapter; keep the
+            # persisted model configuration usable while making the skipped
+            # refresh visible to operators.
+            logger.warning("could not read API runtime during capability refresh: %s", exc, exc_info=exc)
+            return 0
+        get_models = getattr(api_runtime, "get_models_sync", None)
+        if not callable(get_models):
+            return 0
+        health = registry.runtime_health("api", default="unknown") if hasattr(registry, "runtime_health") else "ready"
+        # The full Studio router exposes a durable Registry readiness gate.
+        # Consult it when available so a newly added model cannot be marked
+        # ready merely because the previous catalog was empty.  Test and
+        # embedded routers without that gate retain their observed capability
+        # health.
+        readiness = getattr(router, "runtime_readiness", None)
+        if callable(readiness):
+            try:
+                readiness("api")
+                health = "ready"
+            except Exception:
+                health = "unavailable"
+        registry.clear_runtime("api")
+        models = tuple(get_models())
+        for model in models:
+            registry.register_model(
+                model,
+                capability="C2",
+                health=health,
+                tags=("api",),
+            )
+        return len(models)
 
     def generate_image(
         self,
@@ -1741,6 +2501,13 @@ class PersistentMultiModelManager:
         style: str = "",
     ) -> ImageResponse:
         """Expose the durable image route to legacy task handlers."""
+        if self._router is not None and self.runtime.current_task_id():
+            return self._router_image(
+                prompt,
+                size=size,
+                quality=quality,
+                style=style,
+            )
         return self.runtime.generate_image(prompt, size=size, quality=quality, style=style)
 
 
@@ -1762,7 +2529,11 @@ def build_model_runtime(db: Database, workspace_root: Path) -> tuple[ModelReposi
 
     capabilities = CapabilityRegistry()
     rows = db.fetchall(
-        """SELECT m.model_id, m.name, m.capabilities
+        """SELECT m.id, m.provider_id, m.model_id, m.name, m.capabilities,
+                  EXISTS(
+                      SELECT 1 FROM agent_model_routes image_route
+                      WHERE image_route.agent_role='image' AND image_route.model_id=m.id
+                  ) AS image_route
            FROM models m JOIN model_providers p ON p.id=m.provider_id
            WHERE m.enabled=TRUE AND p.enabled=TRUE
            ORDER BY m.created_at, m.id"""
@@ -1778,6 +2549,15 @@ def build_model_runtime(db: Database, workspace_root: Path) -> tuple[ModelReposi
             model_capabilities = {
                 str(value): "available" for value in raw_capabilities if isinstance(value, str)
             }
+        normalized_capabilities = {
+            name.strip().lower() for name in model_capabilities if name.strip()
+        }
+        supports_image = bool(row.get("image_route")) or bool(
+            normalized_capabilities & {"image", "images", "image-generation", "image_generation"}
+        )
+        supports_embedding = bool(
+            normalized_capabilities & {"embedding", "embeddings", "vector", "vectors"}
+        )
         descriptor = ModelDescriptor(
             runtime_type="api",
             model_id=str(row["model_id"]),
@@ -1789,7 +2569,10 @@ def build_model_runtime(db: Database, workspace_root: Path) -> tuple[ModelReposi
                 "extraction": "C2", "planning": "C2", "writing": "C2",
                 "review": "C2", "long_context": "C2", "tool_use": "C1",
                 "structured_output": "C2", "revision": "C2", "consistency": "C2",
+                "image": "C2" if supports_image else "C0",
+                "embedding": "C2" if supports_embedding else "C0",
             },
+            provider_id=str(row["provider_id"]),
         )
         capabilities.register_model(
             descriptor,
@@ -1804,20 +2587,62 @@ def build_model_runtime(db: Database, workspace_root: Path) -> tuple[ModelReposi
                 "structured_output": "C2",
                 "revision": "C2",
                 "consistency": "C2",
+                "image": "C2" if supports_image else "C0",
+                "embedding": "C2" if supports_embedding else "C0",
             },
         )
     agent_runs = AgentRunStore(db)
-    codex_runtime = CodexRuntime(agent_runs, cwd=workspace_root)
-    for model in codex_runtime._models:
-        capabilities.register_model(model, capability="C4", tags=("codex", "session"))
+    codex_runtime = None
+    codex_installation = db.fetchone(
+        """SELECT state, path, auth_status, capability_verified, health, verified
+           FROM runtime_installations WHERE runtime_type=?""",
+        ("codex-app-server",),
+    )
+    if (
+        codex_installation is not None
+        and codex_installation.get("state") == "ready"
+        and bool(codex_installation.get("verified"))
+        and bool(codex_installation.get("capability_verified"))
+        and codex_installation.get("auth_status") in {"authenticated", "ready"}
+        and codex_installation.get("health") == "healthy"
+    ):
+        codex_path = str(codex_installation.get("path") or "codex").strip() or "codex"
+        codex_runtime = CodexRuntime(
+            agent_runs,
+            command=(codex_path, "app-server"),
+            cwd=workspace_root,
+        )
+        for model in codex_runtime._models:
+            capabilities.register_model(model, capability="C4", tags=("codex", "session"))
+
+    def runtime_readiness(runtime_type: str) -> None:
+        if runtime_type != "codex-app-server":
+            return
+        current = db.fetchone(
+            """SELECT state, auth_status, capability_verified, health, verified
+               FROM runtime_installations WHERE runtime_type=?""",
+            (runtime_type,),
+        )
+        if (
+            current is None
+            or current.get("state") != "ready"
+            or not bool(current.get("verified"))
+            or not bool(current.get("capability_verified"))
+            or current.get("auth_status") not in {"authenticated", "ready"}
+            or current.get("health") != "healthy"
+        ):
+            raise RuntimeUnavailable(f"runtime is not ready: {runtime_type}")
+
     router = RuntimeRouter(
         ComputeScheduler(
             capabilities,
             budget=BudgetBroker(total=10_000, critical_reserve=1_000, db=db, scope="runtime"),
         ),
         runs=agent_runs,
+        runtime_readiness=runtime_readiness,
     )
     router.register("api", ApiModelRuntime(runtime, agent_runs))
-    router.register("codex-app-server", codex_runtime)
+    if codex_runtime is not None:
+        router.register("codex-app-server", codex_runtime)
     manager.attach_runtime_router(router)
     return repository, runtime, manager

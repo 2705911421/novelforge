@@ -30,6 +30,7 @@ from .contracts import (
 )
 from .errors import RuntimeCrashed, RuntimeUnavailable, TaskInterrupted
 from .persistence import AgentRunStore
+from .process import resolve_executable_argv
 
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,7 @@ class StructuredCliRuntime:
         max_budget_usd: float | None = None,
     ) -> None:
         self.runs = runs
+        self._context_bundles = ContextBundleStore(runs.db)
         self.cwd = str(cwd) if cwd else None
         self.executable = str(executable or self.executable).strip()
         if not self.executable:
@@ -123,24 +125,56 @@ class StructuredCliRuntime:
         )
         context_bundle_id = task.context_bundle_id
         context_manifest = task.input_payload.get("contextManifest")
+        if not isinstance(context_manifest, Mapping) and context_bundle_id is None:
+            context_manifest = self._context_bundles.manifest_for_task(
+                durable_task_id=durable_task_id,
+                task_stage=task.task_type,
+                role=task.role,
+                task=task,
+                source=self.__class__.__name__,
+            )
         if isinstance(context_manifest, Mapping):
             task_row = self.runs.db.fetchone(
                 "SELECT project_id, book_id FROM tasks WHERE id=?", (durable_task_id,)
             ) or {}
-            bundle = ContextBundleStore(self.runs.db).create_from_manifest(
-                context_manifest,
-                project_id=context_manifest.get("projectId") or task_row.get("project_id") or task.project_id,
-                book_id=context_manifest.get("bookId") or task_row.get("book_id"),
-                source=self.__class__.__name__,
-                task_id=durable_task_id,
-                role=task.role,
-            )
-            context_bundle_id = bundle.bundle_id
-            self.runs.db.execute(
-                "UPDATE agent_tasks SET context_bundle_id=COALESCE(context_bundle_id, ?), "
-                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (context_bundle_id, task.task_id),
-            )
+            persisted = self.runs.db.fetchone(
+                "SELECT context_bundle_id FROM agent_tasks WHERE id=?", (task.task_id,)
+            ) or {}
+            bound_context_id = str(
+                context_bundle_id or persisted.get("context_bundle_id") or ""
+            ).strip() or None
+            requested_context_id = str(
+                context_manifest.get("bundleId") or context_manifest.get("contextBundleId") or ""
+            ).strip() or None
+            if bound_context_id is not None:
+                if requested_context_id is not None and requested_context_id != bound_context_id:
+                    raise ValueError("CLI ContextBundle does not match the persisted AgentTask")
+                context_bundle_id = bound_context_id
+            elif requested_context_id is not None and self._context_bundles.get(requested_context_id) is not None:
+                context_bundle_id = requested_context_id
+            else:
+                bundle = self._context_bundles.create_from_manifest(
+                    context_manifest,
+                    project_id=context_manifest.get("projectId") or task_row.get("project_id") or task.project_id,
+                    book_id=context_manifest.get("bookId") or task_row.get("book_id"),
+                    source=self.__class__.__name__,
+                    task_id=durable_task_id,
+                    role=task.role,
+                    expected_project_id=task_row.get("project_id") or task.project_id,
+                    expected_book_id=task_row.get("book_id"),
+                )
+                context_bundle_id = bundle.bundle_id
+                self.runs.db.execute(
+                    "UPDATE agent_tasks SET context_bundle_id=COALESCE(context_bundle_id, ?), "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (context_bundle_id, task.task_id),
+                )
+                persisted = self.runs.db.fetchone(
+                    "SELECT context_bundle_id FROM agent_tasks WHERE id=?", (task.task_id,)
+                ) or {}
+                context_bundle_id = str(
+                    persisted.get("context_bundle_id") or context_bundle_id
+                ).strip() or None
 
         run = self.runs.create(
             task=task,
@@ -199,12 +233,18 @@ class StructuredCliRuntime:
                 )
 
             payload = self._parse_output(stdout_text)
-            if isinstance(payload, Mapping) and bool(payload.get("is_error")):
+            payload_error = self._payload_error(payload)
+            if payload_error is not None:
                 raise RuntimeCrashed(
                     f"{self.runtime_type} reported an error",
-                    details={"payload": self._safe_payload(payload), "stderr": stderr_text},
+                    details={"errorShape": payload_error, "stderr": stderr_text},
                 )
             artifact = self._artifact(payload, stdout_text, stderr_text)
+            if not str(artifact.get("content") or "").strip():
+                raise RuntimeCrashed(
+                    f"{self.runtime_type} returned an empty artifact",
+                    details={"stderr": stderr_text},
+                )
             usage = self._usage(payload)
             self.runs.transition(
                 run_id,
@@ -297,7 +337,7 @@ class StructuredCliRuntime:
         return self._capabilities
 
     async def get_usage(self) -> UsageSnapshot:
-        return UsageSnapshot()
+        return self.runs.usage_snapshot(self.runtime_type)
 
     async def shutdown(self) -> None:
         await asyncio.gather(
@@ -316,8 +356,9 @@ class StructuredCliRuntime:
 
     @staticmethod
     async def _spawn(argv: Sequence[str], cwd: str | None) -> Any:
+        launch_argv = resolve_executable_argv(argv)
         return await asyncio.create_subprocess_exec(
-            *argv,
+            *launch_argv,
             cwd=cwd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
@@ -326,10 +367,27 @@ class StructuredCliRuntime:
 
     async def _communicate(self, process: Any) -> tuple[Any, Any]:
         communicate = getattr(process, "communicate", None)
-        if communicate is None:
-            raise RuntimeCrashed("CLI process does not expose communicate()")
         try:
-            result = await asyncio.wait_for(communicate(), timeout=self.timeout_seconds)
+            # ``asyncio.subprocess.Process.communicate`` accumulates the whole
+            # child output before returning.  A vendor CLI can therefore turn
+            # an otherwise bounded diagnostic policy into an unbounded memory
+            # read.  Real asyncio subprocesses expose StreamReader pipes, so
+            # drain those incrementally and retain only the configured prefix.
+            # Small injected/fake processes may expose byte strings instead;
+            # keep their existing communicate contract for compatibility.
+            stdout_pipe = getattr(process, "stdout", None)
+            stderr_pipe = getattr(process, "stderr", None)
+            if callable(getattr(stdout_pipe, "read", None)) or callable(
+                getattr(stderr_pipe, "read", None)
+            ):
+                result = await asyncio.wait_for(
+                    self._communicate_bounded_streams(process),
+                    timeout=self.timeout_seconds,
+                )
+            else:
+                if communicate is None:
+                    raise RuntimeCrashed("CLI process does not expose communicate()")
+                result = await asyncio.wait_for(communicate(), timeout=self.timeout_seconds)
         except asyncio.TimeoutError as exc:
             await self._terminate(process)
             raise RuntimeCrashed(
@@ -338,6 +396,51 @@ class StructuredCliRuntime:
         if not isinstance(result, tuple) or len(result) != 2:
             raise RuntimeCrashed("CLI process returned an invalid communicate result")
         return result[0], result[1]
+
+    async def _communicate_bounded_streams(self, process: Any) -> tuple[bytes, bytes]:
+        """Drain subprocess pipes without retaining more than two prefixes."""
+
+        stdout_task = asyncio.create_task(
+            self._read_bounded_stream(getattr(process, "stdout", None))
+        )
+        stderr_task = asyncio.create_task(
+            self._read_bounded_stream(getattr(process, "stderr", None))
+        )
+        try:
+            stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+            wait = getattr(process, "wait", None)
+            if callable(wait):
+                result = wait()
+                if inspect.isawaitable(result):
+                    await result
+            return stdout, stderr
+        finally:
+            for task in (stdout_task, stderr_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+    async def _read_bounded_stream(self, stream: Any) -> bytes:
+        if stream is None or not callable(getattr(stream, "read", None)):
+            return b""
+        retained = bytearray()
+        retained_limit = self.max_output_chars
+        while True:
+            chunk = stream.read(min(64 * 1024, retained_limit + 1))
+            if inspect.isawaitable(chunk):
+                chunk = await chunk
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", errors="replace")
+            if not isinstance(chunk, (bytes, bytearray)):
+                raise RuntimeCrashed("CLI process returned a non-byte output chunk")
+            if len(retained) < retained_limit:
+                remaining = retained_limit - len(retained)
+                retained.extend(chunk[:remaining])
+            # Continue draining after the retention limit so a verbose child
+            # cannot block on a full pipe while the Host waits for exit.
+        return bytes(retained)
 
     async def _run_probe(self, argv: Sequence[str]) -> Any:
         process = await self._spawn_process(argv)
@@ -455,6 +558,31 @@ class StructuredCliRuntime:
         return artifact
 
     @staticmethod
+    def _payload_error(payload: Any) -> str | None:
+        """Identify vendor error envelopes before they become artifacts."""
+        if not isinstance(payload, Mapping):
+            return None
+        if bool(payload.get("is_error")) or bool(payload.get("isError")):
+            return "is_error"
+        envelope_type = str(payload.get("type") or "").strip().lower()
+        if envelope_type in {"error", "failed", "failure"}:
+            return f"type:{envelope_type}"
+        status = str(payload.get("status") or "").strip().lower()
+        if status in {"error", "failed", "failure"}:
+            return f"status:{status}"
+        for key in ("error", "errors"):
+            value = payload.get(key)
+            if value not in (None, "", [], {}):
+                return f"field:{key}"
+        result = payload.get("result")
+        if isinstance(result, Mapping):
+            for key in ("error", "errors"):
+                value = result.get(key)
+                if value not in (None, "", [], {}):
+                    return f"result.{key}"
+        return None
+
+    @staticmethod
     def _usage(payload: Any) -> dict[str, Any]:
         if not isinstance(payload, Mapping):
             return {}
@@ -564,6 +692,13 @@ class GeminiCliRuntime(StructuredCliRuntime):
     executable = "gemini"
     integration_grade = "C"
     default_model_id = "default"
+    _AUTH_FAILURE_MARKERS = (
+        "error authenticating",
+        "ineligibletiererror",
+        "unsupported client",
+        "authentication failed",
+        "not authenticated",
+    )
 
     def _command(self, task: AgentTask, plan: ComputePlan) -> tuple[str, ...]:
         command: list[str] = [
@@ -590,6 +725,18 @@ class GeminiCliRuntime(StructuredCliRuntime):
             return AuthState(
                 "not_authenticated",
                 detail=diagnostic or output or "Gemini CLI session probe failed",
+            )
+        # Gemini CLI has returned a vendor authentication failure on stdout
+        # with exit code 0 (for example, ``IneligibleTierError`` for an
+        # unsupported Code Assist tier).  Exit status alone is therefore not
+        # an authentication contract; fail closed on explicit error envelopes
+        # before allowing RuntimeManager to mark the adapter READY.
+        normalized_output = str(output or "").strip().casefold()
+        if any(marker in normalized_output for marker in self._AUTH_FAILURE_MARKERS):
+            return AuthState(
+                "not_authenticated",
+                detail=self._bounded(str(output).strip())
+                or "Gemini CLI authentication probe reported an error",
             )
         return AuthState("authenticated", detail="gemini session probe")
 

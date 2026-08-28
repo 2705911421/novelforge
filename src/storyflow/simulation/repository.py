@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import uuid
 from dataclasses import replace
 from datetime import datetime
@@ -18,6 +19,9 @@ from .clock import SimulationClock
 from .memory import AgentMemory, AgentMemoryRepository, AgentMemoryType
 from .scheduler import AgentActivation
 from .knowledge import KnowledgeScope, KnowledgeStatus
+
+
+logger = logging.getLogger(__name__)
 
 
 class SimulationRunDeletedError(ValueError):
@@ -1010,8 +1014,13 @@ class SimulationRepository:
         if explicit_status:
             try:
                 status = KnowledgeStatus(str(explicit_status).upper())
-            except ValueError:
-                pass
+            except ValueError as exc:
+                logger.warning(
+                    "Ignoring invalid simulation knowledge status %r for run %s: %s",
+                    explicit_status,
+                    run_id,
+                    exc,
+                )
 
         records: dict[str, dict[str, Any]] = {}
         secrets = values.get("secrets", {})

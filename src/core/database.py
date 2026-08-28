@@ -2560,6 +2560,149 @@ def _apply_v50(conn: sqlite3.Connection) -> None:
     _execute_sql_script(conn, PHASE_50_RUNTIME_INSTALLER_SQL)
 
 
+PHASE_51_COMPUTE_POLICY_SQL = """
+-- The selected user-facing compute strategy is host configuration, not
+-- narrative Canon.  Keep it in its own durable scope so a restart does not
+-- silently reset the scheduler to a different quality/cost policy.
+CREATE TABLE IF NOT EXISTS compute_policy_settings (
+    scope TEXT PRIMARY KEY,
+    strategy TEXT NOT NULL,
+    budget_mode TEXT NOT NULL DEFAULT 'hard',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+
+def _apply_v51(conn: sqlite3.Connection) -> None:
+    """Persist the Studio Compute Strategy selection."""
+    _execute_sql_script(conn, PHASE_51_COMPUTE_POLICY_SQL)
+
+
+PHASE_52_TASK_WORKFLOW_STATE_SQL = """
+-- ``tasks.status`` remains the worker/lease lifecycle.  This separate field
+-- is the durable narrative workflow state used by the Task Center and
+-- recovery logic; legacy ``stage`` labels remain untouched for compatibility.
+ALTER TABLE tasks ADD COLUMN workflow_state TEXT;
+ALTER TABLE tasks ADD COLUMN workflow_state_updated_at TIMESTAMP;
+CREATE INDEX IF NOT EXISTS idx_tasks_workflow_state
+    ON tasks(type, workflow_state, updated_at);
+"""
+
+
+def _apply_v52(conn: sqlite3.Connection) -> None:
+    """Add and conservatively backfill the canonical chapter workflow state."""
+    _add_column_if_missing(conn, "tasks", "workflow_state TEXT")
+    _add_column_if_missing(conn, "tasks", "workflow_state_updated_at TIMESTAMP")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_workflow_state "
+        "ON tasks(type, workflow_state, updated_at)"
+    )
+
+    # Backfill only the two production chapter-task types.  A historical task
+    # may have been marked completed by a compatibility handler without an
+    # accepted StoryCommit; leave its workflow_state NULL so the inconsistency
+    # stays visible instead of being upgraded into a false COMMITTED claim.
+    from .task_workflow import (
+        CHAPTER_WORKFLOW_TASK_TYPES,
+        initial_workflow_state,
+        story_commit_id,
+    )
+
+    placeholders = ", ".join("?" for _ in CHAPTER_WORKFLOW_TASK_TYPES)
+    rows = conn.execute(
+        f"SELECT id, type, status, stage, data, result, book_id, chapter_number, "
+        f"updated_at FROM tasks WHERE type IN ({placeholders}) AND workflow_state IS NULL",
+        tuple(sorted(CHAPTER_WORKFLOW_TASK_TYPES)),
+    ).fetchall()
+    for row in rows:
+        try:
+            data = json.loads(row["data"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            data = {}
+        try:
+            result = json.loads(row["result"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            result = {}
+
+        workflow_state = None
+        if row["status"] == "completed":
+            commit_id = story_commit_id(result)
+            if isinstance(result, dict) and result.get("completed") is True and commit_id:
+                commit = conn.execute(
+                    """SELECT sc.status, c.book_id, c.number
+                       FROM story_commits sc
+                       JOIN chapters c ON c.id=sc.chapter_id
+                       WHERE sc.id=?""",
+                    (commit_id,),
+                ).fetchone()
+                task_chapter = row["chapter_number"]
+                if task_chapter is None and isinstance(data, dict):
+                    task_chapter = data.get("chapter_number") or data.get("chapterNumber")
+                try:
+                    chapter_matches = task_chapter is None or int(task_chapter) == int(commit["number"])
+                except (TypeError, ValueError, KeyError):
+                    chapter_matches = False
+                if (
+                    commit is not None
+                    and commit["status"] == "accepted"
+                    and (row["book_id"] is None or row["book_id"] == commit["book_id"])
+                    and chapter_matches
+                ):
+                    workflow_state = "COMMITTED"
+        else:
+            workflow_state = initial_workflow_state(
+                row["type"], stage=row["stage"] or "queued", data=data
+            )
+
+        if workflow_state:
+            conn.execute(
+                "UPDATE tasks SET workflow_state=?, workflow_state_updated_at=? WHERE id=?",
+                (workflow_state, row["updated_at"], row["id"]),
+            )
+
+
+PHASE_53_AGENT_PROPOSAL_LEDGER_SQL = """
+-- Agent proposals are durable artifacts, not Canon.  They are linked to the
+-- Host task/run for recovery and audit, while acceptance remains a separate
+-- domain decision (StoryCommit is still the only Canon boundary).
+CREATE TABLE IF NOT EXISTS agent_proposals (
+    id TEXT PRIMARY KEY,
+    proposal_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PROPOSED'
+        CHECK(status IN ('PROPOSED', 'ACCEPTED', 'REJECTED', 'SUPERSEDED')),
+    agent_task_id TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL,
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    agent_run_id TEXT REFERENCES agent_runs(id) ON DELETE SET NULL,
+    project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+    book_id TEXT REFERENCES books(id) ON DELETE SET NULL,
+    chapter_id TEXT REFERENCES chapters(id) ON DELETE SET NULL,
+    review_id TEXT REFERENCES reviews(id) ON DELETE SET NULL,
+    parent_proposal_id TEXT REFERENCES agent_proposals(id) ON DELETE SET NULL,
+    payload JSON NOT NULL DEFAULT '{}',
+    checksum TEXT NOT NULL,
+    decision_reason TEXT,
+    decided_by TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    decided_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_proposals_task_created
+    ON agent_proposals(task_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_proposals_agent_task_created
+    ON agent_proposals(agent_task_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_proposals_run_created
+    ON agent_proposals(agent_run_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_proposals_project_status
+    ON agent_proposals(project_id, status, created_at DESC, id DESC);
+"""
+
+
+def _apply_v53(conn: sqlite3.Connection) -> None:
+    """Add the durable non-Canon Agent Proposal ledger."""
+    _execute_sql_script(conn, PHASE_53_AGENT_PROPOSAL_LEDGER_SQL)
+
+
 class _Migration:
     def __init__(self, version: int, name: str, apply, source: str) -> None:
         self.version = version
@@ -2622,6 +2765,9 @@ _MIGRATIONS = (
     _Migration(48, "control_plane_command_event_ledger", _apply_v48, PHASE_48_CONTROL_PLANE_LEDGER_SQL),
     _Migration(49, "control_plane_command_work_queue", _apply_v49, PHASE_49_CONTROL_COMMAND_QUEUE_SQL),
     _Migration(50, "runtime_manifest_installer_lifecycle", _apply_v50, PHASE_50_RUNTIME_INSTALLER_SQL),
+    _Migration(51, "compute_policy_settings", _apply_v51, PHASE_51_COMPUTE_POLICY_SQL),
+    _Migration(52, "task_workflow_state_machine", _apply_v52, PHASE_52_TASK_WORKFLOW_STATE_SQL),
+    _Migration(53, "agent_proposal_ledger", _apply_v53, PHASE_53_AGENT_PROPOSAL_LEDGER_SQL),
 )
 
 _RUNTIME_EXTENSION_NAME = "narrative_runtime_v2"
@@ -2638,7 +2784,7 @@ def generate_id() -> str:
 class Database:
     """数据库管理器"""
     
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, *, read_only: bool = False):
         """
         初始化数据库管理器
         
@@ -2649,10 +2795,23 @@ class Database:
             db_path = str(Path(__file__).parent.parent.parent / "projects" / "novelforge.db")
         
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.read_only = bool(read_only)
+        if self.read_only:
+            if not self.db_path.is_file():
+                raise FileNotFoundError(f"read-only database does not exist: {self.db_path}")
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # 初始化数据库
-        self._init_db()
+        # A read-only handle is an explicit audit/read-model seam.  It must
+        # never run startup migrations, create a parent directory, or switch
+        # the live database into WAL mode.
+        if not self.read_only:
+            self._init_db()
+
+    @classmethod
+    def open_read_only(cls, db_path: Optional[str] = None) -> "Database":
+        """Open an existing SQLite file without startup migration or writes."""
+        return cls(db_path, read_only=True)
     
     def _init_db(self):
         """Apply immutable, checksummed schema migrations.
@@ -2833,10 +2992,15 @@ class Database:
     @contextmanager
     def connect(self):
         """获取数据库连接的上下文管理器"""
-        conn = sqlite3.connect(str(self.db_path))
+        if self.read_only:
+            source_uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(source_uri, uri=True)
+        else:
+            conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
+        if not self.read_only:
+            conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 5000")
         try:
             yield conn
@@ -2846,6 +3010,8 @@ class Database:
     @contextmanager
     def transaction(self):
         """Yield one foreign-key-enforced connection with all-or-nothing writes."""
+        if self.read_only:
+            raise PermissionError("read-only database handle cannot start a write transaction")
         with self.connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -2892,6 +3058,8 @@ class Database:
 
     def insert(self, table: str, data: Dict) -> str:
         """插入记录，返回ID"""
+        if self.read_only:
+            raise PermissionError("read-only database handle cannot insert")
         self._validate_identifier(table, "table name")
         if 'id' not in data:
             data['id'] = generate_id()
@@ -2908,6 +3076,8 @@ class Database:
     
     def update(self, table: str, data: Dict, where: str, where_params: tuple) -> int:
         """更新记录"""
+        if self.read_only:
+            raise PermissionError("read-only database handle cannot update")
         self._validate_identifier(table, "table name")
         # Some append-only audit tables intentionally have no ``updated_at``.
         # The generic legacy helper remains compatible without manufacturing a
@@ -2926,6 +3096,8 @@ class Database:
     
     def delete(self, table: str, where: str, where_params: tuple) -> int:
         """删除记录"""
+        if self.read_only:
+            raise PermissionError("read-only database handle cannot delete")
         self._validate_identifier(table, "table name")
         sql = f"DELETE FROM {table} WHERE {where}"
         
@@ -2973,6 +3145,8 @@ class Database:
     
     def backup(self, backup_path: str):
         """备份数据库（仅允许备份到 .novelforge-backups 目录）"""
+        if self.read_only:
+            raise PermissionError("read-only database handle cannot create backups")
         import shutil
         dest = Path(backup_path).resolve()
         backups_dir = Path(self.db_path).resolve().parent / ".novelforge-backups"
@@ -2985,6 +3159,8 @@ class Database:
     
     def vacuum(self):
         """压缩数据库"""
+        if self.read_only:
+            raise PermissionError("read-only database handle cannot vacuum")
         with self.connect() as conn:
             conn.execute("VACUUM")
         logger.info("数据库压缩完成")

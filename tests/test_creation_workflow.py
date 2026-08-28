@@ -62,6 +62,20 @@ def test_planning_import_is_durable_and_generates_read_only_views(tmp_path, monk
             },
         )
         assert language.status_code == 200
+        pre_publish = db.fetchone(
+            "SELECT writing_style, style_profile FROM projects WHERE id=?", (book_id,)
+        )
+        assert pre_publish is not None
+        assert pre_publish["writing_style"] in (None, "")
+        assert json.loads(pre_publish["style_profile"] or "{}") == {}
+        draft_voice = db.fetchone(
+            """SELECT draft FROM story_bible_steps
+               WHERE workspace_id=(SELECT id FROM story_bible_workspaces WHERE project_id=?)
+                 AND step_key='voice'""",
+            (book_id,),
+        )
+        assert draft_voice is not None
+        assert "rawGuidance" in json.loads(draft_voice["draft"])["styleProfile"]
         views = client.get(f"/api/v1/books/{book_id}/planning-views")
         assert views.status_code == 200
         assert len(views.json()["views"]) == 4
@@ -89,6 +103,46 @@ def test_planning_import_is_durable_and_generates_read_only_views(tmp_path, monk
     assert {row["filename"] for row in sources} == {"玖安余陈_故事圣经_总整理_20260621.md", "语言规划_玖安余陈.md"}
     assert any("记忆与真相" in row["content"] for row in sources)
     assert db.count("story_architecture_views", "project_id=?", (book_id,)) == 4
+
+
+def test_planning_reads_do_not_materialize_views_or_queue_synthesis(tmp_path, monkeypatch):
+    studio, db, _repository, _manager, runtime = _studio_workspace(tmp_path, monkeypatch)
+    with TestClient(studio.app) as client:
+        created = client.post(
+            "/api/v1/books/create",
+            json={"title": "只读规划读取", "genre": "软科幻", "creationMode": "planned"},
+        )
+        assert created.status_code == 200
+        book_id = created.json()["id"]
+
+        before_views = db.count("story_architecture_views", "project_id=?", (book_id,))
+        preview = client.get(f"/api/v1/books/{book_id}/planning-views")
+        assert preview.status_code == 200
+        assert len(preview.json()["views"]) == 4
+        assert all(item["persisted"] is False for item in preview.json()["views"])
+        assert db.count("story_architecture_views", "project_id=?", (book_id,)) == before_views
+
+        source = client.post(
+            f"/api/v1/books/{book_id}/planning-sources/text",
+            json={
+                "filename": "story.md",
+                "sourceType": "story_bible",
+                "content": "# 核心冲突\n\n记忆与真相。",
+            },
+        )
+        assert source.status_code == 200
+        bible = studio.get_story_bible_repository()
+        for _, step_key in STORY_BIBLE_STEPS:
+            bible.confirm(book_id, step_key)
+        bible.publish(book_id)
+
+        before_tasks = db.count("tasks", "project_id=?", (book_id,))
+        summary = client.get(f"/api/v1/books/{book_id}/planning-summary")
+        assert summary.status_code == 200
+        assert summary.json()["status"] == "not_started"
+        assert summary.json()["taskId"] is None
+        assert db.count("tasks", "project_id=?", (book_id,)) == before_tasks
+        assert runtime.list(project_id=book_id, limit=20) == []
 
 
 def test_authoritative_legacy_project_save_upserts_entities_without_composite_unique_indexes(tmp_path, monkeypatch):

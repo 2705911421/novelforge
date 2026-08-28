@@ -86,6 +86,47 @@ class PersistentTaskWorker:
                                                detail={"reason": "cancelled_at_safe_boundary"},
                                                lease_owner=worker_id)
             if current and current["status"] == "running":
+                # A handler may complete its provider work but deliberately
+                # stop at an author/quality gate.  Preserve that explicit
+                # result and make the decision boundary durable; otherwise a
+                # generic worker would report a blocked artifact as a false
+                # successful task.
+                if not isinstance(result, dict) or not result:
+                    return self.runtime.transition(
+                        task["id"],
+                        "failed",
+                        detail={"reason": "handler returned no task artifact"},
+                        error_code="TASK_RESULT_INVALID",
+                        error="task handler must return a non-empty object result",
+                        result=result if isinstance(result, dict) else None,
+                        lease_owner=worker_id,
+                    )
+                if isinstance(result, dict) and result.get("completed") is False:
+                    return self.runtime.transition(
+                        task["id"], "needs_author_decision",
+                        detail={
+                            "reason": "handler reported incomplete result",
+                            "result": result,
+                        },
+                        error_code="TASK_INCOMPLETE",
+                        error=str(result.get("error") or result.get("quality_gate") or "task requires author decision"),
+                        result=result,
+                        lease_owner=worker_id,
+                    )
+                reported_status = str(result.get("status") or "").strip().lower()
+                if reported_status in {"failed", "error", "incomplete"}:
+                    return self.runtime.transition(
+                        task["id"],
+                        "failed",
+                        detail={
+                            "reason": "handler reported a failed result",
+                            "result": result,
+                        },
+                        error_code="TASK_RESULT_FAILED",
+                        error=str(result.get("error") or reported_status),
+                        result=result,
+                        lease_owner=worker_id,
+                    )
                 return self.runtime.transition(
                     task["id"], "completed", detail={"result": result or {}},
                     result=result or {}, lease_owner=worker_id

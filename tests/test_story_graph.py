@@ -3878,6 +3878,118 @@ def test_storyflow_planning_overlay_is_revisioned_and_semantic(tmp_path):
     assert service.load(book_id)[1] == revision
 
 
+def test_storyflow_planning_preview_is_read_only_and_reports_diff_and_impact(tmp_path):
+    db, _, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    service = StoryFlowPlanningService(db)
+
+    before_workspace = db.fetchone(
+        "SELECT revision, graph FROM plot_workspaces WHERE book_id=?",
+        (book_id,),
+    )
+    before_canon = {
+        table: db.fetchone(f"SELECT COUNT(*) AS count FROM {table} WHERE book_id=?", (book_id,))["count"]
+        for table in ("story_facts", "story_states")
+    }
+    delta = {
+        "operations": [{
+            "op": "move_node",
+            "id": f"chapter:{chapter_one}",
+            "x": 910,
+            "y": 320,
+        }],
+    }
+
+    preview = service.preview_delta(book_id, delta, expected_revision=1)
+
+    assert preview["proposal"]["proposalType"] == "storyflow_planning_change"
+    assert preview["proposal"]["status"] == "PROPOSED"
+    assert preview["proposal"]["requiresAuthorConfirmation"] is True
+    assert preview["proposal"]["canonicalMutation"] is False
+    assert preview["revision"] == 1
+    assert preview["previewDiff"]["hasChanges"] is True
+    assert preview["previewDiff"]["nodes"]["counts"]["changed"] == 1
+    changed = preview["previewDiff"]["nodes"]["changed"][0]
+    assert changed["id"] == f"chapter:{chapter_one}"
+    assert changed["after"]["x"] == 910.0
+    assert preview["impactAnalysis"]["canonicalMutation"] is False
+    assert preview["impactAnalysis"]["affectedNodeIds"] == [f"chapter:{chapter_one}"]
+    assert preview["nextAction"] == "confirm_planning_update"
+
+    assert db.fetchone(
+        "SELECT revision, graph FROM plot_workspaces WHERE book_id=?",
+        (book_id,),
+    ) == before_workspace
+    after_canon = {
+        table: db.fetchone(f"SELECT COUNT(*) AS count FROM {table} WHERE book_id=?", (book_id,))["count"]
+        for table in ("story_facts", "story_states")
+    }
+    assert after_canon == before_canon
+
+
+def test_storyflow_preview_persists_proposal_and_author_apply_closes_task(tmp_path):
+    db, project_id, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    service = StoryFlowPlanningService(db)
+    service.load(book_id)
+    before_canon = {
+        "story_facts": db.fetchone("SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?", (book_id,))["count"],
+        "story_states": db.fetchone("SELECT COUNT(*) AS count FROM story_states WHERE book_id=?", (book_id,))["count"],
+        "story_commits": db.fetchone(
+            "SELECT COUNT(*) AS count FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id WHERE c.book_id=?",
+            (book_id,),
+        )["count"],
+        "narrative_events": db.fetchone("SELECT COUNT(*) AS count FROM narrative_events WHERE book_id=?", (book_id,))["count"],
+    }
+    delta = {
+        "operations": [{
+            "op": "move_node",
+            "id": f"chapter:{chapter_one}",
+            "x": 1200,
+            "y": 420,
+        }],
+    }
+
+    preview = service.preview_delta(book_id, delta, expected_revision=1, persist=True)
+
+    proposal_id = preview["proposal"]["proposalId"]
+    proposal_row = db.fetchone("SELECT * FROM agent_proposals WHERE id=?", (proposal_id,))
+    assert proposal_row is not None
+    assert proposal_row["status"] == "PROPOSED"
+    assert proposal_row["project_id"] == project_id
+    task_id = proposal_row["task_id"]
+    assert task_id
+    task = service.task_runtime.get(task_id)
+    assert task["status"] == "needs_author_decision"
+    assert task["agentTaskId"]
+    assert task["type"] == "storyflow-planning-change"
+    assert db.fetchone("SELECT revision FROM plot_workspaces WHERE book_id=?", (book_id,))["revision"] == 1
+
+    applied = service.apply_proposal(
+        book_id,
+        proposal_id,
+        expected_revision=1,
+        decided_by="author",
+    )
+
+    assert applied["completed"] is True
+    assert applied["canonicalMutation"] is False
+    assert applied["revision"] == 2
+    assert applied["proposal"]["status"] == "ACCEPTED"
+    assert applied["task"]["status"] == "completed"
+    assert applied["task"]["result"]["proposalId"] == proposal_id
+    assert db.fetchone("SELECT status FROM agent_proposals WHERE id=?", (proposal_id,))["status"] == "ACCEPTED"
+    assert db.fetchone("SELECT status FROM tasks WHERE id=?", (task_id,))["status"] == "completed"
+    after_canon = {
+        "story_facts": db.fetchone("SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?", (book_id,))["count"],
+        "story_states": db.fetchone("SELECT COUNT(*) AS count FROM story_states WHERE book_id=?", (book_id,))["count"],
+        "story_commits": db.fetchone(
+            "SELECT COUNT(*) AS count FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id WHERE c.book_id=?",
+            (book_id,),
+        )["count"],
+        "narrative_events": db.fetchone("SELECT COUNT(*) AS count FROM narrative_events WHERE book_id=?", (book_id,))["count"],
+    }
+    assert after_canon == before_canon
+
+
 def test_storyflow_plan_is_fulfilled_by_accepted_story_commit(tmp_path):
     db, _, book_id, chapter_one, chapter_two, _, _ = _seed_book(tmp_path)
     service = StoryFlowPlanningService(db)
@@ -4006,10 +4118,17 @@ def test_storyflow_reconcile_reads_completed_task_result_and_is_idempotent(tmp_p
         },
     )
     runtime.transition(task["id"], "running")
+    runtime.checkpoint(
+        task["id"],
+        "DONE",
+        {"completed": True, "story_commit_id": commit_id},
+        workflow_state="COMMITTED",
+    )
     completed = runtime.transition(
         task["id"],
         "completed",
         result={
+            "completed": True,
             "chapter_id": chapter_two,
             "chapter_number": 2,
             "story_commit_id": commit_id,
@@ -4061,10 +4180,17 @@ def test_storyflow_reconcile_api_uses_durable_task_output(tmp_path, monkeypatch)
         data={"chapter_number": 2, "storyflow_plan_node_id": plan_node["id"]},
     )
     runtime.transition(task["id"], "running")
+    runtime.checkpoint(
+        task["id"],
+        "DONE",
+        {"completed": True, "story_commit_id": commit_id},
+        workflow_state="COMMITTED",
+    )
     runtime.transition(
         task["id"],
         "completed",
         result={
+            "completed": True,
             "chapter_id": chapter_two,
             "chapter_number": 2,
             "story_commit_id": commit_id,
@@ -5514,6 +5640,29 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         planning = client.get(f"/api/v1/books/{project.id}/story-graph/planning")
         assert planning.status_code == 200
         assert planning.json()["revision"] == 1
+        planning_preview = client.post(
+            f"/api/v1/books/{project.id}/story-graph/planning/preview",
+            json={
+                "delta": {
+                    "operations": [{
+                        "op": "move_node",
+                        "id": f"chapter:{chapter_id}",
+                        "x": 760,
+                        "y": 280,
+                    }]
+                },
+                "expectedRevision": 1,
+            },
+        )
+        assert planning_preview.status_code == 200
+        planning_preview_payload = planning_preview.json()
+        assert planning_preview_payload["proposal"]["status"] == "PROPOSED"
+        assert planning_preview_payload["proposal"]["taskId"]
+        assert planning_preview_payload["proposal"]["agentTaskId"]
+        assert planning_preview_payload["task"]["status"] == "needs_author_decision"
+        assert planning_preview_payload["previewDiff"]["hasChanges"] is True
+        assert planning_preview_payload["impactAnalysis"]["canonicalMutation"] is False
+        assert client.get(f"/api/v1/books/{project.id}/story-graph/planning").json()["revision"] == 1
         created_plan = client.post(
             f"/api/v1/books/{project.id}/story-graph/planning/node",
             json={
@@ -5531,6 +5680,8 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         assert plan_node["type"] == "PlanningNode"
         assert created_plan.json()["anchorEdge"]["type"] == "originates_from"
         assert created_plan.json()["revision"] == 2
+        assert created_plan.json()["proposal"]["status"] == "ACCEPTED"
+        assert created_plan.json()["task"]["status"] == "completed"
         linked = client.post(
             f"/api/v1/books/{project.id}/story-graph/planning/edge",
             json={
@@ -5541,6 +5692,8 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
             },
         )
         assert linked.status_code == 200
+        assert linked.json()["proposal"]["status"] == "ACCEPTED"
+        assert linked.json()["task"]["status"] == "completed"
         invalid_anchor = client.post(
             f"/api/v1/books/{project.id}/story-graph/planning/node",
             json={

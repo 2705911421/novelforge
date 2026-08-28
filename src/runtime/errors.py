@@ -82,3 +82,9 @@ class ControlCommandLeaseLost(AgentRuntimeError):
 
     code = "CONTROL_COMMAND_LEASE_LOST"
     retryable = True
+
+
+class PluginTrustError(AgentRuntimeError):
+    """A plugin implementation was not explicitly approved by the Host."""
+
+    code = "PLUGIN_TRUST_REQUIRED"

@@ -8,13 +8,13 @@ an agent never receives a database connection or a direct Canon method.
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Awaitable, Callable, Mapping
 
-from .contracts import AgentTask
+from .contracts import AgentTask, default_agent_task_profile
 from .errors import DomainApprovalRequired, ToolPermissionDenied
-from .approvals import ApprovalEngine
+from .approvals import Approval, ApprovalEngine, is_host_approval_actor
 
 
 class ToolAuthority(str, Enum):
@@ -63,6 +63,10 @@ class ToolCallContext:
     approval_id: str | None = None
     approved: bool = False
     domain_context: Mapping[str, Any] = field(default_factory=dict)
+    # The Host fills this only after it has atomically consumed the durable
+    # approval grant.  Runtime adapters must never construct this fact from
+    # provider/task input, because that would turn a boolean into authority.
+    host_approval: Approval | None = None
 
 
 @dataclass(frozen=True)
@@ -110,14 +114,16 @@ class PermissionEngine:
     """
 
     def evaluate(self, definition: ToolDefinition, task: AgentTask) -> PermissionDecision:
-        profile = task.profile
-        if profile and profile.forbidden_tools and definition.name in set(profile.forbidden_tools):
+        profile = task.profile or default_agent_task_profile(task.role, task.task_type)
+        if profile.forbidden_tools and definition.name in set(profile.forbidden_tools):
             return PermissionDecision(
                 False,
                 reason=f"tool forbidden by task profile: {definition.name}",
                 code="TOOL_FORBIDDEN",
             )
-        if profile and profile.allowed_tools and definition.name not in set(profile.allowed_tools):
+        allowed = set(profile.allowed_tools)
+        allowed_compute = set(profile.allowed_compute_tools)
+        if definition.name not in allowed and definition.name not in allowed_compute:
             return PermissionDecision(
                 False,
                 reason=f"tool not allowed by task profile: {definition.name}",
@@ -184,14 +190,23 @@ class ToolGateway:
         except KeyError:
             raise ToolPermissionDenied(f"tool is not registered: {name}") from None
 
-    def catalog(self, task: AgentTask | None = None) -> list[dict[str, Any]]:
+    def catalog(
+        self,
+        task: AgentTask | None = None,
+        *,
+        include_compute: bool = False,
+    ) -> list[dict[str, Any]]:
         definitions = list(self._definitions.values())
-        if task is not None and task.profile and task.profile.allowed_tools:
-            allowed = set(task.profile.allowed_tools)
-            definitions = [item for item in definitions if item.name in allowed]
-        if task is not None and task.profile:
-            forbidden = set(task.profile.forbidden_tools)
-            definitions = [item for item in definitions if item.name not in forbidden]
+        if task is not None:
+            profile = task.profile or default_agent_task_profile(task.role, task.task_type)
+            allowed = set(profile.allowed_tools)
+            if include_compute:
+                allowed.update(profile.allowed_compute_tools)
+            definitions = [
+                item for item in definitions
+                if item.name in allowed
+                and self.permission_engine.evaluate(item, task).allowed
+            ]
         return [item.to_dict() for item in definitions]
 
     async def invoke(
@@ -204,18 +219,34 @@ class ToolGateway:
         self.permission_engine.enforce(definition, context.task)
         authority = ToolAuthority(definition.authority)
         if definition.requires_approval:
-            if self.approval_engine is not None:
-                self.approval_engine.consume(
-                    context.task.task_id,
-                    name,
-                    domain=definition.domain,
-                    approval_id=context.approval_id,
-                )
-            elif not context.approved or not context.approval_id:
+            if self.approval_engine is None:
                 raise DomainApprovalRequired(
-                    f"authority tool requires explicit approval: {name}",
-                    details={"tool": name, "domain": definition.domain},
+                    f"Host ApprovalEngine is required for an approval-gated tool: {name}",
+                    details={
+                        "tool": name,
+                        "domain": definition.domain,
+                        "approvalCode": "HOST_APPROVAL_ENGINE_REQUIRED",
+                    },
                 )
+            approval = self.approval_engine.consume(
+                context.task.task_id,
+                name,
+                domain=definition.domain,
+                approval_id=context.approval_id,
+            )
+            if authority is ToolAuthority.AUTHORITY and not is_host_approval_actor(approval.approved_by):
+                raise DomainApprovalRequired(
+                    f"authority tool requires a Host approval actor: {name}",
+                    details={
+                        "approvalId": approval.approval_id,
+                        "approvedBy": approval.approved_by,
+                        "approvalCode": "HOST_ACTOR_REQUIRED",
+                    },
+                )
+            # Do not let a caller-supplied ToolCallContext or task payload
+            # masquerade as the approval result.  The handler sees the exact
+            # one-shot record consumed by this Host invocation.
+            context = replace(context, approved=True, host_approval=approval)
         result = definition.handler(dict(arguments or {}), context)
         if inspect.isawaitable(result):
             result = await result

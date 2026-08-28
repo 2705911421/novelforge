@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Mapping, Optional
 
 from .database import Database, generate_id, get_db
-from src.runtime.contracts import AgentTask, AgentTaskProfile, RuntimeEvent
+from .task_workflow import (
+    initial_workflow_state,
+    is_chapter_workflow_task,
+    story_commit_id,
+    workflow_state_for_checkpoint,
+)
+from .narrative_events import ACCEPTANCE_EVENT_TYPES, active_events
+from src.runtime.contracts import AgentTask, AgentTaskProfile, RuntimeEvent, default_agent_task_profile
 from src.runtime.events import RuntimeEventStore
 
 
@@ -35,6 +43,7 @@ class TaskFailure(RuntimeError):
 
 TERMINAL = {"completed", "cancelled", "needs_author_decision"}
 WAITING_ON_CHILD = "waiting_on_child"
+INITIAL_TASK_STATUSES = {"queued", "needs_author_decision"}
 RECOVERY_REQUIRES_AUTHOR = {"world-bootstrap", "write", "write-next"}
 TRANSITIONS = {
     "queued": {"running", "cancelled"},
@@ -66,11 +75,13 @@ TASK_OPERATION_LABELS = {
     "plan-chapter": "章节规划",
     "compose-chapter": "上下文编排",
     "joint-review": "联合审查",
+    "dialogue-write": "生成角色对白",
     "world-bootstrap": "世界观构建",
     "planning-synthesis": "理解规划资料",
     "planning-views-generate": "整理规划视图",
     "forecast": "剧情推演",
     "storyflow-analyze": "StoryFlow 分析",
+    "storyflow-planning-change": "StoryFlow 规划变更",
     "simulation-analyst-query": "Simulation Analyst 查询",
     "simulation-character-chat": "Character Chat",
     "simulation-survey": "Simulation Survey",
@@ -114,6 +125,7 @@ _TASK_PROGRESS = {
     "compose-chapter": {"queued": 0, "plan": 42, "compose": 82, "completed": 100},
     "world-bootstrap": {"queued": 0, "world-bootstrap": 82, "completed": 100},
     "joint-review": {"queued": 0, "joint-review": 82, "completed": 100},
+    "dialogue-write": {"queued": 0, "dialogue-model-call": 82, "completed": 100},
     "planning-synthesis": {"queued": 0, "planning-synthesis-model-call": 55, "completed": 100},
     "planning-views-generate": {"queued": 0, "planning-views-model-call": 55, "planning-views-saved": 92, "completed": 100},
     "model-connection-test": {"queued": 0, "provider-test": 82, "completed": 100},
@@ -121,6 +133,11 @@ _TASK_PROGRESS = {
     "document-index": {"queued": 0, "parsing": 45, "indexed": 88, "completed": 100},
     "forecast": {"queued": 0, "forecast-complete": 92, "completed": 100},
     "storyflow-analyze": {"queued": 0, "storyflow-selection": 24, "storyflow-model-call": 72, "completed": 100},
+    "storyflow-planning-change": {
+        "needs_author_decision": 82,
+        "completed": 100,
+        "rejected": 100,
+    },
 }
 
 
@@ -135,6 +152,7 @@ _AGENT_TASK_TYPES = {
     "write-next",
     "draft-chapter",
     "audit-chapter",
+    "review-chapter",
     "review",
     "revise-chapter",
     "revise",
@@ -142,11 +160,15 @@ _AGENT_TASK_TYPES = {
     "plan-chapter",
     "compose-chapter",
     "joint-review",
+    "dialogue-write",
+    "interactive-film-node-image",
+    "cover-image-generate",
     "world-bootstrap",
     "planning-synthesis",
     "planning-views-generate",
     "forecast",
     "storyflow-analyze",
+    "storyflow-planning-change",
     "simulation-analyst-query",
     "simulation-character-chat",
     "simulation-survey",
@@ -157,19 +179,27 @@ _AGENT_TASK_TYPES = {
     "revision",
     "story-bible-suggest",
     "radar",
+    "radar-scan",
     "translation",
+    "translation-run",
     "interactive-film",
+    "interactive-film-generate",
     "cover-brief",
     "model-connection-test",
     "model-discovery",
     "thought-clarify",
     "thought-framework",
+    # Provider-backed simulation rounds are still NovelForge-owned agent work;
+    # explicit-only rounds use the same envelope even when no model is called.
+    "simulation-round",
 }
 
 _AGENT_TASK_ROLES = {
     "audit-chapter": "reviewer",
+    "review-chapter": "reviewer",
     "review": "reviewer",
     "joint-review": "reviewer",
+    "dialogue-write": "writer",
     "revise-chapter": "reviser",
     "revise": "reviser",
     "rewrite-chapter": "reviser",
@@ -178,6 +208,7 @@ _AGENT_TASK_ROLES = {
     "planning-views-generate": "planner",
     "forecast": "planner",
     "storyflow-analyze": "planner",
+    "storyflow-planning-change": "planner",
     "simulation-analyst-query": "planner",
     "simulation-survey": "planner",
     "simulation-character-chat": "writer",
@@ -189,13 +220,19 @@ _AGENT_TASK_ROLES = {
     "revision": "reviser",
     "story-bible-suggest": "planner",
     "radar": "planner",
+    "radar-scan": "planner",
+    "translation-run": "writer",
+    "interactive-film-generate": "planner",
     "translation": "writer",
     "interactive-film": "planner",
     "cover-brief": "planner",
+    "interactive-film-node-image": "image",
+    "cover-image-generate": "image",
     "model-connection-test": "planner",
     "model-discovery": "planner",
     "thought-clarify": "planner",
     "thought-framework": "planner",
+    "simulation-round": "planner",
 }
 
 
@@ -207,10 +244,36 @@ class TaskRuntime:
 
     def enqueue(self, task_type: str, *, project_id: Optional[str] = None, book_id: Optional[str] = None,
                 chapter_number: Optional[int] = None, data: Optional[dict[str, Any]] = None, stage: str = "queued",
-                idempotency_key: Optional[str] = None) -> dict[str, Any]:
+                idempotency_key: Optional[str] = None, initiated_by: Optional[str] = None,
+                initial_status: str = "queued") -> dict[str, Any]:
+        initial_status = str(initial_status or "queued").strip().lower()
+        if initial_status not in INITIAL_TASK_STATUSES:
+            raise ValueError(
+                f"invalid initial task status: {initial_status}; "
+                f"expected one of {sorted(INITIAL_TASK_STATUSES)}"
+            )
+        if initial_status == "needs_author_decision" and task_type != "storyflow-planning-change":
+            raise ValueError(
+                "initial needs_author_decision is reserved for StoryFlow planning proposals"
+            )
         task_id = generate_id()
         now = datetime.now().isoformat()
         task_data = dict(data or {})
+        if initiated_by is not None:
+            # A Host caller is the authority for provenance.  A nested
+            # payload may carry compatibility metadata, but it must not be
+            # able to impersonate the actor that actually enqueued the task.
+            task_data["initiatedBy"] = str(initiated_by).strip() or "system"
+        else:
+            task_data.setdefault(
+                "initiatedBy",
+                str(
+                    task_data.get("initiated_by")
+                    or task_data.get("source")
+                    or "system"
+                ).strip() or "system",
+            )
+        workflow_state = initial_workflow_state(task_type, stage=stage, data=task_data)
         with self.db.transaction() as conn:
             # Idempotency check inside the transaction to prevent TOCTOU races.
             if idempotency_key:
@@ -223,10 +286,11 @@ class TaskRuntime:
                     return result
             conn.execute(
                 """INSERT INTO tasks(id, type, status, project_id, book_id, chapter_number, stage, data,
-                   idempotency_key, created_at, updated_at)
-                   VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (task_id, task_type, project_id, book_id, chapter_number, stage,
-                 json.dumps(task_data, ensure_ascii=False), idempotency_key, now, now),
+                   workflow_state, workflow_state_updated_at, idempotency_key, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, task_type, initial_status, project_id, book_id, chapter_number, stage,
+                 json.dumps(task_data, ensure_ascii=False), workflow_state,
+                 now if workflow_state else None, idempotency_key, now, now),
             )
             agent_task = self._maybe_create_agent_task(
                 conn,
@@ -236,7 +300,8 @@ class TaskRuntime:
                 task_data=task_data,
                 created_at=now,
             )
-            self._append_event(conn, task_id, "queued", {"stage": stage, "type": task_type})
+            self._sync_agent_task_status(conn, task_id, initial_status)
+            self._append_event(conn, task_id, initial_status, {"stage": stage, "type": task_type})
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         result = self._task_dict(row)
         if agent_task is not None:
@@ -251,6 +316,8 @@ class TaskRuntime:
         chapter_number: Optional[int] = None,
         stage: str = "queued",
         idempotency_key: Optional[str] = None,
+        initiated_by: Optional[str] = None,
+        initial_status: str = "queued",
     ) -> dict[str, Any]:
         """Atomically create a durable TaskRuntime row and its AgentTask envelope.
 
@@ -259,8 +326,22 @@ class TaskRuntime:
         state machine, so a process restart can recover the same work without
         relying on a provider thread.
         """
+        if initiated_by is not None:
+            agent_task = replace(agent_task, initiated_by=initiated_by)
+        initial_status = str(initial_status or "queued").strip().lower()
+        if initial_status not in INITIAL_TASK_STATUSES:
+            raise ValueError(
+                f"invalid initial task status: {initial_status}; "
+                f"expected one of {sorted(INITIAL_TASK_STATUSES)}"
+            )
+        if initial_status == "needs_author_decision" and agent_task.task_type != "storyflow-planning-change":
+            raise ValueError(
+                "initial needs_author_decision is reserved for StoryFlow planning proposals"
+            )
         task_id = generate_id()
         now = datetime.now().isoformat()
+        task_input = dict(agent_task.input_payload)
+        task_input.setdefault("initiatedBy", agent_task.initiated_by)
         with self.db.transaction() as conn:
             if idempotency_key:
                 previous = conn.execute(
@@ -276,17 +357,21 @@ class TaskRuntime:
                     return result
             conn.execute(
                 """INSERT INTO tasks(id, type, status, project_id, book_id, chapter_number,
-                   stage, data, idempotency_key, created_at, updated_at)
-                   VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   stage, data, workflow_state, workflow_state_updated_at,
+                   idempotency_key, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    task_id, agent_task.task_type, agent_task.project_id, book_id,
+                    task_id, agent_task.task_type, initial_status, agent_task.project_id, book_id,
                     chapter_number, stage,
-                    json.dumps(agent_task.input_payload, ensure_ascii=False),
+                    json.dumps(task_input, ensure_ascii=False),
+                    initial_workflow_state(agent_task.task_type, stage=stage, data=task_input),
+                    now if is_chapter_workflow_task(agent_task.task_type) else None,
                     idempotency_key, now, now,
                 ),
             )
             self._insert_agent_task(conn, agent_task, task_id, now)
-            self._append_event(conn, task_id, "queued", {
+            self._sync_agent_task_status(conn, task_id, initial_status)
+            self._append_event(conn, task_id, initial_status, {
                 "stage": stage, "type": agent_task.task_type, "agent_task_id": agent_task.task_id,
             })
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -294,6 +379,71 @@ class TaskRuntime:
         result["agentTaskId"] = agent_task.task_id
         result["agentTask"] = agent_task.to_dict()
         return result
+
+    def complete_author_decision_task(
+        self,
+        task_id: str,
+        result: Mapping[str, Any],
+        *,
+        actor: str,
+        _connection: Any | None = None,
+    ) -> dict[str, Any]:
+        """Complete a non-executing planning task after Host confirmation.
+
+        StoryFlow preview tasks deliberately start at ``needs_author_decision``
+        and must never be claimed by the generic provider worker.  This narrow
+        completion seam lets the author-bound planning command close that task
+        only after its Proposal and overlay update succeed in the same SQLite
+        transaction.  It is intentionally not a general escape hatch for
+        chapter or provider-backed tasks.
+        """
+        from src.runtime.approvals import is_author_approval_actor
+
+        if not is_author_approval_actor(actor):
+            raise ValueError("only an author-facing Host actor can complete this task")
+        if not isinstance(result, Mapping):
+            raise ValueError("author decision task result must be an object")
+        if result.get("completed") is not True:
+            raise TaskStateError(
+                "author decision task completion requires result.completed=true"
+            )
+
+        def complete(conn) -> dict[str, Any]:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            if str(row["type"]) != "storyflow-planning-change":
+                raise TaskStateError(
+                    "author decision completion is only available for StoryFlow planning tasks"
+                )
+            if row["status"] == "completed":
+                return dict(row)
+            if row["status"] != "needs_author_decision":
+                raise TaskStateError(
+                    f"StoryFlow planning task must await author decision, got {row['status']}"
+                )
+            now = datetime.now().isoformat()
+            encoded = json.dumps(dict(result), ensure_ascii=False)
+            conn.execute(
+                """UPDATE tasks SET status='completed', error_code=NULL, error=NULL,
+                   result=?, progress=100, total_steps=CASE WHEN total_steps=0 THEN 1 ELSE total_steps END,
+                   lease_owner=NULL, lease_expires_at=NULL, completed_at=?, updated_at=?
+                   WHERE id=?""",
+                (encoded, now, now, task_id),
+            )
+            self._sync_agent_task_status(conn, task_id, "completed")
+            self._append_event(conn, task_id, "completed", {
+                "reason": "author_confirmed_storyflow_proposal",
+                "actor": str(actor).strip().lower(),
+            })
+            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            return dict(updated)
+
+        if _connection is not None:
+            return complete(_connection)
+        with self.db.transaction() as conn:
+            complete(conn)
+        return self.get(task_id) or {}
 
     def _maybe_create_agent_task(
         self,
@@ -347,22 +497,50 @@ class TaskRuntime:
             context_bundle_id = None
 
         role = _AGENT_TASK_ROLES.get(task_type, "writer")
+        if task_type == "simulation-round":
+            # Provider-mode simulation decisions are role-scoped.  Preserve
+            # the queued decision role in the durable AgentTask so Compute
+            # Policy and audit views do not silently report every round as a
+            # planner task.
+            decision_role = str(task_data.get("decisionRole") or "").strip().lower()
+            if decision_role in {"planner", "writer", "reviewer"}:
+                role = decision_role
+        default_profile = default_agent_task_profile(role, task_type)
         raw_profile = task_data.get("profile")
         if isinstance(raw_profile, Mapping):
+            def profile_tuple(*keys: str, default: tuple[str, ...]) -> tuple[str, ...]:
+                value = next((raw_profile[key] for key in keys if key in raw_profile), default)
+                if not isinstance(value, (list, tuple)):
+                    return ()
+                return tuple(str(item) for item in value if str(item).strip())
+
+            compute_profile_keys = ("allowed_compute_tools", "allowedComputeTools")
+            compute_default = (
+                ()
+                if any(key in raw_profile for key in compute_profile_keys)
+                else default_profile.allowed_compute_tools
+            )
             profile = AgentTaskProfile(
                 role=str(raw_profile.get("role") or role),
                 task_type=str(raw_profile.get("task_type") or raw_profile.get("taskType") or task_type),
-                allowed_tools=tuple(raw_profile.get("allowed_tools") or raw_profile.get("allowedTools") or ()),
-                forbidden_tools=tuple(raw_profile.get("forbidden_tools") or raw_profile.get("forbiddenTools") or ()),
-                minimum_capability=str(raw_profile.get("minimum_capability") or raw_profile.get("minimumCapability") or "C1"),
-                preferred_capability=str(raw_profile.get("preferred_capability") or raw_profile.get("preferredCapability") or "C2"),
-                maximum_capability=str(raw_profile.get("maximum_capability") or raw_profile.get("maximumCapability") or "C3"),
-                minimum_reasoning=str(raw_profile.get("minimum_reasoning") or raw_profile.get("minimumReasoning") or "medium"),
-                preferred_reasoning=str(raw_profile.get("preferred_reasoning") or raw_profile.get("preferredReasoning") or "high"),
-                maximum_reasoning=str(raw_profile.get("maximum_reasoning") or raw_profile.get("maximumReasoning") or "xhigh"),
+                allowed_tools=profile_tuple(
+                    "allowed_tools", "allowedTools", default=default_profile.allowed_tools,
+                ),
+                forbidden_tools=profile_tuple(
+                    "forbidden_tools", "forbiddenTools", default=default_profile.forbidden_tools,
+                ),
+                allowed_compute_tools=profile_tuple(
+                    "allowed_compute_tools", "allowedComputeTools", default=compute_default,
+                ),
+                minimum_capability=str(raw_profile.get("minimum_capability") or raw_profile.get("minimumCapability") or default_profile.minimum_capability),
+                preferred_capability=str(raw_profile.get("preferred_capability") or raw_profile.get("preferredCapability") or default_profile.preferred_capability),
+                maximum_capability=str(raw_profile.get("maximum_capability") or raw_profile.get("maximumCapability") or default_profile.maximum_capability),
+                minimum_reasoning=str(raw_profile.get("minimum_reasoning") or raw_profile.get("minimumReasoning") or default_profile.minimum_reasoning),
+                preferred_reasoning=str(raw_profile.get("preferred_reasoning") or raw_profile.get("preferredReasoning") or default_profile.preferred_reasoning),
+                maximum_reasoning=str(raw_profile.get("maximum_reasoning") or raw_profile.get("maximumReasoning") or default_profile.maximum_reasoning),
             )
         else:
-            profile = AgentTaskProfile(role=role, task_type=task_type)
+            profile = default_profile
         input_payload = dict(task_data)
         input_payload.setdefault("durableTaskId", durable_task_id)
         agent_task = AgentTask(
@@ -380,12 +558,20 @@ class TaskRuntime:
             profile=profile,
             parent_task_id=parent_agent_task_id,
             created_at=created_at,
+            initiated_by=str(
+                task_data.get("initiatedBy")
+                or task_data.get("initiated_by")
+                or task_data.get("source")
+                or "system"
+            ).strip() or "system",
         )
         self._insert_agent_task(conn, agent_task, durable_task_id, created_at)
         return agent_task
 
     @staticmethod
     def _insert_agent_task(conn, agent_task: AgentTask, durable_task_id: str, now: str) -> None:
+        task_input = dict(agent_task.input_payload)
+        task_input.setdefault("initiatedBy", agent_task.initiated_by)
         conn.execute(
             """INSERT INTO agent_tasks(
                    id, task_id, task_type, role, project_id, chapter_id, intent_id,
@@ -398,7 +584,7 @@ class TaskRuntime:
                 agent_task.context_bundle_id,
                 json.dumps(agent_task.constraints, ensure_ascii=False),
                 agent_task.expected_output,
-                json.dumps(agent_task.input_payload, ensure_ascii=False),
+                json.dumps(task_input, ensure_ascii=False),
                 json.dumps(agent_task.profile.to_dict() if agent_task.profile else {}, ensure_ascii=False),
                 agent_task.parent_task_id, now, now,
             ),
@@ -424,6 +610,7 @@ class TaskRuntime:
         book_id: str,
         data: dict[str, Any],
         idempotency_key: str,
+        initiated_by: Optional[str] = None,
     ) -> dict[str, Any]:
         """Atomically enqueue one exclusive continuous-writing session.
 
@@ -434,6 +621,18 @@ class TaskRuntime:
         """
         task_id = generate_id()
         now = datetime.now().isoformat()
+        task_data = dict(data or {})
+        if initiated_by is not None:
+            task_data["initiatedBy"] = str(initiated_by).strip() or "system"
+        else:
+            task_data.setdefault(
+                "initiatedBy",
+                str(
+                    task_data.get("initiated_by")
+                    or task_data.get("source")
+                    or "system"
+                ).strip() or "system",
+            )
         with self.db.transaction() as conn:
             previous = conn.execute(
                 "SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
@@ -464,7 +663,7 @@ class TaskRuntime:
                     task_id,
                     project_id,
                     book_id,
-                    json.dumps(data, ensure_ascii=False),
+                    json.dumps(task_data, ensure_ascii=False),
                     idempotency_key,
                     now,
                     now,
@@ -475,7 +674,7 @@ class TaskRuntime:
                 durable_task_id=task_id,
                 task_type="continuous",
                 project_id=project_id,
-                task_data=data,
+                task_data=task_data,
                 created_at=now,
             )
             self._append_event(conn, task_id, "queued", {"stage": "queued", "type": "continuous"})
@@ -624,15 +823,35 @@ class TaskRuntime:
             row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row is None:
                 raise KeyError(f"task not found: {task_id}")
+            row_data = dict(row)
             current = row["status"]
             if target not in TRANSITIONS.get(current, set()):
                 raise TaskStateError(f"illegal task transition: {current} -> {target}")
-            # Lease fencing: if caller supplies lease_owner, verify it matches.
+            # Lease fencing is the caller's first authority check.  A stale
+            # worker must never be able to advance far enough into a
+            # workflow-specific validation path to look like an authorized
+            # finalizer (or to receive a misleading completion error).
             if lease_owner is not None and row["lease_owner"] != lease_owner:
                 raise TaskStateError(
                     f"lease owner mismatch: task owned by {row['lease_owner']}, "
                     f"caller claims {lease_owner}"
                 )
+            if target == "completed":
+                if result is None:
+                    raise TaskStateError("completed task result is required")
+                if not isinstance(result, dict) or not result:
+                    raise TaskStateError(
+                        "completed task result must be a non-empty object"
+                    )
+                if result.get("completed") is False:
+                    raise TaskStateError("incomplete task result cannot enter completed state")
+                reported_status = str(result.get("status") or "").strip().lower()
+                if reported_status in {"failed", "error", "incomplete"}:
+                    raise TaskStateError(
+                        "failed task result cannot enter completed state"
+                    )
+                if is_chapter_workflow_task(row_data.get("type")):
+                    self._validate_chapter_completion(conn, row_data, result)
             now = datetime.now().isoformat()
             completed_at = now if target in TERMINAL or target == "failed" else None
             conn.execute(
@@ -647,12 +866,16 @@ class TaskRuntime:
                  target, target, target, target, completed_at, now, task_id),
             )
             self._sync_agent_task_status(conn, task_id, target)
-            self._append_event(conn, task_id, target, detail or {"error_code": error_code, "error": error})
+            event_detail = dict(detail or {"error_code": error_code, "error": error})
+            if is_chapter_workflow_task(row_data.get("type")):
+                event_detail.setdefault("workflow_state", row_data.get("workflow_state"))
+            self._append_event(conn, task_id, target, event_detail)
             updated_row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task_dict(updated_row)
 
     def checkpoint(self, task_id: str, stage: str, state: dict[str, Any],
-                   *, lease_owner: Optional[str] = None) -> dict[str, Any]:
+                   *, lease_owner: Optional[str] = None,
+                   workflow_state: Optional[str] = None) -> dict[str, Any]:
         with self.db.transaction() as conn:
             task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if task is None:
@@ -666,22 +889,67 @@ class TaskRuntime:
                 )
             checkpoint_id = generate_id()
             now = datetime.now().isoformat()
+            task_data = json.loads(task["data"] or "{}")
+            current_workflow_state = task["workflow_state"]
+            if is_chapter_workflow_task(task["type"]):
+                if not current_workflow_state:
+                    current_workflow_state = initial_workflow_state(
+                        task["type"], stage=task["stage"] or "queued", data=task_data
+                    )
+                try:
+                    next_workflow_state = workflow_state_for_checkpoint(
+                        task["type"], current_workflow_state, stage, state, workflow_state
+                    )
+                except ValueError as exc:
+                    raise TaskStateError(str(exc)) from exc
+                if next_workflow_state == "COMMITTED":
+                    # Checkpoint payloads wrap the pipeline result under
+                    # ``context``.  Validate the actual result object at the
+                    # completion seam; validating the wrapper would reject a
+                    # genuine accepted StoryCommit as if it were incomplete.
+                    raw_completion_state = state.get("context", state)
+                    completion_state = (
+                        dict(raw_completion_state)
+                        if isinstance(raw_completion_state, Mapping)
+                        else {}
+                    )
+                    self._validate_chapter_completion(
+                        conn,
+                        {**dict(task), "workflow_state": "COMMITTED"},
+                        completion_state,
+                    )
+            else:
+                next_workflow_state = None
             conn.execute(
                 """INSERT INTO task_checkpoints(id, task_id, stage, state, created_at)
                    VALUES (?, ?, ?, ?, ?)""",
                 (checkpoint_id, task_id, stage, json.dumps(state, ensure_ascii=False), now),
             )
-            task_data = json.loads(task["data"] or "{}")
             progress, total_steps = self._progress_snapshot(
                 task["type"], task_data, task["status"], stage, state,
                 persisted_progress=task["progress"], persisted_total=task["total_steps"],
             )
             conn.execute(
-                """UPDATE tasks SET stage=?, progress=?, total_steps=?, updated_at=? WHERE id=?""",
-                (stage, progress, total_steps, now, task_id),
+                """UPDATE tasks SET stage=?, progress=?, total_steps=?,
+                   workflow_state=?, workflow_state_updated_at=?, updated_at=? WHERE id=?""",
+                (
+                    stage, progress, total_steps,
+                    next_workflow_state if is_chapter_workflow_task(task["type"]) else task["workflow_state"],
+                    now if is_chapter_workflow_task(task["type"]) and next_workflow_state else task["workflow_state_updated_at"],
+                    now, task_id,
+                ),
             )
-            self._append_event(conn, task_id, "checkpoint", {"checkpoint_id": checkpoint_id, "stage": stage})
-        return {"id": checkpoint_id, "stage": stage, "state": state}
+            self._append_event(conn, task_id, "checkpoint", {
+                "checkpoint_id": checkpoint_id,
+                "stage": stage,
+                "workflow_state": next_workflow_state,
+            })
+        return {
+            "id": checkpoint_id,
+            "stage": stage,
+            "state": state,
+            "workflow_state": next_workflow_state,
+        }
 
     def defer_until_child(
         self,
@@ -1046,10 +1314,154 @@ class TaskRuntime:
             )
 
     def events(self, task_id: str, *, after_id: int = 0) -> list[dict[str, Any]]:
-        rows = self.db.fetchall("SELECT * FROM task_events WHERE task_id=? AND id>? ORDER BY id", (task_id, after_id))
+        rows = self.db.fetchall(
+            "SELECT * FROM task_events WHERE task_id=? AND id>? ORDER BY id",
+            (task_id, after_id),
+        )
         for row in rows:
-            row["payload"] = json.loads(row["payload"])
+            row["payload"] = self._decode_event_payload(row.get("payload"))
         return rows
+
+    def events_since(
+        self,
+        *,
+        after_id: int = 0,
+        task_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Read the durable event ledger in one globally ordered cursor.
+
+        ``task_events.id`` is an AUTOINCREMENT key shared by every task.  A
+        subscriber must query that ledger directly rather than scanning tasks
+        in UI order: advancing one cursor while visiting tasks can otherwise
+        skip events belonging to a task visited later in the scan.  The
+        optional task filter keeps task-scoped subscriptions on the same
+        cross-process-safe cursor semantics.
+        """
+        bounded_limit = max(1, min(1000, int(limit)))
+        clauses = ["event.id > ?"]
+        params: list[Any] = [int(after_id)]
+        if task_id is not None:
+            clauses.append("event.task_id = ?")
+            params.append(task_id)
+        rows = self.db.fetchall(
+            f"""SELECT event.*, task.status AS task_status
+                FROM task_events AS event
+                JOIN tasks AS task ON task.id = event.task_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY event.id
+                LIMIT ?""",
+            (*params, bounded_limit),
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append({
+                "id": int(row["id"]),
+                "task_id": row["task_id"],
+                "sequence": int(row["sequence"]),
+                "event_type": row["event_type"],
+                "payload": self._decode_event_payload(row.get("payload")),
+                "created_at": row.get("created_at"),
+                "task_status": row.get("task_status"),
+            })
+        return result
+
+    @staticmethod
+    def _decode_event_payload(raw: Any) -> dict[str, Any]:
+        try:
+            payload = json.loads(raw or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _validate_chapter_completion(
+        conn,
+        task_row: Mapping[str, Any],
+        result: Optional[dict[str, Any]],
+    ) -> None:
+        """Require a real accepted StoryCommit at the task completion seam."""
+        if not isinstance(result, dict) or result.get("completed") is not True:
+            raise TaskStateError(
+                "chapter workflow completion requires result.completed=true"
+            )
+        workflow_state = task_row.get("workflow_state")
+        if workflow_state != "COMMITTED":
+            raise TaskStateError(
+                "chapter workflow cannot complete before workflow_state=COMMITTED"
+            )
+        commit_id = story_commit_id(result)
+        if not commit_id:
+            raise TaskStateError(
+                "chapter workflow completion requires an accepted StoryCommit reference"
+            )
+        commit = conn.execute(
+            """SELECT sc.status, sc.chapter_version_id, c.book_id, c.id AS chapter_id, c.number, b.project_id,
+                      EXISTS(
+                          SELECT 1 FROM narrative_events e
+                           WHERE e.commit_id=sc.id
+                             AND e.event_type IN ('StoryCommitAccepted', 'story_commit_accepted')
+                             AND e.book_id=c.book_id
+                             AND e.chapter_id=c.id
+                             AND (sc.chapter_version_id IS NULL
+                                  OR e.chapter_version_id=sc.chapter_version_id)
+                      ) AS accepted_event
+               FROM story_commits sc
+               JOIN chapters c ON c.id=sc.chapter_id
+               JOIN books b ON b.id=c.book_id
+               WHERE sc.id=?""",
+            (commit_id,),
+        ).fetchone()
+        if commit is None or commit["status"] != "accepted":
+            raise TaskStateError(
+                f"chapter workflow StoryCommit is not accepted: {commit_id}"
+            )
+        if not bool(commit["accepted_event"]):
+            raise TaskStateError(
+                "chapter workflow StoryCommit has no accepted NarrativeEvent: "
+                f"{commit_id}"
+            )
+        active_acceptance = next(
+            (
+                event for event in active_events(conn, commit["book_id"])
+                if event.get("event_type") in ACCEPTANCE_EVENT_TYPES
+                and str(event.get("commit_id") or event.get("source_commit_id") or "") == str(commit_id)
+                and str(event.get("chapter_id") or "") == str(commit["chapter_id"])
+                and (
+                    commit["chapter_version_id"] is None
+                    or str(event.get("chapter_version_id") or "") == str(commit["chapter_version_id"])
+                )
+            ),
+            None,
+        )
+        if active_acceptance is None:
+            raise TaskStateError(
+                "chapter workflow StoryCommit has no active accepted NarrativeEvent: "
+                f"{commit_id}"
+            )
+        if task_row.get("book_id") and task_row["book_id"] != commit["book_id"]:
+            raise TaskStateError("chapter workflow StoryCommit belongs to another book")
+        task_data = task_row.get("data")
+        try:
+            task_data = json.loads(task_data or "{}") if isinstance(task_data, str) else task_data
+        except json.JSONDecodeError:
+            task_data = {}
+        task_project = task_row.get("project_id")
+        if task_project is None and isinstance(task_data, Mapping):
+            task_project = task_data.get("project_id") or task_data.get("projectId")
+        if task_project and task_project != commit["project_id"]:
+            raise TaskStateError("chapter workflow StoryCommit belongs to another project")
+        task_chapter = task_row.get("chapter_number")
+        if task_chapter is None and isinstance(task_data, Mapping):
+            task_chapter = task_data.get("chapter_number") or task_data.get("chapterNumber")
+        if task_chapter is not None:
+            try:
+                if int(task_chapter) != int(commit["number"]):
+                    raise TaskStateError(
+                        "chapter workflow StoryCommit belongs to another chapter"
+                    )
+            except (TypeError, ValueError) as exc:
+                raise TaskStateError("chapter workflow chapter number is invalid") from exc
 
     @staticmethod
     def _append_event(conn, task_id: str, event_type: str, payload: dict[str, Any]) -> None:
@@ -1095,6 +1507,18 @@ class TaskRuntime:
         task["bookId"] = task.get("book_id")
         task["projectId"] = task.get("project_id")
         task["taskId"] = task["id"]
+        try:
+            agent_task = self.db.fetchone(
+                "SELECT id FROM agent_tasks WHERE task_id=?", (task["id"],)
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            agent_task = None
+        if agent_task:
+            task["agentTaskId"] = agent_task["id"]
+        task["workflowState"] = task.get("workflow_state")
+        task["workflowStateUpdatedAt"] = task.get("workflow_state_updated_at")
         task["checkpoint"] = self.latest_checkpoint(task["id"])
         checkpoint_state = task["checkpoint"].get("state", {}) if task["checkpoint"] else {}
         progress, total_steps = self._progress_snapshot(

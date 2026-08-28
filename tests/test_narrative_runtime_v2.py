@@ -144,6 +144,29 @@ def test_context_compiler_fails_closed_for_hard_constraints():
     assert exc_info.value.code == "CONTEXT_BUDGET_EXCEEDED"
 
 
+def test_context_compiler_keeps_current_canon_as_p0_before_optional_retrieval():
+    bundle = ContextCompiler.compile([
+        ContextSection("optional retrieval that should be excluded", "rag_chunk"),
+        ContextSection("current canon", "story_fact"),
+    ], budget_tokens=5)
+
+    assert bundle.text == "current canon"
+    assert bundle.sections[0]["sourceType"] == "story_fact"
+    assert bundle.sections[0]["priority"] == ContextCompiler.PRIORITY_VALUES["P0"]
+    assert bundle.sections[0]["hardConstraint"] is True
+    assert bundle.excluded[0]["sourceType"] == "rag_chunk"
+
+
+def test_context_compiler_accepts_named_priority_bands_and_canonical_aliases():
+    section = ContextCompiler.from_manifest(
+        "rules", {"sourceType": "world-rules", "priority": "P3"}
+    )
+
+    assert section.priority == ContextCompiler.PRIORITY_VALUES["P0"]
+    assert section.hard_constraint is True
+    assert section.authority_class == "published_canon_plan"
+
+
 def test_canonical_import_proposal_does_not_mutate_until_author_accepts(tmp_path: Path):
     db, repo, project_id, book_id = _repo(tmp_path)
     service = CanonicalImportService(db, repo)
@@ -170,7 +193,7 @@ def test_canonical_import_proposal_does_not_mutate_until_author_accepts(tmp_path
         chapter_version_id=pending[0]["chapterVersionId"],
     )
     accepted = service.accept(
-        proposed["id"], review_ids={pending[0]["commitId"]: review_id}
+        proposed["id"], review_ids={pending[0]["commitId"]: review_id}, author_confirmed=True
     )
     assert accepted["status"] == "accepted"
     assert db.count("story_commits", "status='accepted'") == 1

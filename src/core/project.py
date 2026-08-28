@@ -1,6 +1,7 @@
 """项目管理 - 负责项目的创建、加载、保存"""
 
 import json
+import logging
 import shutil
 from pathlib import Path
 from datetime import datetime
@@ -21,6 +22,15 @@ from .models import (
 )
 from .config import Config
 from .story_repository import StoryRepository
+
+
+logger = logging.getLogger(__name__)
+
+
+class LegacyProjectWriteError(RuntimeError):
+    """A file-backed project must be migrated before production writes."""
+
+    code = "LEGACY_PROJECT_READ_ONLY"
 
 
 class ProjectManager:
@@ -104,6 +114,34 @@ class ProjectManager:
         # 只允许字母数字和连字符
         return bool(re.match(r'^[a-zA-Z0-9\-]+$', project_id))
 
+    @staticmethod
+    def _legacy_writes_enabled() -> bool:
+        """Allow old file writes only for explicit, non-production development use."""
+        import os
+
+        enabled = any(
+            os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+            for name in (
+                "NOVELFORGE_ENABLE_LEGACY_PROJECT_WRITES",
+                "NOVELFORGE_ENABLE_LEGACY_CREATION_MODES",
+            )
+        )
+        deployment = os.environ.get("NOVELFORGE_ENV", "development").strip().lower()
+        return enabled and deployment not in {"production", "prod", "staging"}
+
+    def _require_legacy_write(self, project_id: str, operation: str) -> None:
+        if self._legacy_writes_enabled():
+            logger.warning(
+                "development-only legacy project write enabled: project=%s operation=%s",
+                project_id,
+                operation,
+            )
+            return
+        raise LegacyProjectWriteError(
+            f"{LegacyProjectWriteError.code}: project {project_id} is file-backed and read-only; "
+            "run the explicit migration preflight and confirmation before writing it"
+        )
+
     def load_project(self, project_id: str) -> Optional[StoryProject]:
         """加载项目"""
         if not self._validate_project_id(project_id):
@@ -126,6 +164,7 @@ class ProjectManager:
         if self.story_repository.is_authoritative_project(project.id):
             self.story_repository.save_authoritative_project(project)
             return
+        self._require_legacy_write(project.id, "save_project")
         project_dir = self.projects_dir / project.id
         project_dir.mkdir(parents=True, exist_ok=True)
 
@@ -173,6 +212,7 @@ class ProjectManager:
             return deleted
         if not project_dir.exists():
             return False
+        self._require_legacy_write(project_id, "delete_project")
         try:
             shutil.rmtree(project_dir)
             return True
@@ -184,17 +224,17 @@ class ProjectManager:
                 for name in files:
                     try:
                         os.remove(os.path.join(root, name))
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        logger.warning("could not remove legacy project file %s: %s", os.path.join(root, name), exc)
                 for name in dirs:
                     try:
                         os.rmdir(os.path.join(root, name))
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        logger.warning("could not remove legacy project directory %s: %s", os.path.join(root, name), exc)
             try:
                 os.rmdir(project_dir)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.warning("could not remove legacy project root %s: %s", project_dir, exc)
             return not project_dir.exists()
 
     def get_project_dir(self, project_id: str) -> Path:
@@ -222,6 +262,7 @@ class ProjectManager:
                 expected_version=expected_version, status=status,
             )
             return
+        self._require_legacy_write(project_id, "save_chapter_content")
         chapters_dir = self.projects_dir / project_id / "chapters"
         chapters_dir.mkdir(parents=True, exist_ok=True)
         chapter_file = chapters_dir / f"chapter_{chapter_number:04d}.md"
@@ -253,6 +294,7 @@ class ProjectManager:
         if self.story_repository.is_authoritative_project(project_id):
             self.story_repository.save_review(project_id, review_data)
             return
+        self._require_legacy_write(project_id, "save_review")
         reviews_dir = self.projects_dir / project_id / "reviews"
         reviews_dir.mkdir(parents=True, exist_ok=True)
         chapter_num = review_data.get("chapter_number", 0)
@@ -266,6 +308,7 @@ class ProjectManager:
             return False
         if self.story_repository.is_authoritative_project(project_id):
             return self.story_repository.delete_chapter(project_id, chapter_number)
+        self._require_legacy_write(project_id, "delete_chapter")
         project = self.load_project(project_id)
         if project is None or chapter_number not in project.chapters:
             return False
@@ -284,6 +327,7 @@ class ProjectManager:
         # 校验chapter_range只允许数字和连字符
         if not re.match(r'^[0-9\-]+$', chapter_range):
             return
+        self._require_legacy_write(project_id, "save_joint_review")
         reviews_dir = self.projects_dir / project_id / "reviews"
         reviews_dir.mkdir(parents=True, exist_ok=True)
         review_file = reviews_dir / f"joint_review_{chapter_range}.json"
@@ -314,19 +358,27 @@ class ProjectManager:
 
         # 恢复角色
         for name, char_data in data.get("characters", {}).items():
-            project.characters[name] = Character(**{k: v for k, v in char_data.items() if k in Character.__dataclass_fields__})
+            payload = {k: v for k, v in char_data.items() if k in Character.__dataclass_fields__}
+            payload.setdefault("name", name)
+            project.characters[name] = Character(**payload)
 
         # 恢复势力
         for name, faction_data in data.get("factions", {}).items():
-            project.factions[name] = Faction(**{k: v for k, v in faction_data.items() if k in Faction.__dataclass_fields__})
+            payload = {k: v for k, v in faction_data.items() if k in Faction.__dataclass_fields__}
+            payload.setdefault("name", name)
+            project.factions[name] = Faction(**payload)
 
         # 恢复地点
         for name, loc_data in data.get("locations", {}).items():
-            project.locations[name] = Location(**{k: v for k, v in loc_data.items() if k in Location.__dataclass_fields__})
+            payload = {k: v for k, v in loc_data.items() if k in Location.__dataclass_fields__}
+            payload.setdefault("name", name)
+            project.locations[name] = Location(**payload)
 
         # 恢复伏笔
         for fid, fs_data in data.get("foreshadowing", {}).items():
-            project.foreshadowing[fid] = Foreshadowing(**{k: v for k, v in fs_data.items() if k in Foreshadowing.__dataclass_fields__})
+            payload = {k: v for k, v in fs_data.items() if k in Foreshadowing.__dataclass_fields__}
+            payload.setdefault("id", fid)
+            project.foreshadowing[fid] = Foreshadowing(**payload)
 
         # 恢复章节
         for num_str, ch_data in data.get("chapters", {}).items():

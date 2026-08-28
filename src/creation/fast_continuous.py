@@ -37,6 +37,7 @@ from ..pipeline.rhythm import StrandWeaveTracker, ReaderEngagementTracker, Chapt
 from .writer import ChapterWriter
 from ..review.reviewer import ChapterReviewer
 from ..review.joint_reviewer import JointReviewer
+from .legacy_modes import require_legacy_creation_mode
 
 
 class PipelineCache:
@@ -80,6 +81,7 @@ class FastContinuousCreationMode:
     def __init__(self, project: StoryProject, project_manager: ProjectManager,
                  model_manager: MultiModelManager, memory: MemorySystem,
                  state: StateManager, config: dict):
+        require_legacy_creation_mode(type(self).__name__)
         self.project = project
         self.project_manager = project_manager
         self.models = model_manager

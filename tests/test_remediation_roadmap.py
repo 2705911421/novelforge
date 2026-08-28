@@ -619,9 +619,26 @@ def test_canonical_import_waits_for_bound_review_before_canon(tmp_path: Path):
         {"overall_score": 96, "passed": True, "verdict": "pass", "issues": []},
         chapter_version_id=pending_commit["chapterVersionId"],
     )
+    with pytest.raises(CanonicalImportError) as missing_confirmation:
+        service.accept(
+            proposed["id"],
+            review_ids={pending_commit["commitId"]: review_id},
+        )
+    assert missing_confirmation.value.code == "IMPORT_AUTHOR_CONFIRMATION_REQUIRED"
+    with pytest.raises(CanonicalImportError) as untrusted_actor:
+        service.accept(
+            proposed["id"],
+            review_ids={pending_commit["commitId"]: review_id},
+            author_confirmed=True,
+            actor_id="agent",
+        )
+    assert untrusted_actor.value.code == "IMPORT_AUTHOR_ACTOR_REQUIRED"
+    assert database.count("story_commits", "status='accepted'") == 0
+
     accepted = service.accept(
         proposed["id"],
         review_ids={pending_commit["commitId"]: review_id},
+        author_confirmed=True,
     )
     assert accepted["status"] == "accepted"
     assert accepted["report"]["stage"] == "accepted"
@@ -656,7 +673,11 @@ def test_canonical_import_failed_review_never_enters_canon(tmp_path: Path):
         chapter_version_id=pending["chapterVersionId"],
     )
     with pytest.raises(CanonicalImportError, match="blocking review issues") as exc_info:
-        service.accept(proposed["id"], review_ids={pending["commitId"]: review_id})
+        service.accept(
+            proposed["id"],
+            review_ids={pending["commitId"]: review_id},
+            author_confirmed=True,
+        )
     assert exc_info.value.code == "IMPORT_REVIEW_GATE"
     assert database.count("story_commits", "status='accepted'") == 0
     assert database.count("narrative_events", "event_type='StoryCommitAccepted'") == 0
@@ -675,6 +696,12 @@ def test_studio_task_runtime_follows_active_story_repository(tmp_path: Path, mon
 
     assert studio.task_runtime.db is database
     assert database.fetchone("SELECT id FROM tasks WHERE id=?", (task["id"],)) is not None
+    receipt = database.fetchone(
+        "SELECT name, status, actor FROM control_commands WHERE name='task.enqueue' "
+        "ORDER BY created_at DESC LIMIT 1"
+    )
+    assert receipt is not None
+    assert dict(receipt) == {"name": "task.enqueue", "status": "accepted", "actor": "system"}
 
 
 def test_handoff_retries_pipeline_provider_failure_without_faking_canon(tmp_path: Path):
@@ -699,7 +726,10 @@ def test_handoff_retries_pipeline_provider_failure_without_faking_canon(tmp_path
     recovered = __import__("asyncio").run(PersistentTaskWorker(
         runtime, {"write-next": lambda _task: {"completed": True}}, retry_delay_seconds=0,
     ).execute_once("handoff-worker-2"))
-    assert recovered is not None and recovered["status"] == "completed"
+    # A compatibility handler cannot complete a chapter task without an
+    # accepted StoryCommit; the durable runtime must expose that integrity
+    # violation instead of manufacturing success.
+    assert recovered is not None and recovered["status"] == "failed"
     assert database.count("story_commits") == 0
 
 
@@ -727,7 +757,7 @@ def test_handoff_worker_restart_preserves_checkpoint_and_requires_author_for_wri
     finished = __import__("asyncio").run(PersistentTaskWorker(
         runtime, {"write-next": lambda _task: {"resumed": True}}, retry_delay_seconds=0,
     ).execute_once("restarted-worker"))
-    assert finished is not None and finished["status"] == "completed"
+    assert finished is not None and finished["status"] == "failed"
     resumed_checkpoint = runtime.latest_checkpoint(task["id"])
     assert resumed_checkpoint is not None
     assert resumed_checkpoint["state"]["context"]["chapter"] == 1
@@ -799,7 +829,7 @@ def test_handoff_worker_restart_recovers_checkpoint_across_process_boundary(tmp_
             {"write-next": lambda _task: {"resumed": True}},
             retry_delay_seconds=0,
         ).execute_once("restarted-process"))
-        assert finished is not None and finished["status"] == "completed"
+        assert finished is not None and finished["status"] == "failed"
         persisted = runtime.latest_checkpoint(task_id)
         assert persisted is not None and persisted["id"] == checkpoint["id"]
         print(json.dumps({"status": finished["status"], "checkpoint_id": persisted["id"]}))
@@ -815,7 +845,7 @@ def test_handoff_worker_restart_recovers_checkpoint_across_process_boundary(tmp_
     )
     assert resume.returncode == 0, resume.stderr
     resumed = json.loads(resume.stdout.strip().splitlines()[-1])
-    assert resumed == {"status": "completed", "checkpoint_id": prepared["checkpoint_id"]}
+    assert resumed == {"status": "failed", "checkpoint_id": prepared["checkpoint_id"]}
 
 
 def test_continuous_parent_and_child_resume_across_worker_process_restart(tmp_path: Path):
@@ -1261,6 +1291,7 @@ def test_studio_lifespan_runs_enabled_worker_and_clears_daemon_state(
 
     assert studio.studio_daemon_state == {
         "task": None,
+        "control_task": None,
         "stop_event": None,
         "worker_id": None,
         "projection": None,

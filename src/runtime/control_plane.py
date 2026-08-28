@@ -8,7 +8,10 @@ SQLite as restart/replay evidence, while listeners remain process-local.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
+import json
+import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping
@@ -24,12 +27,21 @@ from .persistence import (
     ControlCommandStore,
     ControlEventStore,
     ComputePlanStore,
+    ProposalStore,
 )
-from .approvals import ApprovalEngine
-from .contracts import AgentTask, RuntimeEvent
-from .errors import ControlCommandLeaseLost, TaskInterrupted
-from .router import RuntimeRouter
-from .tool_gateway import PermissionEngine, ToolGateway
+from .approvals import ApprovalEngine, ApprovalStatus, is_host_approval_actor
+from .contracts import AgentTask, ComputePlan, RuntimeEvent
+from .errors import (
+    AgentRuntimeError,
+    ComputeEscalationDenied,
+    ControlCommandLeaseLost,
+    TaskInterrupted,
+)
+from .router import RuntimeFallbackPolicy, RuntimeRouter
+from .tool_gateway import PermissionEngine, ToolCallContext, ToolGateway
+
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -197,7 +209,7 @@ class CommandBus:
         if command.name in self._async_handlers:
             return await self._execute_async(command, worker_id=worker_id)
         self._require_handler(command.name, async_handler=False)
-        return self._execute_sync(command, worker_id=worker_id)
+        return await asyncio.to_thread(self._execute_sync, command, worker_id=worker_id)
 
     def _execute_sync(self, envelope: ControlCommand, *, worker_id: str | None = None) -> Any:
         handler = self._handlers[envelope.name]
@@ -389,15 +401,39 @@ class ControlCommandWorker:
             actor=str(claimed.get("actor") or "system"),
             command_id=str(claimed["commandId"]),
         )
+        heartbeat = asyncio.create_task(self._heartbeat(command.command_id))
         try:
             await self.bus.execute_claimed_async(command, worker_id=self.worker_id)
-        except Exception:
+        except Exception as exc:
             # Handler failures are already durable rejected receipts.  Return
             # the receipt so a supervising loop can observe the failure while
             # keeping the worker alive for the next independent command.
+            logger.warning(
+                "Control command worker observed a handler failure",
+                extra={"command_id": command.command_id, "command_name": command.name},
+                exc_info=exc,
+            )
             receipt = self.bus.receipts.get(command.command_id)
             return receipt or claimed
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
         return self.bus.receipts.get(command.command_id) or claimed
+
+    async def _heartbeat(self, command_id: str) -> None:
+        """Keep a live claim from becoming eligible for duplicate execution."""
+        if self.bus.receipts is None:
+            return
+        interval = max(0.1, self.lease_seconds / 3)
+        while True:
+            await asyncio.sleep(interval)
+            if not self.bus.receipts.renew(
+                command_id,
+                self.worker_id,
+                lease_seconds=self.lease_seconds,
+            ):
+                return
 
     async def run_forever(self, *, stop_event: asyncio.Event) -> None:
         """Keep claiming work until the host lifecycle asks this worker to stop."""
@@ -495,10 +531,12 @@ class TaskOrchestrator:
         router: RuntimeRouter,
         *,
         agent_tasks: AgentTaskStore | None = None,
+        fallback_policy: RuntimeFallbackPolicy | None = None,
     ) -> None:
         self.task_runtime = task_runtime
         self.router = router
         self.agent_tasks = agent_tasks or AgentTaskStore(task_runtime.db)
+        self.fallback_policy = fallback_policy or RuntimeFallbackPolicy()
 
     def enqueue(self, task: AgentTask, **kwargs: Any) -> dict[str, Any]:
         """Persist a provider-neutral AgentTask and its durable task link."""
@@ -515,6 +553,7 @@ class TaskOrchestrator:
         *,
         worker_id: str = "agent-orchestrator",
         lease_seconds: int = 60,
+        compute_plan_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Claim and execute one linked AgentTask.
 
@@ -528,6 +567,18 @@ class TaskOrchestrator:
         durable = self.task_runtime.get(durable_task_id)
         if durable is not None and durable.get("stage") == "blocked":
             raise TaskStateError("blocked tasks require an explicit author/workflow transition")
+        compute_plan: ComputePlan | None = None
+        if compute_plan_id:
+            record = self.router.plans.get(compute_plan_id)
+            if record is None:
+                raise KeyError(f"compute plan not found: {compute_plan_id}")
+            if str(record.get("agent_task_id") or record.get("agentTaskId") or "") != task.task_id:
+                raise ValueError("compute plan is not owned by the AgentTask")
+            raw_plan = record.get("plan")
+            if not isinstance(raw_plan, dict):
+                raise ValueError("persisted compute plan is invalid")
+            compute_plan = ComputePlan.from_mapping(raw_plan)
+
         claimed = self.task_runtime.claim_by_id(
             durable_task_id,
             worker_id,
@@ -538,7 +589,11 @@ class TaskOrchestrator:
 
         events: list[RuntimeEvent] = []
         try:
-            async for event in self.router.execute(task):
+            async for event in self.router.execute_with_fallback(
+                task,
+                compute_plan=compute_plan,
+                fallback_policy=self.fallback_policy,
+            ):
                 events.append(event)
             current = self.task_runtime.get(durable_task_id)
             if current is None:
@@ -551,6 +606,7 @@ class TaskOrchestrator:
                     lease_owner=worker_id,
                 )
             if current.get("status") == "running":
+                self._require_succeeded_agent_run(events, durable_task_id)
                 return self.task_runtime.transition(
                     durable_task_id,
                     "completed",
@@ -582,6 +638,116 @@ class TaskOrchestrator:
                     lease_owner=worker_id,
                 )
             raise
+
+    def _require_succeeded_agent_run(
+        self,
+        events: list[RuntimeEvent],
+        durable_task_id: str,
+    ) -> None:
+        """Require a provider success to be backed by durable run state."""
+        terminal = next(
+            (
+                event
+                for event in reversed(events)
+                if event.event_type.replace("/", ".") in {"turn.completed", "turn.complete"}
+            ),
+            None,
+        )
+        if terminal is None or not terminal.agent_run_id:
+            raise AgentRuntimeError(
+                "runtime completed without a durable AgentRun",
+                code="RUNTIME_PROTOCOL_ERROR",
+                retryable=True,
+            )
+        run = self.router.runs.get(terminal.agent_run_id)
+        if (
+            run is None
+            or str(run.get("task_id") or "") != str(durable_task_id)
+            or run.get("status") != "succeeded"
+        ):
+            raise AgentRuntimeError(
+                "runtime completed without a succeeded AgentRun",
+                code="RUNTIME_PROTOCOL_ERROR",
+                retryable=True,
+            )
+
+    def prepare_compute_escalation_request(
+        self,
+        task_id: str,
+        *,
+        requested_capability: str | int,
+        requested_reasoning: str | None = None,
+        plan_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate an Agent escalation request without changing execution."""
+        task = self.agent_tasks.contract(task_id)
+        durable_task_id = task_id
+        if task is None:
+            task = self.agent_tasks.contract_for_durable_task(task_id)
+        else:
+            linked = self.task_runtime.get(task_id)
+            if linked is not None:
+                durable_task_id = task_id
+            else:
+                row = self.agent_tasks.get(task.task_id)
+                durable_task_id = str(row.get("task_id") or task_id) if row else task_id
+        if task is None:
+            raise KeyError(f"agent task not found: {task_id}")
+        durable = self.task_runtime.get(durable_task_id)
+        if durable and durable.get("status") in {
+            "completed", "failed", "cancelled", "needs_author_decision",
+        }:
+            raise TaskStateError("a terminal task cannot request compute escalation")
+        validation = self.router.validate_escalation_request(
+            task,
+            plan_id=plan_id,
+            requested_capability=requested_capability,
+            requested_reasoning=requested_reasoning,
+        )
+        return {
+            "taskId": durable_task_id,
+            "agentTaskId": task.task_id,
+            **validation,
+        }
+
+    def request_escalation(
+        self,
+        durable_task_id: str,
+        *,
+        requested_capability: str | int,
+        requested_reasoning: str | None = None,
+        plan_id: str | None = None,
+        actor: str = "agent",
+        approved: bool = False,
+    ) -> dict[str, Any]:
+        """Create a durable, Host-approved successor ComputePlan.
+
+        This method does not execute a provider call.  The caller receives a
+        plan id and may explicitly pass it to :meth:`execute`; an AgentTask or
+        Runtime cannot turn the request into an implicit capability upgrade.
+        """
+        task = self.agent_tasks.contract_for_durable_task(durable_task_id)
+        if task is None:
+            raise KeyError(f"agent task not found for durable task: {durable_task_id}")
+        durable = self.task_runtime.get(durable_task_id)
+        if durable and durable.get("status") in {
+            "completed", "failed", "cancelled", "needs_author_decision",
+        }:
+            raise TaskStateError("a terminal task cannot request compute escalation")
+        plan = self.router.request_escalation(
+            task,
+            plan_id=plan_id,
+            requested_capability=requested_capability,
+            requested_reasoning=requested_reasoning,
+            actor=actor,
+            approved=approved,
+        )
+        return {
+            "taskId": durable_task_id,
+            "agentTaskId": task.task_id,
+            "plan": plan.to_dict(),
+            "executeWithPlanId": plan.plan_id,
+        }
 
     async def cancel(self, durable_task_id: str) -> dict[str, Any]:
         """Persist cancellation and forward provider interrupts from audit."""
@@ -640,17 +806,37 @@ class ControlPlane:
         self.commands.register("approval.approve", self._approve_approval)
         self.commands.register("approval.reject", self._reject_approval)
         self.commands.register("approval.revoke", self._revoke_approval)
+        self.commands.register(
+            "compute.escalation.request", self._request_compute_escalation
+        )
+        self.commands.register("compute.escalate", self._compute_escalate)
+        self.commands.register(
+            "proposal.accept",
+            lambda payload, actor: self._decide_proposal(payload, actor, "ACCEPTED"),
+        )
+        self.commands.register(
+            "proposal.reject",
+            lambda payload, actor: self._decide_proposal(payload, actor, "REJECTED"),
+        )
+        self.commands.register(
+            "proposal.supersede",
+            lambda payload, actor: self._decide_proposal(payload, actor, "SUPERSEDED"),
+        )
         self.queries.register("task.get", self._get_task)
         self.queries.register("task.events", self._task_events)
         self.queries.register("task.agent-task", self._agent_task)
         self.queries.register("task.agent-runs", self._agent_runs)
         self.queries.register("task.domain-events", self._domain_events)
         self.queries.register("task.compute-plans", self._compute_plans)
+        self.queries.register(
+            "task.compute-escalation-requests", self._compute_escalation_requests
+        )
         self.queries.register("task.context-bundles", self._context_bundles)
         self.queries.register("runtime.ui-events", self._ui_events)
         self.queries.register("approval.get", self._get_approval)
         self.queries.register("approval.list", self._list_approvals)
         self.queries.register("task.tool-calls", self._tool_calls)
+        self.queries.register("task.proposals", self._proposals)
         self.queries.register("task.approvals", self._task_approvals)
         self.queries.register("control.command-receipts", self._command_receipts)
         self.queries.register("control.events", self._control_events)
@@ -681,24 +867,44 @@ class ControlPlane:
             return await self.orchestrator.cancel(task_id)
         return self.task_runtime.cancel(task_id)
 
-    def _enqueue(self, payload: Mapping[str, Any], _actor: str) -> dict[str, Any]:
+    def _enqueue(self, payload: Mapping[str, Any], actor: str) -> dict[str, Any]:
         task_type = str(payload.get("taskType") or payload.get("task_type") or "").strip()
         if not task_type:
             raise ValueError("taskType is required")
         data = payload.get("data")
         if not isinstance(data, dict):
             data = {}
+        project_id = payload.get("projectId") or payload.get("project_id")
+        book_id = payload.get("bookId") or payload.get("book_id")
+        idempotency_key = (
+            payload.get("idempotencyKey")
+            or payload.get("idempotency_key")
+            or payload.get("_commandId")
+        )
+        initiated_by = str(actor or "system").strip() or "system"
+        if task_type == "continuous":
+            return self.task_runtime.enqueue_continuous(
+                project_id=str(project_id or ""),
+                book_id=str(book_id or ""),
+                data=data,
+                idempotency_key=str(idempotency_key),
+                initiated_by=initiated_by,
+            )
         return self.task_runtime.enqueue(
             task_type,
-            project_id=payload.get("projectId") or payload.get("project_id"),
-            book_id=payload.get("bookId") or payload.get("book_id"),
+            project_id=project_id,
+            book_id=book_id,
             chapter_number=payload.get("chapterNumber") or payload.get("chapter_number"),
             data=data,
             stage=str(payload.get("stage") or "queued"),
             idempotency_key=(
-                payload.get("idempotencyKey")
-                or payload.get("idempotency_key")
-                or payload.get("_commandId")
+                idempotency_key
+            ),
+            initiated_by=initiated_by,
+            initial_status=str(
+                payload.get("initialStatus")
+                or payload.get("initial_status")
+                or "queued"
             ),
         )
 
@@ -787,6 +993,331 @@ class ControlPlane:
         )
         return record.to_dict()
 
+    def request_compute_escalation_from_agent(
+        self,
+        arguments: Mapping[str, Any],
+        context: ToolCallContext,
+    ) -> dict[str, Any]:
+        """Host-bind the runtime tool used by an Agent to ask for escalation."""
+        row = AgentTaskStore(self.task_runtime.db).get(context.task.task_id)
+        if row is None:
+            raise KeyError(f"agent task not found: {context.task.task_id}")
+        payload = dict(arguments)
+        payload["taskId"] = row["task_id"]
+        supplied_run_id = str(
+            payload.get("agentRunId") or payload.get("agent_run_id") or ""
+        ).strip() or None
+        bound_run_id = str(context.agent_run_id or "").strip() or None
+        if supplied_run_id and bound_run_id is None:
+            raise ValueError("agentRunId requires a Host-bound AgentRun context")
+        if supplied_run_id and supplied_run_id != bound_run_id:
+            raise ValueError("agentRunId must match the Host-bound AgentRun")
+        if bound_run_id:
+            run = self.task_runtime.db.fetchone(
+                "SELECT agent_task_id, task_id FROM agent_runs WHERE id=?",
+                (bound_run_id,),
+            )
+            if (
+                run is None
+                or str(run["agent_task_id"] or "") != str(context.task.task_id)
+                or str(run["task_id"] or "") != str(row["task_id"] or "")
+            ):
+                raise ValueError("Host-bound AgentRun is outside the AgentTask scope")
+            payload["agentRunId"] = bound_run_id
+        return self._request_compute_escalation(payload, actor="agent")
+
+    def _request_compute_escalation(
+        self,
+        payload: Mapping[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        if self.orchestrator is None:
+            raise RuntimeError("compute escalation requires a RuntimeRouter-backed orchestrator")
+        actor_key = str(actor or "").strip().lower()
+        scheduler = getattr(self.orchestrator.router, "scheduler", None)
+        policy = getattr(scheduler, "policy", None)
+        if (
+            not is_host_approval_actor(actor_key)
+            and policy is not None
+            and not bool(getattr(policy, "allow_agent_escalation", False))
+        ):
+            raise ComputeEscalationDenied(
+                "Agent compute escalation requests are disabled by the active Compute policy",
+                details={
+                    "actor": actor_key or None,
+                    "strategy": getattr(policy, "strategy", None),
+                    "allowAgentEscalation": False,
+                },
+            )
+        task_id = self._task_id(payload)
+        requested = payload.get("requestedCapability") or payload.get("requested_capability")
+        if requested is None or not str(requested).strip():
+            raise ValueError("requestedCapability is required")
+        requested_reasoning = payload.get("requestedReasoning") or payload.get("requested_reasoning")
+        if requested_reasoning is not None and not str(requested_reasoning).strip():
+            requested_reasoning = None
+        plan_id = str(payload.get("planId") or payload.get("plan_id") or "").strip() or None
+        reason = str(payload.get("reason") or "").strip()
+        if not reason:
+            raise ValueError("reason is required for a compute escalation request")
+        if len(reason) > 2_000:
+            raise ValueError("reason exceeds the escalation request limit")
+        raw_evidence = payload.get("evidence", [])
+        if not isinstance(raw_evidence, list):
+            raise ValueError("evidence must be an array")
+        if len(raw_evidence) > 32:
+            raise ValueError("evidence cannot contain more than 32 items")
+        evidence = []
+        for item in raw_evidence:
+            value = str(item).strip()
+            if not value or len(value) > 500:
+                raise ValueError("each escalation evidence item must be 1-500 characters")
+            evidence.append(value)
+
+        validated = self.orchestrator.prepare_compute_escalation_request(
+            task_id,
+            requested_capability=str(requested),
+            requested_reasoning=(
+                str(requested_reasoning) if requested_reasoning is not None else None
+            ),
+            plan_id=plan_id,
+        )
+        agent_task_id = str(validated["agentTaskId"])
+        request_payload = {
+            "taskId": validated["taskId"],
+            "agentTaskId": agent_task_id,
+            "agentRunId": payload.get("agentRunId") or payload.get("agent_run_id"),
+            "planId": validated["plan"]["planId"],
+            "requestedCapability": validated["requestedCapability"],
+            "requestedReasoning": validated["requestedReasoning"],
+            "reason": reason,
+            "evidence": evidence,
+        }
+        request_payload = {
+            key: value for key, value in request_payload.items() if value is not None
+        }
+        serialized_reason = json.dumps(
+            request_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+
+        existing = next(
+            (
+                item for item in self.approvals.list(task_id=agent_task_id)
+                if item.tool_name == "compute.escalation"
+                and item.domain == "compute"
+                and item.status in {ApprovalStatus.REQUESTED, ApprovalStatus.APPROVED}
+            ),
+            None,
+        )
+        if existing is not None:
+            if existing.reason != serialized_reason:
+                raise ValueError("a different compute escalation request is already pending")
+            approval = existing
+            created = False
+        else:
+            approval = self.approvals.request(
+                agent_task_id,
+                "compute.escalation",
+                "compute",
+                requested_by=str(actor or "agent").strip() or "agent",
+                ttl_seconds=payload.get("ttlSeconds") or payload.get("ttl_seconds"),
+                reason=serialized_reason,
+            )
+            created = True
+        if created:
+            self.events.publish(
+                "compute.escalation.requested",
+                {
+                    **request_payload,
+                    "approvalId": approval.approval_id,
+                    "status": "PENDING_HOST_APPROVAL",
+                    "validation": {
+                        key: value for key, value in validated.items() if key != "plan"
+                    },
+                    "plan": validated["plan"],
+                },
+                command_id=self._command_id(payload),
+            )
+        return {
+            **request_payload,
+            "requestId": approval.approval_id,
+            "approvalId": approval.approval_id,
+            "status": (
+                "PENDING_HOST_APPROVAL"
+                if approval.status is ApprovalStatus.REQUESTED
+                else "APPROVED"
+            ),
+            "canonicalMutation": False,
+            "computePlanChanged": False,
+        }
+
+    def _compute_escalate(self, payload: Mapping[str, Any], actor: str) -> dict[str, Any]:
+        if self.orchestrator is None:
+            raise RuntimeError("compute escalation requires a RuntimeRouter-backed orchestrator")
+        task_id = self._task_id(payload)
+        request_id = str(payload.get("requestId") or payload.get("request_id") or "").strip()
+        if request_id:
+            if not is_host_approval_actor(actor):
+                raise ValueError("only a Host actor can apply an approved compute escalation")
+            task_row = AgentTaskStore(self.task_runtime.db).get_for_durable_task(task_id)
+            if task_row is None:
+                raise KeyError(f"agent task not found for durable task: {task_id}")
+            approval = self.approvals.get(request_id)
+            if approval is None:
+                raise KeyError(f"compute escalation approval not found: {request_id}")
+            if (
+                approval.task_id != str(task_row["agentTaskId"])
+                or approval.tool_name != "compute.escalation"
+                or approval.domain != "compute"
+            ):
+                raise ValueError("compute escalation approval is outside the task scope")
+            if approval.status is not ApprovalStatus.APPROVED:
+                raise ValueError(
+                    f"compute escalation approval is not active: {approval.status.value}"
+                )
+            if not is_host_approval_actor(approval.approved_by):
+                raise ValueError("compute escalation approval lacks a Host approver")
+            try:
+                request_payload = json.loads(approval.reason or "{}")
+            except json.JSONDecodeError as exc:
+                raise ValueError("compute escalation approval payload is invalid") from exc
+            if not isinstance(request_payload, dict):
+                raise ValueError("compute escalation approval payload is invalid")
+            request_task_id = str(request_payload.get("taskId") or "")
+            if request_task_id != task_id:
+                raise ValueError("compute escalation approval is outside the task scope")
+            requested = request_payload.get("requestedCapability")
+            if not requested:
+                raise ValueError("compute escalation approval has no requested capability")
+            # Validate the immutable request again before consuming its
+            # one-shot Host approval.  The apply command never trusts caller
+            # supplied target fields over the approved request payload.
+            self.orchestrator.prepare_compute_escalation_request(
+                task_id,
+                requested_capability=str(requested),
+                requested_reasoning=(
+                    str(request_payload.get("requestedReasoning"))
+                    if request_payload.get("requestedReasoning") is not None else None
+                ),
+                plan_id=str(request_payload.get("planId") or "").strip() or None,
+            )
+            consumed = self.approvals.consume(
+                str(task_row["agentTaskId"]),
+                "compute.escalation",
+                domain="compute",
+                approval_id=request_id,
+            )
+            result = self.orchestrator.request_escalation(
+                task_id,
+                requested_capability=str(requested),
+                requested_reasoning=(
+                    str(request_payload.get("requestedReasoning"))
+                    if request_payload.get("requestedReasoning") is not None else None
+                ),
+                plan_id=str(request_payload.get("planId") or "").strip() or None,
+                actor=str(consumed.approved_by or actor),
+                approved=True,
+            )
+            result.update({
+                "status": "APPLIED",
+                "requestId": request_id,
+                "approvalId": request_id,
+            })
+            self.events.publish(
+                "compute.escalation.applied",
+                result,
+                command_id=self._command_id(payload),
+            )
+            return result
+        requested = payload.get("requestedCapability") or payload.get("requested_capability")
+        if requested is None or not str(requested).strip():
+            raise ValueError("requestedCapability is required")
+        plan_id = str(payload.get("planId") or payload.get("plan_id") or "").strip() or None
+        requested_reasoning = payload.get("requestedReasoning") or payload.get("requested_reasoning")
+        # A provider/runtime may submit a request, but only an authenticated
+        # Host actor can approve it.  The boolean in a provider payload is not
+        # an approval credential.
+        caller = str(actor or "system").strip().lower()
+        approved = bool(payload.get("approved", False)) and caller not in {
+            "agent", "runtime", "provider", "codex", "claude", "gemini",
+        }
+        return self.orchestrator.request_escalation(
+            task_id,
+            requested_capability=str(requested),
+            requested_reasoning=str(requested_reasoning) if requested_reasoning is not None else None,
+            plan_id=plan_id,
+            actor=caller or "system",
+            approved=approved,
+        )
+
+    def _decide_proposal(
+        self,
+        payload: Mapping[str, Any],
+        actor: str,
+        status: str,
+    ) -> dict[str, Any]:
+        """Record a Host decision without accepting anything into Canon."""
+        if not is_host_approval_actor(actor):
+            raise ValueError("only a Host actor can decide an Agent proposal")
+        task_id = self._task_id(payload)
+        if self.task_runtime.get(task_id) is None:
+            raise KeyError(f"durable task not found: {task_id}")
+        proposal_id = str(
+            payload.get("proposalId") or payload.get("proposal_id") or ""
+        ).strip()
+        if not proposal_id:
+            raise ValueError("proposalId is required")
+        reason = str(payload.get("reason") or "")[:4000]
+        successor_id = str(
+            payload.get("successorProposalId")
+            or payload.get("successor_proposal_id")
+            or ""
+        ).strip() or None
+        proposal_store = ProposalStore(self.task_runtime.db)
+        proposal = proposal_store.get(proposal_id)
+        if proposal is None:
+            raise KeyError(f"proposal not found: {proposal_id}")
+        if status == "ACCEPTED" and str(proposal.get("proposalType") or "").strip().lower() == "planning_synthesis":
+            raise ValueError(
+                "planning synthesis requires the author confirmation endpoint; "
+                "generic proposal acceptance cannot apply planning projections"
+            )
+        if status == "ACCEPTED" and str(proposal.get("proposalType") or "").strip().lower() == "world_bootstrap":
+            raise ValueError(
+                "world bootstrap requires the author confirmation endpoint; "
+                "generic proposal acceptance cannot stage Story Bible drafts"
+            )
+        result = proposal_store.decide_for_task(
+            proposal_id,
+            task_id,
+            status,
+            decided_by=str(actor).strip() or "system",
+            reason=reason,
+            successor_proposal_id=successor_id,
+        )
+        event_payload = {
+            "taskId": task_id,
+            "proposalId": proposal_id,
+            "proposalType": result.get("proposalType"),
+            "status": result.get("status"),
+            "decidedBy": result.get("decided_by") or result.get("decidedBy"),
+            "reason": result.get("decision_reason") or reason,
+            "canonicalMutation": False,
+        }
+        if successor_id:
+            event_payload["successorProposalId"] = successor_id
+        self.events.publish(
+            f"proposal.{status.lower()}",
+            event_payload,
+            command_id=self._command_id(payload),
+        )
+        return {
+            **result,
+            "status": result.get("status", status),
+            "canonicalMutation": False,
+            "decision": status,
+        }
+
     def _get_approval(self, payload: Mapping[str, Any]) -> dict[str, Any] | None:
         approval = self.approvals.get(self._approval_id(payload))
         return approval.to_dict() if approval else None
@@ -832,17 +1363,68 @@ class ControlPlane:
         return AgentRunStore(self.task_runtime.db).list_for_task(self._task_id(payload))
 
     def _domain_events(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-        events = RuntimeEventStore(self.task_runtime.db)
-        result: list[dict[str, Any]] = []
-        for run in self._agent_runs(payload):
-            result.extend(events.domain_events(str(run["id"])))
-        return result
+        """Read a task's DomainEvent ledger with a durable cross-run cursor.
+
+        AgentRun sequence numbers restart for every retry or role-specific
+        run.  The DomainEvent row id is therefore the only cursor that can
+        safely resume a task-wide projection without duplicating or skipping
+        events.
+        """
+        raw_after = payload.get("afterId") or payload.get("after_id") or 0
+        raw_limit = payload.get("limit", 200)
+        try:
+            after_id = max(0, int(raw_after))
+            limit = max(1, min(1000, int(raw_limit)))
+        except (TypeError, ValueError):
+            raise ValueError("afterId and limit must be integers") from None
+        return RuntimeEventStore(self.task_runtime.db).domain_events_for_task(
+            self._task_id(payload), after_id=after_id, limit=limit,
+        )
 
     def _compute_plans(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         agent_task = self._agent_task(payload)
         if not agent_task:
             return []
         return ComputePlanStore(self.task_runtime.db).list(str(agent_task["id"]))
+
+    def _compute_escalation_requests(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Read durable escalation requests and their current approval state."""
+        task_id = self._task_id(payload)
+        agent_task = self._agent_task(payload)
+        if agent_task is None:
+            return []
+        raw_limit = payload.get("limit", 200)
+        try:
+            limit = max(1, min(1000, int(raw_limit)))
+        except (TypeError, ValueError):
+            raise ValueError("limit must be an integer") from None
+        events = self.events.list_since(
+            after_id=0,
+            name="compute.escalation.requested",
+            limit=limit,
+        )
+        result: list[dict[str, Any]] = []
+        for event in events:
+            request = event.get("payload")
+            if not isinstance(request, Mapping):
+                continue
+            if str(request.get("taskId") or "") != task_id:
+                continue
+            item = dict(request)
+            item["eventId"] = event.get("eventId")
+            approval_id = str(
+                item.get("approvalId") or item.get("requestId") or ""
+            ).strip()
+            approval = self.approvals.get(approval_id) if approval_id else None
+            if approval is not None:
+                item["approval"] = approval.to_dict()
+                item["status"] = (
+                    "PENDING_HOST_APPROVAL"
+                    if approval.status is ApprovalStatus.REQUESTED
+                    else approval.status.value.upper()
+                )
+            result.append(item)
+        return result
 
     def _context_bundles(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         run_rows = self._agent_runs(payload)
@@ -878,6 +1460,10 @@ class ControlPlane:
             for call in store.tool_calls(str(run["id"])):
                 result.append({"agentRunId": run["id"], **call})
         return result
+
+    def _proposals(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+        task_id = self._task_id(payload)
+        return ProposalStore(self.task_runtime.db).list_for_task(task_id)
 
     def _task_approvals(self, payload: Mapping[str, Any]) -> list[dict[str, Any]]:
         store = AgentRunStore(self.task_runtime.db)

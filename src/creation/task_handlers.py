@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from typing import Any, Callable, Optional
@@ -50,6 +51,7 @@ from src.planning.planning_synthesis import (
 from src.creation.continuous_service import ContinuousWritingService
 from src.interactive_film.service import InteractiveFilmStore, normalize_graph
 from src.prompts.prompt_repository import PromptRepository
+from src.runtime.persistence import ProposalStore
 
 
 class LegacyTaskHandlers:
@@ -107,6 +109,7 @@ class LegacyTaskHandlers:
             "plan-chapter": self.plan_chapter,
             "compose-chapter": self.compose_chapter,
             "joint-review": self.joint_review,
+            "dialogue-write": self.dialogue_write,
             "model-connection-test": self.model_connection_test,
             "model-discovery": self.model_discovery,
             "ingest-document": self.ingest_document,
@@ -133,9 +136,60 @@ class LegacyTaskHandlers:
         project = self._project(task)
         brief = self._text(task["data"].get("brief"))
         self.runtime.checkpoint(task["id"], "world-bootstrap", {"project_id": project.id})
-        WorldWizard(self.model_manager, self.project_manager).build_world(brief, project)
-        self.project_manager.save_project(project)
-        return {"project_id": project.id, "world_built": True}
+        proposal = WorldWizard(self.model_manager, self.project_manager).generate_world_proposal(
+            brief,
+            project=project,
+        )
+        if "error" in proposal:
+            raise ValueError(f"world bootstrap returned an invalid proposal: {proposal.get('error')}")
+        book = self.project_manager.story_repository.book_for_project(project.id)
+        if not book:
+            raise KeyError(f"no authoritative book for project: {project.id}")
+        proposal_payload = {
+            "proposalType": "world_bootstrap",
+            "projectId": project.id,
+            "bookId": book["id"],
+            "world": proposal,
+            "requiresAuthorConfirmation": True,
+            "canonicalMutation": False,
+        }
+        proposal_basis = {
+            "taskId": task["id"],
+            "projectId": project.id,
+            "world": proposal,
+        }
+        proposal_id = hashlib.sha256(
+            json.dumps(proposal_basis, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:32]
+        proposal_record = ProposalStore(self.project_manager.story_repository.db).create(
+            proposal_id=proposal_id,
+            proposal_type="world_bootstrap",
+            payload=proposal_payload,
+            durable_task_id=str(task["id"]),
+            project_id=project.id,
+            book_id=str(book["id"]),
+        )
+        self.runtime.checkpoint(
+            task["id"],
+            "proposal-ready",
+            {
+                "project_id": project.id,
+                "requires_author_confirmation": True,
+                "canon_written": False,
+                "proposal_id": proposal_record["id"],
+                "proposal_status": proposal_record["status"],
+            },
+        )
+        return {
+            "project_id": project.id,
+            "world_built": False,
+            "proposal_status": "needs_author_confirmation",
+            "requires_author_confirmation": True,
+            "canon_written": False,
+            "proposal": proposal,
+            "proposal_id": proposal_record["id"],
+            "proposal_ledger_status": proposal_record["status"],
+        }
 
     def write_next(self, task: dict[str, Any]) -> dict[str, Any]:
         data = task["data"]
@@ -245,8 +299,7 @@ class LegacyTaskHandlers:
             project, chapter_number, plan, self._text(data.get("context"))
         )
         project.chapters[chapter_number] = chapter
-        self.project_manager.save_chapter_content(project.id, chapter_number, chapter.content)
-        self.project_manager.save_project(project)
+        self._save_generated_chapter(project, chapter_number, chapter)
         return {
             "chapter": chapter_number,
             "title": chapter.title,
@@ -265,8 +318,7 @@ class LegacyTaskHandlers:
         reviewer = ChapterReviewer(self.model_manager, pass_score=self._config_int("review", "pass_score", 93))
         review = reviewer.review_chapter(chapter, project)
         chapter.review = review
-        self.project_manager.save_review(project.id, review.to_dict())
-        self.project_manager.save_project(project)
+        self._save_review_artifact(project, review)
         passed, reason = reviewer.check_dual_gate(review)
         return self._review_result(chapter_number, review, passed, reason)
 
@@ -291,9 +343,8 @@ class LegacyTaskHandlers:
         revised.review = review
         revised.revision_count += 1
         project.chapters[chapter_number] = revised
-        self.project_manager.save_chapter_content(project.id, chapter_number, revised.content)
-        self.project_manager.save_review(project.id, review.to_dict())
-        self.project_manager.save_project(project)
+        self._save_generated_chapter(project, chapter_number, revised)
+        self._save_review_artifact(project, review)
         passed, reason = reviewer.check_dual_gate(review)
         return {**self._review_result(chapter_number, review, passed, reason), "revisionCount": revised.revision_count}
 
@@ -313,8 +364,7 @@ class LegacyTaskHandlers:
             project, chapter_number, plan, self._text(data.get("context"))
         )
         project.chapters[chapter_number] = revised
-        self.project_manager.save_chapter_content(project.id, chapter_number, revised.content)
-        self.project_manager.save_project(project)
+        self._save_generated_chapter(project, chapter_number, revised)
         return {"chapter": chapter_number, "title": revised.title, "wordCount": revised.word_count, "message": "重写完成"}
 
     def plan_chapter(self, task: dict[str, Any]) -> dict[str, Any]:
@@ -385,6 +435,46 @@ class LegacyTaskHandlers:
             "summary": review["summary"],
             "issues": review["issues"],
         }
+
+    def dialogue_write(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Generate dialogue inside the durable task and Runtime scope."""
+        project = self._project(task)
+        data = task.get("data") or {}
+        character_name = self._text(data.get("character_name"))
+        scene_description = self._text(data.get("scene_description"))
+        tone = self._text(data.get("tone")) or "casual"
+        context = self._text(data.get("context"))
+        if not character_name or not scene_description:
+            raise ValueError("dialogue-write task requires character_name and scene_description")
+
+        book_context: Optional[dict[str, Any]] = None
+        character = project.characters.get(character_name)
+        if character:
+            book_context = {
+                "personality": getattr(character, "personality", ""),
+                "background": getattr(character, "background", ""),
+                "appearance": getattr(character, "appearance", ""),
+            }
+        self.runtime.checkpoint(
+            task["id"],
+            "dialogue-model-call",
+            {"character_name": character_name, "tone": tone},
+        )
+        from src.llm.dialogue import DialogueWriter
+
+        result = DialogueWriter(self.model_manager).generate(
+            character_name=character_name,
+            scene_description=scene_description,
+            tone=tone,
+            context=context,
+            book_context=book_context,
+        )
+        self.runtime.checkpoint(
+            task["id"],
+            "dialogue-complete",
+            {"character_name": character_name},
+        )
+        return result
 
     def model_connection_test(self, task: dict[str, Any]) -> dict[str, Any]:
         """Probe a configured provider from a durable task, never from HTTP."""
@@ -921,6 +1011,8 @@ class LegacyTaskHandlers:
             **chat_kwargs,
         )
         content = response.content.strip()
+        if not content:
+            raise ValueError("STORY_BIBLE_OUTPUT_EMPTY: model returned empty content")
         # Try to parse JSON from response.
         try:
             if content.startswith("```"):
@@ -928,9 +1020,19 @@ class LegacyTaskHandlers:
             suggested_payload = json.loads(content)
         except json.JSONDecodeError:
             suggested_payload = content
-        self.bible_repository.save_suggestion(project_id, step_key, suggested_payload)
+        if isinstance(suggested_payload, dict) and "error" in suggested_payload:
+            raise ValueError("STORY_BIBLE_OUTPUT_INVALID: model returned an error artifact")
+        saved = self.bible_repository.save_suggestion(project_id, step_key, suggested_payload)
         self.runtime.checkpoint(task["id"], "suggestion-saved", {"step_key": step_key})
-        return {"project_id": project_id, "step_key": step_key, "suggestion_saved": True}
+        saved_step = next(
+            step for step in saved["steps"] if step["step_key"] == step_key
+        )
+        return {
+            "project_id": project_id,
+            "step_key": step_key,
+            "suggestion_saved": True,
+            "suggestion": saved_step.get("suggestion"),
+        }
 
     def thought_clarify(self, task: dict[str, Any]) -> dict[str, Any]:
         """Ask the next targeted question in a durable thought session."""
@@ -1114,6 +1216,7 @@ class LegacyTaskHandlers:
             task["id"], "planning-synthesis-model-call", {"source_count": len(sources), "step_count": len(steps)},
             lease_owner=task.get("lease_owner"),
         )
+        degraded = False
         try:
             response = self.model_manager.chat(
                 [{"role": "user", "content": build_synthesis_prompt(sources, steps)}],
@@ -1127,22 +1230,54 @@ class LegacyTaskHandlers:
             # A provider outage must not restore the raw JSON surface.  Save a
             # clearly labelled source-backed projection so the author can keep
             # working and see exactly why AI refinement is still pending.
+            degraded = True
             synthesis = build_fallback_synthesis(sources, steps, error=str(exc))
-        self.project_manager.story_repository.apply_planning_synthesis(project_id, synthesis)
+        book = self.project_manager.story_repository.book_for_project(project_id)
+        if not book:
+            raise KeyError(f"no authoritative book for project: {project_id}")
+        proposal_payload = {
+            "proposalType": "planning_synthesis",
+            "projectId": project_id,
+            "bookId": book["id"],
+            "synthesis": synthesis,
+            "requiresAuthorConfirmation": True,
+            "canonicalMutation": False,
+        }
+        proposal_basis = {
+            "taskId": task["id"],
+            "projectId": project_id,
+            "synthesis": {key: value for key, value in synthesis.items() if key != "generated_at"},
+        }
+        proposal_id = hashlib.sha256(
+            json.dumps(proposal_basis, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:32]
+        proposal = ProposalStore(self.project_manager.story_repository.db).create(
+            proposal_id=proposal_id,
+            proposal_type="planning_synthesis",
+            payload=proposal_payload,
+            durable_task_id=str(task["id"]),
+            project_id=project_id,
+            book_id=str(book["id"]),
+        )
         self._set_planning_status(
             project_id,
             metadata={
                 "planningSynthesisStatus": synthesis["status"],
                 "planningSynthesisGeneratedBy": synthesis["generated_by"],
                 "planningSummary": synthesis,
+                "planningSynthesisProposalId": proposal["id"],
+                "planningSynthesisProposalStatus": proposal["status"],
+                "planningSynthesisApplied": False,
             },
         )
         self.runtime.checkpoint(
-            task["id"], "planning-synthesis-saved", {
+            task["id"], "planning-synthesis-proposed", {
                 "generated_by": synthesis["generated_by"],
                 "character_count": len(synthesis.get("characters") or []),
                 "faction_count": len(synthesis.get("factions") or []),
                 "location_count": len(synthesis.get("locations") or []),
+                "proposal_id": proposal["id"],
+                "canonical_mutation": False,
             },
             lease_owner=task.get("lease_owner"),
         )
@@ -1150,11 +1285,20 @@ class LegacyTaskHandlers:
             "projectId": project_id,
             "generatedBy": synthesis["generated_by"],
             "status": synthesis["status"],
+            "proposalId": proposal["id"],
+            "proposalStatus": proposal["status"],
+            "canonicalMutation": False,
+            "applied": False,
             "characterCount": len(synthesis.get("characters") or []),
             "factionCount": len(synthesis.get("factions") or []),
             "locationCount": len(synthesis.get("locations") or []),
             "needsReview": synthesis["needs_review"],
             "error": synthesis.get("error", ""),
+            # A degraded source-backed fallback is an inspectable artifact,
+            # not a successful AI execution.  The generic worker uses this
+            # explicit marker to keep the task at the author decision gate.
+            "completed": not degraded,
+            "degraded": degraded,
         }
 
     def forecast(self, task: dict[str, Any]) -> dict[str, Any]:
@@ -2145,6 +2289,36 @@ class LegacyTaskHandlers:
             raise KeyError(f"authoritative book not found for project: {project_id}")
         return CanonicalMemoryReader(self.project_manager.story_repository, book["id"])
 
+    def _save_generated_chapter(self, project: Any, chapter_number: int, chapter: Any) -> None:
+        """Persist a generated chapter as a reviewable version artifact.
+
+        The compatibility handlers still support file-backed legacy projects,
+        but an authoritative project must not be saved through the broad
+        ``save_project`` adapter after a model call: that entrypoint also
+        writes world/entity fields.  Chapter generation is a draft/version
+        operation; StoryCommit acceptance remains the Canon boundary.
+        """
+        repository = self.project_manager.story_repository
+        if repository.is_authoritative_project(project.id):
+            repository.save_chapter_content(
+                project.id,
+                chapter_number,
+                chapter.content,
+                title=chapter.title,
+                status="draft",
+            )
+            return
+        self.project_manager.save_chapter_content(project.id, chapter_number, chapter.content)
+        self.project_manager.save_project(project)
+
+    def _save_review_artifact(self, project: Any, review: Any) -> None:
+        """Persist a review without broad-write side effects on authority DB."""
+        self.project_manager.save_review(project.id, review.to_dict())
+        if not self.project_manager.story_repository.is_authoritative_project(project.id):
+            # File-backed legacy projects still store the review reference on
+            # the compatible project JSON so a later revision can find it.
+            self.project_manager.save_project(project)
+
     def _composer(self, project_id: str) -> Composer:
         return Composer(self.model_manager, ControlSurface(self.project_manager.get_project_dir(project_id)))
 
@@ -2212,10 +2386,12 @@ class LegacyTaskHandlers:
     @staticmethod
     def _parse_json_response(content: str) -> Any:
         text = (content or "").strip()
+        if not text:
+            raise ValueError("model response was empty")
         if text.startswith("```"):
             text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
         except json.JSONDecodeError:
             positions = [index for index in (text.find("{"), text.find("[")) if index >= 0]
             start = min(positions, default=-1)
@@ -2223,9 +2399,12 @@ class LegacyTaskHandlers:
             if start < 0 or end <= start:
                 raise ValueError("model response was not valid JSON")
             try:
-                return json.loads(text[start:end + 1])
+                parsed = json.loads(text[start:end + 1])
             except json.JSONDecodeError as exc:
                 raise ValueError("model response was not valid JSON") from exc
+        if isinstance(parsed, dict) and "error" in parsed:
+            raise ValueError("model response contained an error artifact")
+        return parsed
 
     @staticmethod
     def _string_list(value: Any) -> list[str]:

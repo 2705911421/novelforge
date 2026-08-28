@@ -49,6 +49,47 @@ def get_managers(project_path=None):
     return config, project_mgr, model_mgr
 
 
+def _enqueue_host_task(
+    database,
+    task_type: str,
+    *,
+    project_id: str | None = None,
+    book_id: str | None = None,
+    chapter_number: int | None = None,
+    data: dict[str, Any] | None = None,
+    stage: str = "queued",
+    idempotency_key: str | None = None,
+    initiated_by: str | None = None,
+    initial_status: str = "queued",
+) -> dict[str, Any]:
+    """Submit a CLI gesture through the same durable Host command seam as Studio."""
+    from ..core.task_runtime import TaskRuntime
+    from ..runtime.control_plane import ControlPlane
+
+    task_data = dict(data or {})
+    actor = str(
+        initiated_by
+        or task_data.get("initiatedBy")
+        or task_data.get("initiated_by")
+        or task_data.get("source")
+        or "system"
+    ).strip() or "system"
+    return ControlPlane(TaskRuntime(database)).commands.dispatch(
+        "task.enqueue",
+        {
+            "taskType": task_type,
+            "projectId": project_id,
+            "bookId": book_id,
+            "chapterNumber": chapter_number,
+            "data": task_data,
+            "stage": stage,
+            "idempotencyKey": idempotency_key,
+            "initialStatus": initial_status,
+        },
+        actor=actor,
+    )
+
+
 @click.group()
 @click.option('--project', '-p', default=None, help='项目路径')
 @click.pass_context
@@ -75,7 +116,6 @@ def init(ctx, name, genre, import_file):
 
     # 如果有导入文件
     if import_file:
-        from ..core.task_runtime import TaskRuntime
         from ..wizard.guided_setup import WorldWizard
         wizard = WorldWizard(cast(Any, model_mgr), project_mgr)
         content = wizard.import_world_file(import_file)
@@ -84,7 +124,8 @@ def init(ctx, name, genre, import_file):
         book = project_mgr.story_repository.book_for_project(project.id)
         if not book:
             raise click.ClickException("项目没有 authoritative book")
-        task = TaskRuntime(project_mgr.story_repository.db).enqueue(
+        task = _enqueue_host_task(
+            project_mgr.story_repository.db,
             "world-bootstrap", project_id=project.id, book_id=book["id"], data={"brief": content}
         )
         console.print(f"✅ 世界观构建任务已排队 [dim](ID: {task['id']})[/]")
@@ -108,7 +149,6 @@ def ingest(ctx, project_id, file_path, doc_type):
     if not project:
         raise click.ClickException(f"项目不存在: {project_id}")
 
-    from ..core.task_runtime import TaskRuntime
     from ..ingestion.service import DEFAULT_MAX_BYTES, DocumentIngestionError, DocumentRepository
     book = project_mgr.story_repository.book_for_project(project.id)
     if not book:
@@ -121,7 +161,8 @@ def ingest(ctx, project_id, file_path, doc_type):
         document, deduplicated = document_repository.create_upload(
             project.id, file_path.name, file_path.read_bytes(), doc_type=doc_type
         )
-        task = TaskRuntime(project_mgr.story_repository.db).enqueue(
+        task = _enqueue_host_task(
+            project_mgr.story_repository.db,
             "ingest-document", project_id=project.id, book_id=book["id"], data={"document_id": document["id"]},
             idempotency_key=f"ingest-document:{document['id']}:{document['source_fingerprint']}",
         )
@@ -187,8 +228,6 @@ def wizard(ctx, project_id, user_input):
         console.print(f"[red]项目不存在: {project_id}[/]")
         return
 
-    from ..core.task_runtime import TaskRuntime
-
     console.print(Panel("[bold cyan]🌍 世界观构建向导[/]", border_style="cyan"))
 
     if not user_input:
@@ -198,7 +237,8 @@ def wizard(ctx, project_id, user_input):
     book = project_mgr.story_repository.book_for_project(project.id)
     if not book:
         raise click.ClickException(f"项目没有 authoritative book: {project.id}")
-    task = TaskRuntime(project_mgr.story_repository.db).enqueue(
+    task = _enqueue_host_task(
+        project_mgr.story_repository.db,
         "world-bootstrap",
         project_id=project.id,
         book_id=book["id"],
@@ -224,12 +264,12 @@ def write(ctx, project_id, chapter, context):
 
     if chapter == 0:
         chapter = project.get_latest_chapter_number() + 1
-    from ..core.task_runtime import TaskRuntime
     book = project_mgr.story_repository.book_for_project(project.id)
     if not book:
         console.print(f"[red]项目没有 authoritative book: {project.id}[/]")
         return
-    task = TaskRuntime(project_mgr.story_repository.db).enqueue(
+    task = _enqueue_host_task(
+        project_mgr.story_repository.db,
         "write-next", project_id=project.id, book_id=book["id"],
         data={"chapter_number": chapter, "context": context, "count": 1},
     )
@@ -286,6 +326,9 @@ def continuous(ctx, project_id, start, count, context):
             project_mgr.story_repository,
             runtime,
             joint_review_interval=configured_interval,
+            enqueue_task=lambda task_type, **kwargs: _enqueue_host_task(
+                project_mgr.story_repository.db, task_type, **kwargs
+            ),
         ).start_continuous(project.id, book["id"], start, count, context)
     except (TaskStateError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc

@@ -2,6 +2,8 @@
 NovelForge 核心模块测试
 """
 
+import sqlite3
+
 import pytest
 from pathlib import Path
 
@@ -59,6 +61,24 @@ class TestDatabase:
         """测试数据库初始化"""
         assert db.db_path.exists()
         assert db.get_version() == 1
+
+    def test_open_read_only_skips_migrations_and_rejects_writes(self, tmp_path):
+        db_path = tmp_path / "audit-only.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+            conn.execute("INSERT INTO marker(value) VALUES ('preserved')")
+
+        read_only = Database.open_read_only(str(db_path))
+
+        assert read_only.fetchone("SELECT value FROM marker") == {"value": "preserved"}
+        assert not read_only.table_exists("schema_migrations")
+        with pytest.raises(PermissionError, match="read-only"):
+            with read_only.transaction():
+                pass
+        with pytest.raises(PermissionError, match="read-only"):
+            read_only.insert("marker", {"value": "must-not-write"})
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            read_only.execute("CREATE TABLE should_not_exist (id INTEGER)")
     
     def test_table_exists(self, db):
         """测试表是否存在"""

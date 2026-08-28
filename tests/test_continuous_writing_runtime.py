@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,126 @@ def test_continuous_runs_real_joint_review_at_interval(continuous_deps):
     assert review_tasks[0]["status"] == "completed"
 
 
+def test_nested_continuous_provider_call_uses_child_task_scope(continuous_deps):
+    database, repository, runtime, project_id, book_id, _tmp_path = continuous_deps
+    parent = runtime.enqueue(
+        "continuous",
+        project_id=project_id,
+        book_id=book_id,
+        data={"start_chapter": 1, "count": 1},
+    )
+    claimed_parent = runtime.claim("continuous-parent")
+    assert claimed_parent is not None and claimed_parent["id"] == parent["id"]
+
+    class ScopedModel:
+        def __init__(self):
+            self.current_task_id = None
+            self.calls: list[str | None] = []
+
+        @contextmanager
+        def task_scope(self, task_id):
+            previous = self.current_task_id
+            self.current_task_id = task_id
+            try:
+                yield
+            finally:
+                self.current_task_id = previous
+
+        def chat(self, _messages, *, task_type=None, **_kwargs):
+            del task_type
+            self.calls.append(self.current_task_id)
+            return type("Response", (), {"content": "child-scoped provider result"})()
+
+    model = ScopedModel()
+    service = ContinuousWritingService(database, model, repository, runtime)
+
+    class ChildPipeline:
+        def execute(self, _task):
+            model.chat([], task_type="write-next")
+            return {"completed": False, "quality_gate": "TEST_SCOPE_ONLY"}
+
+    service.pipeline = ChildPipeline()
+    child = runtime.enqueue(
+        "write-next",
+        project_id=project_id,
+        book_id=book_id,
+        data={"chapter_number": 1, "parent_task_id": parent["id"]},
+        stage="blocked",
+        idempotency_key=f"continuous-child:{parent['id']}:scope",
+    )
+
+    with model.task_scope(parent["id"]):
+        result = service._execute_chapter_child(claimed_parent, child)
+
+    assert result == {"completed": False, "quality_gate": "TEST_SCOPE_ONLY"}
+    assert model.calls == [child["id"]]
+
+
+def test_nested_continuous_joint_review_uses_child_task_scope(continuous_deps, monkeypatch):
+    database, repository, runtime, project_id, book_id, _tmp_path = continuous_deps
+    parent = runtime.enqueue(
+        "continuous",
+        project_id=project_id,
+        book_id=book_id,
+        data={"start_chapter": 1, "count": 1},
+    )
+    claimed_parent = runtime.claim("continuous-parent")
+    assert claimed_parent is not None and claimed_parent["id"] == parent["id"]
+
+    class ScopedModel:
+        def __init__(self):
+            self.current_task_id = None
+            self.calls: list[str | None] = []
+
+        @contextmanager
+        def task_scope(self, task_id):
+            previous = self.current_task_id
+            self.current_task_id = task_id
+            try:
+                yield
+            finally:
+                self.current_task_id = previous
+
+        def chat(self, _messages, *, task_type=None, **_kwargs):
+            del task_type
+            self.calls.append(self.current_task_id)
+
+    model = ScopedModel()
+
+    class StubJointReviewService:
+        def __init__(self, _database, model_manager):
+            self.model_manager = model_manager
+
+        def review_chapters(self, *_args, **_kwargs):
+            self.model_manager.chat([], task_type="joint-review")
+            return {
+                "id": "review-child-scope",
+                "overall_score": 95,
+                "verdict": "pass",
+                "summary": "scoped",
+                "issues": [],
+            }
+
+    from src.creation import continuous_service as continuous_service_module
+
+    monkeypatch.setattr(
+        continuous_service_module, "JointReviewService", StubJointReviewService
+    )
+    service = ContinuousWritingService(database, model, repository, runtime)
+
+    with model.task_scope(parent["id"]):
+        result = service._execute_joint_review_child(
+            claimed_parent, project_id, book_id, 1, 1
+        )
+
+    child = next(
+        item for item in runtime.list()
+        if item["type"] == "joint-review" and item["id"] != parent["id"]
+    )
+    assert result["review_id"] == "review-child-scope"
+    assert model.calls == [child["id"]]
+
+
 def test_retryable_child_failure_retries_parent_without_author_intervention(continuous_deps):
     database, repository, runtime, project_id, book_id, _tmp_path = continuous_deps
     model = RecordingModel(fail_first=True)
@@ -181,6 +302,49 @@ def test_continuous_start_rejects_another_queued_session(continuous_deps):
     assert database.count(
         "tasks", "type='continuous' AND book_id=?", (book_id,)
     ) == 1
+
+
+def test_continuous_idempotency_includes_pinned_run_configuration(continuous_deps, monkeypatch):
+    database, repository, runtime, project_id, book_id, _tmp_path = continuous_deps
+    service = ContinuousWritingService(database, RecordingModel(), repository, runtime)
+    configurations = {
+        "loose": {
+            "strict_planning": False,
+            "planning_snapshot_id": None,
+            "planning_snapshot_version": None,
+            "planning_snapshot_checksum": None,
+            "prompt_policy_versions": {"write-next": {"version": 1}},
+            "quality_policy": {"score_threshold": 90, "max_revisions": 2},
+        },
+        "strict": {
+            "strict_planning": True,
+            "planning_snapshot_id": "published-snapshot",
+            "planning_snapshot_version": 3,
+            "planning_snapshot_checksum": "snapshot-checksum",
+            "prompt_policy_versions": {"write-next": {"version": 2}},
+            "quality_policy": {"score_threshold": 95, "max_revisions": 1},
+        },
+    }
+    selected = ["loose"]
+    monkeypatch.setattr(
+        service,
+        "_capture_run_configuration",
+        lambda *_args, **_kwargs: configurations[selected[0]],
+    )
+
+    first = service.start_continuous(project_id, book_id, 1, 1, "same direction")
+    runtime.cancel(first["taskId"])
+    selected[0] = "strict"
+    second = service.start_continuous(project_id, book_id, 1, 1, "same direction")
+    repeated = service.start_continuous(project_id, book_id, 1, 1, "same direction")
+
+    assert second["taskId"] != first["taskId"]
+    assert repeated["taskId"] == second["taskId"]
+    rows = database.fetchall(
+        "SELECT id, data FROM tasks WHERE type='continuous' ORDER BY created_at, id"
+    )
+    assert len(rows) == 2
+    assert '"planning_snapshot_id": "published-snapshot"' in rows[1]["data"]
 
 
 def test_expired_lease_owner_cannot_finalize_task(continuous_deps):

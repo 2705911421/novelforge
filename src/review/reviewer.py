@@ -1,13 +1,9 @@
 """审查与打分系统 - 借鉴 inkOS 审计员架构"""
 
-import logging
 from ..core.models import ChapterReview, ReviewDimension, ReviewVerdict, StoryProject, Chapter
 from ..llm.client import MultiModelManager
 from ..llm.prompts import PromptManager
 from ..pipeline.rules import genre_contract_lines
-
-logger = logging.getLogger(__name__)
-
 
 class ChapterReviewer:
     """章节审查器 - 双重门禁机制"""
@@ -53,11 +49,10 @@ class ChapterReviewer:
         messages = [{"role": "user", "content": prompt}]
         system = "你是一位严格但公正的小说审稿编辑，专注于提升作品质量。"
 
-        try:
-            response = client.chat_json(messages, system)
-        except Exception as e:
-            logger.warning("Review LLM call failed: %s", e)
-            response = {}
+        # Provider failures must reach the durable worker.  Turning an outage
+        # into an empty review would make a failed review look like a valid
+        # low-scoring artifact and could persist a misleading result.
+        response = client.chat_json(messages, system)
 
         # 解析审查结果
         review = self._parse_review(chapter.number, response)
@@ -85,14 +80,35 @@ class ChapterReviewer:
 
     def _parse_review(self, chapter_number: int, data: dict) -> ChapterReview:
         """解析审查结果"""
+        if not isinstance(data, dict):
+            raise ValueError("CHAPTER_REVIEW_OUTPUT_INVALID: expected a JSON object")
+        if "error" in data:
+            raise ValueError("CHAPTER_REVIEW_OUTPUT_INVALID: model returned invalid JSON")
+
+        score = data.get("overall_score")
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 100:
+            raise ValueError("CHAPTER_REVIEW_OUTPUT_INVALID: overall_score must be 0..100")
+        specific_issues = data.get("specific_issues", [])
+        if not isinstance(specific_issues, list):
+            raise ValueError("CHAPTER_REVIEW_OUTPUT_INVALID: specific_issues must be an array")
+        revision_suggestions = data.get("revision_suggestions", [])
+        if not isinstance(revision_suggestions, list):
+            raise ValueError("CHAPTER_REVIEW_OUTPUT_INVALID: revision_suggestions must be an array")
+        dimensions = data.get("dimensions", [])
+        if not isinstance(dimensions, list) or any(not isinstance(item, dict) for item in dimensions):
+            raise ValueError("CHAPTER_REVIEW_OUTPUT_INVALID: dimensions must be an array of objects")
+        verdict_str = data.get("verdict", "needs_revision")
+        if verdict_str not in {item.value for item in ReviewVerdict}:
+            raise ValueError("CHAPTER_REVIEW_OUTPUT_INVALID: verdict is invalid")
+
         review = ChapterReview(chapter_number=chapter_number)
 
-        review.overall_score = data.get("overall_score", 0)
-        review.specific_issues = data.get("specific_issues", [])
-        review.revision_suggestions = data.get("revision_suggestions", [])
+        review.overall_score = score
+        review.specific_issues = specific_issues
+        review.revision_suggestions = revision_suggestions
 
         # 解析维度评分
-        for dim_data in data.get("dimensions", []):
+        for dim_data in dimensions:
             dim = ReviewDimension(
                 name=dim_data.get("name", ""),
                 score=dim_data.get("score", 0),
@@ -102,11 +118,7 @@ class ChapterReviewer:
             review.dimensions.append(dim)
 
         # 解析结论
-        verdict_str = data.get("verdict", "needs_revision")
-        try:
-            review.verdict = ReviewVerdict(verdict_str)
-        except ValueError:
-            review.verdict = ReviewVerdict.NEEDS_REVISION
+        review.verdict = ReviewVerdict(verdict_str)
 
         return review
 

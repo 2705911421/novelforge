@@ -7,7 +7,7 @@ and filters, and returns a bounded read model.  Canvas state is persisted by
 the same module in a separate UI workspace table and never enters StoryFact or
 StoryState.
 
-Split plan (TODO):
+Module boundary notes (future decomposition candidates):
 - schema.py (lines 35-400): NODE_TYPES, EDGE_TYPES, PORTS, EDGE_RULES constants
 - query.py (lines 400-585): StoryGraphQuery and validation
 - adapters.py (lines 600-1100): data adapters and conversion functions
@@ -25,6 +25,7 @@ import binascii
 import difflib
 import hashlib
 import json
+import logging
 import math
 import re
 from typing import Any, Iterable, Optional
@@ -38,6 +39,8 @@ SPATIAL_INDEX_SCHEMA_VERSION = 3
 # contract.  Bumping this version forces an older database to rebuild both
 # sides before the warm Inspector path is allowed to answer.
 NODE_INDEX_SCHEMA_VERSION = 3
+
+logger = logging.getLogger(__name__)
 
 
 class StoryGraphError(ValueError):
@@ -3322,8 +3325,12 @@ class StoryGraphProjector:
                 try:
                     if int(candidate_number) > int(chapter_number):
                         future_chapters.append(item)
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    logger.debug(
+                        "ignoring invalid StoryGraph chapter number during impact analysis: %r",
+                        candidate_number,
+                        exc_info=exc,
+                    )
             if node_type == "Fact" or node.get("source_type") == "story_facts":
                 affected_facts.append(item)
             boundary = str(item.get("impactBoundary") or "").upper()

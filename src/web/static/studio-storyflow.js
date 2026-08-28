@@ -1687,7 +1687,31 @@
       hideEdgeChooser();
       try {
         const planning = await api('GET', `/books/${currentBook()}/story-graph/planning`);
+        const edgeId = storyflowClientId('planning-edge');
+        const preview = await api('POST', `/books/${currentBook()}/story-graph/planning/preview`, {
+          delta: { operations: [{
+            op: 'add_edge',
+            edge: {
+              id: edgeId,
+              source: connection.sourceNodeId,
+              target: targetNode.id,
+              type: edgeType,
+              kind: edgeType,
+              edgeType,
+              label: edgeType,
+              status: 'planned',
+              sourcePort: connection.sourcePort,
+              targetPort,
+              sourceRef: 'storyflow',
+              metadata: { createdFrom: 'storyflow-canvas' },
+            },
+          }] },
+          expectedRevision: Number(planning.revision || 1),
+        });
+        if (!confirmStoryFlowPreview(preview)) return;
         await api('POST', `/books/${currentBook()}/story-graph/planning/edge`, {
+          edgeId,
+          proposalId: preview.proposal?.proposalId,
           sourceNodeId: connection.sourceNodeId,
           targetNodeId: targetNode.id,
           edgeType,
@@ -1707,6 +1731,23 @@
   }
 
   function hideEdgeChooser() { document.getElementById('sf-edge-chooser')?.remove(); }
+
+  function storyflowClientId(prefix) {
+    const generated = globalThis.crypto?.randomUUID?.();
+    return `${prefix}:${generated || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+  }
+
+  function confirmStoryFlowPreview(preview) {
+    const diff = preview?.previewDiff || {};
+    const nodes = diff.nodes?.counts || {};
+    const edges = diff.edges?.counts || {};
+    return window.confirm(
+      `确认写入 StoryFlow planning overlay？\n` +
+      `节点：新增 ${nodes.added || 0}、修改 ${nodes.changed || 0}、移除 ${nodes.removed || 0}\n` +
+      `关系：新增 ${edges.added || 0}、修改 ${edges.changed || 0}、移除 ${edges.removed || 0}\n` +
+      `影响分析仅基于已记录语义证据；不会写入 Canon。`
+    );
+  }
 
   function onCanvasContextMenu(event) {
     event.preventDefault();
@@ -4314,7 +4355,52 @@
       submit.disabled = true;
         try {
         const revision = await planningRevision();
+        const nodeId = storyflowClientId('planning');
+        const anchorEdgeId = linkToAnchor ? storyflowClientId('planning-edge') : null;
+        const previewOperations = [{
+          op: 'add_node',
+          node: {
+            id: nodeId,
+            kind: 'planning-node',
+            type: 'PlanningNode',
+            label: title,
+            title,
+            summary,
+            description: summary,
+            status: status.toLowerCase(),
+            source: 'author',
+            sourceRef: 'storyflow',
+            metadata: { createdFrom: 'storyflow-canvas' },
+          },
+        }];
+        if (linkToAnchor) {
+          previewOperations.push({
+            op: 'add_edge',
+            edge: {
+              id: anchorEdgeId,
+              source: nodeId,
+              target: anchor.id,
+              type: anchorRelation.type,
+              kind: anchorRelation.type,
+              edgeType: anchorRelation.type,
+              label: anchorRelation.label,
+              status: status.toLowerCase(),
+              sourceRef: 'storyflow',
+              metadata: { createdFrom: 'storyflow-canvas' },
+            },
+          });
+        }
+        const preview = await api('POST', `/books/${currentBook()}/story-graph/planning/preview`, {
+          delta: { operations: previewOperations },
+          expectedRevision: revision,
+        });
+        if (!confirmStoryFlowPreview(preview)) {
+          submit.disabled = false;
+          return;
+        }
         const result = await api('POST', `/books/${currentBook()}/story-graph/planning/node`, {
+          nodeId,
+          proposalId: preview.proposal?.proposalId,
           title,
           summary,
           subtype: 'author-flow-node',
@@ -4327,6 +4413,7 @@
           },
           anchorNodeId: linkToAnchor ? anchor.id : null,
           anchorEdgeType: linkToAnchor ? anchorRelation.type : null,
+          anchorEdgeId,
           anchorLabel: linkToAnchor ? anchorRelation.label : '',
           anchorMetadata: linkToAnchor ? {
             createdFrom: 'storyflow-canvas',

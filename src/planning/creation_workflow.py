@@ -230,6 +230,13 @@ def build_imported_story_bible_payloads(
             result[step_key]["description"] = _clip(body, 10_000)
         elif step_key in {"protagonist", "main_characters", "relationships", "factions", "locations"}:
             result[step_key]["entities"] = _meaningful_lines(body, 30)
+    if language_text.strip():
+        # Keep the derived style analysis inside the reviewable Story Bible
+        # voice draft.  The projects projection is updated only by the
+        # explicit Story Bible publish boundary.
+        style_profile, writing_style = build_style_profile(language_text, language_filename)
+        result["voice"]["summary"] = writing_style
+        result["voice"]["styleProfile"] = style_profile
     result["references"]["sourceOverview"] = {
         "storyCharacters": len(story_text),
         "referenceCharacters": len(reference_text),

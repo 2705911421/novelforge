@@ -795,6 +795,27 @@ body::before {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+/* Runtime registry rows must stay inside their grid column even when a
+   discovered executable path is longer than the available workspace. */
+.runtime-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 12rem);
+  align-items: start;
+}
+
+.runtime-row > :first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.runtime-row > .spacer {
+  display: none;
+}
+
+.runtime-row > :last-child {
+  min-width: 0;
+}
+
 .grid-3 {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }

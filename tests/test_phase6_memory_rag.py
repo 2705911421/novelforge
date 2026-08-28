@@ -169,6 +169,104 @@ def test_reference_chunks_share_durable_embedding_projection_across_restart(rag_
     assert second["results"][0]["source_id"] == first["results"][0]["source_id"]
 
 
+def test_reference_projection_uses_bounded_embedding_batches(rag_fixture):
+    _root, database, _manager, project, documents, service = rag_fixture
+    indexed = _index(documents, service, project.id, "reference.txt", b"initial", "reference")
+    contents = [f"reference chunk {index}" for index in range(33)]
+    documents.replace_chunks_and_index(
+        indexed["id"],
+        [
+            {
+                "id": f"{indexed['id']}-chunk-{index}",
+                "chunk_index": index,
+                "content": content,
+                "start_char": 0,
+                "end_char": len(content),
+                "checksum": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "metadata": {"source_document_id": indexed["id"]},
+            }
+            for index, content in enumerate(contents)
+        ],
+        {"resolved_type": "reference", "chunk_count": len(contents)},
+    )
+    book = database.fetchone("SELECT id FROM books WHERE project_id=?", (project.id,))
+    assert book is not None
+
+    class BatchEmbedder:
+        def __init__(self):
+            self.calls = []
+
+        def embed_many(self, texts):
+            self.calls.append(list(texts))
+            return [[float(index), 1.0] for index, _text in enumerate(texts)]
+
+        def __call__(self, _text):
+            raise AssertionError("scalar embedding should not be used when a batch seam is available")
+
+    embedder = BatchEmbedder()
+    retriever = DurableHybridRetriever(
+        database, model_key="bounded-reference-embedding", embedder=embedder,
+    )
+    report = retriever.sync_reference_chunks(book["id"], project.id)
+
+    assert report["changed"] == 33
+    assert report["ready"] == 33
+    assert report["degraded"] == 0
+    assert [len(call) for call in embedder.calls] == [32, 1]
+    assert database.count(
+        "embedding_projections",
+        "book_id=? AND model_key=? AND status='ready'",
+        (book["id"], "bounded-reference-embedding"),
+    ) == 33
+
+
+def test_reference_projection_batch_failure_falls_back_to_scalar(rag_fixture):
+    _root, database, _manager, project, documents, service = rag_fixture
+    indexed = _index(documents, service, project.id, "reference.txt", b"initial", "reference")
+    contents = ["moon gate opens", "harbor bell rings"]
+    documents.replace_chunks_and_index(
+        indexed["id"],
+        [
+            {
+                "id": f"{indexed['id']}-chunk-{index}",
+                "chunk_index": index,
+                "content": content,
+                "start_char": 0,
+                "end_char": len(content),
+                "checksum": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "metadata": {"source_document_id": indexed["id"]},
+            }
+            for index, content in enumerate(contents)
+        ],
+        {"resolved_type": "reference", "chunk_count": len(contents)},
+    )
+    book = database.fetchone("SELECT id FROM books WHERE project_id=?", (project.id,))
+    assert book is not None
+
+    class RecoverableBatchEmbedder:
+        def __init__(self):
+            self.batch_calls = 0
+            self.scalar_calls = 0
+
+        def embed_many(self, _texts):
+            self.batch_calls += 1
+            raise RuntimeError("batch endpoint unavailable")
+
+        def __call__(self, _text):
+            self.scalar_calls += 1
+            return [1.0, 0.0]
+
+    embedder = RecoverableBatchEmbedder()
+    report = DurableHybridRetriever(
+        database, model_key="recoverable-batch-embedding", embedder=embedder,
+    ).sync_reference_chunks(book["id"], project.id)
+
+    assert report["ready"] == 2
+    assert report["degraded"] == 0
+    assert embedder.batch_calls == 1
+    assert embedder.scalar_calls == 2
+
+
 def test_writing_pipeline_uses_reference_embedding_projection_when_route_exists(
     rag_fixture, monkeypatch,
 ):
