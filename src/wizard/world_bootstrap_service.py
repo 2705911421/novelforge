@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import json
-import logging
-from typing import Any
+from datetime import datetime
+from typing import Any, Mapping
 
 from src.core.database import Database
 from src.planning.story_bible import STORY_BIBLE_STEPS, StoryBibleRepository
-
-logger = logging.getLogger(__name__)
-
+from src.runtime.approvals import is_author_approval_actor
+from src.runtime.persistence import ProposalStore
 
 STEP_GUIDANCE: dict[str, tuple[str, str, str]] = {
     "intent": ("故事想表达什么", "明确作品的情感目标与主题，后面所有设定都以此为方向。", "如果读者只记住一句话，你希望他记住什么？"),
@@ -158,26 +157,26 @@ class WorldBootstrapService:
 
         prompt = "".join(prompt_parts)
 
+        response = self.model_manager.chat(
+            [{"role": "user", "content": prompt}],
+            system="你是一个专业的小说创作策划助手，擅长设计长篇小说的世界观、角色、剧情等设定。请直接返回结构化内容，不要使用代码块标记。若未明确提供世界名称，使用“架空世界”。",
+            task_type="story-bible-suggest",
+        )
+        content = response.content.strip()
+        if not content:
+            raise ValueError("STORY_BIBLE_OUTPUT_EMPTY: model returned empty content")
+
+        # Try to parse JSON from response. Provider failures must propagate;
+        # only a non-JSON model artifact is treated as a textual suggestion.
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
         try:
-            response = self.model_manager.chat(
-                [{"role": "user", "content": prompt}],
-                system="你是一个专业的小说创作策划助手，擅长设计长篇小说的世界观、角色、剧情等设定。请直接返回结构化内容，不要使用代码块标记。若未明确提供世界名称，使用“架空世界”。",
-                task_type="story-bible-suggest",
-            )
-            content = response.content.strip()
-
-            # Try to parse JSON from response.
-            if content.startswith("```"):
-                content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-            try:
-                suggested = json.loads(content)
-            except json.JSONDecodeError:
-                suggested = content
-
-        except Exception as exc:
-            logger.warning("AI generation failed: %s", exc)
-            suggested = {"error": "AI generation failed. Please try again or enter manually."}
+            suggested = json.loads(content)
+        except json.JSONDecodeError:
+            suggested = content
+        if isinstance(suggested, dict) and "error" in suggested:
+            raise ValueError("STORY_BIBLE_OUTPUT_INVALID: model returned an error artifact")
 
         # Save suggestion.
         self.bible_repo.save_suggestion(project_id, step_key, suggested)
@@ -194,3 +193,172 @@ class WorldBootstrapService:
             "status": result["workspace"]["status"],
             "published_snapshot_id": result["workspace"]["published_snapshot_id"],
         }
+
+
+class WorldBootstrapProposalAuthority:
+    """Move a generated world proposal into author-reviewable Story Bible drafts."""
+
+    def __init__(self, db: Database):
+        self.db = db
+        self.bible_repo = StoryBibleRepository(db)
+
+    def accept(
+        self,
+        proposal_id: str,
+        project_id: str,
+        *,
+        actor: str,
+        author_confirmed: bool,
+        reason: str = "",
+        task_id: str | None = None,
+        book_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Accept only the proposal artifact, never the project's Canon.
+
+        The generated world becomes AI-originated Story Bible material.  The
+        author must still review and confirm the 25 steps before the existing
+        Story Bible publish boundary can update project projections.
+        """
+        proposal_id = str(proposal_id or "").strip()
+        project_id = str(project_id or "").strip()
+        if not proposal_id or not project_id:
+            raise ValueError("proposal_id and project_id are required")
+        if not author_confirmed:
+            raise ValueError("author confirmation is required before world proposal acceptance")
+        if not is_author_approval_actor(actor):
+            raise ValueError("only an author-facing Host actor can accept a world proposal")
+
+        store = ProposalStore(self.db)
+        if not store.available:
+            raise RuntimeError("agent proposal ledger is unavailable before schema migration 53")
+        candidate = store.get(proposal_id)
+        if candidate is None:
+            raise KeyError(f"world bootstrap proposal not found: {proposal_id}")
+        if str(candidate.get("proposalType") or candidate.get("proposal_type") or "").strip().lower() != "world_bootstrap":
+            raise ValueError("proposal is not a world bootstrap proposal")
+        if str(candidate.get("project_id") or candidate.get("projectId") or "") != project_id:
+            raise ValueError("world bootstrap proposal is outside the project scope")
+        if task_id is not None and str(candidate.get("task_id") or "") != str(task_id):
+            raise ValueError("world bootstrap proposal is outside the durable task scope")
+        candidate_status = str(candidate.get("status") or "").upper()
+        if candidate_status not in {"PROPOSED", "ACCEPTED"}:
+            raise ValueError(f"cannot accept world bootstrap proposal in status {candidate_status}")
+        authoritative_book = self.db.fetchone(
+            "SELECT id FROM books WHERE project_id=? ORDER BY created_at LIMIT 1", (project_id,)
+        )
+        if authoritative_book is None:
+            raise KeyError(f"no authoritative book for project: {project_id}")
+        if candidate.get("book_id") and str(candidate["book_id"]) != str(authoritative_book["id"]):
+            raise ValueError("world bootstrap proposal is outside the authoritative book scope")
+        if book_id is not None and str(book_id) != str(authoritative_book["id"]):
+            raise ValueError("world bootstrap task is outside the authoritative book scope")
+        self.bible_repo.ensure(project_id)
+
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"world bootstrap proposal not found: {proposal_id}")
+            if str(row["proposal_type"] or "").strip().lower() != "world_bootstrap":
+                raise ValueError("proposal is not a world bootstrap proposal")
+            if str(row["project_id"] or "") != project_id:
+                raise ValueError("world bootstrap proposal is outside the project scope")
+            if task_id is not None and str(row["task_id"] or "") != str(task_id):
+                raise ValueError("world bootstrap proposal is outside the durable task scope")
+            authoritative_book = conn.execute(
+                "SELECT id FROM books WHERE project_id=? ORDER BY created_at LIMIT 1", (project_id,)
+            ).fetchone()
+            if authoritative_book is None:
+                raise KeyError(f"no authoritative book for project: {project_id}")
+            if row["book_id"] and str(row["book_id"]) != str(authoritative_book["id"]):
+                raise ValueError("world bootstrap proposal is outside the authoritative book scope")
+            if book_id is not None and str(book_id) != str(authoritative_book["id"]):
+                raise ValueError("world bootstrap task is outside the authoritative book scope")
+
+            status = str(row["status"] or "").upper()
+            if status == "ACCEPTED":
+                result = ProposalStore._decode(row)
+                result.update({
+                    "applied": False,
+                    "stagedToStoryBible": True,
+                    "canonicalMutation": False,
+                    "idempotent": True,
+                })
+                return result
+            if status != "PROPOSED":
+                raise ValueError(f"cannot accept world bootstrap proposal in status {status}")
+
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("world bootstrap proposal payload is invalid") from exc
+            document = payload.get("world") if isinstance(payload, Mapping) else None
+            if not isinstance(document, dict):
+                raise ValueError("world bootstrap proposal has no world payload")
+            drafts = self._story_bible_drafts(document)
+            staged = self.bible_repo.stage_ai_drafts(
+                project_id, drafts, _connection=conn
+            )
+            now = datetime.now().isoformat()
+            accepted = store.transition(
+                proposal_id,
+                "ACCEPTED",
+                decided_by=actor,
+                reason=reason,
+                _connection=conn,
+            )
+            control_event_id = None
+            if self.db.table_exists("control_events"):
+                event_cursor = conn.execute(
+                    """INSERT INTO control_events(name, command_id, payload, created_at)
+                       VALUES (?, NULL, ?, ?)""",
+                    (
+                        "world_bootstrap.proposal.accepted",
+                        json.dumps({
+                            "projectId": project_id,
+                            "bookId": str(authoritative_book["id"]),
+                            "proposalId": proposal_id,
+                            "decidedBy": str(actor).strip() or "author",
+                            "stagedStepKeys": staged["suggestionStepKeys"],
+                            "canonicalMutation": False,
+                        }, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                control_event_id = int(event_cursor.lastrowid or 0)
+            accepted.update({
+                "applied": False,
+                "stagedToStoryBible": True,
+                "stagedStepKeys": staged["suggestionStepKeys"],
+                "draftedStepKeys": staged["draftedStepKeys"],
+                "canonicalMutation": False,
+                "idempotent": False,
+                "controlEventId": control_event_id,
+            })
+            return accepted
+
+    @staticmethod
+    def _story_bible_drafts(document: Mapping[str, Any]) -> dict[str, Any]:
+        world = document.get("world")
+        world = world if isinstance(world, dict) else {}
+        drafts: dict[str, Any] = {}
+
+        def put(step_key: str, value: Any) -> None:
+            if value not in (None, "", [], {}):
+                drafts[step_key] = value
+
+        put("intent", document.get("author_intent"))
+        put("core_conflict", world.get("core_conflict") or document.get("core_conflict"))
+        put("world", world)
+        put("world_rules", world.get("world_rules"))
+        put("power_system", world.get("power_system"))
+        put("main_characters", document.get("characters"))
+        put("factions", document.get("factions"))
+        put("locations", document.get("locations"))
+        put("volumes", document.get("volumes"))
+        put("timeline", document.get("timeline"))
+        put("foreshadowing", document.get("foreshadowing"))
+        put("voice", document.get("writing_style"))
+        put("techniques", document.get("writing_style"))
+        return drafts

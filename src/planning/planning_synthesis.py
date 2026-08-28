@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from src.planning.creation_workflow import (
     _meaningful_lines,
@@ -274,3 +274,134 @@ world（name、setting_description、core_conflict、power_system{name、descrip
 author_intent（字符串）、writing_style（summary、voice、pov、rhythm、dialogue、imagery、emotion、dos、donts、techniques）、
 characters、factions、locations、foreshadowing。
 角色、势力、地点和伏笔必须是对象数组；每项至少包含 name 或 description。摘要要短、可核对，不能返回 sourceDocuments、sections 或原始 JSON。"""
+
+
+class PlanningSynthesisAuthority:
+    """Apply a planning synthesis only after an explicit author decision.
+
+    Planning synthesis is a structured planning projection, not a narrative
+    event.  The generated artifact is nevertheless treated as an Agent
+    Proposal so a provider turn cannot silently become authoring truth.  The
+    repository projection and proposal decision are committed together.
+    """
+
+    def __init__(self, repository: Any):
+        self.repository = repository
+
+    def accept(
+        self,
+        proposal_id: str,
+        project_id: str,
+        *,
+        actor: str,
+        author_confirmed: bool,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        from src.runtime.approvals import is_author_approval_actor
+        from src.runtime.persistence import ProposalStore
+
+        proposal_id = str(proposal_id or "").strip()
+        project_id = str(project_id or "").strip()
+        if not proposal_id or not project_id:
+            raise ValueError("proposal_id and project_id are required")
+        if not author_confirmed:
+            raise ValueError("author confirmation is required before planning synthesis acceptance")
+        if not is_author_approval_actor(actor):
+            raise ValueError("only an author-facing Host actor can accept planning synthesis")
+        store = ProposalStore(self.repository.db)
+        if not store.available:
+            raise RuntimeError("agent proposal ledger is unavailable before schema migration 53")
+
+        with self.repository.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"planning synthesis proposal not found: {proposal_id}")
+            if str(row["proposal_type"] or "").strip().lower() != "planning_synthesis":
+                raise ValueError("proposal is not a planning synthesis")
+            if str(row["project_id"] or "") != project_id:
+                raise ValueError("planning synthesis proposal is outside the project scope")
+            book = conn.execute(
+                "SELECT id FROM books WHERE project_id=? ORDER BY created_at LIMIT 1", (project_id,)
+            ).fetchone()
+            if book is None:
+                raise KeyError(f"no authoritative book for project: {project_id}")
+            if row["book_id"] and str(row["book_id"]) != str(book["id"]):
+                raise ValueError("planning synthesis proposal is outside the authoritative book scope")
+
+            status = str(row["status"] or "").upper()
+            if status == "ACCEPTED":
+                result = ProposalStore._decode(row)
+                result.update({"applied": True, "canonicalMutation": False, "idempotent": True})
+                return result
+            if status != "PROPOSED":
+                raise ValueError(f"cannot accept planning synthesis proposal in status {status}")
+
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("planning synthesis proposal payload is invalid") from exc
+            synthesis = payload.get("synthesis") if isinstance(payload, Mapping) else None
+            if not isinstance(synthesis, dict):
+                raise ValueError("planning synthesis proposal has no synthesis payload")
+
+            projection = self.repository.apply_planning_synthesis(
+                project_id, synthesis, _conn=conn
+            )
+            now = datetime.now().isoformat()
+            conn.execute(
+                """UPDATE agent_proposals
+                   SET status='ACCEPTED', decision_reason=?, decided_by=?,
+                       decided_at=?, updated_at=? WHERE id=? AND status='PROPOSED'""",
+                (str(reason or "")[:4000], str(actor).strip()[:200], now, now, proposal_id),
+            )
+            control_event_id = None
+            if self.repository.db.table_exists("control_events"):
+                event_cursor = conn.execute(
+                    """INSERT INTO control_events(name, command_id, payload, created_at)
+                       VALUES (?, NULL, ?, ?)""",
+                    (
+                        "planning.synthesis.accepted",
+                        json.dumps({
+                            "projectId": project_id,
+                            "proposalId": proposal_id,
+                            "decidedBy": str(actor).strip() or "author",
+                            "canonicalMutation": False,
+                        }, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                control_event_id = int(event_cursor.lastrowid or 0)
+            workflow = conn.execute(
+                "SELECT metadata FROM creation_workflows WHERE project_id=?", (project_id,)
+            ).fetchone()
+            if workflow is not None:
+                try:
+                    metadata = json.loads(workflow["metadata"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata.update({
+                    "planningSynthesisProposalStatus": "ACCEPTED",
+                    "planningSynthesisApplied": True,
+                    "planningSynthesisAcceptedBy": str(actor).strip() or "author",
+                    "planningSynthesisAcceptedAt": now,
+                })
+                conn.execute(
+                    "UPDATE creation_workflows SET metadata=?, updated_at=? WHERE project_id=?",
+                    (json.dumps(metadata, ensure_ascii=False), now, project_id),
+                )
+            accepted = conn.execute(
+                "SELECT * FROM agent_proposals WHERE id=?", (proposal_id,)
+            ).fetchone()
+            result = ProposalStore._decode(accepted)
+            result.update({
+                "applied": True,
+                "canonicalMutation": False,
+                "idempotent": False,
+                "projection": projection,
+                "controlEventId": control_event_id,
+            })
+            return result

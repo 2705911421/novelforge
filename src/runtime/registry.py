@@ -9,20 +9,137 @@ checks, and supervised health checks.
 from __future__ import annotations
 
 import json
+import hashlib
+import base64
+import hmac
+import ipaddress
+import logging
+import os
+import platform
+import re
 import shutil
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Mapping
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from src.core.database import Database
 
 from .contracts import AuthState, RuntimeCapabilities
-from .errors import AuthenticationRequired, RuntimeUnavailable
+from .errors import AuthenticationRequired, RuntimeIncompatible, RuntimeNotInstalled, RuntimeUnavailable
+from .process import resolve_executable_argv
+
+
+_DEFAULT_BOUNDED_PROCESS_OUTPUT_CHARS = 16_000
+
+logger = logging.getLogger(__name__)
+
+
+class _ValidatedRedirectHandler(HTTPRedirectHandler):
+    """Follow only redirects that pass the caller's transport policy.
+
+    ``urllib.request.urlopen`` follows redirects before the response object is
+    returned. Checking only ``response.geturl()`` therefore validates too
+    late: a public catalog/download URL could already have caused a request
+    to an internal target. The Runtime Plane installs this handler on its
+    default opener so every redirect hop is checked before it is followed.
+    """
+
+    def __init__(self, validator: Callable[[str], None]) -> None:
+        super().__init__()
+        self._validator = validator
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        self._validator(str(newurl or ""))
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_validated_url(
+    request: Request,
+    *,
+    timeout: float,
+    validator: Callable[[str], None],
+) -> Any:
+    """Open a URL with per-hop validation while preserving normal redirects."""
+    opener = build_opener(_ValidatedRedirectHandler(validator))
+    return opener.open(request, timeout=timeout)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _drain_bounded_process_stream(stream: Any, *, max_output_chars: int) -> bytes:
+    """Drain a child pipe completely while retaining only a bounded prefix."""
+    if stream is None:
+        return b""
+    retained = bytearray()
+    retained_limit = max(1, int(max_output_chars)) + 1
+    while True:
+        chunk = stream.read(64 * 1024)
+        if not chunk:
+            break
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", errors="replace")
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise RuntimeError("child process returned a non-byte output chunk")
+        if len(retained) < retained_limit:
+            retained.extend(chunk[: retained_limit - len(retained)])
+    return bytes(retained)
+
+
+def _run_bounded_process(
+    command: Sequence[str],
+    *,
+    timeout_seconds: float,
+    max_output_chars: int = _DEFAULT_BOUNDED_PROCESS_OUTPUT_CHARS,
+) -> subprocess.CompletedProcess[str]:
+    """Run an argv-only child with concurrent, bounded stdout/stderr drains."""
+    launch_command = resolve_executable_argv(command)
+    process = subprocess.Popen(
+        list(launch_command),
+        shell=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="novelforge-process-drain") as executor:
+        stdout_future = executor.submit(
+            _drain_bounded_process_stream,
+            process.stdout,
+            max_output_chars=max_output_chars,
+        )
+        stderr_future = executor.submit(
+            _drain_bounded_process_stream,
+            process.stderr,
+            max_output_chars=max_output_chars,
+        )
+        try:
+            returncode = process.wait(timeout=timeout_seconds)
+        except BaseException:
+            try:
+                process.kill()
+            except Exception as exc:
+                logger.debug("bounded child process kill failed after timeout: %s", exc)
+            try:
+                process.wait(timeout=5)
+            except Exception as exc:
+                logger.debug("bounded child process wait failed after kill: %s", exc)
+            raise
+        stdout = stdout_future.result()
+        stderr = stderr_future.result()
+    return subprocess.CompletedProcess(
+        list(launch_command),
+        returncode,
+        stdout=stdout.decode("utf-8", errors="replace"),
+        stderr=stderr.decode("utf-8", errors="replace"),
+    )
 
 
 class InstallState(str, Enum):
@@ -41,9 +158,178 @@ class InstallState(str, Enum):
 
 class AcquisitionType(str, Enum):
     BUILTIN = "builtin"
+    BUNDLED = "bundled"
+    DOWNLOAD_BINARY = "download_binary"
+    PACKAGE_MANAGER = "package_manager"
+    VENDOR_INSTALLER = "vendor_installer"
+    COMMAND_BOOTSTRAP = "command_bootstrap"
+    EXTERNAL = "external"
+    # Legacy names remain readable for manifests created before the Runtime
+    # Plane acquisition taxonomy was expanded.
     MANAGED = "managed"
     SYSTEM = "system"
     CUSTOM = "custom"
+
+
+class RuntimeSource(str, Enum):
+    """Where the executable is expected to come from."""
+
+    BUILTIN = "builtin"
+    MANAGED = "managed"
+    SYSTEM = "system"
+    CUSTOM = "custom"
+    EXTERNAL = "external"
+
+
+class InstallAction(str, Enum):
+    DISCOVER = "discover"
+    INSTALL = "install"
+    UPDATE = "update"
+    REPAIR = "repair"
+    UNINSTALL = "uninstall"
+
+
+@dataclass(frozen=True)
+class PrerequisiteCheck:
+    name: str
+    required: bool
+    available: bool
+    detail: str = ""
+    version: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "required": self.required,
+            "available": self.available,
+            "detail": self.detail,
+            "version": self.version,
+        }
+
+
+@dataclass(frozen=True)
+class PrerequisiteResult:
+    ready: bool
+    checks: tuple[PrerequisiteCheck, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"ready": self.ready, "checks": [item.to_dict() for item in self.checks]}
+
+
+@dataclass(frozen=True)
+class CompatibilityResult:
+    compatible: bool
+    warning: str | None = None
+    reason: str | None = None
+    observed_version: str | None = None
+    minimum_version: str | None = None
+    maximum_tested_version: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "compatible": self.compatible,
+            "warning": self.warning,
+            "reason": self.reason,
+            "observedVersion": self.observed_version,
+            "minimumVersion": self.minimum_version,
+            "maximumTestedVersion": self.maximum_tested_version,
+        }
+
+
+@dataclass(frozen=True)
+class InstallerPlan:
+    runtime_type: str
+    action: InstallAction
+    source: RuntimeSource
+    acquisition: AcquisitionType
+    command: tuple[str, ...] = ()
+    requires_approval: bool = False
+    trusted: bool = False
+    allowed: bool = True
+    shell: bool = False
+    risk: str = "low"
+    explanation: str = ""
+    artifact_url: str | None = None
+    artifact_path: str | None = None
+    artifact_sha256: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "runtimeType": self.runtime_type,
+            "action": self.action.value,
+            "source": self.source.value,
+            "acquisition": self.acquisition.value,
+            "command": list(self.command),
+            "requiresApproval": self.requires_approval,
+            "trusted": self.trusted,
+            "allowed": self.allowed,
+            "shell": self.shell,
+            "risk": self.risk,
+            "explanation": self.explanation,
+            "artifactUrl": self.artifact_url,
+            "artifactPath": self.artifact_path,
+            "artifactSha256": self.artifact_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class InstallEvent:
+    runtime_type: str
+    action: InstallAction
+    phase: str
+    status: str
+    message: str
+    detail: Mapping[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "runtimeType": self.runtime_type,
+            "action": self.action.value,
+            "phase": self.phase,
+            "status": self.status,
+            "message": self.message,
+            "detail": dict(self.detail),
+            "createdAt": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    verified: bool
+    path: str | None = None
+    version: str | None = None
+    checks: tuple[str, ...] = ()
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "verified": self.verified,
+            "path": self.path,
+            "version": self.version,
+            "checks": list(self.checks),
+            "reason": self.reason,
+        }
+
+
+class IPluginInstaller(Protocol):
+    """Concrete installer contract behind the host-owned InstallerBroker."""
+
+    def detect(self) -> RuntimeInstallation: ...
+
+    def check_prerequisites(self) -> PrerequisiteResult: ...
+
+    def plan(self, action: InstallAction) -> InstallerPlan: ...
+
+    def install(self, *, approved: bool = False) -> RuntimeInstallation: ...
+
+    def update(self, *, approved: bool = False) -> RuntimeInstallation: ...
+
+    def repair(self, *, approved: bool = False) -> RuntimeInstallation: ...
+
+    def uninstall(self, *, approved: bool = False) -> RuntimeInstallation: ...
+
+    def verify(self) -> VerificationResult: ...
 
 
 @dataclass(frozen=True)
@@ -61,11 +347,101 @@ class RuntimeManifest:
     source: str = "builtin"
     signature: str | None = None
     minimum_host_version: str | None = None
+    source_kind: RuntimeSource = RuntimeSource.SYSTEM
+    integration_grade: str = "C"
+    platforms: Mapping[str, Any] = field(default_factory=dict)
+    verification: Mapping[str, Any] = field(default_factory=dict)
+    authentication: Mapping[str, Any] = field(default_factory=dict)
+    compatibility: Mapping[str, Any] = field(default_factory=dict)
+    installer: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in ("runtime_type", "display_name", "version", "protocol"):
             if not str(getattr(self, name)).strip():
                 raise ValueError(f"manifest {name} is required")
+        if not isinstance(self.acquisition, AcquisitionType):
+            object.__setattr__(
+                self,
+                "acquisition",
+                AcquisitionType(str(self.acquisition).strip().lower()),
+            )
+        grade = str(self.integration_grade).strip().upper()
+        if grade not in {"S", "A", "B", "C", "D"}:
+            raise ValueError("integration_grade must be one of S, A, B, C, D")
+        object.__setattr__(self, "integration_grade", grade)
+        if not isinstance(self.source_kind, RuntimeSource):
+            object.__setattr__(
+                self,
+                "source_kind",
+                RuntimeSource(str(self.source_kind).strip().lower()),
+            )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeManifest":
+        """Parse an external manifest without silently dropping bad fields."""
+        if not isinstance(payload, Mapping):
+            raise ValueError("runtime manifest must be an object")
+
+        def required(name: str, *aliases: str) -> str:
+            for key in (name, *aliases):
+                value = payload.get(key)
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+            raise ValueError(f"manifest {name} is required")
+
+        def mapping(name: str, default: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+            value = payload.get(name)
+            if value is None:
+                return default or {}
+            if not isinstance(value, Mapping):
+                raise ValueError(f"manifest {name} must be an object")
+            return dict(value)
+
+        def sequence(name: str) -> tuple[Any, ...]:
+            value = payload.get(name)
+            if value is None:
+                return ()
+            if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+                raise ValueError(f"manifest {name} must be an array")
+            return tuple(value)
+
+        def mapping_sequence(name: str) -> tuple[Mapping[str, Any], ...]:
+            values = sequence(name)
+            if any(not isinstance(item, Mapping) for item in values):
+                raise ValueError(f"manifest {name} entries must be objects")
+            return tuple(dict(item) for item in values)
+
+        command = sequence("command")
+        if any(not isinstance(item, (str, int, float, bool)) for item in command):
+            raise ValueError("manifest command entries must be scalar argv values")
+        source = str(payload.get("source") or "").strip()
+        raw_source_kind = str(payload.get("sourceKind") or RuntimeSource.EXTERNAL.value)
+        try:
+            source_kind = RuntimeSource(raw_source_kind.strip().lower())
+        except ValueError as exc:
+            raise ValueError(f"manifest sourceKind is invalid: {raw_source_kind!r}") from exc
+        return cls(
+            runtime_type=required("runtimeType", "id"),
+            display_name=required("displayName", "name", "id"),
+            version=required("version"),
+            protocol=required("protocol"),
+            acquisition=payload.get("acquisition", AcquisitionType.SYSTEM.value),
+            executable=str(payload.get("executable") or "") or None,
+            command=tuple(str(item) for item in command),
+            capabilities=mapping("capabilities"),
+            models=mapping_sequence("models"),
+            dependencies=mapping_sequence("dependencies"),
+            source=source,
+            signature=str(payload.get("signature") or "") or None,
+            minimum_host_version=str(payload.get("minimumHostVersion") or "") or None,
+            source_kind=source_kind,
+            integration_grade=str(payload.get("integrationGrade") or "C"),
+            platforms=mapping("platforms"),
+            verification=mapping("verification"),
+            authentication=mapping("authentication"),
+            compatibility=mapping("compatibility"),
+            installer=mapping("installer"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -82,6 +458,13 @@ class RuntimeManifest:
             "source": self.source,
             "signature": self.signature,
             "minimumHostVersion": self.minimum_host_version,
+            "sourceKind": self.source_kind.value,
+            "integrationGrade": self.integration_grade.upper(),
+            "platforms": dict(self.platforms),
+            "verification": dict(self.verification),
+            "authentication": dict(self.authentication),
+            "compatibility": dict(self.compatibility),
+            "installer": dict(self.installer),
         }
 
 
@@ -96,6 +479,8 @@ class RuntimeInstallation:
     health: str = "unknown"
     last_error: str | None = None
     updated_at: str = field(default_factory=_now)
+    source_kind: RuntimeSource = RuntimeSource.SYSTEM
+    verified: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -103,36 +488,189 @@ class RuntimeInstallation:
             "state": self.state.value,
             "path": self.path,
             "version": self.version,
-            "auth": {
-                "status": self.auth.status,
-                "accountLabel": self.auth.account_label,
-                "detail": self.auth.detail,
-            },
+            "auth": self.auth.to_dict(),
             "capabilityVerified": self.capability_verified,
             "health": self.health,
             "lastError": self.last_error,
             "updatedAt": self.updated_at,
+            "sourceKind": self.source_kind.value,
+            "verified": self.verified,
         }
 
 
 class DependencyResolver:
-    """Resolve manifest-level dependencies without executing installers."""
+    """Resolve manifest-level dependencies without executing installers.
+
+    Discovery is deliberately read-only.  Installing or repairing a missing
+    dependency remains an explicit InstallerBroker action with its own
+    approval and command preview.  When a manifest declares a minimum
+    version, the resolver uses a bounded, argv-only ``--version`` probe so a
+    PATH hit is not mistaken for a compatible dependency.
+    """
+
+    _VERSION_ARGS = frozenset({"--version", "-V", "-v", "/version"})
+    _VERSION_PATTERN = re.compile(r"(?<![\w.])v?\d+(?:\.\d+){0,3}(?![\w.])", re.IGNORECASE)
+
+    def __init__(
+        self,
+        runner: Callable[[Sequence[str]], Any] | None = None,
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        self.runner = runner or self._run_version_probe
+        self.timeout_seconds = float(timeout_seconds)
 
     def resolve(self, manifest: RuntimeManifest, available: Mapping[str, str]) -> list[dict[str, str]]:
+        normalized_available = {
+            self._dependency_key(key): value for key, value in available.items()
+        }
         missing: list[dict[str, str]] = []
         for dependency in manifest.dependencies:
             name = str(dependency.get("name") or "").strip()
             minimum = str(dependency.get("minimumVersion") or "")
-            if not name or name not in available:
+            available_value = normalized_available.get(self._dependency_key(name))
+            if not name or available_value is None:
                 missing.append({"name": name, "minimumVersion": minimum, "reason": "missing"})
-            elif minimum and self._version_key(available[name]) < self._version_key(minimum):
+            elif minimum and self._version_key(str(available_value)) < self._version_key(minimum):
                 missing.append({
                     "name": name,
                     "minimumVersion": minimum,
-                    "availableVersion": available[name],
+                    "availableVersion": str(available_value),
                     "reason": "version",
                 })
         return missing
+
+    def check_prerequisites(
+        self,
+        manifest: RuntimeManifest,
+        *,
+        available: Mapping[str, str] | None = None,
+    ) -> PrerequisiteResult:
+        environment = {
+            self._dependency_key(key): value
+            for key, value in (available or self.detect_environment()).items()
+        }
+        checks: list[PrerequisiteCheck] = []
+        current_platform = platform.system().lower()
+        supported = manifest.platforms.get(current_platform) if isinstance(manifest.platforms, Mapping) else None
+        if supported is False:
+            checks.append(PrerequisiteCheck(
+                current_platform, True, False,
+                f"runtime manifest does not support {current_platform}",
+            ))
+        elif isinstance(manifest.platforms, Mapping) and manifest.platforms:
+            checks.append(PrerequisiteCheck(current_platform, True, supported is not False, "platform supported"))
+
+        for dependency in manifest.dependencies:
+            name = str(dependency.get("name") or dependency.get("executable") or "").strip()
+            if not name:
+                checks.append(PrerequisiteCheck("manifest dependency", True, False, "dependency name is missing"))
+                continue
+            key = self._dependency_key(name)
+            value = environment.get(key)
+            minimum = str(dependency.get("minimumVersion") or "")
+            required = bool(dependency.get("required", True))
+            if value is None:
+                checks.append(PrerequisiteCheck(name, required, False, "not found"))
+                continue
+            available_version = None
+            probe_detail = str(value)
+            if minimum:
+                available_version, probe_detail = self._probe_version(name, value, dependency)
+                if available_version is None:
+                    checks.append(PrerequisiteCheck(
+                        name, required, False,
+                        f"{probe_detail}; minimum version {minimum} cannot be verified",
+                    ))
+                    continue
+            if minimum and self._version_key(available_version) < self._version_key(minimum):
+                checks.append(PrerequisiteCheck(
+                    name, required, False,
+                    f"version {available_version} is below {minimum}", available_version,
+                ))
+                continue
+            checks.append(PrerequisiteCheck(name, required, True, probe_detail, available_version))
+        return PrerequisiteResult(
+            ready=all(item.available or not item.required for item in checks),
+            checks=tuple(checks),
+        )
+
+    def _probe_version(
+        self,
+        name: str,
+        executable: Any,
+        dependency: Mapping[str, Any],
+    ) -> tuple[str | None, str]:
+        executable_text = str(executable or "").strip()
+        if not executable_text:
+            return None, "dependency executable path is empty"
+        raw_args = dependency.get("versionArgs", ("--version",))
+        if isinstance(raw_args, (str, bytes)) or not isinstance(raw_args, Sequence):
+            return None, "dependency versionArgs must be an argv array"
+        args = tuple(str(item).strip() for item in raw_args)
+        if len(args) != 1 or args[0] not in self._VERSION_ARGS:
+            return None, "dependency versionArgs must contain one read-only version argument"
+        command = (executable_text, *args)
+        try:
+            result = self.runner(command)
+        except FileNotFoundError:
+            return None, f"{name} version probe executable was not found"
+        except Exception as exc:
+            return None, f"{name} version probe failed: {exc}"
+        return_code = getattr(result, "returncode", None)
+        stdout = getattr(result, "stdout", "")
+        stderr = getattr(result, "stderr", "")
+        if isinstance(result, tuple):
+            if len(result) > 0:
+                return_code = result[0]
+            if len(result) > 1:
+                stdout = result[1]
+            if len(result) > 2:
+                stderr = result[2]
+        if return_code not in (0, None):
+            return None, f"{name} version probe failed with exit code {return_code}"
+        output = " ".join(str(value or "") for value in (stdout, stderr))
+        match = self._VERSION_PATTERN.search(output)
+        if match is None:
+            return None, f"{name} version probe returned no version"
+        return match.group(0).lstrip("vV"), f"{executable_text} ({name} version probe)"
+
+    @staticmethod
+    def _dependency_key(value: Any) -> str:
+        return str(value or "").strip().lower().replace("_", " ").replace("-", " ")
+
+    def _run_version_probe(self, command: Sequence[str]) -> Any:
+        return _run_bounded_process(
+            command,
+            timeout_seconds=self.timeout_seconds,
+            max_output_chars=_DEFAULT_BOUNDED_PROCESS_OUTPUT_CHARS,
+        )
+
+    @staticmethod
+    def detect_environment() -> dict[str, str]:
+        """Return executable locations available to the current host."""
+        candidates = {
+            "node": ("node",),
+            "npm": ("npm",),
+            "python": (sys.executable or "python",),
+            "git": ("git",),
+            "git bash": ("bash",),
+            "wsl": ("wsl",),
+            # Windows ships Windows PowerShell while newer installations may
+            # expose PowerShell 7 as ``pwsh``.  Treat both as first-class.
+            "powershell": ("pwsh", "powershell", "powershell.exe"),
+            "winget": ("winget",),
+        }
+        available: dict[str, str] = {"platform": platform.system().lower()}
+        for name, executables in candidates.items():
+            for executable in executables:
+                path = shutil.which(executable)
+                if path:
+                    available[name] = path
+                    break
+        return available
 
     @staticmethod
     def _version_key(value: str) -> tuple[int, ...]:
@@ -143,27 +681,722 @@ class DependencyResolver:
         return tuple((parts + [0, 0, 0])[:3])
 
 
+@dataclass(frozen=True)
+class ManifestTrust:
+    trusted: bool
+    allowed: bool
+    reason: str = ""
+    signing_key_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trusted": self.trusted,
+            "allowed": self.allowed,
+            "reason": self.reason,
+            "signingKeyId": self.signing_key_id,
+        }
+
+
+@dataclass(frozen=True)
+class TrustedPublicKey:
+    """One host-configured signing key and its rotation lifecycle state.
+
+    ``active`` and ``retiring`` keys may verify new payloads during an
+    overlap window. ``revoked`` keys are rejected even when their signature
+    is cryptographically valid. Key material remains host configuration;
+    manifests and catalogs only carry the stable key id.
+    """
+
+    public_key: bytes | str
+    status: str = "active"
+    replaced_by: str | None = None
+
+    _STATUSES = frozenset({"active", "retiring", "revoked"})
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.public_key, (bytes, str)) or not self.public_key:
+            raise ValueError("trusted public key material is required")
+        status = str(self.status or "").strip().lower()
+        if status not in self._STATUSES:
+            raise ValueError(
+                "trusted public key status must be active, retiring, or revoked"
+            )
+        replaced_by = str(self.replaced_by or "").strip() or None
+        if status == "retiring" and not replaced_by:
+            raise ValueError("a retiring public key must declare replaced_by")
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "replaced_by", replaced_by)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Expose lifecycle metadata without echoing key material."""
+        return {"status": self.status, "replacedBy": self.replaced_by}
+
+
+class ManifestVerifier:
+    """Validate manifest provenance before any installer command is exposed."""
+
+    def __init__(
+        self,
+        trusted_sources: Iterable[str] = ("novelforge", "openai"),
+        trusted_public_keys: Mapping[
+            str,
+            bytes | str | TrustedPublicKey | Mapping[str, Any],
+        ] | None = None,
+    ):
+        self.trusted_sources = frozenset(str(item).strip().lower() for item in trusted_sources if str(item).strip())
+        self.trusted_public_keys = {
+            str(key).strip(): self._normalize_public_key(value)
+            for key, value in (trusted_public_keys or {}).items()
+            if str(key).strip()
+        }
+        for key_id, record in self.trusted_public_keys.items():
+            if record.replaced_by and record.replaced_by not in self.trusted_public_keys:
+                raise ValueError(
+                    f"trusted public key {key_id!r} replaces an unknown key: "
+                    f"{record.replaced_by}"
+                )
+
+    def verify(self, manifest: RuntimeManifest) -> ManifestTrust:
+        payload = manifest.to_dict()
+        signature = payload.pop("signature", None)
+        trust = self.verify_payload(
+            payload,
+            signature,
+            source=manifest.source,
+            source_kind=manifest.source_kind,
+        )
+        if not signature and manifest.installer and not trust.trusted:
+            return ManifestTrust(False, True, "untrusted installer manifest requires explicit approval")
+        return trust
+
+    def verify_payload(
+        self,
+        payload: Mapping[str, Any],
+        signature: str | None,
+        *,
+        source: str = "",
+        source_kind: RuntimeSource = RuntimeSource.SYSTEM,
+    ) -> ManifestTrust:
+        """Verify a canonical catalog or manifest payload before import."""
+        source_text = str(source or "").strip().lower()
+        if not isinstance(source_kind, RuntimeSource):
+            try:
+                source_kind = RuntimeSource(str(source_kind).strip().lower())
+            except ValueError:
+                source_kind = RuntimeSource.CUSTOM
+        trusted = source_text in self.trusted_sources or source_kind is RuntimeSource.BUILTIN
+        signature = str(signature or "").strip()
+        if signature:
+            if signature.lower().startswith("sha256:") or self._valid_signature_format(signature):
+                expected = signature.lower().removeprefix("sha256:")
+                try:
+                    actual = hashlib.sha256(self.canonical_payload_for(payload)).hexdigest()
+                except (TypeError, ValueError):
+                    return ManifestTrust(False, False, "manifest cannot be canonicalized for verification")
+                if not hmac.compare_digest(actual, expected):
+                    return ManifestTrust(False, False, "manifest SHA-256 does not match its canonical payload")
+                if trusted:
+                    return ManifestTrust(True, True, "trusted source and manifest SHA-256 verified")
+                return ManifestTrust(False, True, "manifest SHA-256 verified; source still requires explicit approval")
+            if signature.lower().startswith("ed25519:"):
+                return self._verify_ed25519_payload(payload, signature, trusted)
+            return ManifestTrust(False, False, "manifest signature format is unsupported")
+        return ManifestTrust(trusted, True, "trusted source" if trusted else "unsigned payload")
+
+    @staticmethod
+    def canonical_payload(manifest: RuntimeManifest) -> bytes:
+        """Return the stable bytes covered by a manifest integrity signature."""
+        payload = manifest.to_dict()
+        payload.pop("signature", None)
+        return ManifestVerifier.canonical_payload_for(payload)
+
+    @staticmethod
+    def canonical_payload_for(payload: Mapping[str, Any]) -> bytes:
+        """Return stable UTF-8 bytes for a signed JSON-compatible payload."""
+        return json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def _verify_ed25519(self, manifest: RuntimeManifest, signature: str, trusted: bool) -> ManifestTrust:
+        payload = manifest.to_dict()
+        payload.pop("signature", None)
+        return self._verify_ed25519_payload(payload, signature, trusted)
+
+    def _verify_ed25519_payload(
+        self,
+        payload: Mapping[str, Any],
+        signature: str,
+        trusted: bool,
+    ) -> ManifestTrust:
+        parts = signature.split(":", 2)
+        if len(parts) != 3 or not parts[1].strip() or not parts[2].strip():
+            return ManifestTrust(False, False, "ed25519 manifest signature is malformed")
+        key_id, encoded_signature = parts[1].strip(), parts[2].strip()
+        key_record = self.trusted_public_keys.get(key_id)
+        if key_record is None:
+            return ManifestTrust(False, False, f"manifest signing key is not trusted: {key_id}")
+        if key_record.status == "revoked":
+            return ManifestTrust(False, False, f"manifest signing key is revoked: {key_id}", key_id)
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+            key_bytes = self._decode_signature_bytes(key_record.public_key, expected_length=32)
+            signature_bytes = self._decode_signature_bytes(encoded_signature, expected_length=64)
+            Ed25519PublicKey.from_public_bytes(key_bytes).verify(
+                signature_bytes,
+                self.canonical_payload_for(payload),
+            )
+        except ImportError:
+            return ManifestTrust(False, False, "Ed25519 verification support is unavailable")
+        except (TypeError, ValueError) as exc:
+            return ManifestTrust(False, False, f"invalid Ed25519 manifest signature: {exc}")
+        except Exception:
+            return ManifestTrust(False, False, "Ed25519 manifest signature verification failed")
+        reason = (
+            "trusted source and Ed25519 manifest signature verified"
+            if trusted
+            else "Ed25519 manifest signature verified"
+        )
+        if key_record.status == "retiring":
+            reason += "; signing key is retiring"
+        return ManifestTrust(True, True, reason, key_id)
+
+    @staticmethod
+    def _normalize_public_key(
+        value: bytes | str | TrustedPublicKey | Mapping[str, Any],
+    ) -> TrustedPublicKey:
+        if isinstance(value, TrustedPublicKey):
+            return value
+        if isinstance(value, Mapping):
+            material = (
+                value.get("publicKey")
+                or value.get("public_key")
+                or value.get("key")
+                or value.get("value")
+            )
+            if material is None:
+                raise ValueError("trusted public key entry must contain publicKey")
+            return TrustedPublicKey(
+                material,
+                status=str(value.get("status") or "active"),
+                replaced_by=(
+                    str(value.get("replacedBy") or value.get("replaced_by") or "")
+                    or None
+                ),
+            )
+        return TrustedPublicKey(value)
+
+    @staticmethod
+    def _decode_signature_bytes(value: bytes | str, *, expected_length: int) -> bytes:
+        if isinstance(value, bytes):
+            decoded = value
+        else:
+            text = str(value).strip()
+            try:
+                decoded = base64.b64decode(text, validate=True)
+            except (ValueError, TypeError):
+                decoded = bytes.fromhex(text)
+        if len(decoded) != expected_length:
+            raise ValueError(f"expected {expected_length} bytes, got {len(decoded)}")
+        return decoded
+
+    @staticmethod
+    def _valid_signature_format(signature: str) -> bool:
+        value = signature.lower()
+        if value.startswith("sha256:"):
+            value = value[7:]
+        return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+class ManifestCatalog:
+    """Import a signed catalog without fetching or executing anything.
+
+    Transport is intentionally outside this class.  A caller may obtain a
+    document from a future Marketplace service or a local file, but the Host
+    must present the complete signed document here before any manifest enters
+    the persistent Registry.  Catalog signatures require Ed25519 so a claimed
+    source name cannot substitute for an authenticity check.
+    """
+
+    def __init__(
+        self,
+        verifier: ManifestVerifier | None = None,
+        *,
+        max_manifests: int = 256,
+    ) -> None:
+        if max_manifests <= 0:
+            raise ValueError("max_manifests must be positive")
+        self.verifier = verifier or ManifestVerifier()
+        self.max_manifests = int(max_manifests)
+
+    def parse(self, document: Mapping[str, Any]) -> tuple[RuntimeManifest, ...]:
+        if not isinstance(document, Mapping):
+            raise ValueError("runtime catalog must be an object")
+        payload = dict(document)
+        signature = str(payload.pop("signature", "") or "").strip()
+        source = str(payload.get("source") or "").strip()
+        raw_source_kind = payload.get("sourceKind", RuntimeSource.EXTERNAL.value)
+        try:
+            source_kind = raw_source_kind if isinstance(raw_source_kind, RuntimeSource) else RuntimeSource(
+                str(raw_source_kind).strip().lower()
+            )
+        except ValueError as exc:
+            raise ValueError(f"catalog sourceKind is invalid: {raw_source_kind!r}") from exc
+        if not signature.lower().startswith("ed25519:"):
+            raise RuntimeUnavailable("runtime catalog requires an Ed25519 signature")
+        trust = self.verifier.verify_payload(
+            payload,
+            signature,
+            source=source,
+            source_kind=source_kind,
+        )
+        if not trust.trusted or not trust.allowed:
+            raise RuntimeUnavailable(f"runtime catalog was rejected: {trust.reason}")
+
+        raw_manifests = payload.get("manifests")
+        if isinstance(raw_manifests, (str, bytes)) or not isinstance(raw_manifests, Sequence):
+            raise ValueError("runtime catalog manifests must be an array")
+        if len(raw_manifests) > self.max_manifests:
+            raise RuntimeUnavailable(
+                "runtime catalog exceeds the maximum manifest count",
+                details={
+                    "count": len(raw_manifests),
+                    "maxManifests": self.max_manifests,
+                },
+            )
+        manifests: list[RuntimeManifest] = []
+        seen: set[str] = set()
+        for index, raw_manifest in enumerate(raw_manifests):
+            if not isinstance(raw_manifest, Mapping):
+                raise ValueError(f"runtime catalog manifest {index} must be an object")
+            manifest_payload = dict(raw_manifest)
+            manifest_payload.setdefault("source", source)
+            manifest_payload.setdefault("sourceKind", source_kind.value)
+            manifest = RuntimeManifest.from_dict(manifest_payload)
+            if manifest.runtime_type in seen:
+                raise ValueError(f"runtime catalog contains duplicate runtime: {manifest.runtime_type}")
+            seen.add(manifest.runtime_type)
+            if manifest.signature:
+                manifest_trust = self.verifier.verify(manifest)
+                if not manifest_trust.allowed:
+                    raise RuntimeUnavailable(
+                        f"runtime manifest was rejected: {manifest.runtime_type}: {manifest_trust.reason}"
+                    )
+            manifests.append(manifest)
+        if not manifests:
+            raise ValueError("runtime catalog contains no manifests")
+        return tuple(manifests)
+
+    def import_into(
+        self,
+        registry: "RuntimeRegistry",
+        document: Mapping[str, Any],
+    ) -> tuple[RuntimeManifest, ...]:
+        """Validate the complete catalog, then register all of its manifests."""
+        manifests = self.parse(document)
+        # A signed catalog is one configuration unit.  Do not leave a
+        # partially imported Marketplace catalog behind if a later Registry
+        # row fails.  RuntimeRegistry also restores its in-memory indexes when
+        # the transaction rolls back.
+        registry.register_manifests(manifests)
+        return manifests
+
+
+class ArtifactVerifier:
+    """Verify a downloaded/local artifact without executing it."""
+
+    def verify(self, path: str | Path | None, expected_sha256: str | None = None) -> VerificationResult:
+        if not path:
+            return VerificationResult(False, reason="artifact path is missing")
+        artifact = Path(path).expanduser()
+        if not artifact.is_file():
+            return VerificationResult(False, path=str(artifact), reason="artifact does not exist")
+        checks = ["file-exists"]
+        if expected_sha256:
+            digest = hashlib.sha256()
+            with artifact.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            expected = expected_sha256.lower().removeprefix("sha256:")
+            if digest.hexdigest().lower() != expected:
+                return VerificationResult(
+                    False, path=str(artifact), checks=tuple(checks),
+                    reason="artifact SHA-256 does not match manifest",
+                )
+            checks.append("sha256")
+        return VerificationResult(True, path=str(artifact), checks=tuple(checks))
+
+
+class ArtifactDownloader:
+    """Download a declared binary into a verified, atomically replaced path.
+
+    This is intentionally a byte transport primitive.  It never executes the
+    result and it requires a manifest SHA-256 before replacing the target.
+    Install approval is enforced by :class:`ManifestPluginInstaller`; this
+    class additionally bounds the response and rejects insecure URLs.
+    """
+
+    DEFAULT_MAX_BYTES = 256 * 1024 * 1024
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 60.0,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        opener: Callable[..., Any] | None = None,
+        allow_loopback_http: bool = False,
+        allow_private_network: bool = False,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        self.timeout_seconds = float(timeout_seconds)
+        self.max_bytes = int(max_bytes)
+        self.opener = opener or self._open_url
+        self.allow_loopback_http = bool(allow_loopback_http)
+        self.allow_private_network = bool(allow_private_network)
+
+    def download(
+        self,
+        url: str,
+        target: str | Path,
+        expected_sha256: str,
+    ) -> VerificationResult:
+        normalized_url = str(url or "").strip()
+        self._validate_url(normalized_url)
+        expected = str(expected_sha256 or "").strip().lower().removeprefix("sha256:")
+        if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+            raise RuntimeUnavailable("downloaded binaries require a valid manifest SHA-256")
+        target_text = str(target or "").strip()
+        if not target_text:
+            raise RuntimeUnavailable("downloaded binaries require an explicit target path")
+        target_path = Path(target_text).expanduser()
+        if not target_path.name or target_path.is_dir():
+            raise RuntimeUnavailable("download target must be a file path")
+
+        request = Request(
+            normalized_url,
+            headers={
+                "Accept": "application/octet-stream",
+                "User-Agent": "NovelForge-RuntimeArtifact/1",
+            },
+            method="GET",
+        )
+        response: Any | None = None
+        temporary_path: Path | None = None
+        try:
+            try:
+                response = self.opener(request, timeout=self.timeout_seconds)
+            except Exception as exc:
+                raise RuntimeUnavailable(
+                    f"runtime artifact fetch failed: {exc}",
+                    details={"url": normalized_url},
+                ) from exc
+            if response is None:
+                raise RuntimeUnavailable(
+                    "runtime artifact fetch returned no response",
+                    details={"url": normalized_url},
+                )
+
+            final_url = getattr(response, "geturl", lambda: normalized_url)()
+            self._validate_url(str(final_url or normalized_url))
+            status = getattr(response, "status", None)
+            if status is None:
+                status = getattr(response, "code", 200)
+            if isinstance(status, int) and status >= 400:
+                raise RuntimeUnavailable(
+                    f"runtime artifact returned HTTP {status}",
+                    details={"url": normalized_url, "status": status},
+                )
+            headers = getattr(response, "headers", None)
+            content_length = headers.get("Content-Length") if headers is not None else None
+            if content_length is not None:
+                try:
+                    if int(content_length) > self.max_bytes:
+                        raise RuntimeUnavailable("runtime artifact exceeds the maximum size")
+                except ValueError as exc:
+                    raise RuntimeUnavailable("runtime artifact Content-Length is invalid") from exc
+
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{target_path.name}.", suffix=".download", dir=str(target_path.parent)
+            )
+            temporary_path = Path(temporary_name)
+            digest = hashlib.sha256()
+            total = 0
+            with os.fdopen(descriptor, "wb") as stream:
+                while True:
+                    chunk = response.read(min(1024 * 1024, self.max_bytes - total + 1))
+                    if not chunk:
+                        break
+                    if not isinstance(chunk, (bytes, bytearray)):
+                        raise RuntimeUnavailable("runtime artifact response was not bytes")
+                    total += len(chunk)
+                    if total > self.max_bytes:
+                        raise RuntimeUnavailable("runtime artifact exceeds the maximum size")
+                    stream.write(chunk)
+                    digest.update(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            if not hmac.compare_digest(digest.hexdigest().lower(), expected):
+                raise RuntimeUnavailable("downloaded artifact SHA-256 does not match manifest")
+            os.replace(temporary_path, target_path)
+            temporary_path = None
+            return VerificationResult(
+                True,
+                path=str(target_path),
+                checks=("download", "sha256", "atomic-install"),
+            )
+        except RuntimeUnavailable:
+            raise
+        except Exception as exc:
+            raise RuntimeUnavailable(
+                f"runtime artifact could not be installed: {exc}",
+                details={"url": normalized_url, "target": str(target_path)},
+            ) from exc
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.debug("temporary runtime artifact cleanup failed for %s: %s", temporary_path, exc)
+
+    def _validate_url(self, url: str) -> None:
+        if self.url_allowed(
+            url,
+            allow_loopback_http=self.allow_loopback_http,
+            allow_private_network=self.allow_private_network,
+        ):
+            return
+        try:
+            parsed = urlparse(url)
+        except ValueError as exc:
+            raise RuntimeUnavailable("runtime artifact URL is malformed") from exc
+        if parsed.username or parsed.password:
+            raise RuntimeUnavailable("runtime artifact URL must not contain userinfo")
+        if not parsed.netloc:
+            raise RuntimeUnavailable("runtime artifact URL must include a host")
+        raise RuntimeUnavailable(
+            "runtime artifact transport requires HTTPS and a non-private host"
+        )
+
+    def _open_url(self, request: Request, *, timeout: float) -> Any:
+        """Use the Host transport policy for every redirect hop."""
+        return _open_validated_url(request, timeout=timeout, validator=self._validate_url)
+
+    @staticmethod
+    def url_allowed(
+        url: str,
+        *,
+        allow_loopback_http: bool = False,
+        allow_private_network: bool = False,
+    ) -> bool:
+        try:
+            parsed = urlparse(str(url or "").strip())
+            hostname = (parsed.hostname or "").rstrip(".").casefold()
+        except ValueError:
+            return False
+        if parsed.username or parsed.password or not parsed.netloc:
+            return False
+        loopback = ArtifactDownloader._is_loopback_host(hostname)
+        private = ArtifactDownloader._is_private_host(hostname)
+        if parsed.scheme == "https":
+            return bool(allow_private_network or not private)
+        return bool(
+            parsed.scheme == "http"
+            and allow_loopback_http
+            and loopback
+        )
+
+    @staticmethod
+    def _is_loopback_host(hostname: str) -> bool:
+        if hostname in {"localhost", "localhost.localdomain"}:
+            return True
+        try:
+            return ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _is_private_host(hostname: str) -> bool:
+        if not hostname:
+            return True
+        if hostname in {
+            "localhost",
+            "localhost.localdomain",
+            "host.docker.internal",
+            "metadata.google.internal",
+            "metadata.goog",
+            "instance-data",
+        } or hostname.endswith((".localhost", ".internal")):
+            return True
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            return False
+        return bool(
+            address.is_loopback
+            or address.is_private
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_unspecified
+        )
+
+
+class TrustedInstallationPolicy:
+    """Host policy preventing silent arbitrary shell execution."""
+
+    _PACKAGE_MANAGERS = frozenset({"npm", "npm.cmd", "pip", "pip.exe", "python", "python.exe", "uv", "winget"})
+    _VERSION_ARGS = frozenset({"--version", "-V", "-v", "/version"})
+
+    def __init__(
+        self,
+        verifier: ManifestVerifier | None = None,
+        *,
+        allow_private_network: bool = False,
+    ):
+        self.verifier = verifier or ManifestVerifier()
+        self.allow_private_network = bool(allow_private_network)
+
+    def evaluate(self, manifest: RuntimeManifest, action: InstallAction) -> ManifestTrust:
+        trust = self.verifier.verify(manifest)
+        raw_command = manifest.installer.get(f"{action.value}Command") if isinstance(manifest.installer, Mapping) else None
+        if raw_command is None and action is InstallAction.INSTALL and isinstance(manifest.installer, Mapping):
+            raw_command = manifest.installer.get("command")
+        if isinstance(raw_command, str):
+            return ManifestTrust(False, False, "installer command must be an argv array, not a shell string")
+        command = self.command_for(manifest, action)
+        if action is InstallAction.UNINSTALL:
+            if manifest.acquisition in {AcquisitionType.BUILTIN, AcquisitionType.BUNDLED}:
+                return ManifestTrust(False, False, "built-in or bundled runtimes cannot be uninstalled")
+            if not command and manifest.acquisition is not AcquisitionType.DOWNLOAD_BINARY:
+                return ManifestTrust(False, False, "uninstall action must be declared by the runtime manifest")
+        if manifest.acquisition is AcquisitionType.DOWNLOAD_BINARY:
+            # Validate download metadata while producing the plan, before a
+            # user is shown an approval prompt. Uninstall only needs the
+            # exact declared target; install/update/repair additionally need
+            # an HTTPS source and a manifest SHA-256.
+            download_url, target_path, expected_hash = self.download_spec(manifest)
+            if command:
+                return ManifestTrust(False, False, "downloaded binaries cannot use an installer command")
+            if not target_path:
+                return ManifestTrust(False, False, "downloaded binaries require an installer resultPath")
+            if action is not InstallAction.UNINSTALL:
+                if not download_url:
+                    return ManifestTrust(False, False, "downloaded binaries require an installer downloadUrl")
+                if not ArtifactDownloader.url_allowed(
+                    download_url,
+                    allow_private_network=self.allow_private_network,
+                ):
+                    return ManifestTrust(False, False, "downloaded binaries require an HTTPS downloadUrl")
+                normalized_hash = str(expected_hash or "").strip().lower().removeprefix("sha256:")
+                if len(normalized_hash) != 64 or any(char not in "0123456789abcdef" for char in normalized_hash):
+                    return ManifestTrust(False, False, "downloaded binaries require a valid manifest SHA-256")
+        if not command:
+            return trust
+        if any(not str(part).strip() for part in command):
+            return ManifestTrust(False, False, "installer command contains an empty argument")
+        if bool(manifest.installer.get("shell")):
+            return ManifestTrust(False, False, "shell installers are not allowed through the runtime broker")
+        executable = Path(command[0]).name.lower()
+        if manifest.acquisition is AcquisitionType.PACKAGE_MANAGER and executable not in self._PACKAGE_MANAGERS:
+            return ManifestTrust(False, False, f"package manager is not allowlisted: {executable}")
+        if not trust.allowed:
+            return trust
+        return trust
+
+    @staticmethod
+    def download_spec(manifest: RuntimeManifest) -> tuple[str | None, str | None, str | None]:
+        installer = manifest.installer if isinstance(manifest.installer, Mapping) else {}
+        download_url = installer.get("downloadUrl") or installer.get("url")
+        target_path = installer.get("resultPath") or installer.get("targetPath") or installer.get("downloadPath")
+        expected_hash = manifest.verification.get("sha256") if isinstance(manifest.verification, Mapping) else None
+        return (
+            str(download_url).strip() if download_url is not None and str(download_url).strip() else None,
+            str(target_path).strip() if target_path is not None and str(target_path).strip() else None,
+            str(expected_hash).strip() if expected_hash is not None and str(expected_hash).strip() else None,
+        )
+
+    @staticmethod
+    def command_for(manifest: RuntimeManifest, action: InstallAction) -> tuple[str, ...]:
+        if not isinstance(manifest.installer, Mapping):
+            return ()
+        raw = manifest.installer.get(f"{action.value}Command")
+        if raw is None and action is InstallAction.INSTALL:
+            raw = manifest.installer.get("command")
+        if isinstance(raw, str):
+            # The policy rejects strings; keep this branch empty for callers
+            # that use command_for only to build a safe preview.
+            return ()
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            return tuple(str(item) for item in raw)
+        return ()
+
+    @classmethod
+    def version_command_allowed(
+        cls,
+        manifest: RuntimeManifest,
+        command: Sequence[str],
+        runtime_path: str | None,
+    ) -> bool:
+        """Keep verification probes read-only and bound to the declared executable."""
+        if len(command) != 2 or any(not str(item).strip() for item in command):
+            return False
+        if str(command[1]) not in cls._VERSION_ARGS:
+            return False
+        declared = runtime_path or manifest.executable or (manifest.command[0] if manifest.command else None)
+        if not declared:
+            return False
+        return cls._executable_key(command[0]) == cls._executable_key(declared)
+
+    @staticmethod
+    def _executable_key(value: str | Path) -> str:
+        name = Path(str(value)).name.casefold()
+        for suffix in (".exe", ".cmd", ".bat", ".ps1", ".com"):
+            if name.endswith(suffix):
+                return name[: -len(suffix)]
+        return name
+
+
 class RuntimeRegistry:
     """Persistent registry of runtime manifests and observed installations."""
 
     _TRANSITIONS = {
         InstallState.NOT_INSTALLED: {InstallState.INSTALLING, InstallState.INSTALLED},
-        InstallState.INSTALLING: {InstallState.INSTALLED, InstallState.BROKEN, InstallState.INCOMPATIBLE},
-        InstallState.INSTALLED: {InstallState.NOT_AUTHENTICATED, InstallState.AUTHENTICATED,
-                                 InstallState.CAPABILITY_VERIFIED, InstallState.BROKEN,
-                                 InstallState.NEEDS_UPDATE, InstallState.REPAIRING},
-        InstallState.NOT_AUTHENTICATED: {InstallState.AUTHENTICATED, InstallState.BROKEN,
-                                         InstallState.REPAIRING},
-        InstallState.AUTHENTICATED: {InstallState.CAPABILITY_VERIFIED, InstallState.BROKEN,
-                                     InstallState.NEEDS_UPDATE, InstallState.REPAIRING},
-        InstallState.CAPABILITY_VERIFIED: {InstallState.READY, InstallState.BROKEN,
-                                           InstallState.NEEDS_UPDATE, InstallState.REPAIRING},
-        InstallState.READY: {InstallState.BROKEN, InstallState.NEEDS_UPDATE, InstallState.REPAIRING,
-                             InstallState.NOT_AUTHENTICATED, InstallState.AUTHENTICATED},
-        InstallState.BROKEN: {InstallState.REPAIRING, InstallState.INSTALLING, InstallState.NOT_INSTALLED},
-        InstallState.NEEDS_UPDATE: {InstallState.INSTALLING, InstallState.REPAIRING, InstallState.BROKEN},
-        InstallState.INCOMPATIBLE: {InstallState.REPAIRING, InstallState.NOT_INSTALLED},
-        InstallState.REPAIRING: {InstallState.INSTALLED, InstallState.BROKEN, InstallState.INCOMPATIBLE},
+        InstallState.INSTALLING: {InstallState.INSTALLED, InstallState.BROKEN, InstallState.INCOMPATIBLE,
+                                  InstallState.NOT_INSTALLED},
+        InstallState.INSTALLED: {InstallState.INSTALLING, InstallState.NOT_AUTHENTICATED, InstallState.AUTHENTICATED,
+                                 InstallState.CAPABILITY_VERIFIED, InstallState.BROKEN, InstallState.INCOMPATIBLE,
+                                 InstallState.NEEDS_UPDATE, InstallState.REPAIRING, InstallState.NOT_INSTALLED},
+        InstallState.NOT_AUTHENTICATED: {InstallState.INSTALLING, InstallState.AUTHENTICATED, InstallState.BROKEN,
+                                         InstallState.INCOMPATIBLE,
+                                         InstallState.REPAIRING, InstallState.NOT_INSTALLED},
+        InstallState.AUTHENTICATED: {InstallState.INSTALLING, InstallState.CAPABILITY_VERIFIED, InstallState.BROKEN,
+                                     InstallState.INCOMPATIBLE,
+                                     InstallState.NEEDS_UPDATE, InstallState.REPAIRING, InstallState.NOT_INSTALLED},
+        InstallState.CAPABILITY_VERIFIED: {InstallState.INSTALLING, InstallState.READY, InstallState.BROKEN,
+                                           InstallState.INCOMPATIBLE,
+                                           InstallState.NEEDS_UPDATE, InstallState.REPAIRING, InstallState.NOT_INSTALLED},
+        InstallState.READY: {InstallState.INSTALLING, InstallState.BROKEN, InstallState.INCOMPATIBLE,
+                             InstallState.NEEDS_UPDATE, InstallState.REPAIRING,
+                             InstallState.NOT_AUTHENTICATED, InstallState.AUTHENTICATED,
+                             InstallState.NOT_INSTALLED},
+        InstallState.BROKEN: {InstallState.INSTALLED, InstallState.REPAIRING,
+                              InstallState.INSTALLING, InstallState.NOT_INSTALLED},
+        InstallState.NEEDS_UPDATE: {InstallState.INSTALLING, InstallState.REPAIRING,
+                                    InstallState.BROKEN, InstallState.NOT_INSTALLED},
+        InstallState.INCOMPATIBLE: {InstallState.INSTALLED, InstallState.REPAIRING,
+                                    InstallState.NOT_INSTALLED},
+        InstallState.REPAIRING: {InstallState.INSTALLED, InstallState.INSTALLING,
+                                 InstallState.BROKEN, InstallState.INCOMPATIBLE, InstallState.NOT_INSTALLED},
     }
 
     def __init__(self, db: Database | None = None):
@@ -174,14 +1407,69 @@ class RuntimeRegistry:
             self._load()
 
     def register_manifest(self, manifest: RuntimeManifest) -> RuntimeManifest:
+        return self._register_manifest(manifest)
+
+    def register_manifests(
+        self,
+        manifests: Iterable[RuntimeManifest],
+    ) -> tuple[RuntimeManifest, ...]:
+        """Register a catalog as one all-or-nothing Registry operation.
+
+        Catalog parsing happens before this method is called, but persistence
+        can still fail midway through a batch. Keep the SQLite rows and the
+        process-local indexes at the same version so a later retry or restart
+        cannot observe only part of a signed catalog.
+        """
+        batch = tuple(manifests)
+        if not batch:
+            return ()
+        previous_manifests = dict(self._manifests)
+        previous_installations = dict(self._installations)
+        try:
+            if self.db is None:
+                for manifest in batch:
+                    self._register_manifest(manifest)
+            else:
+                with self.db.transaction() as conn:
+                    for manifest in batch:
+                        self._register_manifest(manifest, conn=conn)
+        except Exception:
+            self._manifests = previous_manifests
+            self._installations = previous_installations
+            raise
+        return batch
+
+    def _register_manifest(
+        self,
+        manifest: RuntimeManifest,
+        *,
+        conn: Any | None = None,
+    ) -> RuntimeManifest:
         self._manifests[manifest.runtime_type] = manifest
-        self._persist_manifest(manifest)
+        self._persist_manifest(manifest, conn=conn)
         if manifest.runtime_type not in self._installations:
-            self._set_installation(RuntimeInstallation(manifest.runtime_type, version=manifest.version))
+            self._set_installation(RuntimeInstallation(
+                manifest.runtime_type,
+                version=manifest.version,
+                source_kind=manifest.source_kind,
+            ), conn=conn)
         else:
             current = self._installations[manifest.runtime_type]
-            if current.version and current.version != manifest.version and current.state is InstallState.READY:
-                self._set_installation(self._replace(current, state=InstallState.NEEDS_UPDATE, version=manifest.version))
+            changes: dict[str, Any] = {}
+            if current.source_kind is not manifest.source_kind:
+                changes["source_kind"] = manifest.source_kind
+            if current.version and current.version != manifest.version and current.state in {
+                InstallState.INSTALLED,
+                InstallState.NOT_AUTHENTICATED,
+                InstallState.AUTHENTICATED,
+                InstallState.CAPABILITY_VERIFIED,
+                InstallState.READY,
+            }:
+                # Keep the observed installed version; the manifest version is
+                # the candidate version and must not erase that evidence.
+                changes["state"] = InstallState.NEEDS_UPDATE
+            if changes:
+                self._set_installation(self._replace(current, **changes), conn=conn)
         return manifest
 
     def get_manifest(self, runtime_type: str) -> RuntimeManifest | None:
@@ -200,54 +1488,246 @@ class RuntimeRegistry:
 
     def discover(self, runtime_type: str) -> RuntimeInstallation:
         manifest = self._require_manifest(runtime_type)
-        path = shutil.which(manifest.executable) if manifest.executable else None
+        current = self._installations.get(runtime_type)
+        # A custom-path connection is durable Registry evidence. Prefer that
+        # exact path when it still exists, then fall back to manifest/PATH
+        # discovery so a PATH change does not hide the connected runtime.
+        path = self._resolve_executable(manifest, preferred_path=current.path if current else None)
+        if current is not None and current.state not in {
+            InstallState.NOT_INSTALLED, InstallState.INSTALLING, InstallState.REPAIRING,
+        } and (path or manifest.acquisition is AcquisitionType.BUILTIN):
+            # Discovery is observational.  It must not erase authentication,
+            # capability, or health evidence when a user presses refresh.
+            updated = self._replace(
+                current,
+                path=path or current.path,
+                source_kind=manifest.source_kind,
+            )
+            self._set_installation(updated)
+            return updated
+        if current is not None and current.state in {
+            InstallState.INSTALLED,
+            InstallState.NOT_AUTHENTICATED,
+            InstallState.AUTHENTICATED,
+            InstallState.CAPABILITY_VERIFIED,
+            InstallState.READY,
+        } and not path and manifest.acquisition is not AcquisitionType.BUILTIN:
+            # A previously connected executable disappearing is a broken
+            # installation, not a clean "not installed" state.  Preserve the
+            # last path and evidence so the Marketplace can explain Repair.
+            return self._transition(
+                current,
+                InstallState.BROKEN,
+                capability_verified=False,
+                health="unhealthy",
+                last_error="runtime executable was not found during discovery",
+                verified=False,
+            )
+        if current is not None and current.state in {
+            InstallState.BROKEN,
+            InstallState.INCOMPATIBLE,
+            InstallState.NEEDS_UPDATE,
+        } and not path and manifest.acquisition is not AcquisitionType.BUILTIN:
+            # A previously classified failure must remain actionable.  Do not
+            # turn a broken/incompatible/update-required installation into a
+            # clean NOT_INSTALLED row merely because its executable is still
+            # absent; that would erase the reason and the Repair/Update path.
+            return self._replace(current, source_kind=manifest.source_kind)
         if manifest.acquisition is AcquisitionType.BUILTIN:
             installation = RuntimeInstallation(
                 runtime_type, InstallState.INSTALLED, path=manifest.executable,
-                version=manifest.version, health="unknown",
+                version=manifest.version, health="unknown", source_kind=manifest.source_kind,
             )
         elif path:
             installation = RuntimeInstallation(
                 runtime_type, InstallState.INSTALLED, path=path,
-                version=manifest.version, health="unknown",
+                version=manifest.version, health="unknown", source_kind=manifest.source_kind,
             )
         else:
-            installation = RuntimeInstallation(runtime_type, InstallState.NOT_INSTALLED, version=manifest.version)
+            installation = RuntimeInstallation(
+                runtime_type, InstallState.NOT_INSTALLED,
+                version=manifest.version, source_kind=manifest.source_kind,
+            )
         self._set_installation(installation)
         return installation
 
+    @staticmethod
+    def _resolve_executable(
+        manifest: RuntimeManifest,
+        preferred_path: str | Path | None = None,
+    ) -> str | None:
+        candidates: list[str] = []
+        manifest_executable = str(manifest.executable or "").strip()
+        # An existing explicit Manifest path is a deliberate configuration
+        # change and must win over a stale Registry path. Bare executable
+        # names are kept after the preferred path so custom connections stay
+        # stable even when PATH contains a different installation.
+        if manifest_executable and Path(manifest_executable).expanduser().is_file():
+            candidates.append(manifest_executable)
+        if preferred_path is not None and str(preferred_path).strip():
+            candidates.append(str(preferred_path).strip())
+        if manifest_executable and manifest_executable not in candidates:
+            candidates.append(manifest_executable)
+        if manifest.command:
+            candidates.append(str(manifest.command[0]).strip())
+        for candidate in candidates:
+            if not candidate:
+                continue
+            explicit = Path(candidate).expanduser()
+            if explicit.is_file():
+                return str(explicit)
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+        return None
+
     def mark_authenticated(self, runtime_type: str, auth: AuthState) -> RuntimeInstallation:
         current = self._require_installation(runtime_type)
+        if not current.verified:
+            raise RuntimeUnavailable(f"runtime artifact is not verified: {runtime_type}")
         state = InstallState.AUTHENTICATED if auth.status in {"authenticated", "ready"} else InstallState.NOT_AUTHENTICATED
-        return self._transition(current, state, auth=auth)
+        # Authentication is a new observation.  A failed re-authentication
+        # must invalidate old capability/health evidence instead of leaving a
+        # stale READY-looking read model behind.
+        return self._transition(
+            current,
+            state,
+            auth=auth,
+            capability_verified=False if state is InstallState.NOT_AUTHENTICATED else current.capability_verified,
+            health="unknown" if state is InstallState.NOT_AUTHENTICATED else current.health,
+        )
 
     def mark_capability_verified(self, runtime_type: str, capabilities: RuntimeCapabilities) -> RuntimeInstallation:
         current = self._require_installation(runtime_type)
+        if not current.verified:
+            raise RuntimeUnavailable(f"runtime artifact is not verified: {runtime_type}")
         if current.state not in {InstallState.AUTHENTICATED, InstallState.INSTALLED, InstallState.CAPABILITY_VERIFIED}:
+            if current.state is InstallState.NOT_INSTALLED:
+                raise RuntimeNotInstalled(f"runtime is not installed: {runtime_type}")
             raise RuntimeUnavailable(f"runtime is not installed/authenticated: {runtime_type}")
         return self._transition(current, InstallState.CAPABILITY_VERIFIED,
                                 capability_verified=True, health="healthy")
 
+    def mark_verified(self, runtime_type: str, result: VerificationResult) -> RuntimeInstallation:
+        current = self._require_installation(runtime_type)
+        if not result.verified:
+            updated = self._replace(current, verified=False, last_error=result.reason or "runtime verification failed")
+            self._set_installation(updated)
+            return updated
+        updated = self._replace(
+            current,
+            path=result.path or current.path,
+            version=result.version or current.version,
+            verified=True,
+            last_error=None,
+        )
+        # Verification is a durable lifecycle fact, not just a read-model
+        # decoration.  Persist it before authentication/capability refreshes
+        # reload the current installation and overwrite the in-memory value.
+        self._set_installation(updated)
+        return updated
+
+    def mark_incompatible(self, runtime_type: str, reason: str) -> RuntimeInstallation:
+        current = self._require_installation(runtime_type)
+        return self._transition(
+            current,
+            InstallState.INCOMPATIBLE,
+            last_error=reason or "runtime version is incompatible",
+        )
+
+    def compatibility(self, runtime_type: str, observed_version: str | None = None) -> CompatibilityResult:
+        manifest = self._require_manifest(runtime_type)
+        compatibility = manifest.compatibility if isinstance(manifest.compatibility, Mapping) else {}
+        minimum = str(compatibility.get("minimumVersion") or "") or None
+        maximum = str(compatibility.get("maximumTestedVersion") or "") or None
+        observed = observed_version or (self._installations.get(runtime_type) or RuntimeInstallation(runtime_type)).version
+        if observed and minimum and DependencyResolver._version_key(observed) < DependencyResolver._version_key(minimum):
+            return CompatibilityResult(False, reason=f"version {observed} is below minimum {minimum}",
+                                       observed_version=observed, minimum_version=minimum,
+                                       maximum_tested_version=maximum)
+        if observed and maximum and DependencyResolver._version_key(observed) > DependencyResolver._version_key(maximum):
+            return CompatibilityResult(True, warning=f"version {observed} is newer than maximum tested {maximum}",
+                                       observed_version=observed, minimum_version=minimum,
+                                       maximum_tested_version=maximum)
+        tested = compatibility.get("testedVersions") if isinstance(compatibility, Mapping) else None
+        if observed and isinstance(tested, Sequence) and not isinstance(tested, (str, bytes)) and str(observed) not in {
+            str(item) for item in tested
+        }:
+            return CompatibilityResult(True, warning=f"version {observed} is not listed as tested",
+                                       observed_version=observed, minimum_version=minimum,
+                                       maximum_tested_version=maximum)
+        return CompatibilityResult(True, observed_version=observed, minimum_version=minimum,
+                                   maximum_tested_version=maximum)
+
     def mark_health(self, runtime_type: str, *, healthy: bool, detail: str = "") -> RuntimeInstallation:
         current = self._require_installation(runtime_type)
-        if healthy and current.capability_verified:
+        if healthy and current.capability_verified and current.verified:
             return self._transition(current, InstallState.READY, health="healthy", last_error=None)
         if healthy:
-            return self._replace(current, health="healthy", last_error=None)
+            updated = self._replace(current, health="healthy", last_error=None)
+            self._set_installation(updated)
+            return updated
         return self._transition(current, InstallState.BROKEN, health="unhealthy", last_error=detail or "health check failed")
 
     def require_ready(self, runtime_type: str) -> RuntimeManifest:
         manifest = self._require_manifest(runtime_type)
         installation = self._require_installation(runtime_type)
         if installation.state is not InstallState.READY:
+            if installation.state is InstallState.NOT_INSTALLED:
+                raise RuntimeNotInstalled(f"runtime is not installed: {runtime_type}")
+            if installation.state is InstallState.INCOMPATIBLE:
+                raise RuntimeIncompatible(f"runtime is incompatible: {runtime_type}")
             if installation.state is InstallState.NOT_AUTHENTICATED:
                 raise AuthenticationRequired(f"runtime is not authenticated: {runtime_type}")
             raise RuntimeUnavailable(f"runtime is not ready: {runtime_type} ({installation.state.value})")
+        if not installation.verified:
+            raise RuntimeUnavailable(f"runtime artifact is not verified: {runtime_type}")
+        if installation.auth.status not in {"authenticated", "ready"}:
+            raise AuthenticationRequired(f"runtime is not authenticated: {runtime_type}")
+        if not installation.capability_verified:
+            raise RuntimeUnavailable(f"runtime capabilities are not verified: {runtime_type}")
         return manifest
 
     def set_error(self, runtime_type: str, detail: str) -> RuntimeInstallation:
         current = self._require_installation(runtime_type)
         return self._transition(current, InstallState.BROKEN, health="unhealthy", last_error=detail)
+
+    def record_install_event(self, event: InstallEvent) -> None:
+        if self.db is None:
+            return
+        self.db.execute(
+            """INSERT INTO runtime_install_events(
+                   runtime_type, action, phase, status, message, detail, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                event.runtime_type, event.action.value, event.phase, event.status,
+                event.message, json.dumps(dict(event.detail), ensure_ascii=False), event.created_at,
+            ),
+        )
+
+    def install_events(self, runtime_type: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        if self.db is None:
+            return []
+        rows = self.db.fetchall(
+            """SELECT runtime_type, action, phase, status, message, detail, created_at
+               FROM runtime_install_events WHERE runtime_type=?
+               ORDER BY id DESC LIMIT ?""",
+            (runtime_type, max(1, min(int(limit), 200))),
+        )
+        result: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            detail = row.get("detail")
+            try:
+                detail = json.loads(detail or "{}")
+            except (TypeError, json.JSONDecodeError):
+                detail = {"value": detail}
+            result.append({
+                "runtimeType": row.get("runtime_type"), "action": row.get("action"),
+                "phase": row.get("phase"), "status": row.get("status"),
+                "message": row.get("message"), "detail": detail,
+                "createdAt": row.get("created_at"),
+            })
+        return result
 
     def _transition(self, current: RuntimeInstallation, state: InstallState, **changes: Any) -> RuntimeInstallation:
         if state is not current.state and state not in self._TRANSITIONS.get(current.state, set()):
@@ -256,27 +1736,37 @@ class RuntimeRegistry:
         self._set_installation(updated)
         return updated
 
-    def _set_installation(self, installation: RuntimeInstallation) -> None:
+    def _set_installation(
+        self,
+        installation: RuntimeInstallation,
+        *,
+        conn: Any | None = None,
+    ) -> None:
         self._installations[installation.runtime_type] = installation
         if self.db is None:
             return
-        self.db.execute(
-            """INSERT INTO runtime_installations(
-                   runtime_type, state, path, version, auth_status, account_label,
-                   auth_detail, capability_verified, health, last_error, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(runtime_type) DO UPDATE SET state=excluded.state,
-                   path=excluded.path, version=excluded.version,
-                   auth_status=excluded.auth_status, account_label=excluded.account_label,
-                   auth_detail=excluded.auth_detail, capability_verified=excluded.capability_verified,
-                   health=excluded.health, last_error=excluded.last_error, updated_at=excluded.updated_at""",
-            (
-                installation.runtime_type, installation.state.value, installation.path,
-                installation.version, installation.auth.status, installation.auth.account_label,
-                installation.auth.detail, int(installation.capability_verified), installation.health,
-                installation.last_error, installation.updated_at,
-            ),
+        statement = """INSERT INTO runtime_installations(
+                       runtime_type, state, path, version, auth_status, account_label,
+                       auth_detail, capability_verified, health, last_error, updated_at,
+                       source_kind, verified
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(runtime_type) DO UPDATE SET state=excluded.state,
+                       path=excluded.path, version=excluded.version,
+                       auth_status=excluded.auth_status, account_label=excluded.account_label,
+                       auth_detail=excluded.auth_detail, capability_verified=excluded.capability_verified,
+                       health=excluded.health, last_error=excluded.last_error, updated_at=excluded.updated_at,
+                       source_kind=excluded.source_kind, verified=excluded.verified"""
+        params = (
+            installation.runtime_type, installation.state.value, installation.path,
+            installation.version, installation.auth.status, installation.auth.account_label,
+            installation.auth.detail, int(installation.capability_verified), installation.health,
+            installation.last_error, installation.updated_at, installation.source_kind.value,
+            int(installation.verified),
         )
+        if conn is not None:
+            conn.execute(statement, params)
+        else:
+            self.db.execute(statement, params)
 
     def _load(self) -> None:
         db = self.db
@@ -285,6 +1775,9 @@ class RuntimeRegistry:
         try:
             rows = db.fetchall("SELECT * FROM runtime_registry ORDER BY runtime_type")
             for row in rows:
+                metadata = json.loads(row.get("metadata") or "{}")
+                if not isinstance(metadata, Mapping):
+                    metadata = {}
                 self._manifests[row["runtime_type"]] = RuntimeManifest(
                     runtime_type=row["runtime_type"], display_name=row["display_name"],
                     version=row["version"], protocol=row["protocol"],
@@ -295,15 +1788,27 @@ class RuntimeRegistry:
                     dependencies=tuple(json.loads(row.get("dependencies") or "[]")),
                     source=row.get("source") or "", signature=row.get("signature"),
                     minimum_host_version=row.get("minimum_host_version"),
+                    source_kind=RuntimeSource(metadata.get("sourceKind") or RuntimeSource.SYSTEM.value),
+                    integration_grade=str(metadata.get("integrationGrade") or "C"),
+                    platforms=metadata.get("platforms") or {},
+                    verification=metadata.get("verification") or {},
+                    authentication=metadata.get("authentication") or {},
+                    compatibility=metadata.get("compatibility") or {},
+                    installer=metadata.get("installer") or {},
                 )
             rows = db.fetchall("SELECT * FROM runtime_installations")
             for row in rows:
+                manifest = self._manifests.get(row["runtime_type"])
                 self._installations[row["runtime_type"]] = RuntimeInstallation(
                     runtime_type=row["runtime_type"], state=InstallState(row["state"]),
                     path=row.get("path"), version=row.get("version"),
                     auth=AuthState(row.get("auth_status") or "unknown", row.get("account_label"), row.get("auth_detail") or ""),
                     capability_verified=bool(row.get("capability_verified")), health=row.get("health") or "unknown",
                     last_error=row.get("last_error"), updated_at=row.get("updated_at") or _now(),
+                    source_kind=RuntimeSource(row.get("source_kind") or (
+                        manifest.source_kind.value if manifest else RuntimeSource.SYSTEM.value
+                    )),
+                    verified=bool(row.get("verified")),
                 )
         except Exception as exc:
             # The registry is an additive feature.  A database that predates
@@ -311,29 +1816,47 @@ class RuntimeRegistry:
             if "no such table" not in str(exc).lower():
                 raise
 
-    def _persist_manifest(self, manifest: RuntimeManifest) -> None:
+    def _persist_manifest(
+        self,
+        manifest: RuntimeManifest,
+        *,
+        conn: Any | None = None,
+    ) -> None:
         if self.db is None:
             return
-        self.db.execute(
-            """INSERT INTO runtime_registry(
-                   runtime_type, display_name, version, protocol, acquisition,
-                   executable, command, capabilities, models, dependencies,
-                   source, signature, minimum_host_version, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(runtime_type) DO UPDATE SET display_name=excluded.display_name,
-                   version=excluded.version, protocol=excluded.protocol,
-                   acquisition=excluded.acquisition, executable=excluded.executable,
-                   command=excluded.command, capabilities=excluded.capabilities,
-                   models=excluded.models, dependencies=excluded.dependencies,
-                   source=excluded.source, signature=excluded.signature,
-                   minimum_host_version=excluded.minimum_host_version, updated_at=excluded.updated_at""",
-            (
-                manifest.runtime_type, manifest.display_name, manifest.version, manifest.protocol,
-                manifest.acquisition.value, manifest.executable, json.dumps(manifest.command),
-                json.dumps(manifest.capabilities), json.dumps(manifest.models), json.dumps(manifest.dependencies),
-                manifest.source, manifest.signature, manifest.minimum_host_version, _now(),
-            ),
+        statement = """INSERT INTO runtime_registry(
+                       runtime_type, display_name, version, protocol, acquisition,
+                       executable, command, capabilities, models, dependencies,
+                       source, signature, minimum_host_version, metadata, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(runtime_type) DO UPDATE SET display_name=excluded.display_name,
+                       version=excluded.version, protocol=excluded.protocol,
+                       acquisition=excluded.acquisition, executable=excluded.executable,
+                       command=excluded.command, capabilities=excluded.capabilities,
+                       models=excluded.models, dependencies=excluded.dependencies,
+                       source=excluded.source, signature=excluded.signature,
+                       minimum_host_version=excluded.minimum_host_version, metadata=excluded.metadata,
+                       updated_at=excluded.updated_at"""
+        params = (
+            manifest.runtime_type, manifest.display_name, manifest.version, manifest.protocol,
+            manifest.acquisition.value, manifest.executable, json.dumps(manifest.command),
+            json.dumps(manifest.capabilities), json.dumps(manifest.models), json.dumps(manifest.dependencies),
+            manifest.source, manifest.signature, manifest.minimum_host_version,
+            json.dumps({
+                "sourceKind": manifest.source_kind.value,
+                "integrationGrade": manifest.integration_grade.upper(),
+                "platforms": dict(manifest.platforms),
+                "verification": dict(manifest.verification),
+                "authentication": dict(manifest.authentication),
+                "compatibility": dict(manifest.compatibility),
+                "installer": dict(manifest.installer),
+            }, ensure_ascii=False),
+            _now(),
         )
+        if conn is not None:
+            conn.execute(statement, params)
+        else:
+            self.db.execute(statement, params)
 
     def _require_manifest(self, runtime_type: str) -> RuntimeManifest:
         manifest = self._manifests.get(runtime_type)
@@ -353,51 +1876,647 @@ class RuntimeRegistry:
             "runtime_type": current.runtime_type, "state": current.state, "path": current.path,
             "version": current.version, "auth": current.auth, "capability_verified": current.capability_verified,
             "health": current.health, "last_error": current.last_error, "updated_at": _now(),
+            "source_kind": current.source_kind, "verified": current.verified,
         }
         values.update(changes)
         return RuntimeInstallation(**values)
 
 
-class InstallerBroker:
-    """Lifecycle facade with a hard boundary around untrusted installers."""
+class ManifestPluginInstaller:
+    """Manifest-backed installer used by every Runtime Plane adapter.
 
-    def __init__(self, registry: RuntimeRegistry, *, executor: Callable[[RuntimeManifest], str] | None = None):
+    The default runner invokes argv arrays with ``shell=False``.  A manifest
+    can therefore describe a package-manager or vendor installer without
+    turning Marketplace metadata into an implicit shell script.  A custom
+    executor remains injectable for a trusted host integration and is never
+    selected implicitly by a community manifest.
+    """
+
+    _MAX_PROCESS_DIAGNOSTIC_CHARS = 16_000
+    _SECRET_OUTPUT_PATTERN = re.compile(
+        r"(?i)(authorization|x-api-key|api[_-]?key|access[_-]?token|"
+        r"refresh[_-]?token|password|secret)\s*[:=]\s*([^\s,;]+)"
+    )
+    _BEARER_OUTPUT_PATTERN = re.compile(r"(?i)\bBearer\s+([^\s,;]+)")
+
+    def __init__(
+        self,
+        registry: RuntimeRegistry,
+        runtime_type: str,
+        *,
+        dependency_resolver: DependencyResolver | None = None,
+        policy: TrustedInstallationPolicy | None = None,
+        artifact_verifier: ArtifactVerifier | None = None,
+        artifact_downloader: ArtifactDownloader | None = None,
+        executor: Callable[[RuntimeManifest], str] | None = None,
+        runner: Callable[[Sequence[str]], Any] | None = None,
+    ) -> None:
         self.registry = registry
+        self.runtime_type = runtime_type
+        self.dependency_resolver = dependency_resolver or DependencyResolver(runner=runner)
+        self.policy = policy or TrustedInstallationPolicy()
+        self.artifact_verifier = artifact_verifier or ArtifactVerifier()
+        self.artifact_downloader = artifact_downloader or ArtifactDownloader()
         self.executor = executor
+        self.runner = runner or self._run_process
 
-    def install(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
-        manifest = self.registry._require_manifest(runtime_type)
-        current = self.registry._require_installation(runtime_type)
-        if manifest.acquisition in {AcquisitionType.CUSTOM, AcquisitionType.MANAGED}:
-            if not approved or self.executor is None:
-                raise RuntimeUnavailable("managed/custom runtime installation requires explicit approved executor")
-            self.registry._transition(current, InstallState.INSTALLING)
-            try:
-                path = self.executor(manifest)
-            except Exception as exc:
-                return self.registry.set_error(runtime_type, str(exc))
-            return self.registry._transition(
-                self.registry._require_installation(runtime_type), InstallState.INSTALLED,
-                path=path, version=manifest.version, health="unknown",
-            )
-        installation = self.registry.discover(runtime_type)
-        if installation.state is InstallState.NOT_INSTALLED:
-            raise RuntimeUnavailable(f"runtime executable not found: {runtime_type}")
+    def detect(self) -> RuntimeInstallation:
+        self._emit(InstallAction.DISCOVER, "discovery", "started", "Checking for an existing runtime")
+        installation = self.registry.discover(self.runtime_type)
+        self._emit(
+            InstallAction.DISCOVER, "discovery", "completed",
+            "Existing runtime detected" if installation.state is not InstallState.NOT_INSTALLED else "Runtime not found",
+            {"state": installation.state.value, "path": installation.path},
+        )
         return installation
 
+    def check_prerequisites(self) -> PrerequisiteResult:
+        manifest = self.registry._require_manifest(self.runtime_type)
+        return self.dependency_resolver.check_prerequisites(manifest)
+
+    def plan(self, action: InstallAction) -> InstallerPlan:
+        manifest = self.registry._require_manifest(self.runtime_type)
+        trust = self.policy.evaluate(manifest, action)
+        command = self.policy.command_for(manifest, action)
+        artifact_url, artifact_path, artifact_sha256 = self.policy.download_spec(manifest)
+        write_action = action in {InstallAction.INSTALL, InstallAction.UPDATE, InstallAction.REPAIR, InstallAction.UNINSTALL}
+        # Every mutating lifecycle action is an explicit user decision, even
+        # when it only connects an existing system executable.  Discovery is
+        # the read-only path for a no-confirmation probe.
+        requires_approval = write_action
+        risk = "high" if command or artifact_url else ("medium" if write_action else "low")
+        explanation = trust.reason or (
+            "connect the detected executable" if action is InstallAction.INSTALL and not command
+            else "download and verify the declared binary" if artifact_url and action is not InstallAction.UNINSTALL
+            else "no installer command declared"
+        )
+        return InstallerPlan(
+            runtime_type=self.runtime_type,
+            action=action,
+            source=manifest.source_kind,
+            acquisition=manifest.acquisition,
+            command=command,
+            requires_approval=requires_approval,
+            trusted=trust.trusted,
+            allowed=trust.allowed,
+            shell=bool(manifest.installer.get("shell")) if isinstance(manifest.installer, Mapping) else False,
+            risk=risk,
+            explanation=explanation,
+            artifact_url=artifact_url,
+            artifact_path=artifact_path,
+            artifact_sha256=artifact_sha256,
+        )
+
+    def verify(self) -> VerificationResult:
+        manifest = self.registry._require_manifest(self.runtime_type)
+        current = self.registry._require_installation(self.runtime_type)
+        # BUILTIN represents a Host-owned in-process runtime (for example the
+        # API gateway), so its manifest is the artifact itself.  BUNDLED is
+        # different: it promises a packaged executable and must still prove
+        # that the declared/observed file exists before it can be marked
+        # verified.  Treating both values as "verified without a path" would
+        # let a missing bundled binary reach the ready/authentication path.
+        if manifest.acquisition is AcquisitionType.BUILTIN and not current.path:
+            return VerificationResult(True, version=manifest.version, checks=("builtin-manifest",))
+        expected = manifest.verification.get("sha256") if isinstance(manifest.verification, Mapping) else None
+        path = current.path or RuntimeRegistry._resolve_executable(manifest)
+        artifact = self.artifact_verifier.verify(path, str(expected) if expected else None)
+        if not artifact.verified:
+            return artifact
+        checks = list(artifact.checks)
+        version = current.version or manifest.version
+        version_command = manifest.verification.get("versionCommand") if isinstance(manifest.verification, Mapping) else None
+        if version_command is not None:
+            if isinstance(version_command, str):
+                return VerificationResult(False, path=artifact.path, checks=tuple(checks),
+                                          reason="version command must be an argv array")
+            if not isinstance(version_command, Sequence) or isinstance(version_command, (bytes, str)):
+                return VerificationResult(False, path=artifact.path, checks=tuple(checks),
+                                          reason="version command is invalid")
+            command = tuple(str(item) for item in version_command)
+            if not command or any(not item.strip() for item in command):
+                return VerificationResult(False, path=artifact.path, checks=tuple(checks),
+                                          reason="version command is empty")
+            if not self.policy.version_command_allowed(manifest, command, artifact.path):
+                return VerificationResult(
+                    False,
+                    path=artifact.path,
+                    checks=tuple(checks),
+                    reason="version command must call the declared runtime with a read-only version argument",
+                )
+            # Bind the read-only probe to the path that was actually verified;
+            # re-resolving a bare command through PATH could otherwise probe a
+            # different executable than the artifact whose hash was checked.
+            verified_path = artifact.path
+            if verified_path is None:
+                return VerificationResult(False, checks=tuple(checks),
+                                          reason="verified artifact has no executable path")
+            result = self.runner((verified_path, *command[1:]))
+            return_code = getattr(result, "returncode", None)
+            if return_code is None and isinstance(result, tuple):
+                return_code = result[0]
+            if return_code not in (0, None):
+                return VerificationResult(False, path=artifact.path, checks=tuple(checks),
+                                          reason=f"version command failed with exit code {return_code}")
+            output = ""
+            if hasattr(result, "stdout"):
+                output += str(getattr(result, "stdout") or "")
+            if hasattr(result, "stderr"):
+                output += " " + str(getattr(result, "stderr") or "")
+            match = re.search(r"\b\d+(?:\.\d+){1,3}\b", output)
+            if match:
+                version = match.group(0)
+            checks.append("version-command")
+        return VerificationResult(True, path=artifact.path, version=version, checks=tuple(checks))
+
+    def install(self, *, approved: bool = False) -> RuntimeInstallation:
+        return self._execute(InstallAction.INSTALL, approved=approved)
+
+    def update(self, *, approved: bool = False) -> RuntimeInstallation:
+        return self._execute(InstallAction.UPDATE, approved=approved)
+
+    def repair(self, *, approved: bool = False) -> RuntimeInstallation:
+        return self._execute(InstallAction.REPAIR, approved=approved)
+
+    def uninstall(self, *, approved: bool = False) -> RuntimeInstallation:
+        return self._execute(InstallAction.UNINSTALL, approved=approved)
+
+    def _execute(self, action: InstallAction, *, approved: bool) -> RuntimeInstallation:
+        manifest = self.registry._require_manifest(self.runtime_type)
+        current = self.registry._require_installation(self.runtime_type)
+        plan = self.plan(action)
+        if not plan.allowed:
+            raise RuntimeUnavailable(plan.explanation or "runtime installer plan is not allowed")
+        if not plan.trusted and plan.command:
+            # Untrusted declarative manifests may still be reviewed, but they
+            # cannot smuggle a command past the host trust policy.
+            if not approved:
+                raise RuntimeUnavailable(f"installer trust review required: {plan.explanation}")
+        if plan.shell:
+            raise RuntimeUnavailable("shell installers are not supported by the runtime broker")
+        if plan.requires_approval and not approved:
+            raise RuntimeUnavailable(f"explicit approval required for runtime {action.value}")
+
+        if action in {InstallAction.UPDATE, InstallAction.REPAIR} and current.state is InstallState.NOT_INSTALLED:
+            raise RuntimeNotInstalled(f"runtime is not installed: {self.runtime_type}")
+
+        if action in {InstallAction.INSTALL, InstallAction.UPDATE, InstallAction.REPAIR}:
+            prerequisites = self.check_prerequisites()
+            if not prerequisites.ready:
+                missing = [item.name for item in prerequisites.checks if item.required and not item.available]
+                detail = ", ".join(missing) or "runtime prerequisites are not satisfied"
+                self._emit(action, "prerequisites", "failed", detail, prerequisites.to_dict())
+                raise RuntimeUnavailable(detail)
+            target_state = InstallState.REPAIRING if action is InstallAction.REPAIR else InstallState.INSTALLING
+            if current.state is not target_state:
+                current = self.registry._transition(current, target_state)
+            self._emit(action, "installation", "started", f"{action.value} started", {"plan": plan.to_dict()})
+            try:
+                path = self._run_install_command(manifest, plan, action=action, current=current)
+                if path:
+                    current = self.registry._replace(current, path=path)
+                    self.registry._set_installation(current)
+                elif not plan.command:
+                    current = self.registry.discover(self.runtime_type)
+                if current.state is InstallState.NOT_INSTALLED:
+                    raise RuntimeNotInstalled(f"runtime executable not found: {self.runtime_type}")
+                verification = self.verify()
+                self._emit(action, "verification", "completed" if verification.verified else "failed",
+                           "Runtime verification completed" if verification.verified else "Runtime verification failed",
+                           verification.to_dict())
+                if not verification.verified:
+                    self.registry._transition(
+                        self.registry._require_installation(self.runtime_type), InstallState.BROKEN,
+                        health="unhealthy", last_error=verification.reason or "runtime verification failed",
+                    )
+                    raise RuntimeUnavailable(verification.reason or "runtime verification failed")
+                compatibility = self.registry.compatibility(self.runtime_type, verification.version)
+                if not compatibility.compatible:
+                    self.registry.mark_incompatible(
+                        self.runtime_type,
+                        compatibility.reason or "runtime version is incompatible",
+                    )
+                    raise RuntimeIncompatible(compatibility.reason or "runtime version is incompatible")
+                current = self.registry.mark_verified(self.runtime_type, verification)
+                current = self.registry._transition(
+                    current, InstallState.INSTALLED,
+                    path=verification.path or current.path,
+                    version=verification.version or current.version or manifest.version,
+                    health="unknown", last_error=None,
+                )
+                self._emit(action, "installation", "completed", f"{action.value} completed",
+                           {"verification": verification.to_dict(), "compatibility": compatibility.to_dict()})
+                return current
+            except Exception as exc:
+                if not isinstance(exc, RuntimeUnavailable):
+                    detail = str(exc)
+                else:
+                    detail = str(exc)
+                current = self.registry._require_installation(self.runtime_type)
+                if current.state in {InstallState.INSTALLING, InstallState.REPAIRING}:
+                    current = self.registry.set_error(self.runtime_type, detail)
+                self._emit(action, "installation", "failed", detail, {"errorType": type(exc).__name__})
+                raise
+
+        if action is InstallAction.UNINSTALL:
+            if manifest.acquisition in {AcquisitionType.BUILTIN, AcquisitionType.BUNDLED}:
+                raise RuntimeUnavailable(f"built-in runtime cannot be uninstalled: {self.runtime_type}")
+            if not plan.command and manifest.acquisition is not AcquisitionType.DOWNLOAD_BINARY:
+                raise RuntimeUnavailable(
+                    f"runtime has no supervised uninstall action: {self.runtime_type}"
+                )
+            self._emit(action, "uninstallation", "started", "Uninstall started", {"plan": plan.to_dict()})
+            try:
+                self._run_install_command(manifest, plan, action=action, current=current)
+                result = self.registry._transition(
+                    current, InstallState.NOT_INSTALLED, path=None, capability_verified=False,
+                    health="unknown", last_error=None, verified=False,
+                )
+                self._emit(action, "uninstallation", "completed", "Runtime uninstalled")
+                return result
+            except Exception as exc:
+                if current.state is not InstallState.BROKEN:
+                    self.registry.set_error(self.runtime_type, str(exc))
+                self._emit(action, "uninstallation", "failed", str(exc), {"errorType": type(exc).__name__})
+                raise
+        raise ValueError(f"unsupported installer action: {action.value}")
+
+    def _run_install_command(
+        self,
+        manifest: RuntimeManifest,
+        plan: InstallerPlan,
+        *,
+        action: InstallAction,
+        current: RuntimeInstallation | None = None,
+    ) -> str | None:
+        if manifest.acquisition is AcquisitionType.DOWNLOAD_BINARY:
+            download_url, target_path, expected_hash = self.policy.download_spec(manifest)
+            if action is InstallAction.UNINSTALL and not plan.command:
+                if not current or not current.path:
+                    return None
+                if not target_path or self._path_key(current.path) != self._path_key(target_path):
+                    raise RuntimeUnavailable(
+                        "refusing to remove a downloaded artifact outside its declared resultPath"
+                    )
+                Path(current.path).unlink(missing_ok=True)
+                return None
+            if not download_url or not target_path or not expected_hash:
+                raise RuntimeUnavailable("downloaded binary installer metadata is incomplete")
+            self._emit(
+                action,
+                "download",
+                "started",
+                "Downloading declared runtime artifact",
+                {"url": download_url, "target": target_path, "sha256": expected_hash},
+            )
+            result = self.artifact_downloader.download(download_url, target_path, expected_hash)
+            self._emit(action, "download", "completed", "Runtime artifact downloaded and verified", result.to_dict())
+            return result.path
+        if self.executor is not None:
+            path = self.executor(manifest)
+            self._emit(
+                action,
+                "process",
+                "completed",
+                "Custom installer executor completed",
+                {"executor": "host-bound", "path": str(path) if path else None},
+            )
+            return path
+        if not plan.command:
+            return None
+        result = self.runner(plan.command)
+        return_code = getattr(result, "returncode", None)
+        if return_code is None and isinstance(result, tuple):
+            return_code = result[0]
+        diagnostic = self._process_diagnostic(result, return_code)
+        self._emit(
+            action,
+            "process",
+            "completed" if return_code in (0, None) else "failed",
+            "Installer process completed" if return_code in (0, None) else "Installer process failed",
+            diagnostic,
+        )
+        if return_code not in (0, None):
+            raise RuntimeUnavailable(f"installer command failed with exit code {return_code}")
+        configured_path = manifest.installer.get("resultPath") if isinstance(manifest.installer, Mapping) else None
+        return str(configured_path) if configured_path else None
+
+    @classmethod
+    def _process_diagnostic(cls, result: Any, return_code: Any) -> dict[str, Any]:
+        """Return bounded, redacted installer output for the embedded console."""
+        return {
+            "returncode": return_code,
+            "stdout": cls._redact_process_output(getattr(result, "stdout", "")),
+            "stderr": cls._redact_process_output(getattr(result, "stderr", "")),
+        }
+
+    @classmethod
+    def _redact_process_output(cls, value: Any) -> str:
+        if isinstance(value, (bytes, bytearray)):
+            text = bytes(value).decode("utf-8", errors="replace")
+        else:
+            text = str(value or "")
+        text = cls._SECRET_OUTPUT_PATTERN.sub(r"\1=[REDACTED]", text)
+        text = cls._BEARER_OUTPUT_PATTERN.sub("Bearer [REDACTED]", text)
+        if len(text) > cls._MAX_PROCESS_DIAGNOSTIC_CHARS:
+            return text[:cls._MAX_PROCESS_DIAGNOSTIC_CHARS] + "\n[output truncated]"
+        return text
+
+    @staticmethod
+    def _path_key(value: str | Path) -> str:
+        return os.path.normcase(os.path.abspath(str(Path(value).expanduser())))
+
+    @classmethod
+    def _run_process(cls, command: Sequence[str]) -> Any:
+        """Run an installer while draining both pipes with bounded retention."""
+        return _run_bounded_process(
+            command,
+            timeout_seconds=300,
+            max_output_chars=cls._MAX_PROCESS_DIAGNOSTIC_CHARS,
+        )
+
+    @classmethod
+    def _drain_process_stream(cls, stream: Any) -> bytes:
+        return _drain_bounded_process_stream(
+            stream,
+            max_output_chars=cls._MAX_PROCESS_DIAGNOSTIC_CHARS,
+        )
+
+    def _emit(
+        self,
+        action: InstallAction,
+        phase: str,
+        status: str,
+        message: str,
+        detail: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.registry.record_install_event(InstallEvent(
+            self.runtime_type, action, phase, status, message, detail or {},
+        ))
+
+
+class CodexInstaller(ManifestPluginInstaller):
+    """Codex App Server installer/diagnostic adapter."""
+
+
+class ClaudeCodeInstaller(ManifestPluginInstaller):
+    """Claude Code installer/diagnostic adapter."""
+
+
+class GeminiInstaller(ManifestPluginInstaller):
+    """Gemini CLI installer/diagnostic adapter."""
+
+
+class LocalRuntimeInstaller(ManifestPluginInstaller):
+    """Local model runtime installer/diagnostic adapter."""
+
+
+class InstallerBroker:
+    """Lifecycle facade with explicit plans, trust checks, and audit events."""
+
+    _ADAPTERS: Mapping[str, type[ManifestPluginInstaller]] = {
+        "codex-app-server": CodexInstaller,
+        "claude-code": ClaudeCodeInstaller,
+        "gemini-cli": GeminiInstaller,
+        "local-runtime": LocalRuntimeInstaller,
+    }
+
+    def __init__(
+        self,
+        registry: RuntimeRegistry,
+        *,
+        executor: Callable[[RuntimeManifest], str] | None = None,
+        runner: Callable[[Sequence[str]], Any] | None = None,
+        dependency_resolver: DependencyResolver | None = None,
+        policy: TrustedInstallationPolicy | None = None,
+        artifact_downloader: ArtifactDownloader | None = None,
+    ) -> None:
+        self.registry = registry
+        self.executor = executor
+        self.runner = runner
+        self.dependency_resolver = dependency_resolver or DependencyResolver(runner=runner)
+        self.policy = policy or TrustedInstallationPolicy()
+        self.artifact_downloader = artifact_downloader or ArtifactDownloader()
+        self._installers: dict[str, ManifestPluginInstaller] = {}
+
+    def installer(self, runtime_type: str) -> ManifestPluginInstaller:
+        if runtime_type not in self._installers:
+            installer_type = self._ADAPTERS.get(runtime_type, ManifestPluginInstaller)
+            self._installers[runtime_type] = installer_type(
+                self.registry, runtime_type,
+                dependency_resolver=self.dependency_resolver,
+                policy=self.policy,
+                artifact_downloader=self.artifact_downloader,
+                executor=self.executor,
+                runner=self.runner,
+            )
+        return self._installers[runtime_type]
+
+    def discover(self, runtime_type: str) -> RuntimeInstallation:
+        return self.installer(runtime_type).detect()
+
+    def plan(self, runtime_type: str, action: InstallAction = InstallAction.INSTALL) -> InstallerPlan:
+        return self.installer(runtime_type).plan(action)
+
+    def diagnostics(self, runtime_type: str) -> dict[str, Any]:
+        installer = self.installer(runtime_type)
+        installation = self.registry._require_installation(runtime_type)
+        return {
+            "manifest": self.registry._require_manifest(runtime_type).to_dict(),
+            "installation": installation.to_dict(),
+            "prerequisites": installer.check_prerequisites().to_dict(),
+            "compatibility": self.registry.compatibility(runtime_type).to_dict(),
+            "plans": {
+                action.value: installer.plan(action).to_dict()
+                for action in InstallAction
+                if action is not InstallAction.DISCOVER
+            },
+            "events": self.registry.install_events(runtime_type),
+            "trust": self.policy.verifier.verify(self.registry._require_manifest(runtime_type)).to_dict(),
+        }
+
+    def install(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
+        return self.installer(runtime_type).install(approved=approved)
+
+    def update(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
+        return self.installer(runtime_type).update(approved=approved)
+
     def repair(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
-        current = self.registry._require_installation(runtime_type)
-        self.registry._transition(current, InstallState.REPAIRING)
-        try:
-            return self.install(runtime_type, approved=approved)
-        except Exception as exc:
-            return self.registry.set_error(runtime_type, str(exc))
+        return self.installer(runtime_type).repair(approved=approved)
 
     def uninstall(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
-        if not approved:
-            raise RuntimeUnavailable("uninstall requires explicit approval")
-        current = self.registry._require_installation(runtime_type)
-        return self.registry._transition(
-            current, InstallState.NOT_INSTALLED, path=None, capability_verified=False,
-            health="unknown", last_error=None,
-        )
+        return self.installer(runtime_type).uninstall(approved=approved)
+
+
+class RuntimeManager:
+    """Host-owned Runtime Plane facade over Registry and InstallerBroker.
+
+    The manager is the stable lifecycle entrypoint for Studio integrations.
+    It keeps manifest/discovery/installation concerns together without making
+    vendor adapters or Marketplace payloads responsible for Registry writes.
+    Authentication and capability probes remain adapter-owned and are exposed
+    separately through the runtime contract.
+    """
+
+    def __init__(
+        self,
+        registry: RuntimeRegistry,
+        broker: InstallerBroker | None = None,
+        *,
+        runtime_adapters: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.registry = registry
+        self.broker = broker or InstallerBroker(registry)
+        self.runtime_adapters = dict(runtime_adapters or {})
+
+    def list(self) -> list[dict[str, Any]]:
+        return self.registry.list()
+
+    def manifest(self, runtime_type: str) -> RuntimeManifest:
+        return self.registry._require_manifest(runtime_type)
+
+    def installation(self, runtime_type: str) -> RuntimeInstallation:
+        return self.registry._require_installation(runtime_type)
+
+    def installer(self, runtime_type: str) -> ManifestPluginInstaller:
+        return self.broker.installer(runtime_type)
+
+    def bind_runtime(self, runtime_type: str, runtime: Any) -> None:
+        """Bind a Host-owned adapter for reconnect/authentication probes."""
+        if not str(runtime_type).strip():
+            raise ValueError("runtime_type is required")
+        self.runtime_adapters[str(runtime_type)] = runtime
+
+    def discover(self, runtime_type: str) -> RuntimeInstallation:
+        return self.broker.discover(runtime_type)
+
+    def plan(self, runtime_type: str, action: InstallAction = InstallAction.INSTALL) -> InstallerPlan:
+        return self.broker.plan(runtime_type, action)
+
+    def diagnostics(self, runtime_type: str) -> dict[str, Any]:
+        return self.broker.diagnostics(runtime_type)
+
+    def install(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
+        return self.broker.install(runtime_type, approved=approved)
+
+    def update(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
+        return self.broker.update(runtime_type, approved=approved)
+
+    def repair(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
+        return self.broker.repair(runtime_type, approved=approved)
+
+    def uninstall(self, runtime_type: str, *, approved: bool = False) -> RuntimeInstallation:
+        return self.broker.uninstall(runtime_type, approved=approved)
+
+    async def reconnect(self, runtime_type: str) -> dict[str, Any]:
+        """Reconnect an observed installation and re-run its official probes.
+
+        Reconnect is observational: it never installs a package or reads
+        vendor credentials.  The adapter owns the official authentication and
+        capability probes; this Host facade owns the durable Registry state.
+        """
+        return await self._connect(runtime_type, action="reconnect")
+
+    async def reauthenticate(self, runtime_type: str) -> dict[str, Any]:
+        """Re-run the adapter's official authentication probe.
+
+        Vendors differ in whether their CLI can launch an interactive login.
+        The current contract intentionally does not scrape credentials or
+        invent an undocumented login command.  A vendor adapter may expose an
+        official auth flow later; until then this action truthfully reports the
+        result of the supported auth check.
+        """
+        return await self._connect(runtime_type, action="reauthenticate")
+
+    async def _connect(self, runtime_type: str, *, action: str) -> dict[str, Any]:
+        try:
+            runtime = self.runtime_adapters[runtime_type]
+        except KeyError:
+            raise RuntimeUnavailable(
+                f"runtime adapter is not registered: {runtime_type}"
+            ) from None
+
+        installation = self.discover(runtime_type)
+        if installation.state is InstallState.NOT_INSTALLED:
+            raise RuntimeNotInstalled(f"runtime is not installed: {runtime_type}")
+        if installation.state in {InstallState.INSTALLING, InstallState.REPAIRING, InstallState.NEEDS_UPDATE}:
+            raise RuntimeUnavailable(
+                f"runtime lifecycle must finish before {action}: {runtime_type} ({installation.state.value})"
+            )
+
+        try:
+            if not installation.verified:
+                verification = self.installer(runtime_type).verify()
+                if not verification.verified:
+                    raise RuntimeUnavailable(
+                        verification.reason or f"runtime verification failed: {runtime_type}"
+                    )
+                installation = self.registry.mark_verified(runtime_type, verification)
+                compatibility = self.registry.compatibility(runtime_type, verification.version)
+                if not compatibility.compatible:
+                    self.registry.mark_incompatible(
+                        runtime_type,
+                        compatibility.reason or "runtime version is incompatible",
+                    )
+                    raise RuntimeIncompatible(
+                        compatibility.reason or "runtime version is incompatible"
+                    )
+                installation = self.registry.get_installation(runtime_type) or installation
+            if installation.state is InstallState.INCOMPATIBLE:
+                compatibility = self.registry.compatibility(runtime_type, installation.version)
+                if not compatibility.compatible:
+                    raise RuntimeIncompatible(
+                        compatibility.reason or "runtime version is incompatible"
+                    )
+            if installation.state in {InstallState.BROKEN, InstallState.INCOMPATIBLE}:
+                installation = self.registry._transition(
+                    installation,
+                    InstallState.INSTALLED,
+                    health="unknown",
+                    last_error=None,
+                )
+            initialized = await runtime.initialize()
+            auth = await runtime.authenticate()
+            installation = self.registry.mark_authenticated(runtime_type, auth)
+            result: dict[str, Any] = {
+                "runtimeType": runtime_type,
+                "action": action,
+                "installation": installation.to_dict(),
+                "auth": auth.to_dict(),
+                "capabilities": None,
+                "ready": False,
+            }
+            if auth.status not in {"authenticated", "ready"}:
+                return result
+
+            capabilities = (
+                initialized
+                if isinstance(initialized, RuntimeCapabilities)
+                else await runtime.get_capabilities()
+            )
+            if not isinstance(capabilities, RuntimeCapabilities):
+                raise RuntimeUnavailable(
+                    f"runtime capability probe returned an invalid result: {runtime_type}"
+                )
+            installation = self.registry.mark_capability_verified(runtime_type, capabilities)
+            installation = self.registry.mark_health(runtime_type, healthy=True)
+            result.update({
+                "installation": installation.to_dict(),
+                "capabilities": capabilities.to_dict(),
+                "ready": installation.state is InstallState.READY,
+            })
+            return result
+        except Exception as exc:
+            try:
+                self.registry.set_error(runtime_type, str(exc))
+            except Exception as state_error:
+                # Preserve the original connection failure.  Registry state
+                # is best effort here because an illegal transition must not
+                # hide the adapter's authoritative error.
+                logger.warning(
+                    "could not persist runtime connection failure for %s: %s",
+                    runtime_type,
+                    state_error,
+                    exc_info=state_error,
+                )
+            raise

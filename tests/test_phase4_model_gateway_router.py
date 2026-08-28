@@ -18,8 +18,9 @@ from src.creation.task_handlers import LegacyTaskHandlers
 from src.llm.gateway import LLMResponse
 from src.llm.model_runtime import (
     CredentialStore, ModelConfigurationError, ModelRepository, PersistentModelRuntime,
-    PersistentMultiModelManager,
+    PersistentMultiModelManager, build_model_runtime,
 )
+from src.runtime.contracts import ModelDescriptor
 from src.planning.plot_workspace import PlotWorkspaceError, PlotWorkspaceRepository
 from src.story_graph import StoryFlowPlanningService, StoryGraphProjector
 
@@ -352,6 +353,280 @@ def test_missing_route_fails_before_any_provider_call(model_runtime):
     assert repository.runs_for_task(task["id"]) == []
 
 
+def test_embedding_provider_transport_is_owned_by_model_runtime(model_runtime, monkeypatch):
+    database, repository = model_runtime
+    repository.save_configuration({
+        "providers": [{
+            "id": "provider-a", "name": "Test compatible provider", "providerType": "openai",
+            "baseUrl": "https://example.invalid/v1", "credentialEnv": "NOVELFORGE_TEST_KEY",
+        }],
+        "models": [{
+            "id": "embedding-model", "providerId": "provider-a", "name": "Embedding model",
+            "modelId": "embedding-test", "capabilities": ["embedding"],
+        }],
+        "routes": {"embedding": "embedding-model"},
+    })
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"embedding": [0.25, 0.5, 0.75]}]}
+
+    class Client:
+        def __init__(self, **kwargs):
+            assert kwargs["timeout"] == 60
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, url, *, headers, json):
+            assert url == "https://example.invalid/v1/embeddings"
+            assert headers["Authorization"] == "Bearer not-for-sqlite-or-api"
+            assert json == {"model": "embedding-test", "input": "moon gate"}
+            return Response()
+
+    from src.llm import model_runtime as model_runtime_module
+    from src.rag.embedding_provider import EmbeddingProviderUnavailable, RoutedEmbeddingProvider
+
+    monkeypatch.setattr(model_runtime_module.httpx, "Client", Client)
+    runtime = PersistentModelRuntime(repository)
+    provider = RoutedEmbeddingProvider(repository)
+    with pytest.raises(EmbeddingProviderUnavailable, match="runtime is not attached"):
+        provider("moon gate")
+
+    task = TaskRuntime(database).enqueue("basic-rag")
+    provider.bind_runtime(runtime)
+    with runtime.task_scope(task["id"]):
+        assert provider("moon gate") == [0.25, 0.5, 0.75]
+
+
+def test_embedding_runtime_requires_durable_task_before_provider_access(model_runtime):
+    _database, repository = model_runtime
+    runtime = PersistentModelRuntime(repository)
+    with pytest.raises(ModelConfigurationError) as error:
+        runtime.embed("moon gate")
+    assert error.value.code == "MODEL_TASK_CONTEXT_REQUIRED"
+
+
+def test_embedding_manager_uses_runtime_router_and_exact_capability(model_runtime, monkeypatch):
+    database, repository = model_runtime
+    repository.save_configuration({
+        "providers": [{
+            "id": "provider-a", "name": "Test compatible provider", "providerType": "openai",
+            "baseUrl": "https://example.invalid/v1", "credentialEnv": "NOVELFORGE_TEST_KEY",
+        }],
+        "models": [{
+            "id": "embedding-model", "providerId": "provider-a", "name": "Embedding model",
+            "modelId": "embedding-test", "capabilities": ["embedding"],
+        }],
+        "routes": {"embedding": "embedding-model"},
+    })
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"embedding": [0.1, 0.2, 0.3]}]}
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, url, *, json, **_kwargs):
+            assert url == "https://example.invalid/v1/embeddings"
+            assert json == {"model": "embedding-test", "input": "router-owned query"}
+            return Response()
+
+    from src.llm import model_runtime as model_runtime_module
+
+    monkeypatch.setattr(model_runtime_module.httpx, "Client", Client)
+    _repository, _runtime, manager = build_model_runtime(database, database.db_path.parent)
+    task = TaskRuntime(database).enqueue("basic-rag")
+    with manager.task_scope(task["id"]):
+        vector = manager.embed("router-owned query")
+
+    assert vector == [0.1, 0.2, 0.3]
+    agent_run = database.fetchone(
+        "SELECT ar.status, cp.plan, ar.artifacts FROM agent_runs ar "
+        "JOIN compute_plans cp ON cp.agent_task_id=ar.agent_task_id "
+        "WHERE ar.task_id=? ORDER BY ar.started_at DESC LIMIT 1",
+        (task["id"],),
+    )
+    assert agent_run is not None
+    assert agent_run["status"] == "succeeded"
+    assert '"capabilityDimension": "embedding"' in agent_run["plan"]
+    assert '"embedding"' in agent_run["artifacts"]
+
+
+def test_embedding_manager_batches_through_runtime_router(model_runtime, monkeypatch):
+    database, repository = model_runtime
+    repository.save_configuration({
+        "providers": [{
+            "id": "provider-a", "name": "Test compatible provider", "providerType": "openai",
+            "baseUrl": "https://example.invalid/v1", "credentialEnv": "NOVELFORGE_TEST_KEY",
+        }],
+        "models": [{
+            "id": "embedding-model", "providerId": "provider-a", "name": "Embedding model",
+            "modelId": "embedding-test", "capabilities": ["embedding"],
+        }],
+        "routes": {"embedding": "embedding-model"},
+    })
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            # The provider is allowed to return indexed entries out of order.
+            return {
+                "data": [
+                    {"index": 1, "embedding": [0.4, 0.5]},
+                    {"index": 0, "embedding": [0.1, 0.2]},
+                ]
+            }
+
+    calls = []
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, url, *, json, **_kwargs):
+            assert url == "https://example.invalid/v1/embeddings"
+            calls.append(json)
+            return Response()
+
+    from src.llm import model_runtime as model_runtime_module
+
+    monkeypatch.setattr(model_runtime_module.httpx, "Client", Client)
+    _repository, _runtime, manager = build_model_runtime(database, database.db_path.parent)
+    task = TaskRuntime(database).enqueue("basic-rag")
+    with manager.task_scope(task["id"]):
+        vectors = manager.embed_many(["first", "second"])
+
+    assert vectors == [[0.1, 0.2], [0.4, 0.5]]
+    assert calls == [{"model": "embedding-test", "input": ["first", "second"]}]
+    agent_run = database.fetchone(
+        "SELECT ar.status, ar.usage, ar.artifacts FROM agent_runs ar "
+        "JOIN compute_plans cp ON cp.agent_task_id=ar.agent_task_id "
+        "WHERE ar.task_id=? ORDER BY ar.started_at DESC LIMIT 1",
+        (task["id"],),
+    )
+    assert agent_run is not None
+    assert agent_run["status"] == "succeeded"
+    assert '"embeddingCount": 2' in agent_run["usage"]
+    assert '"count": 2' in agent_run["artifacts"]
+
+
+def test_embedding_route_pins_provider_when_external_model_ids_collide(model_runtime, monkeypatch):
+    database, repository = model_runtime
+    monkeypatch.setenv("NOVELFORGE_PROVIDER_B_KEY", "provider-b-secret")
+    repository.save_configuration({
+        "providers": [
+            {
+                "id": "provider-a",
+                "name": "Provider A",
+                "providerType": "openai",
+                "baseUrl": "https://example.invalid/v1",
+                "credentialEnv": "NOVELFORGE_TEST_KEY",
+            },
+            {
+                "id": "provider-b",
+                "name": "Provider B",
+                "providerType": "openai",
+                "baseUrl": "https://example.invalid/v1",
+                "credentialEnv": "NOVELFORGE_PROVIDER_B_KEY",
+            },
+        ],
+        "models": [
+            {
+                "id": "model-a",
+                "providerId": "provider-a",
+                "name": "Provider A embedding",
+                "modelId": "shared-embedding-model",
+                "capabilities": ["embedding"],
+            },
+            {
+                "id": "model-b",
+                "providerId": "provider-b",
+                "name": "Provider B embedding",
+                "modelId": "shared-embedding-model",
+                "capabilities": ["embedding"],
+            },
+        ],
+        "routes": {
+            "writer": "model-a",
+            "planner": "model-a",
+            "reviewer": "model-a",
+            "embedding": "model-a",
+        },
+    })
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"embedding": [0.7, 0.8]}]}
+
+    calls = []
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, url, *, headers, json):
+            calls.append({"url": url, "headers": headers, "json": json})
+            return Response()
+
+    from src.llm import model_runtime as model_runtime_module
+    from src.rag.embedding_provider import RoutedEmbeddingProvider
+
+    monkeypatch.setattr(model_runtime_module.httpx, "Client", Client)
+    _repository, _runtime, manager = build_model_runtime(database, database.db_path.parent)
+    provider = RoutedEmbeddingProvider(repository, manager)
+    task = TaskRuntime(database).enqueue("basic-rag")
+
+    with manager.task_scope(task["id"]):
+        assert provider("provider-scoped query") == [0.7, 0.8]
+
+    assert calls[0]["headers"]["Authorization"] == "Bearer not-for-sqlite-or-api"
+    assert calls[0]["json"] == {
+        "model": "shared-embedding-model",
+        "input": "provider-scoped query",
+    }
+    plan = database.fetchone(
+        "SELECT compute_plan FROM agent_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1",
+        (task["id"],),
+    )
+    assert plan is not None
+    assert json.loads(plan["compute_plan"])["providerId"] == "provider-a"
+
+
 def test_missing_credential_is_a_failed_generation_run(model_runtime, monkeypatch):
     database, repository = model_runtime
     monkeypatch.delenv("NOVELFORGE_TEST_KEY", raising=False)
@@ -392,6 +667,40 @@ def test_empty_provider_response_is_a_failed_generation_run(model_runtime):
     assert attempt["status"] == "failed"
     assert attempt["error_code"] == "PROVIDER_EMPTY_RESPONSE"
     assert attempt["response_artifact"] is None
+
+
+def test_legacy_model_call_gets_explicit_incomplete_context_snapshot(model_runtime):
+    database, repository = model_runtime
+
+    class FakeGateway:
+        def register_provider(self, _name, _config):
+            pass
+
+        def chat(self, _name, _messages, _system, **_kwargs):
+            return LLMResponse(content="bounded context", model="test-model", tokens_used=1)
+
+    task = TaskRuntime(database).enqueue("story-bible-suggest")
+    runtime = PersistentModelRuntime(repository, gateway=FakeGateway())
+    with runtime.task_scope(task["id"]):
+        response = runtime.invoke("planner", [{"role": "user", "content": "suggest"}])
+
+    assert response.content == "bounded context"
+    run = repository.runs_for_task(task["id"])[0]
+    manifest = run["input_reference"]["context_manifest"]
+    assert manifest["provenance"]["contextAuthority"] == "host-task-boundary"
+    assert manifest["provenance"]["contextCompleteness"] == "not_supplied"
+    assert "canonCommit" in manifest["provenance"]["missingNativeFields"]
+    agent_run = database.fetchone(
+        "SELECT context_bundle_id FROM agent_runs WHERE task_id=?", (task["id"],)
+    )
+    assert agent_run is not None and agent_run["context_bundle_id"]
+    bundle = database.fetchone(
+        "SELECT provenance, canon_commit FROM context_bundles WHERE id=?",
+        (agent_run["context_bundle_id"],),
+    )
+    assert bundle is not None
+    assert json.loads(bundle["provenance"])["contextCompleteness"] == "not_supplied"
+    assert bundle["canon_commit"] is None
 
 
 def test_durable_provider_check_creates_a_generation_run(model_runtime, tmp_path):
@@ -1048,6 +1357,207 @@ def test_provider_model_discovery_persists_catalog_without_manual_model_name(tmp
     assert [item["name"] for item in repository.configuration()["models"]] == ["mimo-v2.5", "mimo-v2.5-pro"]
 
 
+def test_model_discovery_refreshes_the_attached_scheduler_catalog(tmp_path):
+    from types import SimpleNamespace
+
+    from src.compute.scheduler import CapabilityRegistry, ComputeScheduler
+    from src.runtime.api_runtime import ApiModelRuntime
+    from src.runtime.persistence import AgentRunStore
+
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    repository = ModelRepository(database, CredentialStore(tmp_path))
+    repository.save_configuration({
+        "providers": [{
+            "id": "catalog-provider", "name": "Catalog provider", "providerType": "custom",
+            "baseUrl": "https://gateway.example.invalid/v1", "credentialEnv": "CATALOG_API_KEY",
+        }],
+        "models": [], "routes": {},
+    })
+    persistent = PersistentModelRuntime(repository)
+    manager = PersistentMultiModelManager(persistent)
+    capabilities = CapabilityRegistry()
+    capabilities.register_model(
+        ModelDescriptor("api", "stale-model", "Stale", reasoning_levels=("medium", "high")),
+        capability="C2",
+        health="ready",
+        tags=("api",),
+    )
+    api_runtime = ApiModelRuntime(persistent, AgentRunStore(database))
+    router = SimpleNamespace(
+        scheduler=ComputeScheduler(capabilities),
+        get=lambda runtime_type: api_runtime if runtime_type == "api" else None,
+    )
+    manager.attach_runtime_router(router)
+
+    def persist_discovered(provider_id):
+        return {
+            "providerId": provider_id,
+            "models": repository.save_discovered_models(provider_id, [{
+                "modelId": "fresh-model", "name": "Fresh", "capabilities": ["chat"],
+            }]),
+            "count": 1,
+        }
+
+    persistent.discover_models = persist_discovered
+    discovered = manager.discover_models("catalog-provider")
+
+    assert discovered["count"] == 1
+    assert [item["modelId"] for item in capabilities.snapshot()] == ["fresh-model"]
+
+
+def test_studio_model_configuration_invalidation_refreshes_attached_scheduler(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from src.compute.scheduler import CapabilityRegistry, ComputeScheduler
+    from src.runtime.api_runtime import ApiModelRuntime
+    from src.runtime.persistence import AgentRunStore
+    from src.web import studio
+
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    repository = ModelRepository(database, CredentialStore(tmp_path))
+    repository.save_configuration({
+        "providers": [{
+            "id": "catalog-provider", "name": "Catalog provider", "providerType": "custom",
+            "baseUrl": "https://gateway.example.invalid/v1", "credentialEnv": "CATALOG_API_KEY",
+        }],
+        "models": [{
+            "id": "old-model", "providerId": "catalog-provider", "name": "Old", "modelId": "old-model",
+        }],
+        "routes": {},
+    })
+    persistent = PersistentModelRuntime(repository)
+    manager = PersistentMultiModelManager(persistent)
+    capabilities = CapabilityRegistry()
+    capabilities.register_model(
+        ModelDescriptor("api", "stale-model", "Stale", reasoning_levels=("medium", "high")),
+        capability="C2",
+        health="ready",
+        tags=("api",),
+    )
+    api_runtime = ApiModelRuntime(persistent, AgentRunStore(database))
+    router = SimpleNamespace(
+        scheduler=ComputeScheduler(capabilities),
+        get=lambda runtime_type: api_runtime if runtime_type == "api" else None,
+    )
+    manager.attach_runtime_router(router)
+    plane = {"db": database}
+    monkeypatch.setitem(studio._runtime_plane_cache, id(database), plane)
+    monkeypatch.setattr(studio, "model_mgr", manager)
+
+    repository.delete_model("old-model")
+    repository.save_configuration({
+        "providers": [],
+        "models": [{
+            "id": "fresh-model", "providerId": "catalog-provider", "name": "Fresh", "modelId": "fresh-model",
+        }],
+        "routes": {},
+    })
+    studio._invalidate_runtime_capability_cache(database)
+
+    assert [item["modelId"] for item in capabilities.snapshot()] == ["fresh-model"]
+
+
+def test_capability_refresh_is_observable_noop_when_api_adapter_is_missing(tmp_path):
+    from types import SimpleNamespace
+
+    from src.compute.scheduler import CapabilityRegistry, ComputeScheduler
+
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    persistent = PersistentModelRuntime(ModelRepository(database, CredentialStore(tmp_path)))
+    manager = PersistentMultiModelManager(persistent)
+    capabilities = CapabilityRegistry()
+
+    def missing_adapter(_runtime_type):
+        raise KeyError("api adapter is not registered")
+
+    manager.attach_runtime_router(SimpleNamespace(
+        scheduler=ComputeScheduler(capabilities),
+        get=missing_adapter,
+    ))
+
+    assert manager.refresh_api_capabilities() == 0
+
+
+def test_studio_worker_rebinds_handlers_to_the_active_repository(tmp_path, monkeypatch):
+    from src.core.project import ProjectManager
+    from src.web import studio
+
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    repository = StoryRepository(database, workspace_root=tmp_path)
+    manager = ProjectManager(str(tmp_path), repository=repository)
+    runtime = TaskRuntime(database)
+    model_manager = object()
+    monkeypatch.setattr(studio, "story_repository", repository)
+    monkeypatch.setattr(studio, "project_mgr", manager)
+    monkeypatch.setattr(studio, "task_runtime", runtime)
+    monkeypatch.setattr(studio, "model_mgr", model_manager)
+
+    worker = studio._get_studio_task_worker()
+    handler_owner = worker.handlers["world-bootstrap"].__self__
+
+    assert worker.runtime is runtime
+    assert handler_owner.project_manager is manager
+    assert handler_owner.model_manager is model_manager
+    assert studio._get_studio_task_worker() is worker
+
+
+def test_studio_project_config_follows_active_repository_workspace(tmp_path, monkeypatch):
+    from src.web import studio
+
+    database = Database(str(tmp_path / "projects" / "novelforge.db"))
+    repository = StoryRepository(database, workspace_root=tmp_path)
+    monkeypatch.setattr(studio, "story_repository", repository)
+
+    client = TestClient(studio.app)
+    initial = client.get("/api/v1/project")
+    assert initial.status_code == 200
+    assert initial.json()["passScore"] == 93
+
+    sentinel = 987654
+    updated = client.put("/api/v1/project", json={"passScore": sentinel})
+    assert updated.status_code == 200
+    assert Config(project_path=str(tmp_path)).get("review", "pass_score") == sentinel
+    assert studio.config.get("review", "pass_score") != sentinel
+
+
+def test_studio_rebinds_same_database_when_workspace_root_changes(tmp_path, monkeypatch):
+    from src.ingestion.service import DocumentRepository
+    from src.web import studio
+
+    database = Database(str(tmp_path / "shared" / "novelforge.db"))
+    first_root = tmp_path / "workspace-first"
+    second_root = tmp_path / "workspace-second"
+    first_repository = StoryRepository(database, workspace_root=first_root)
+    first_manager = ProjectManager(str(first_root), repository=first_repository)
+    first_documents = DocumentRepository(database, first_root)
+
+    monkeypatch.setattr(studio, "story_repository", first_repository)
+    monkeypatch.setattr(studio, "project_mgr", first_manager)
+    monkeypatch.setattr(studio, "document_repository", first_documents)
+    first_components = studio._active_model_runtime_components_for(database)
+    first_worker = studio._get_studio_task_worker()
+
+    second_repository = StoryRepository(database, workspace_root=second_root)
+    monkeypatch.setattr(studio, "story_repository", second_repository)
+
+    rebound_manager = studio.get_active_project_manager()
+    rebound_documents = studio.get_document_repository()
+    second_components = studio._active_model_runtime_components_for(database)
+    second_worker = studio._get_studio_task_worker()
+
+    assert rebound_manager is not first_manager
+    assert rebound_manager.base_dir.resolve() == second_root.resolve()
+    assert rebound_documents is not first_documents
+    assert rebound_documents.workspace_root == second_root.resolve()
+    assert first_components[1].repository.credentials.root == first_root / ".novelforge-secrets"
+    assert second_components[1] is not first_components[1]
+    assert second_components[1].repository.credentials.root == second_root / ".novelforge-secrets"
+    assert second_worker is not first_worker
+    rebound_worker_manager = studio._studio_task_worker_bindings[id(database)]["projectManager"]
+    assert rebound_worker_manager is not first_manager
+    assert rebound_worker_manager.base_dir.resolve() == second_root.resolve()
+
+
 def test_studio_model_discovery_is_queued_without_provider_secret_in_task(tmp_path, monkeypatch):
     from src.web import studio
 
@@ -1069,7 +1579,7 @@ def test_studio_model_discovery_is_queued_without_provider_secret_in_task(tmp_pa
     task = runtime.get(response.json()["taskId"])
     assert task is not None
     assert task["type"] == "model-discovery"
-    assert task["data"] == {"provider_id": "custom-provider"}
+    assert task["data"] == {"provider_id": "custom-provider", "initiatedBy": "system"}
     assert "MIMO_API_KEY" not in str(task)
 
 
@@ -1092,5 +1602,5 @@ def test_studio_service_api_persists_nine_role_ready_configuration_and_queues_te
     task = runtime.get(queued.json()["taskId"])
     assert task is not None
     assert task["type"] == "model-connection-test"
-    assert task["data"] == {"provider_id": "provider-a"}
+    assert task["data"] == {"provider_id": "provider-a", "initiatedBy": "system"}
     assert client.get(f"/api/v1/tasks/{task['id']}/generation-runs").json() == {"runs": []}

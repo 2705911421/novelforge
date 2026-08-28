@@ -49,6 +49,10 @@ class ChapterPlanner:
         system = "你是一位专业的小说章节规划师，擅长为长篇小说制定精确的章节创作计划。"
 
         response = client.chat_json(messages, system)
+        if not isinstance(response, dict):
+            raise ValueError("CHAPTER_PLAN_OUTPUT_INVALID: expected a JSON object")
+        if "error" in response:
+            raise ValueError("CHAPTER_PLAN_OUTPUT_INVALID: model returned invalid JSON")
         return response
 
     def _build_project_context(self, project: StoryProject) -> str:

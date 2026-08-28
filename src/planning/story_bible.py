@@ -168,6 +168,96 @@ class StoryBibleRepository:
             )
         return self._required(project_id)
 
+    def stage_ai_drafts(
+        self,
+        project_id: str,
+        drafts: dict[str, Any],
+        *,
+        _connection: Any | None = None,
+    ) -> dict[str, list[str]]:
+        """Stage AI material without confirming or publishing any step.
+
+        Existing author drafts are preserved and the incoming value is kept as
+        the AI suggestion.  Empty steps receive the incoming value as a draft,
+        but confirmed steps are never reopened by an automated proposal.
+        ``_connection`` lets an author decision commit this staging and its
+        proposal-ledger transition in one Host-owned transaction.
+        """
+        if not isinstance(drafts, dict):
+            raise StoryBibleError("PAYLOAD_INVALID", "Story Bible drafts must be an object")
+        serialized = {
+            step_key: self._serialize_payload(payload)
+            for step_key, payload in drafts.items()
+            if step_key in STEP_KEYS
+        }
+        if not serialized:
+            return {"draftedStepKeys": [], "suggestionStepKeys": []}
+        workspace = self._workspace_for_update(project_id)
+        now = datetime.now().isoformat()
+
+        def stage(conn: Any) -> dict[str, list[str]]:
+            row = conn.execute(
+                "SELECT * FROM story_bible_workspaces WHERE id=?", (workspace["id"],)
+            ).fetchone()
+            if row is None:
+                raise StoryBibleError("BIBLE_NOT_FOUND", "Story Bible workspace was not found")
+            drafted: list[str] = []
+            suggestions: list[str] = []
+            first_staged_number: int | None = None
+            for step_key, payload in serialized.items():
+                step = conn.execute(
+                    "SELECT * FROM story_bible_steps WHERE workspace_id=? AND step_key=?",
+                    (workspace["id"], step_key),
+                ).fetchone()
+                if step is None or step["status"] == "confirmed":
+                    continue
+                existing = step["draft"]
+                has_existing = existing not in (None, "", "{}", "[]", '""')
+                draft_value = existing if has_existing else payload
+                draft_source = step["source"] if has_existing else "ai"
+                conn.execute(
+                    """UPDATE story_bible_steps
+                       SET status='draft', draft=?, source=?, suggestion=?,
+                           error_code=NULL, error_detail=NULL, version=version+1,
+                           updated_at=? WHERE id=?""",
+                    (draft_value, draft_source, payload, now, step["id"]),
+                )
+                suggestions.append(step_key)
+                if has_existing:
+                    continue
+                drafted.append(step_key)
+                first_staged_number = (
+                    int(step["step_number"])
+                    if first_staged_number is None
+                    else min(first_staged_number, int(step["step_number"]))
+                )
+            if suggestions:
+                if first_staged_number is None:
+                    first_staged_number = int(row["current_step"])
+                else:
+                    # Filling an earlier empty step changes the context for
+                    # later confirmations.  Reopen those confirmations so a
+                    # proposal cannot leave a stale mixed-version Story Bible.
+                    conn.execute(
+                        """UPDATE story_bible_steps SET status='draft', confirmed_at=NULL,
+                           updated_at=? WHERE workspace_id=? AND step_number>?
+                           AND status='confirmed'""",
+                        (now, workspace["id"], first_staged_number),
+                    )
+                conn.execute(
+                    """UPDATE story_bible_workspaces
+                       SET status='draft', published_snapshot_id=NULL,
+                           current_step=MIN(current_step, ?), updated_at=?, published_at=NULL
+                       WHERE id=?""",
+                    (first_staged_number, now, workspace["id"]),
+                )
+            return {"draftedStepKeys": drafted, "suggestionStepKeys": suggestions}
+
+        if _connection is not None:
+            return stage(_connection)
+        with self.db.transaction() as conn:
+            return stage(conn)
+
     def confirm(self, project_id: str, step_key: str) -> dict[str, Any]:
         workspace = self._workspace_for_update(project_id)
         step_number = self._step_number(step_key)
@@ -228,11 +318,31 @@ class StoryBibleRepository:
             world = self._world_projection(step_map, snapshot_id)
             intent = self._text_projection(step_map.get("intent"))
             style = self._style_projection(step_map)
-            conn.execute(
-                """UPDATE projects SET author_intent=?, writing_style=?, world_setting=?, updated_at=?
-                   WHERE id=?""",
-                (intent, style, json.dumps(world, ensure_ascii=False, sort_keys=True), now, project_id),
+            voice = step_map.get("voice")
+            style_profile = (
+                voice.get("styleProfile", voice.get("style_profile"))
+                if isinstance(voice, dict)
+                else None
             )
+            if isinstance(style_profile, dict):
+                conn.execute(
+                    """UPDATE projects SET author_intent=?, writing_style=?, style_profile=?,
+                       world_setting=?, updated_at=? WHERE id=?""",
+                    (
+                        intent,
+                        style,
+                        json.dumps(style_profile, ensure_ascii=False, sort_keys=True),
+                        json.dumps(world, ensure_ascii=False, sort_keys=True),
+                        now,
+                        project_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """UPDATE projects SET author_intent=?, writing_style=?, world_setting=?, updated_at=?
+                       WHERE id=?""",
+                    (intent, style, json.dumps(world, ensure_ascii=False, sort_keys=True), now, project_id),
+                )
             conn.execute(
                 """UPDATE story_bible_workspaces SET status='published', draft_version=?,
                    published_snapshot_id=?, updated_at=?, published_at=? WHERE id=?""",

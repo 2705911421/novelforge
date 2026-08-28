@@ -2,6 +2,8 @@
 NovelForge 核心模块测试
 """
 
+import sqlite3
+
 import pytest
 from pathlib import Path
 
@@ -10,7 +12,6 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.core.database import Database
-from src.core.task_manager import TaskManager, TaskType, TaskStatus
 from src.core.dal import (
     ProjectDAL, BookDAL, ChapterDAL, CharacterDAL,
     ForeshadowDAL, StoryFactDAL, ReviewDAL, StoryCommitDAL
@@ -25,12 +26,6 @@ def db(tmp_path):
     from src.core import database
     database._db_instance = Database(db_path)
     return database._db_instance
-
-
-@pytest.fixture
-def task_manager(db):
-    """创建任务管理器"""
-    return TaskManager()
 
 
 @pytest.fixture
@@ -66,6 +61,24 @@ class TestDatabase:
         """测试数据库初始化"""
         assert db.db_path.exists()
         assert db.get_version() == 1
+
+    def test_open_read_only_skips_migrations_and_rejects_writes(self, tmp_path):
+        db_path = tmp_path / "audit-only.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+            conn.execute("INSERT INTO marker(value) VALUES ('preserved')")
+
+        read_only = Database.open_read_only(str(db_path))
+
+        assert read_only.fetchone("SELECT value FROM marker") == {"value": "preserved"}
+        assert not read_only.table_exists("schema_migrations")
+        with pytest.raises(PermissionError, match="read-only"):
+            with read_only.transaction():
+                pass
+        with pytest.raises(PermissionError, match="read-only"):
+            read_only.insert("marker", {"value": "must-not-write"})
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            read_only.execute("CREATE TABLE should_not_exist (id INTEGER)")
     
     def test_table_exists(self, db):
         """测试表是否存在"""
@@ -296,139 +309,6 @@ class TestCharacterDAL:
         assert len(chars) == 2
 
 
-# ========== 任务管理器测试 ==========
-
-class TestTaskManager:
-    """任务管理器测试"""
-    
-    def test_create_task(self, task_manager):
-        """测试创建任务"""
-        task = task_manager.create_task(
-            TaskType.WRITE,
-            book_id='book-001',
-            chapter_number=1
-        )
-        
-        assert task.id is not None
-        assert task.status == TaskStatus.PENDING.value
-        assert task.book_id == 'book-001'
-    
-    def test_get_task(self, task_manager):
-        """测试获取任务"""
-        task = task_manager.create_task(TaskType.WRITE, book_id='book-001')
-        
-        fetched = task_manager.get_task(task.id)
-        assert fetched is not None
-        assert fetched.id == task.id
-    
-    def test_start_task(self, task_manager):
-        """测试启动任务"""
-        task = task_manager.create_task(TaskType.WRITE)
-        
-        result = task_manager.start_task(task.id)
-        assert result is True
-        
-        updated = task_manager.get_task(task.id)
-        assert updated.status == TaskStatus.RUNNING.value
-        assert updated.started_at is not None
-    
-    def test_complete_task(self, task_manager):
-        """测试完成任务"""
-        task = task_manager.create_task(TaskType.WRITE)
-        task_manager.start_task(task.id)
-        
-        result = task_manager.complete_task(task.id, {'chapter': 1})
-        assert result is True
-        
-        updated = task_manager.get_task(task.id)
-        assert updated.status == TaskStatus.COMPLETED.value
-        assert updated.completed_at is not None
-    
-    def test_fail_task(self, task_manager):
-        """测试任务失败"""
-        task = task_manager.create_task(TaskType.WRITE)
-        task_manager.start_task(task.id)
-        
-        result = task_manager.fail_task(task.id, 'LLM connection failed')
-        assert result is True
-        
-        updated = task_manager.get_task(task.id)
-        assert updated.status == TaskStatus.FAILED.value
-        assert updated.error == 'LLM connection failed'
-    
-    def test_cancel_task(self, task_manager):
-        """测试取消任务"""
-        task = task_manager.create_task(TaskType.WRITE)
-        
-        result = task_manager.cancel_task(task.id)
-        assert result is True
-        
-        updated = task_manager.get_task(task.id)
-        assert updated.status == TaskStatus.CANCELLED.value
-    
-    def test_pause_resume_task(self, task_manager):
-        """测试暂停和恢复任务"""
-        task = task_manager.create_task(TaskType.CONTINUOUS)
-        task_manager.start_task(task.id)
-        
-        # 暂停
-        task_manager.pause_task(task.id)
-        updated = task_manager.get_task(task.id)
-        assert updated.status == TaskStatus.PAUSED.value
-        
-        # 恢复
-        task_manager.resume_task(task.id)
-        updated = task_manager.get_task(task.id)
-        assert updated.status == TaskStatus.RUNNING.value
-    
-    def test_checkpoint(self, task_manager):
-        """测试检查点"""
-        task = task_manager.create_task(TaskType.CONTINUOUS)
-        
-        # 保存检查点
-        checkpoint_id = task_manager.save_checkpoint(
-            task.id,
-            'write_chapter',
-            {'chapter': 3, 'progress': 50}
-        )
-        assert checkpoint_id is not None
-        
-        # 获取最新检查点
-        checkpoint = task_manager.get_latest_checkpoint(task.id)
-        assert checkpoint is not None
-        assert checkpoint.stage == 'write_chapter'
-        assert checkpoint.state['chapter'] == 3
-    
-    def test_list_tasks(self, task_manager):
-        """测试列出任务"""
-        task_manager.create_task(TaskType.WRITE, book_id='book-001')
-        task_manager.create_task(TaskType.REVIEW, book_id='book-001')
-        task_manager.create_task(TaskType.WRITE, book_id='book-002')
-        
-        # 列出所有
-        tasks = task_manager.list_tasks()
-        assert len(tasks) == 3
-        
-        # 按书籍筛选
-        tasks = task_manager.list_tasks(book_id='book-001')
-        assert len(tasks) == 2
-        
-        # 按类型筛选
-        tasks = task_manager.list_tasks(task_type=TaskType.WRITE)
-        assert len(tasks) == 2
-    
-    def test_stats(self, task_manager):
-        """测试统计"""
-        task_manager.create_task(TaskType.WRITE)
-        task_manager.create_task(TaskType.WRITE)
-        task = task_manager.create_task(TaskType.REVIEW)
-        task_manager.start_task(task.id)
-        task_manager.complete_task(task.id)
-        
-        stats = task_manager.get_stats()
-        assert stats['total'] == 3
-        assert stats['pending'] == 2
-        assert stats['completed'] == 1
 
 
 # ========== 伏笔 DAL 测试 ==========

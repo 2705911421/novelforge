@@ -82,7 +82,11 @@ def test_studio_parity_surfaces_are_real_and_persisted(tmp_path, monkeypatch):
             json={"sourceName": "sample", "text": "短句。第二句！"},
         )
         assert imported.status_code == 200
-        assert client.get(f"/api/v1/books/{project.id}").json()["writingStyle"]
+        assert imported.json()["storyBibleDrafted"] == ["voice"]
+        style_book = client.get(f"/api/v1/books/{project.id}").json()
+        assert style_book["writingStyle"] in (None, "")
+        assert style_book["writingStyleDraft"] == imported.json()["writingStyle"]
+        assert style_book["styleProfileDraft"]["sourceName"] == "sample"
 
         wizard = client.get(f"/api/v1/books/{project.id}/wizard/state")
         assert wizard.status_code == 200
@@ -168,6 +172,58 @@ def test_studio_parity_surfaces_are_real_and_persisted(tmp_path, monkeypatch):
         )
         assert fanfic.status_code == 200
         assert task_type(fanfic.json()["taskId"]) == "world-bootstrap"
+        fanfic_id = fanfic.json()["bookId"]
+        fanfic_row = db.fetchone(
+            "SELECT author_intent FROM projects WHERE id=?", (fanfic_id,)
+        )
+        assert fanfic_row is not None
+        assert fanfic_row["author_intent"] in (None, "")
+        fanfic_source = db.fetchone(
+            "SELECT source_type, content FROM planning_sources WHERE project_id=?",
+            (fanfic_id,),
+        )
+        assert fanfic_source is not None
+        assert fanfic_source["source_type"] == "reference"
+        assert fanfic_source["content"] == "Canon material"
+        fanfic_bible = StoryBibleRepository(db).get(fanfic_id)
+        assert fanfic_bible is not None
+        intent_step = next(item for item in fanfic_bible["steps"] if item["step_key"] == "intent")
+        assert intent_step["draft"] == "fanfic:canon\nCanon material"
+
+        spinoff = client.post(
+            "/api/v1/spinoff/init",
+            json={
+                "title": "Parity spinoff",
+                "parentBookId": project.id,
+                "direction": "follow the unresolved harbor mystery",
+            },
+        )
+        assert spinoff.status_code == 200
+        spinoff_id = spinoff.json()["bookId"]
+        spinoff_intent = StoryBibleRepository(db).get(spinoff_id)
+        assert spinoff_intent is not None
+        assert next(item for item in spinoff_intent["steps"] if item["step_key"] == "intent")["draft"] == (
+            f"spinoff of {project.name}\nfollow the unresolved harbor mystery"
+        )
+        assert db.fetchone(
+            "SELECT 1 FROM planning_sources WHERE project_id=? AND metadata LIKE '%parentProjectId%'",
+            (spinoff_id,),
+        ) is not None
+
+        imitation = client.post(
+            "/api/v1/imitation/init",
+            json={
+                "title": "Parity imitation",
+                "referenceText": "A short stylistic reference.",
+                "storyIdea": "A new story about a lighthouse keeper.",
+            },
+        )
+        assert imitation.status_code == 200
+        imitation_id = imitation.json()["bookId"]
+        assert db.fetchone(
+            "SELECT 1 FROM planning_sources WHERE project_id=? AND source_type='reference'",
+            (imitation_id,),
+        ) is not None
 
         graph = {
             "projectId": project.id,

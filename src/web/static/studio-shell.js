@@ -224,7 +224,13 @@
   }
 
   function routePath(meta) {
-    if (!meta || meta.id === 'dashboard' || !S.book) return '/';
+    if (!meta || meta.id === 'dashboard') return '/';
+    // Runtime onboarding is a global setup surface, not a fake project whose
+    // id happens to be "more".  Give it a stable deep link so first-use
+    // navigation does not pollute the active-book state or query a project
+    // that does not exist.
+    if (meta.id === 'more' && meta.page === 'agent-config' && !S.book) return '/runtime';
+    if (!S.book) return '/';
     const book = encodeURIComponent(S.book);
     if (meta.id === 'overview') return `/project/${book}`;
     if (meta.id === 'more') return `/project/${book}/more/${encodeURIComponent(meta.morePage || meta.page)}`;
@@ -235,12 +241,19 @@
     const parts = window.location.pathname.split('/').filter(Boolean).map((part) => {
       try { return decodeURIComponent(part); } catch (_) { return part; }
     });
+    if (parts.length === 1 && (parts[0] === 'runtime' || parts[0] === 'agent-config')) {
+      return { bookId: null, meta: { id: 'more', page: 'agent-config', morePage: 'agent-config' } };
+    }
     if (parts[0] !== 'project' || !parts[1]) return null;
     const bookId = parts[1];
     if (!parts[2]) return { bookId, meta: { id: 'overview', page: 'book' } };
     if (parts[2] === 'more') {
       const morePage = parts[3] || 'tasks';
-      return { bookId, meta: resolveRoute(morePage) || { id: 'more', page: morePage, morePage } };
+      const meta = resolveRoute(morePage) || { id: 'more', page: morePage, morePage };
+      if (bookId === 'more' && morePage === 'agent-config') {
+        return { bookId: null, meta };
+      }
+      return { bookId, meta };
     }
     return { bookId, meta: resolveRoute(parts[2]) || { id: 'overview', page: 'book' } };
   }
@@ -300,7 +313,10 @@
   function navigate(route, options = {}) {
     const meta = typeof route === 'string' ? resolveRoute(route) : route;
     if (!meta) return legacyGo(route);
-    if (meta.id !== 'dashboard' && !S.book) {
+    // Runtime configuration is a global setup surface: first-use onboarding
+    // must remain reachable before an author has opened or created a book.
+    const globalSetup = meta.id === 'more' && meta.page === 'agent-config';
+    if (meta.id !== 'dashboard' && !S.book && !globalSetup) {
       return legacyGo('dashboard');
     }
 

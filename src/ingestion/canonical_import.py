@@ -10,6 +10,7 @@ from typing import Any, Iterable, Mapping, Optional
 from src.core.database import Database, generate_id
 from src.core.narrative_events import CANONICAL_IMPORT_ACCEPTED, append_event
 from src.core.story_repository import StoryRepository
+from src.runtime.approvals import is_author_approval_actor
 
 
 class CanonicalImportError(ValueError):
@@ -173,6 +174,7 @@ class CanonicalImportService:
         item_ids: Optional[Iterable[str]] = None,
         actor_id: str = "author",
         review_ids: Optional[Mapping[str, str]] = None,
+        author_confirmed: bool = False,
     ) -> dict[str, Any]:
         record = self.get(import_id)
         if record is None:
@@ -188,6 +190,16 @@ class CanonicalImportService:
                 result = dict(record)
                 result["reviewRequired"] = True
                 return result
+            if author_confirmed is not True:
+                raise CanonicalImportError(
+                    "IMPORT_AUTHOR_CONFIRMATION_REQUIRED",
+                    "author confirmation is required before imported StoryCommits enter Canon",
+                )
+            if not is_author_approval_actor(actor_id):
+                raise CanonicalImportError(
+                    "IMPORT_AUTHOR_ACTOR_REQUIRED",
+                    "canonical import acceptance requires an author-facing Host actor",
+                )
             return self._finalize_pending_commits(record, pending_commits, review_map, actor_id)
 
         selected = {str(item) for item in item_ids} if item_ids is not None else None

@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.core.database import Database
+from src.core.project import ProjectManager
 from src.core.story_repository import StoryRepository
 from src.core.task_runtime import TaskRuntime
 from src.integrations import ExtensionConfigurationError, MCPServerRepository, SkillRepository
@@ -18,6 +19,8 @@ from src.llm.model_runtime import (
     PersistentModelRuntime,
     PersistentMultiModelManager,
 )
+from src.planning.story_bible import StoryBibleRepository
+from src.runtime.studio_chat import StudioChatService
 
 
 def test_routes_support_multiple_accounts_and_editable_system_prompts(tmp_path, monkeypatch):
@@ -217,27 +220,111 @@ def test_thought_chat_claims_planner_route_and_completes_durable_task(tmp_path, 
     monkeypatch.setattr(studio, "story_repository", StoryRepository(db))
     monkeypatch.setattr(studio, "task_runtime", TaskRuntime(db))
     monkeypatch.setattr(studio, "skill_repository", SkillRepository(db))
-    seen_roles = []
-
-    class Client:
-        def chat(self, **_kwargs):
-            return LLMResponse(content="规划师提问", model="fake-planner", tokens_used=1)
+    chat_calls: list[dict] = []
 
     class Manager:
         @contextmanager
         def task_scope(self, _task_id):
             yield
 
-        def get_client(self, role):
-            seen_roles.append(role)
-            return Client()
+        def chat(self, *, messages, system, task_type=None, **_kwargs):
+            chat_calls.append({
+                "messages": messages,
+                "system": system,
+                "task_type": task_type,
+                "context_manifest": _kwargs.get("context_manifest"),
+            })
+            return LLMResponse(content="规划师提问", model="fake-planner", tokens_used=1)
 
     monkeypatch.setattr(studio, "model_mgr", Manager())
     client = TestClient(studio.app)
     response = client.post("/api/v1/chat", json={"message": "一个关于记忆的念头", "mode": "thought"})
     assert response.status_code == 200
     assert response.json()["reply"] == "规划师提问"
-    assert seen_roles == ["planner"]
+    # The endpoint routes thought mode through the durable task-type seam; the
+    # model manager resolves that task type to the planner role.
+    assert [call["task_type"] for call in chat_calls] == ["thought-clarify"]
+    assert chat_calls[0]["context_manifest"]["chapterIntent"]["mode"] == "thought"
+    assert chat_calls[0]["context_manifest"]["provenance"]["contextAuthority"] == "studio-chat-host"
+    assert PersistentMultiModelManager._task_roles["thought-clarify"] == "planner"
     task = TaskRuntime(db).get(response.json()["taskId"])
     assert task is not None
     assert task["status"] == "completed"
+    assert task["result"]["content"] == "规划师提问"
+
+    retried = client.post(
+        "/api/v1/chat",
+        json={
+            "message": "一个关于记忆的念头",
+            "mode": "thought",
+            "sessionId": response.json()["sessionId"],
+        },
+    )
+    assert retried.status_code == 200
+    assert retried.json()["taskId"] == response.json()["taskId"]
+    assert len(chat_calls) == 1
+    session = client.get(
+        f"/api/v1/chat/sessions/{response.json()['sessionId']}"
+    )
+    assert len(session.json()["messages"]) == 2
+
+
+def test_studio_chat_host_prepares_traceable_context_and_preserves_task_scope(tmp_path):
+    db = Database(str(tmp_path / "studio-chat.db"))
+    repository = StoryRepository(db)
+    manager = ProjectManager(str(tmp_path), repository=repository)
+    project = manager.create_project("Host Chat", "science-fiction")
+    project.author_intent = "让每次选择都付出可见代价。"
+    project.writing_style = "克制、具体、少形容词。"
+    manager.save_project(project)
+    book = repository.book_for_project(project.id)
+    assert book is not None
+
+    service = StudioChatService(
+        project_loader=manager.load_project,
+        skill_loader=lambda _skill_ids, *, project_id=None: [
+            {"name": "Continuity", "instructions": "保持时间线一致。"}
+        ],
+        story_repository=repository,
+        story_bible_repository=StoryBibleRepository(db),
+    )
+    preparation = service.prepare(book_id=project.id, mode="short", skill_ids=["continuity"])
+
+    assert preparation.role == "writer"
+    assert preparation.task_type == "chat"
+    assert "Host Chat" in preparation.system_prompt
+    assert "保持时间线一致。" in preparation.system_prompt
+    assert preparation.context_manifest["bookId"] == book["id"]
+    assert preparation.context_manifest["authorIntent"]["content"] == project.author_intent
+    assert preparation.context_manifest["storyBible"]["status"] == "unpublished"
+    assert preparation.context_manifest["memoryEvidence"] == []
+    assert preparation.context_manifest["provenance"]["contextAuthority"] == "studio-chat-host"
+
+    calls: list[dict] = []
+
+    class RuntimeManager:
+        @contextmanager
+        def task_scope(self, task_id):
+            calls.append({"scope": task_id})
+            yield
+
+        def chat(self, *, messages, system, task_type, context_manifest, max_tokens):
+            calls.append({
+                "messages": messages,
+                "system": system,
+                "task_type": task_type,
+                "context_manifest": context_manifest,
+                "max_tokens": max_tokens,
+            })
+            return LLMResponse(content="host response", model="host-model")
+
+    service.model_manager = RuntimeManager()
+    response = service.invoke(
+        task_id="durable-chat-task",
+        preparation=preparation,
+        messages=[{"role": "user", "content": "开始"}],
+    )
+    assert response.content == "host response"
+    assert calls[0] == {"scope": "durable-chat-task"}
+    assert calls[1]["task_type"] == "chat"
+    assert calls[1]["context_manifest"]["bookId"] == book["id"]

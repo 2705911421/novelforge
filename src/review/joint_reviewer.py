@@ -56,6 +56,10 @@ class JointReviewer:
         system = "你是一位资深的小说总编辑，负责确保长篇小说的整体质量与一致性。"
 
         response = client.chat_json(messages, system)
+        if not isinstance(response, dict):
+            raise ValueError("JOINT_REVIEW_OUTPUT_INVALID: expected a JSON object")
+        if "error" in response:
+            raise ValueError("JOINT_REVIEW_OUTPUT_INVALID: model returned invalid JSON")
 
         # 解析结果
         review = JointReview(

@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.core.database import Database, MigrationError, SCHEMA_SQL
 from src.core.legacy_migration import LegacyMigrationError, LegacyMigrationService
-from src.core.project import ProjectManager
+from src.core.project import LegacyProjectWriteError, ProjectManager
 from src.core.story_repository import ChapterStateError, StoryRepository
 from src.core.task_runtime import TaskFailure, TaskRuntime, TaskStateError
 from src.core.task_worker import PersistentTaskWorker
@@ -65,7 +65,12 @@ def _legacy_project(root, project_id="legacy", content="Markdown body"):
 
 
 def test_migration_engine_records_versions_and_rejects_checksum_tampering(phase_db):
-    assert phase_db.fetchone("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 46
+    assert phase_db.fetchone("SELECT MAX(version) AS version FROM schema_migrations")["version"] == 53
+    task_columns = {
+        row["name"] for row in phase_db.fetchall("PRAGMA table_info(tasks)")
+    }
+    assert {"workflow_state", "workflow_state_updated_at"}.issubset(task_columns)
+    assert phase_db.table_exists("agent_proposals")
     with phase_db.transaction() as conn:
         conn.execute("UPDATE schema_migrations SET checksum='tampered' WHERE version=2")
     with pytest.raises(MigrationError, match="checksum mismatch"):
@@ -319,6 +324,8 @@ def test_cli_generation_commands_enqueue_tasks_for_the_separate_worker(tmp_path)
     assert {task["type"] for task in queued} == {"world-bootstrap", "write-next", "continuous"}
     assert all(task["status"] == "queued" for task in queued)
     assert all(task["book_id"] == book["id"] for task in queued)
+    assert database.count("control_commands", "name='task.enqueue'") == 3
+    assert database.count("control_command_queue") == 0
 
 
 def test_explicit_legacy_migration_backups_preserves_db_only_and_imports_memory(tmp_path, phase_db):
@@ -335,6 +342,104 @@ def test_explicit_legacy_migration_backups_preserves_db_only_and_imports_memory(
     assert phase_db.get_by_id("projects", "db-only")["migration_status"] == "unmanaged"
     assert phase_db.count("story_facts", "source = 'legacy'") == 1
     assert service.migrate("legacy", plan["fingerprint"])["idempotent"] is True
+
+
+def test_unmigrated_file_project_is_read_only_until_explicit_development_opt_in(tmp_path, phase_db, monkeypatch):
+    project_dir = _legacy_project(tmp_path)
+    manager = ProjectManager(tmp_path, repository=StoryRepository(phase_db))
+    project = manager.load_project("legacy")
+    assert project is not None
+    original_project = (project_dir / "project.json").read_text(encoding="utf-8")
+
+    monkeypatch.delenv("NOVELFORGE_ENABLE_LEGACY_PROJECT_WRITES", raising=False)
+    monkeypatch.delenv("NOVELFORGE_ENABLE_LEGACY_CREATION_MODES", raising=False)
+    monkeypatch.setenv("NOVELFORGE_ENV", "development")
+
+    with pytest.raises(LegacyProjectWriteError, match="LEGACY_PROJECT_READ_ONLY"):
+        manager.save_project(project)
+    with pytest.raises(LegacyProjectWriteError, match="LEGACY_PROJECT_READ_ONLY"):
+        manager.save_chapter_content("legacy", 1, "must not replace the legacy body")
+    with pytest.raises(LegacyProjectWriteError, match="LEGACY_PROJECT_READ_ONLY"):
+        manager.save_review("legacy", {"chapter_number": 1, "overall_score": 99})
+    with pytest.raises(LegacyProjectWriteError, match="LEGACY_PROJECT_READ_ONLY"):
+        manager.delete_chapter("legacy", 1)
+    with pytest.raises(LegacyProjectWriteError, match="LEGACY_PROJECT_READ_ONLY"):
+        manager.delete_project("legacy")
+
+    assert (project_dir / "project.json").read_text(encoding="utf-8") == original_project
+    assert (project_dir / "chapters" / "chapter_0001.md").read_text(encoding="utf-8") == "Markdown body"
+    assert project_dir.exists()
+
+
+@pytest.mark.integration
+def test_studio_rejects_mutations_of_unmigrated_file_project(tmp_path, phase_db, monkeypatch):
+    from src.web import studio
+
+    _legacy_project(tmp_path, project_id="api")
+    repository = StoryRepository(phase_db)
+    manager = ProjectManager(tmp_path, repository=repository)
+    monkeypatch.setenv("NOVELFORGE_DISABLE_STUDIO_WORKER", "1")
+    monkeypatch.setattr(studio, "story_repository", repository)
+    monkeypatch.setattr(studio, "project_mgr", manager)
+
+    with TestClient(studio.app) as client:
+        workflow = client.get("/api/v1/books/api/creation-workflow")
+        assert workflow.status_code == 200
+        assert workflow.json()["legacyProject"] is True
+        assert workflow.json()["workflow"] is None
+
+        story_bible = client.get("/api/v1/books/api/story-bible")
+        assert story_bible.status_code == 200
+        assert story_bible.json()["legacyProject"] is True
+        assert story_bible.json()["steps"] == []
+
+        wizard = client.get("/api/v1/books/api/wizard/state")
+        assert wizard.status_code == 200
+        assert wizard.json()["legacyProject"] is True
+
+        views = client.get("/api/v1/books/api/planning-views")
+        assert views.status_code == 200
+        assert views.json()["legacyProject"] is True
+
+        session_read = client.get(
+            "/api/v1/chat/sessions/legacy-session?bookId=api"
+        )
+        assert session_read.status_code == 200
+        assert session_read.json()["messages"] == []
+        assert not (tmp_path / "projects" / "api" / "studio" / "sessions").exists()
+
+        chat = client.post(
+            "/api/v1/chat",
+            json={"bookId": "api", "message": "must stay read-only"},
+        )
+        assert chat.status_code == 409
+        assert chat.json()["detail"]["code"] == "LEGACY_PROJECT_READ_ONLY"
+
+        for response in (
+            client.put("/api/v1/books/api", json={"title": "must stay unchanged"}),
+            client.put("/api/v1/books/api/chapters/1", json={"content": "must stay unchanged"}),
+            client.delete("/api/v1/books/api/chapters/1"),
+            client.delete("/api/v1/books/api"),
+            client.post(
+                "/api/v1/books/api/story-graph/planning/node",
+                json={"title": "must stay unchanged"},
+            ),
+            client.post("/api/v1/books/api/simulation/snapshots"),
+            client.post("/api/v1/books/api/chapters/1/review"),
+            client.post(
+                "/api/v1/books/api/export-save",
+                json={"format": "md", "approvedOnly": False},
+            ),
+        ):
+            assert response.status_code == 409
+            assert response.json()["detail"]["code"] == "LEGACY_PROJECT_READ_ONLY"
+
+    assert not repository.is_authoritative_project("api")
+    assert phase_db.fetchone("SELECT 1 FROM creation_workflows WHERE project_id=?", ("api",)) is None
+    assert phase_db.fetchone(
+        "SELECT 1 FROM story_bible_workspaces WHERE project_id=?", ("api",)
+    ) is None
+    assert (tmp_path / "projects" / "api" / "project.json").exists()
 
 
 def test_legacy_conflicting_bodies_stops_for_author_decision(tmp_path, phase_db):
@@ -431,6 +536,8 @@ def test_legacy_web_routes_enqueue_durable_tasks_without_running_a_worker(tmp_pa
     )
     assert invalid_count.status_code == 422
     assert [task["status"] for task in runtime.list(project_id=project_id)] == ["queued"] * 3
+    assert phase_db.count("control_commands", "name='task.enqueue'") == 3
+    assert phase_db.count("control_command_queue") == 0
 
 
 @pytest.mark.integration
@@ -466,6 +573,13 @@ def test_legacy_task_controls_share_the_durable_state_machine(tmp_path, phase_db
     final_task = runtime.get(task["id"])
     assert final_task is not None
     assert final_task["status"] == "cancelled"
+    control_rows = phase_db.fetchall(
+        "SELECT name, actor FROM control_commands WHERE name LIKE 'task.%' ORDER BY created_at"
+    )
+    assert [row["name"] for row in control_rows] == [
+        "task.pause", "task.resume", "task.cancel",
+    ]
+    assert {row["actor"] for row in control_rows} == {"studio"}
 
     missing = client.post("/api/tasks/missing-task/cancel")
     assert missing.status_code == 404
@@ -505,6 +619,23 @@ def test_legacy_web_auth_matches_studio_fail_closed_boundary(monkeypatch):
     monkeypatch.setattr(legacy_web, "_NOVELFORGE_API_KEY", "test-secret")
     assert dispatch(query_string=b"api_key=test-secret").status_code == 401
     assert dispatch(headers=[(b"authorization", b"Bearer test-secret")]).status_code == 200
+
+
+def test_legacy_model_runtime_startup_failure_fails_closed(monkeypatch):
+    from fastapi import HTTPException
+
+    legacy_web = importlib.import_module("src.web.app")
+    monkeypatch.setattr(legacy_web, "model_runtime", None)
+    monkeypatch.setattr(legacy_web, "_model_runtime_error", "RuntimeError: startup failure")
+
+    with pytest.raises(HTTPException) as raised:
+        legacy_web._require_model_runtime()
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail == {
+        "code": "MODEL_RUNTIME_UNAVAILABLE",
+        "message": "Model runtime is unavailable; inspect server logs for the startup failure.",
+    }
 
 
 def test_studio_web_auth_exposes_only_minimal_liveness_without_a_key(monkeypatch):

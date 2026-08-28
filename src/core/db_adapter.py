@@ -154,8 +154,16 @@ class DatabaseAdapter:
             try:
                 world_data = json.loads(project_row['world_setting'])
                 project.world = WorldSetting(**world_data)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                pass
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                # Keep the legacy read model usable, but make malformed
+                # persisted metadata observable instead of silently dropping
+                # the world setting.
+                logger.warning(
+                    "could not decode persisted world_setting for project %s: %s",
+                    project_id,
+                    exc,
+                    exc_info=exc,
+                )
         
         return project
     

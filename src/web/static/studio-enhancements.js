@@ -45,7 +45,7 @@
     if (!target) return;
     if (window.modelWork && task?.id) window.modelWork.attachTask(task.id, label || task?.displayName || task?.type, task);
     target.innerHTML = `<div class="card"><div class="row"><b>${esc(label || task?.type || '任务')}</b><span class="spacer"></span>${statusBadge(task?.status)}</div>
-      <p class="dim-note mt8">阶段：${esc(typeof taskStageLabel === 'function' ? taskStageLabel(task?.stage, task?.status) : (task?.stage || 'queued'))} · ${esc(taskError(task))}</p>
+      <p class="dim-note mt8">阶段：${esc(typeof taskStageLabel === 'function' ? taskStageLabel(task?.stage, task?.status, task?.workflowState) : (task?.stage || 'queued'))} · ${esc(taskError(task))}</p>
       ${window.modelWork ? window.modelWork.renderInline(task, label || task?.displayName || task?.type, { compact: true }) : `<div class="progress mt8"><div class="progress-bar" style="width:${Math.max(0, Math.min(100, Number(task?.progressPercent ?? task?.progress) || 0))}%"></div></div>`}
       ${task?.result ? (typeof readableTaskResult === 'function' ? readableTaskResult(task.result, '执行结果') : `<details class="mt8"><summary>执行结果</summary><p class="text-sm" style="white-space:pre-wrap;margin-top:8px">${esc(taskValueText(task.result))}</p></details>`) : ''}
     </div>`;
@@ -612,7 +612,32 @@
   }
   async function savePlotDelta(delta) {
     try {
-      const data = await api('POST', `/books/${S.book}/plot-canvas/delta`, { delta, expectedRevision: plotState.revision });
+      const preview = await api('POST', `/books/${S.book}/story-graph/planning/preview`, {
+        delta,
+        expectedRevision: plotState.revision,
+      });
+      const diff = preview.previewDiff || {};
+      const nodeCounts = diff.nodes?.counts || {};
+      const edgeCounts = diff.edges?.counts || {};
+      if (!diff.hasChanges) {
+        toast('这次规划变更没有产生差异，未创建新的 revision。', '');
+        return;
+      }
+      const approved = window.confirm(
+        `确认写入 StoryFlow planning overlay？\n` +
+        `节点：新增 ${nodeCounts.added || 0}、修改 ${nodeCounts.changed || 0}、移除 ${nodeCounts.removed || 0}\n` +
+        `关系：新增 ${edgeCounts.added || 0}、修改 ${edgeCounts.changed || 0}、移除 ${edgeCounts.removed || 0}\n` +
+        `这不会写入 Canon。`
+      );
+      if (!approved) {
+        toast('已取消，规划 overlay 未改变。', '');
+        return;
+      }
+      const data = await api('POST', `/books/${S.book}/plot-canvas/delta`, {
+        delta,
+        proposalId: preview.proposal?.proposalId,
+        expectedRevision: plotState.revision,
+      });
       plotState.graph = data.graph; plotState.revision = data.revision; drawPlotGraph(); renderPlotInspector();
     } catch (error) {
       await reloadPlotCanvas().catch(() => {}); drawPlotGraph(); renderPlotInspector();
@@ -847,14 +872,14 @@
     const synthesis = planning.summary || {};
     const synthesizedStyle = synthesis.writing_style || {};
     const synthesizedStyleText = synthesizedStyle.summary || [synthesizedStyle.voice, synthesizedStyle.pov, synthesizedStyle.rhythm].filter(Boolean).join('；');
-    const styleText = synthesizedStyleText || '尚未形成文风摘要。完成“规划资料理解”后，AI 会把上传资料提炼成可执行的写作约束。';
-    const intentText = synthesis.author_intent || '尚未形成作者意图摘要。你可以在这里补充作品希望读者感受到什么。';
+    const styleText = synthesizedStyleText || book.writingStyleDraft || book.writingStyle || '';
+    const intentText = synthesis.author_intent || book.authorIntentDraft || book.authorIntent || '';
     const planningLabel = planning.status === 'ready' ? 'AI 已完成资料理解' : planning.status === 'needs_review' ? '资料理解完成，等待复核' : planning.status === 'running' || planning.status === 'queued' ? '资料理解任务进行中' : '尚未完成资料理解';
     const extensionRows = (extensions.skills || []).map((item) => ({ ...item, extensionType: 'skill', kind: 'Skill' }))
       .concat((extensions.mcpServers || []).map((item) => ({ ...item, extensionType: 'mcp', kind: 'MCP' })));
     const extensionHtml = extensionRows.map((item) => '<div class="list-row"><div><b>' + esc(item.name) + '</b><div class="dim-note">' + esc(item.kind) + ' · ' + esc(item.description || item.transport || '全局配置') + '</div></div><span class="spacer"></span>' + projectExtensionScope(item) + '</div>').join('') || '<p class="dim-note">还没有全局 Skill 或 MCP。请先进入“模型 / Skill / MCP”进行配置。</p>';
     p.innerHTML = header('作品设置', esc(book.title || S.book), '<button class="btn btn-primary" onclick="saveProjectSettings()">保存作品设置</button>') +
-      '<div class="content"><div class="info-banner" style="max-width:840px"><b>' + esc(planningLabel) + '：</b><span>这里展示 AI 理解后的文风和作者意图摘要，不会把上传文件原文直接塞进表单。需要保留未整理资料时，系统仍会在后台留存来源。</span></div><div class="card" style="max-width:840px"><div class="grid grid-3"><label class="fld">标题<input class="input" id="project-setting-title" value="' + escAttr(book.title || '') + '"></label><label class="fld">题材<input class="input" id="project-setting-genre" value="' + escAttr(book.genre || '') + '"></label><label class="fld">目标卷数<input class="input" id="project-setting-volumes" type="number" min="1" value="' + escAttr(book.targetVolumes || 5) + '"></label></div><input type="hidden" id="project-setting-style-source" value="' + escAttr(book.writingStyle || '') + '"><input type="hidden" id="project-setting-intent-source" value="' + escAttr(book.authorIntent || '') + '"><label class="fld">AI 理解后的写作风格摘要<textarea class="input textarea" id="project-setting-style" placeholder="例如：冷静克制的近距离第三人称，情绪通过动作和物件呈现…">' + esc(styleText) + '</textarea></label><label class="fld">作者意图摘要<textarea class="input textarea" id="project-setting-intent" placeholder="这部作品想让读者持续追问什么？">' + esc(intentText) + '</textarea></label><details class="mt8"><summary>高级：结构化文风配置（可选）</summary><p class="dim-note mt8">供熟悉 JSON 的作者微调；普通创作不需要编辑这里。</p><textarea class="input textarea mono mt8" id="project-setting-style-profile" style="min-height:220px">' + esc(JSON.stringify(book.styleProfile || {}, null, 2)) + '</textarea></details><p class="dim-note">写作、审查和剧情推演会读取上面的摘要与结构化约束。</p></div><div class="card"><div class="card-title-row"><div><h3>本作品可用的 Skill / MCP</h3><p class="dim-note">它们在“全局 AI 配置”中只需定义一次；这里仅决定本作品是否启用。跟随全局表示使用全局默认状态。</p></div><button class="btn btn-primary" onclick="saveProjectExtensionOverrides()">保存本作品开关</button></div>' + extensionHtml + '<div class="warn-banner" style="margin-top:12px">Skill 当前会作为 AI 对话和 Agent 的额外指令使用；MCP 当前保存并校验连接定义，真实 MCP 握手/工具调用尚未接入。</div></div></div>';
+      '<div class="content"><div class="info-banner" style="max-width:840px"><b>' + esc(planningLabel) + '：</b><span>这里展示 AI 理解后的文风和作者意图摘要，不会把上传文件原文直接塞进表单。需要保留未整理资料时，系统仍会在后台留存来源。作者修改的规划字段会保存为 Story Bible 草稿，发布前不会改变 Canon。</span></div><div class="card" style="max-width:840px"><div class="grid grid-3"><label class="fld">标题<input class="input" id="project-setting-title" value="' + escAttr(book.title || '') + '"></label><label class="fld">题材<input class="input" id="project-setting-genre" value="' + escAttr(book.genre || '') + '"></label><label class="fld">目标卷数<input class="input" id="project-setting-volumes" type="number" min="1" value="' + escAttr(book.targetVolumes || 5) + '"></label></div><input type="hidden" id="project-setting-style-source" value="' + escAttr(book.writingStyleDraft || book.writingStyle || '') + '"><input type="hidden" id="project-setting-intent-source" value="' + escAttr(book.authorIntentDraft || book.authorIntent || '') + '"><label class="fld">AI 理解后的写作风格摘要<textarea class="input textarea" id="project-setting-style" placeholder="例如：冷静克制的近距离第三人称，情绪通过动作和物件呈现…">' + esc(styleText) + '</textarea></label><label class="fld">作者意图摘要<textarea class="input textarea" id="project-setting-intent" placeholder="这部作品想让读者持续追问什么？">' + esc(intentText) + '</textarea></label><details class="mt8"><summary>高级：结构化文风配置（可选）</summary><p class="dim-note mt8">供熟悉 JSON 的作者微调；普通创作不需要编辑这里。</p><textarea class="input textarea mono mt8" id="project-setting-style-profile" style="min-height:220px">' + esc(JSON.stringify(book.styleProfileDraft || book.styleProfile || {}, null, 2)) + '</textarea></details><p class="dim-note">写作、审查和剧情推演会读取上面的摘要与结构化约束。</p></div><div class="card"><div class="card-title-row"><div><h3>本作品可用的 Skill / MCP</h3><p class="dim-note">它们在“全局 AI 配置”中只需定义一次；这里仅决定本作品是否启用。跟随全局表示使用全局默认状态。</p></div><button class="btn btn-primary" onclick="saveProjectExtensionOverrides()">保存本作品开关</button></div>' + extensionHtml + '<div class="warn-banner" style="margin-top:12px">Skill 当前会作为 AI 对话和 Agent 的额外指令使用；MCP 当前保存并校验连接定义，真实 MCP 握手/工具调用尚未接入。</div></div></div>';
   };
 
   const readableProjectSettingsPage = PAGES['project-settings'];
@@ -1360,6 +1385,65 @@
     p.innerHTML = header('Studio 扩展', '按“用途、作用范围、当前能力”整理入口；看到“可用”即可直接操作，MCP 的未接入部分会在页面明确说明。', '') + '<div class="content"><div class="warn-banner">全局 AI 配置只需要设置一次。选中某部作品后，在“作品设置”里可以单独启用、停用或恢复 Skill / MCP 的全局默认。</div><div class="grid grid-3">' + cards + '</div></div>';
   };
   const extensionState = { config: null, skills: [], mcpServers: [] };
+  const runtimeInstallationAction = (runtime) => {
+    const state = runtime?.installation?.state || '';
+    return state === 'not_installed' ? 'install' : 'reconnect';
+  };
+  const runtimeOnboardingCard = (registryState, capabilityState) => {
+    const runtimes = Array.isArray(registryState?.runtimes) ? registryState.runtimes : [];
+    const capabilities = new Map(
+      (Array.isArray(capabilityState?.runtimes) ? capabilityState.runtimes : [])
+        .map((item) => [item.runtimeType, item]),
+    );
+    const ready = runtimes.some((item) => {
+      const runtimeType = item?.manifest?.runtimeType;
+      return item?.installation?.state === 'ready' || capabilities.get(runtimeType)?.health === 'ready';
+    });
+    if (ready) return '';
+    const byType = new Map(runtimes.map((item) => [item?.manifest?.runtimeType, item]));
+    const status = (runtimeType) => byType.get(runtimeType)?.installation?.state || 'not observed';
+    const codex = byType.get('codex-app-server');
+    const codexAction = runtimeInstallationAction(codex);
+    const statusText = (runtimeType) => esc(status(runtimeType));
+    return '<div class="card runtime-onboarding" data-runtime-onboarding="true">' +
+      '<div class="card-title-row"><div><div class="wizard-kicker">Welcome to NovelForge</div><h2>Choose Intelligence Runtime</h2><p class="dim-note">NovelForge 保留作品、任务和 Canon 的控制权；Runtime 只是可替换的智能执行器。先选择一个可用入口，之后仍可在高级设置中切换。</p></div><span class="badge badge-info">首次使用</span></div>' +
+      '<div class="card runtime-onboarding-recommended"><div class="card-title-row"><div><span class="badge badge-success">Recommended</span><h3 class="mt8">Codex</h3><p class="dim-note">Use your ChatGPT account · No API key required</p><p class="text-sm mt8">通过官方 App Server 认证；当前状态：' + statusText('codex-app-server') + '</p></div><button class="btn btn-primary" onclick="runtimeOnboardingAction(\'codex-app-server\',\'' + codexAction + '\')">Continue with ChatGPT</button></div></div>' +
+      '<div class="grid grid-2 mt16"><div><h3>Other runtimes</h3><div class="row row-wrap mt8">' +
+        '<button class="btn btn-secondary" onclick="runtimeOnboardingAction(\'claude-code\',\'' + runtimeInstallationAction(byType.get('claude-code')) + '\')">Claude Code · ' + statusText('claude-code') + '</button>' +
+        '<button class="btn btn-secondary" onclick="runtimeOnboardingAction(\'gemini-cli\',\'' + runtimeInstallationAction(byType.get('gemini-cli')) + '\')">Gemini CLI · ' + statusText('gemini-cli') + '</button>' +
+        '<button class="btn btn-secondary" onclick="runtimeOnboardingAction(\'local-runtime\',\'' + runtimeInstallationAction(byType.get('local-runtime')) + '\')">Local · ' + statusText('local-runtime') + '</button>' +
+        '<button class="btn btn-secondary" onclick="runtimeOpenApiSetup()">OpenAI API · 配置</button>' +
+      '</div></div><div><h3>下一步</h3><ol class="provider-guide-steps mt8"><li>选择 Runtime 或配置 API Provider。</li><li>完成官方认证 / 连接检查。</li><li>看到 Ready 后开始创作。</li></ol><p class="dim-note">安装、认证和能力探测由 Runtime Plane 负责；未 Ready 的 Runtime 不会被 Scheduler 静默使用。</p></div></div>' +
+      '</div>';
+  };
+  const runtimeDashboardSetupCard = (registryState) => {
+    const runtimes = Array.isArray(registryState?.runtimes) ? registryState.runtimes : [];
+    if (runtimes.some((item) => item?.installation?.state === 'ready')) return '';
+    const observed = runtimes
+      .map((item) => item?.manifest?.displayName || item?.manifest?.runtimeType)
+      .filter(Boolean)
+      .slice(0, 4)
+      .join(' · ');
+    return '<div class="card runtime-first-use" data-runtime-first-use="true"><div class="card-title-row"><div><div class="wizard-kicker">Welcome to NovelForge</div><h2>先选择你的 Intelligence Runtime</h2><p class="dim-note">选择 Codex、API、Claude、Gemini 或 Local 后再开始创作。作品和 Canon 始终由 NovelForge 管理，Runtime 未 Ready 时不会被当作可用引擎。</p>' +
+      (observed ? '<p class="text-sm mt8">已发现：' + esc(observed) + '</p>' : '') +
+      '</div><button class="btn btn-primary" onclick="go(\'agent-config\')">选择 AI Runtime</button></div></div>';
+  };
+  const legacyDashboardPage = PAGES.dashboard;
+  PAGES.dashboard = async (p) => {
+    await legacyDashboardPage(p);
+    try {
+      const registryState = await api('GET', '/runtime/registry');
+      const markup = runtimeDashboardSetupCard(registryState);
+      const content = p.querySelector('.content');
+      if (!markup || !content || content.querySelector('[data-runtime-first-use]')) return;
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = markup;
+      if (wrapper.firstElementChild) content.prepend(wrapper.firstElementChild);
+    } catch (_) {
+      // Runtime setup is an additive dashboard hint; the health/error page is
+      // still rendered by the base Dashboard when the registry is unavailable.
+    }
+  };
   // The provider table uses a unique display name.  Keep preset-based setup
   // convenient when the author adds two accounts from the same vendor.
   const originalAddProviderPreset = window.addProviderPreset;
@@ -1814,14 +1898,22 @@
         gate.innerHTML = '<div class="planning-gate-content"><b>开始前请先配置 LLM 供应商</b><span>' + esc(preflight.modelReadiness?.message || '三种创作入口都必须先接入可用的模型。') + '</span><span class="dim-note">缺少路由：' + esc((preflight.modelReadiness?.missingRoles || []).join('、') || '供应商 / 模型') + '</span><div class="planning-gate-actions"><button class="btn btn-sm btn-primary" onclick="go(\'agent-config\')">打开 AI 配置</button></div></div>';
         content?.prepend(gate);
       }
-    } catch (_) {}
+    } catch (error) {
+      const content = p.querySelector('.content');
+      const gate = document.createElement('div');
+      gate.className = 'warn-banner planning-gate mb16';
+      gate.innerHTML = '<div class="planning-gate-content"><b>无法确认 AI Runtime 状态</b><span>' + esc(error?.message || '创作前置检查失败，请先打开 AI 配置确认 Runtime。') + '</span><div class="planning-gate-actions"><button class="btn btn-sm btn-primary" onclick="go(\'agent-config\')">打开 AI 配置</button></div></div>';
+      content?.prepend(gate);
+    }
     const field = p.querySelector('#c-genre')?.closest('.field');
     if (!field) return;
     let genres = [];
     try {
       const result = await api('GET', '/genres');
       genres = result.genres || [];
-    } catch (_) {}
+    } catch (error) {
+      toast('题材列表读取失败：' + (error?.message || '未知错误'), 'error');
+    }
     const current = p.querySelector('#c-genre')?.value || '';
     field.innerHTML = '<label>题材</label><select class="input" id="c-genre-select" onchange="selectCreateGenre(this.value)"><option value="">请选择内置题材</option>' +
       genres.map((genre) => '<option value="' + escAttr(genre.id || genre.key) + '">' + esc(genre.name) + ' · ' + esc((genre.tags || []).slice(0, 3).join(' / ')) + '</option>').join('') +
@@ -1873,26 +1965,54 @@
     runtimeSection.innerHTML = '<div class="loading"><div class="spinner"></div>正在读取 Runtime Plane 状态…</div>';
     content.prepend(runtimeSection);
     try {
-      const [registryState, capabilityState, policyState, toolState] = await Promise.all([
+      const [registryState, capabilityState, policyState, toolState, telemetryState] = await Promise.all([
         api('GET', '/runtime/registry'),
         api('GET', '/runtime/capabilities'),
         api('GET', '/compute/policy'),
         api('GET', '/runtime/tools'),
+        api('GET', '/compute/telemetry'),
       ]);
       const capabilities = Object.fromEntries((capabilityState.runtimes || []).map((item) => [item.runtimeType, item]));
       const runtimeRows = (registryState.runtimes || []).map((item) => {
         const manifest = item.manifest || {};
         const installation = item.installation || {};
         const capability = capabilities[manifest.runtimeType] || {};
-        const action = installation.state === 'not_installed'
-          ? '<button class="btn btn-sm btn-secondary" onclick="runtimePlaneAction(\'' + escAttr(manifest.runtimeType) + '\',\'install\')">安装 / 发现</button>'
-          : '<button class="btn btn-sm btn-ghost" onclick="runtimePlaneAction(\'' + escAttr(manifest.runtimeType) + '\',\'discover\')">重新发现</button>';
-        return '<div class="list-row runtime-row" style="align-items:flex-start"><div><b>' + esc(manifest.displayName || manifest.runtimeType) + '</b><div class="dim-note mt8">' + esc(manifest.protocol || 'unknown') + ' · ' + esc(manifest.acquisition || 'unknown') + (installation.path ? ' · ' + esc(installation.path) : '') + '</div></div><div class="spacer"></div><div style="text-align:right">' + statusBadge(installation.state || 'unknown') + '<div class="dim-note mt8">' + esc((capability.integrationGrade || '—') + ' · ' + (capability.models || []).length + ' models') + '</div>' + action + '</div></div>';
+        const runtimeType = escAttr(manifest.runtimeType);
+        const controls = [];
+        if (installation.state === 'not_installed') {
+          controls.push('<button class="btn btn-sm btn-secondary" onclick="runtimePlaneAction(\'' + runtimeType + '\',\'install\')">安装 / 发现</button>');
+        } else {
+          controls.push('<button class="btn btn-sm btn-ghost" onclick="runtimePlaneAction(\'' + runtimeType + '\',\'discover\')">重新发现</button>');
+          controls.push('<button class="btn btn-sm btn-ghost" onclick="runtimePlaneAction(\'' + runtimeType + '\',\'reconnect\')">重新连接</button>');
+          if (manifest.authentication?.type !== 'local-no-auth') {
+            controls.push('<button class="btn btn-sm btn-ghost" onclick="runtimePlaneAction(\'' + runtimeType + '\',\'reauthenticate\')">重新认证</button>');
+          }
+          if (installation.state === 'broken' || installation.state === 'needs_update') {
+            controls.push('<button class="btn btn-sm btn-ghost" onclick="runtimePlaneAction(\'' + runtimeType + '\',\'repair\')">修复 / 更新</button>');
+          }
+          if (['installed', 'authenticated', 'capability_verified', 'ready', 'needs_update'].includes(installation.state) && manifest.acquisition !== 'builtin' && manifest.acquisition !== 'bundled') {
+            controls.push('<button class="btn btn-sm btn-ghost" onclick="runtimePlaneAction(\'' + runtimeType + '\',\'update\')">更新</button>');
+          }
+          const hasSupervisedUninstall = manifest.acquisition === 'download_binary' || Array.isArray(manifest.installer?.uninstallCommand);
+          if (hasSupervisedUninstall) {
+            controls.push('<button class="btn btn-sm btn-ghost" onclick="runtimePlaneAction(\'' + runtimeType + '\',\'uninstall\')">卸载</button>');
+          }
+        }
+        controls.unshift('<button class="btn btn-sm btn-ghost" onclick="runtimePlaneDiagnostics(\'' + runtimeType + '\')">详情</button>');
+        const action = '<div class="row row-wrap mt8" style="justify-content:flex-end">' + controls.join('') + '</div>';
+        const verification = installation.verified ? ' · 已校验' : '';
+        return '<div class="list-row runtime-row" style="align-items:flex-start"><div><b>' + esc(manifest.displayName || manifest.runtimeType) + '</b><div class="dim-note mt8">' + esc(manifest.protocol || 'unknown') + ' · ' + esc(manifest.acquisition || 'unknown') + ' · source:' + esc(manifest.sourceKind || installation.sourceKind || 'unknown') + verification + (installation.path ? ' · ' + esc(installation.path) : '') + '</div></div><div class="spacer"></div><div style="text-align:right">' + statusBadge(installation.state || 'unknown') + '<div class="dim-note mt8">' + esc((capability.integrationGrade || manifest.integrationGrade || '—') + ' · ' + (capability.models || []).length + ' models') + '</div>' + action + '</div></div>';
       }).join('') || '<p class="dim-note">暂无 Runtime manifest。</p>';
       const toolRows = (toolState.tools || []).map((tool) => '<span class="badge ' + (tool.authority === 'authority' ? 'badge-warning' : tool.authority === 'proposal' ? 'badge-info' : 'badge-muted') + '">' + esc(tool.name) + ' · ' + esc(tool.authority) + '</span>').join('');
-      runtimeSection.innerHTML = '<div class="card-title-row"><div><h2>Runtime Center / Marketplace</h2><p class="dim-note">Runtime、模型、Reasoning 与 NovelForge 领域权限分层；运行时状态来自持久化 Registry，不把 manifest 当作已就绪。</p></div><span class="badge badge-info">Control / Compute / Runtime</span></div>' +
-        '<div class="grid grid-2"><div><h3>Runtime Registry</h3>' + runtimeRows + '</div><div><h3>Compute Policy</h3><div class="kv"><span>Capability</span><b>' + esc(policyState.floor) + ' → ' + esc(policyState.preferred) + ' → ' + esc(policyState.ceiling) + '</b></div><div class="kv"><span>Critical floor</span><b>' + esc(policyState.criticalFloor) + '</b></div><div class="kv"><span>Agent self-escalation</span><b>' + (policyState.allowAgentEscalation ? '允许（需审批）' : '禁止') + '</b></div><div class="kv"><span>Budget</span><b>' + esc(String(policyState.budget?.available ?? '—')) + ' NF_CU available</b></div></div></div>' +
-        '<div class="workspace-section"><b>Tool Gateway catalog</b><div class="row row-wrap mt8">' + (toolRows || '<span class="dim-note">暂无工具</span>') + '</div><p class="dim-note mt8">Authority 工具必须同时满足任务 allowlist、Canon-write 约束、运行时批准和作者确认；Agent 不能直接写 SQLite。</p></div>';
+      const telemetryRows = (telemetryState.summary || []).slice(0, 12).map((item) =>
+        '<div class="list-row"><span>' + esc(item.taskType || 'unknown') + '</span><span>' + esc(item.runtimeType || 'runtime') + ' / ' + esc(item.modelId || 'unknown') + '</span><span class="text-sm text-muted">' + esc(item.reasoning || 'unknown') + ' · runs ' + esc(String(item.runs ?? 0)) + ' · success ' + esc(String(item.successRate ?? 0)) + '</span></div>'
+      ).join('') || '<span class="dim-note">暂无 AgentRun telemetry；完成任务后这里会显示成功率、成本和延迟摘要。</span>';
+      const strategyButtons = (policyState.strategies || []).map((strategy) => '<button class="btn btn-sm ' + (strategy.id === policyState.strategy ? 'btn-primary' : 'btn-ghost') + '" onclick="computePolicySelect(\'' + escAttr(strategy.id) + '\')" title="' + escAttr(strategy.description || '') + '">' + esc(strategy.name || strategy.id) + '</button>').join('');
+       runtimeSection.innerHTML = runtimeOnboardingCard(registryState, capabilityState) +
+         '<div class="card-title-row"><div><h2>Runtime Center / Marketplace</h2><p class="dim-note">Runtime、模型、Reasoning 与 NovelForge 领域权限分层；运行时状态来自持久化 Registry，不把 manifest 当作已就绪。</p></div><div class="row row-wrap"><input class="input" id="runtime-catalog-url" placeholder="https://trusted.example/runtime-catalog.json" style="width:280px"><button class="btn btn-sm btn-secondary" onclick="runtimeCatalogFetch()">导入签名 Catalog</button><span class="badge badge-info">Control / Compute / Runtime</span></div></div>' +
+        '<div class="grid grid-2"><div><h3>Runtime Registry</h3>' + runtimeRows + '</div><div><h3>Compute Strategy · ' + esc(policyState.strategyName || policyState.strategy || '—') + '</h3><div class="row row-wrap mt8">' + strategyButtons + '</div><p class="dim-note mt8">' + esc((policyState.strategies || []).find((item) => item.id === policyState.strategy)?.description || '策略由 Compute Scheduler 执行。') + '</p><div class="kv"><span>Capability</span><b>' + esc(policyState.floor) + ' → ' + esc(policyState.preferred) + ' → ' + esc(policyState.ceiling) + '</b></div><div class="kv"><span>Critical floor</span><b>' + esc(policyState.criticalFloor) + '（所有策略均不可绕过）</b></div><div class="kv"><span>Agent escalation requests</span><b>' + (policyState.allowAgentEscalation ? '允许（需 Host 审批）' : '禁止') + '</b></div><div class="kv"><span>Budget</span><b>' + esc(String(policyState.budget?.available ?? '—')) + ' NF_CU available · ' + esc(policyState.budgetMode || 'hard') + '</b></div><p class="dim-note mt8">角色默认交给 Scheduler：Planner · Writer · Reviewer · Fact Extractor · Image · Embedding · Reranker。</p></div></div>' +
+        '<div class="workspace-section"><b>Tool Gateway catalog</b><div class="row row-wrap mt8">' + (toolRows || '<span class="dim-note">暂无工具</span>') + '</div><p class="dim-note mt8">Authority 工具必须同时满足任务 allowlist、Canon-write 约束、运行时批准和作者确认；Agent 不能直接写 SQLite。</p></div>' +
+        '<div class="workspace-section"><b>Compute telemetry（只读证据）</b><div class="mt8">' + telemetryRows + '</div><p class="dim-note mt8">用于未来自适应调度的历史观察；当前 Scheduler 仍以显式 Policy、Capability 与 Budget 为准。</p></div>';
     } catch (error) {
       runtimeSection.innerHTML = '<div class="warn-banner" style="border-color:var(--error);color:var(--error)"><b>Runtime Plane 状态读取失败。</b><span>' + esc(error.message || 'unknown error') + '</span></div>';
     }
@@ -1929,13 +2049,72 @@
     if (mcpHeaders) mcpHeaders.placeholder = '每行填写一项请求头，敏感值使用环境变量名';
   };
 
+  window.runtimePlaneDiagnostics = async function (runtimeType) {
+    try {
+      const data = await api('GET', '/runtime/' + encodeURIComponent(runtimeType) + '/diagnostics');
+      const manifest = data.manifest || {};
+      const installation = data.installation || {};
+      const auth = installation.auth || {};
+      const checks = (data.prerequisites?.checks || []).map((item) => '<div class="list-row"><span>' + esc(item.name || 'prerequisite') + '</span><span class="badge ' + (item.available ? 'badge-success' : (item.required ? 'badge-error' : 'badge-warning')) + '">' + (item.available ? '可用' : (item.required ? '缺失' : '可选')) + '</span><span class="dim-note">' + esc(item.detail || '') + '</span></div>').join('') || '<p class="dim-note">没有声明前置依赖。</p>';
+      const plans = Object.entries(data.plans || {}).map(([action, plan]) => {
+        const command = Array.isArray(plan.command) && plan.command.length ? '<div class="mono mt8">命令：' + esc(plan.command.join(' ')) + '</div>' : '';
+        const artifact = plan.artifactUrl ? '<div class="mono mt8">Artifact：' + esc(plan.artifactUrl) + ' → ' + esc(plan.artifactPath || '未声明目标') + '<br>SHA-256：' + esc(plan.artifactSha256 || '未声明') + '</div>' : '';
+        return '<div class="list-row" style="display:block"><div class="row"><b>' + esc(action) + '</b><span class="spacer"></span><span class="badge ' + (plan.allowed ? 'badge-success' : 'badge-error') + '">' + (plan.allowed ? '允许' : '拒绝') + '</span><span class="badge badge-muted">' + esc(plan.risk || '—') + '</span></div><div class="dim-note mt8">' + esc(plan.explanation || '') + '</div>' + command + artifact + '</div>';
+      }).join('') || '<p class="dim-note">没有可用操作计划。</p>';
+      const events = [...(data.events || [])].reverse().slice(0, 30).map((event) => '<details class="mt8"><summary>' + esc(event.createdAt || '') + ' · ' + esc(event.action || '') + ' · ' + esc(event.phase || '') + ' · ' + esc(event.status || '') + '</summary><p class="text-sm mt8">' + esc(event.message || '') + '</p>' + (event.detail && Object.keys(event.detail).length ? '<pre class="mono" style="white-space:pre-wrap;max-height:240px;overflow:auto">' + pretty(event.detail) + '</pre>' : '') + '</details>').join('') || '<p class="dim-note">暂无安装事件。</p>';
+      modal('<div class="modal-header"><div><h3>' + esc(manifest.displayName || runtimeType) + ' · Runtime 详情</h3><p class="dim-note">Manifest、安装状态、认证、前置检查和可审阅操作计划</p></div><button class="close-x" onclick="closeModal()">×</button></div>' +
+        '<div class="grid grid-2"><div class="card"><h4>Observed installation</h4><div class="kv"><span>状态</span><b>' + statusBadge(installation.state || 'unknown') + '</b></div><div class="kv"><span>路径</span><b class="mono">' + esc(installation.path || '—') + '</b></div><div class="kv"><span>版本</span><b>' + esc(installation.version || manifest.version || '—') + '</b></div><div class="kv"><span>健康</span><b>' + esc(installation.health || '—') + '</b></div><div class="kv"><span>Artifact verified</span><b>' + (installation.verified ? '是' : '否') + '</b></div><div class="kv"><span>Auth</span><b>' + esc(auth.status || 'unknown') + '</b></div><p class="dim-note mt8">' + esc(auth.detail || installation.lastError || '') + '</p></div>' +
+        '<div class="card"><h4>Manifest</h4><div class="kv"><span>Protocol</span><b>' + esc(manifest.protocol || '—') + '</b></div><div class="kv"><span>Acquisition</span><b>' + esc(manifest.acquisition || '—') + '</b></div><div class="kv"><span>Source</span><b>' + esc(manifest.sourceKind || '—') + '</b></div><div class="kv"><span>Integration grade</span><b>' + esc(manifest.integrationGrade || '—') + '</b></div><div class="kv"><span>Compatibility</span><b>' + esc(data.compatibility?.compatible ? 'compatible' : (data.compatibility?.reason || 'unknown')) + '</b></div></div></div>' +
+        '<div class="divider"></div><h4>Prerequisites</h4><div class="mt8">' + checks + '</div><div class="divider"></div><h4>审阅操作计划</h4><div class="mt8">' + plans + '</div><div class="divider"></div><h4>Embedded Installation Console</h4><div class="card mt8">' + events + '</div>', true);
+    } catch (error) { toast(error.message || 'Runtime diagnostics failed', 'error'); }
+  };
+
+  window.runtimeOpenApiSetup = function () {
+    const target = document.getElementById('provider-editor');
+    if (!target) return;
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    target.querySelector('#provider-preset, .pm-name')?.focus();
+  };
+  window.runtimeOnboardingAction = async function (runtimeType, action) {
+    await window.runtimePlaneAction(runtimeType, action);
+  };
   window.runtimePlaneAction = async function (runtimeType, action) {
     try {
-      const result = await api('POST', '/runtime/' + encodeURIComponent(runtimeType) + '/' + action, action === 'install' ? { approved: true } : undefined);
-      toast((result.installation?.state || 'runtime state updated') + ' · ' + runtimeType, 'success');
+      const requiresApproval = ['install', 'repair', 'update', 'uninstall'].includes(action);
+      if (requiresApproval) {
+        const diagnostics = await api('GET', '/runtime/' + encodeURIComponent(runtimeType) + '/diagnostics');
+        const plan = diagnostics.plans?.[action] || {};
+        const command = Array.isArray(plan.command) && plan.command.length ? '\n命令：' + plan.command.join(' ') : (plan.artifactUrl ? '\n下载：' + plan.artifactUrl + '\n目标：' + (plan.artifactPath || '未声明') + '\nSHA-256：' + (plan.artifactSha256 || '未声明') : '\n本次操作不声明外部命令，将由 Runtime Registry 进行连接/发现。');
+        const trust = plan.allowed === false ? '\n该计划被主机安全策略拒绝。' : (plan.trusted ? '\n来源：已信任。' : '\n来源：未信任，必须由作者明确批准。');
+        if (!window.confirm('确认执行 Runtime ' + action + '：' + runtimeType + '？' + command + trust)) return;
+      }
+      const result = await api('POST', '/runtime/' + encodeURIComponent(runtimeType) + '/' + action, requiresApproval ? { approved: true } : undefined);
+      const state = result.installation?.state || (result.ready ? 'ready' : 'runtime state updated');
+      const detail = result.auth?.detail ? ' · ' + result.auth.detail : '';
+      toast(state + ' · ' + runtimeType + detail, result.ready === false && result.auth?.status === 'not_authenticated' ? 'error' : 'success');
       const page = document.getElementById('page');
       if (page && typeof PAGES['agent-config'] === 'function') await PAGES['agent-config'](page);
     } catch (error) { toast(error.message || 'Runtime operation failed', 'error'); }
+  };
+  window.computePolicySelect = async function (strategy) {
+    try {
+      const result = await api('POST', '/compute/policy', { strategy });
+      toast('Compute Strategy 已切换为 ' + (result.strategyName || strategy), 'success');
+      const page = document.getElementById('page');
+      if (page && typeof PAGES['agent-config'] === 'function') await PAGES['agent-config'](page);
+    } catch (error) { toast(error.message || 'Compute Strategy 更新失败', 'error'); }
+  };
+  window.runtimeCatalogFetch = async function () {
+    const input = document.getElementById('runtime-catalog-url');
+    const url = String(input?.value || '').trim();
+    if (!url) { toast('请输入签名 Runtime Catalog URL', 'error'); return; }
+    if (!window.confirm('从该 HTTPS 地址获取并验证签名 Catalog？\n' + url)) return;
+    try {
+      const result = await api('POST', '/runtime/catalog/fetch', { url });
+      toast('已导入 ' + String(result.count || 0) + ' 个 Runtime manifest', 'success');
+      const page = document.getElementById('page');
+      if (page && typeof PAGES['agent-config'] === 'function') await PAGES['agent-config'](page);
+    } catch (error) { toast(error.message || 'Runtime Catalog fetch failed', 'error'); }
   };
   // Deep links and old scripts may still call services; render the unified page.
   PAGES.services = PAGES['agent-config'];
@@ -1972,5 +2151,10 @@
   };
 
   renderNav();
-  render();
+  // When the Workbench loader is present it intentionally initializes the
+  // shell only after every page adapter has registered.  Rendering here as
+  // well races that first shell render (a slow dashboard request can
+  // overwrite a deep-linked AI Runtime page).  Standalone legacy loading
+  // still owns its initial render when no shell has been initialized.
+  if (!window.__novelforgeStudioShell || window.StudioShell) render();
 })();

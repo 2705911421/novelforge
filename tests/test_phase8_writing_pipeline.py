@@ -168,6 +168,91 @@ def test_pipeline_full_happy_path(pipeline_deps):
     assert "claimed" in stage_names
 
 
+def test_reviewer_input_isolated_from_writer_chain(pipeline_deps):
+    """Reviewer receives a fresh evidence bundle, not Writer intermediates."""
+    db = pipeline_deps["db"]
+    runtime = pipeline_deps["runtime"]
+    repo = pipeline_deps["repo"]
+    project_id = pipeline_deps["project_id"]
+    book_id = pipeline_deps["book_id"]
+
+    class CapturingReviewModel(DummyModelManager):
+        def __init__(self):
+            super().__init__()
+            self.review_prompt = ""
+            self.review_manifest = None
+
+        def chat(self, messages, system=None, task_type=None, **kwargs):
+            if task_type == "review":
+                self.review_prompt = messages[0]["content"]
+                self.review_manifest = kwargs.get("context_manifest")
+            return super().chat(messages, system=system, task_type=task_type, **kwargs)
+
+    draft = repo.append_chapter_version(book_id, 1, "CURRENT_DRAFT_VISIBLE " * 40)
+    model = CapturingReviewModel()
+    pipeline = WritingPipeline(db, model, repo, runtime)
+    task = runtime.enqueue(
+        "write-next",
+        project_id=project_id,
+        book_id=book_id,
+        data={"chapter_number": 1},
+    )
+    claimed = runtime.claim("review-isolation-worker", lease_seconds=60)
+    assert claimed is not None
+
+    result = pipeline._review(
+        claimed,
+        {
+            "project_id": project_id,
+            "book_id": book_id,
+            "chapter_number": 1,
+            "chapter_id": db.fetchone(
+                "SELECT id FROM chapters WHERE book_id=? AND number=1", (book_id,)
+            )["id"],
+            "draft_version": draft["version"],
+            "draft_version_id": draft["version_id"],
+            "chapter_plan": {"goal": "preserve the unresolved clue"},
+            "context_parts": [
+                "## Story Bible\nCANON_FACT_VISIBLE",
+                "## StoryFlow Chapter Intent\nINTENT_VISIBLE",
+                "## 参考资料\nEVIDENCE_VISIBLE",
+            ],
+            "context_manifest": {
+                "source": "writer-context",
+                "schemaVersion": 3,
+                "contextSha256": "writer-context-hash",
+                "items": [
+                    {"sourceType": "story_bible", "sourceId": "bible-1"},
+                    {"sourceType": "planning_node", "sourceId": "intent-1"},
+                    {"sourceType": "rag_chunk", "sourceId": "evidence-1"},
+                ],
+            },
+            "prompt_a1": "WRITER_A1_SECRET",
+            "prompt_a2": "WRITER_A2_SECRET",
+            "alpha_content": "ORIGINAL_ALPHA_SECRET",
+        },
+    )
+
+    assert model.review_manifest is not None
+    assert model.review_manifest["allowedInputs"] == [
+        "Canon", "Intent", "Draft", "Rubric", "Relevant Evidence",
+    ]
+    assert model.review_manifest["isolation"]["inheritsWriterThreadHistory"] is False
+    assert model.review_manifest["sourceContext"]["contextSha256"] == "writer-context-hash"
+    assert "## Canon" in model.review_prompt
+    assert "## Intent" in model.review_prompt
+    assert "## Draft" in model.review_prompt
+    assert "## Rubric" in model.review_prompt
+    assert "## Relevant Evidence" in model.review_prompt
+    for secret in ("WRITER_A1_SECRET", "WRITER_A2_SECRET", "ORIGINAL_ALPHA_SECRET"):
+        assert secret not in model.review_prompt
+
+    reviewer_input = result["context"]["reviewer_input"]
+    assert result["context"]["context_manifest"]["reviewerInput"] == reviewer_input
+    section_ids = {section["id"] for section in reviewer_input["sections"]}
+    assert section_ids == {"canon", "intent", "draft", "rubric", "relevant_evidence"}
+
+
 def test_context_manifest_binds_story_graph_and_writer_prompt_components(pipeline_deps):
     """Writer context records the real StoryFlow slice and prompt components."""
     db = pipeline_deps["db"]
@@ -221,6 +306,9 @@ def test_context_manifest_binds_story_graph_and_writer_prompt_components(pipelin
     )["context"]
     manifest = built["context_manifest"]
     assert manifest["schemaVersion"] == 3
+    assert manifest["chapterIntent"]["nodeId"] == plan_node["id"]
+    assert manifest["chapterIntent"]["source"] == "storyflow"
+    assert manifest["planning"]["chapterNumber"] == 2
     graph_items = [item for item in manifest["items"] if item["sourceType"] == "story_graph_node"]
     assert graph_items
     assert any(item["sourceId"] == f"character:{character_id}" for item in graph_items)
@@ -334,6 +422,13 @@ def test_context_manifest_records_style_constraints_and_memory_boundary(pipeline
     assert manifest["availability"]["memory"]["status"] == "not_available"
     assert manifest["availability"]["memory"]["owner"] == "story_repository.narrative_memory"
     assert "legacy file-backed MemorySystem" in manifest["availability"]["memory"]["reason"]
+    assert manifest["authorIntent"]["intent"] == "Keep the unresolved identity mystery intact."
+    assert manifest["authorIntent"]["writingStyle"] == "Close third person, restrained prose."
+    assert manifest["authorIntent"]["styleProfile"]["rhythm"] == "short paragraphs"
+    assert manifest["planning"]["source"] == "chapter_plan"
+    assert manifest["chapterIntent"]["source"] == "chapter_plan"
+    assert manifest["memoryEvidence"] == []
+    assert manifest["provenance"]["contextAuthority"] == "Host.WritingPipeline"
 
 
 def test_pipeline_acceptance_fulfills_storyflow_plan(pipeline_deps):

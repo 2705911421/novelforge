@@ -92,13 +92,31 @@ class DialogueWriter:
         )
 
         try:
-            client = self.model_manager.get_client(self.client_role)
-            response = client.chat(
-                [{"role": "user", "content": prompt}],
-                system=system,
-            )
-            dialogue_text = response.content.strip()
+            messages = [{"role": "user", "content": prompt}]
+            response: Any
+            manager_chat = getattr(self.model_manager, "chat", None)
+            if callable(manager_chat):
+                # The production manager owns Runtime routing.  Dialogue is
+                # still compatible with older client-only integrations below,
+                # but must not choose a provider client when the manager can
+                # route a durable task.
+                response = manager_chat(
+                    messages,
+                    system=system,
+                    task_type="dialogue-write",
+                )
+            else:
+                client = self.model_manager.get_client(self.client_role)
+                response = client.chat(messages, system=system)
+            content = getattr(response, "content", None)
+            if not isinstance(content, str) or not content.strip():
+                raise DialogueWriterError(
+                    "EMPTY_OUTPUT", "dialogue provider returned empty content"
+                )
+            dialogue_text = content.strip()
         except Exception as exc:
+            if isinstance(exc, DialogueWriterError):
+                raise
             logger.error("Dialogue generation failed: %s", exc)
             raise DialogueWriterError("GENERATION_FAILED", str(exc)) from exc
 

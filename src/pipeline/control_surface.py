@@ -15,6 +15,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from src.core.legacy_modes import require_legacy_creation_mode
+
 
 @dataclass
 class AuthorIntent:
@@ -209,13 +211,22 @@ class ControlSurface:
         self.project_dir = project_dir
         self.control_dir = project_dir / "control"
         self.runtime_dir = self.control_dir / "runtime"
-        self.control_dir.mkdir(parents=True, exist_ok=True)
+
+    def _ensure_dirs(self) -> None:
+        """Create control storage only when a caller is actually writing."""
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
 
     # ========== 作者意图 ==========
 
     def save_author_intent(self, intent: AuthorIntent):
-        """保存作者意图"""
+        """保存旧版作者意图文档（仅开发兼容）。
+
+        Author Intent is now an author-owned Story Bible draft.  Keeping this
+        file-backed writer callable in a normal deployment would create a
+        second source of truth outside the Host transaction boundary.
+        """
+        require_legacy_creation_mode("ControlSurface.save_author_intent")
+        self._ensure_dirs()
         intent.updated_at = datetime.now().isoformat()
         path = self.control_dir / "author_intent.md"
         with open(path, "w", encoding="utf-8") as f:
@@ -238,6 +249,7 @@ class ControlSurface:
 
     def save_current_focus(self, focus: CurrentFocus):
         """保存当前关注点"""
+        self._ensure_dirs()
         focus.updated_at = datetime.now().isoformat()
         path = self.control_dir / "current_focus.md"
         with open(path, "w", encoding="utf-8") as f:
@@ -259,6 +271,7 @@ class ControlSurface:
 
     def save_chapter_intent(self, intent: ChapterIntent):
         """保存章节意图"""
+        self._ensure_dirs()
         chapter_num = intent.chapter_number
         # Markdown版本
         md_path = self.runtime_dir / f"chapter-{chapter_num:04d}.intent.md"
@@ -282,6 +295,7 @@ class ControlSurface:
 
     def save_rule_stack(self, stack: RuleStack):
         """保存规则栈"""
+        self._ensure_dirs()
         chapter_num = stack.chapter_number
         yaml_path = self.runtime_dir / f"chapter-{chapter_num:04d}.rule-stack.yaml"
         with open(yaml_path, "w", encoding="utf-8") as f:
@@ -305,6 +319,7 @@ class ControlSurface:
 
     def save_context_trace(self, trace: ContextTrace):
         """保存上下文轨迹"""
+        self._ensure_dirs()
         chapter_num = trace.chapter_number
         json_path = self.runtime_dir / f"chapter-{chapter_num:04d}.context.json"
         with open(json_path, "w", encoding="utf-8") as f:

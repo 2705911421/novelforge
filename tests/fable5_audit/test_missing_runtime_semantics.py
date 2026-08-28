@@ -40,6 +40,13 @@ class DeterministicAuditModel:
                 "dimensions": {},
                 "issues": [],
             })
+        elif task_type == "joint-review":
+            response.content = json.dumps({
+                "overall_score": 95,
+                "verdict": "pass",
+                "summary": "chapters remain consistent",
+                "issues": [],
+            })
         elif task_type == "fact-extraction":
             response.content = json.dumps([{"fact_type": "event", "content": "the gate opens"}])
         else:

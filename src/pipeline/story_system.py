@@ -25,6 +25,28 @@ from typing import Optional
 from datetime import datetime
 
 
+_LEGACY_STORY_SYSTEM_OPT_IN = "NOVELFORGE_ENABLE_LEGACY_CREATION_MODES"
+_PRODUCTION_ENVS = {"production", "prod", "staging"}
+
+
+def require_legacy_story_system() -> None:
+    """Keep the file-backed StorySystem behind the development compatibility gate.
+
+    The durable Host path is owned by ``StoryRepository`` and ``TaskRuntime``.
+    This class remains importable for historical tooling, but constructing it
+    creates ``story-system`` directories and therefore must never be an
+    accidental production side effect.
+    """
+    enabled = os.environ.get(_LEGACY_STORY_SYSTEM_OPT_IN, "").strip().lower() in {"1", "true", "yes"}
+    deployment = os.environ.get("NOVELFORGE_ENV", "development").strip().lower()
+    if not enabled or deployment in _PRODUCTION_ENVS:
+        raise RuntimeError(
+            "LEGACY_STORY_SYSTEM_DISABLED: file-backed StorySystem is deprecated; "
+            "use StoryRepository/TaskRuntime. Set "
+            f"{_LEGACY_STORY_SYSTEM_OPT_IN}=1 only for development compatibility."
+        )
+
+
 # ========== 合同结构 ==========
 
 @dataclass
@@ -414,6 +436,7 @@ class StorySystem:
     """
 
     def __init__(self, project_dir: Path):
+        require_legacy_story_system()
         self.project_dir = project_dir
         self.story_dir = project_dir / "story-system"
         self.commits_dir = self.story_dir / "commits"

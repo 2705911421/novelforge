@@ -193,15 +193,15 @@ CHAPTER_REVIEW_PROMPT = """你是一位严格的小说审稿编辑。请对以�
 
 ## 输出要求
 以JSON格式返回，包含：
-{
+{{
     "overall_score": 总分(0-100),
     "dimensions": [
-        {"name": "维度名", "score": 分数, "issues": ["问题"], "suggestions": ["建议"]}
+        {{"name": "维度名", "score": 分数, "issues": ["问题"], "suggestions": ["建议"]}}
     ],
     "specific_issues": ["具体需要修改的问题（必须可操作）"],
     "revision_suggestions": ["修订建议"],
     "verdict": "pass/needs_revision/major_issues"
-}
+}}
 
 注意：
 - specific_issues 必须是具体的、可操作的问题描述，不能是笼统的建议

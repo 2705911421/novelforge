@@ -5,12 +5,112 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from src.core.database import Database, generate_id
 from src.prompts.prompt_repository import PromptRepository
 
 logger = logging.getLogger(__name__)
+
+
+_JOINT_REVIEW_SEVERITIES = {"blocking", "critical", "major", "minor"}
+
+
+def normalize_joint_review_issue(
+    issue: Mapping[str, Any],
+    *,
+    issue_id: str | None = None,
+    joint_review_id: str | None = None,
+) -> dict[str, Any]:
+    """Normalize one model issue to the Host's ReviewIssue shape.
+
+    ``joint_review_issues`` predates the Agent Runtime proposal boundary and
+    intentionally remains a compatibility table.  The service therefore
+    adds the common Review/Revision fields at its API boundary instead of
+    pretending that an arbitrary model dictionary is already actionable.
+    """
+    raw_chapters = issue.get("chapter_numbers", issue.get("chapterNumbers"))
+    if isinstance(raw_chapters, (str, bytes)) or not isinstance(raw_chapters, (list, tuple)):
+        raise ValueError("joint review issue chapter_numbers must be an array")
+    chapter_numbers: list[int] = []
+    for raw_number in raw_chapters:
+        if isinstance(raw_number, bool) or not isinstance(raw_number, int) or raw_number < 1:
+            raise ValueError("joint review issue chapter_numbers must contain positive integers")
+        if raw_number not in chapter_numbers:
+            chapter_numbers.append(raw_number)
+    if not chapter_numbers:
+        raise ValueError("joint review issue must reference at least one chapter")
+
+    dimension = issue.get("dimension")
+    if not isinstance(dimension, str) or not dimension.strip():
+        raise ValueError("joint review issue dimension is required")
+    description = issue.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError("joint review issue description is required")
+    severity = str(issue.get("severity") or "").strip().lower()
+    if severity not in _JOINT_REVIEW_SEVERITIES:
+        raise ValueError("joint review issue severity is invalid")
+
+    priority = issue.get("priority", 5)
+    if isinstance(priority, bool) or not isinstance(priority, int) or not 1 <= priority <= 10:
+        raise ValueError("joint review issue priority must be between 1 and 10")
+    suggestion = issue.get("suggestion", "")
+    if suggestion is None:
+        suggestion = ""
+    if not isinstance(suggestion, str):
+        raise ValueError("joint review issue suggestion must be a string")
+    blocking = issue.get("blocking")
+    if blocking is None:
+        blocking = severity in {"blocking", "critical", "major"}
+    if not isinstance(blocking, bool):
+        raise ValueError("joint review issue blocking must be boolean")
+    status = str(issue.get("status") or "open").strip().lower()
+    if status not in {"open", "resolved"}:
+        raise ValueError("joint review issue status must be open or resolved")
+
+    result: dict[str, Any] = {
+        "chapter_numbers": chapter_numbers,
+        "dimension": dimension.strip()[:200],
+        "severity": severity,
+        "blocking": blocking,
+        "location": str(issue.get("location") or "chapters:" + ",".join(map(str, chapter_numbers)))[:500],
+        "description": description.strip()[:20_000],
+        "suggestion": suggestion.strip()[:20_000],
+        "priority": priority,
+        "status": status,
+        "source": "joint_review",
+    }
+    if issue_id:
+        result["id"] = str(issue_id)
+    if joint_review_id:
+        # Keep both spellings: the snake_case fields match the compatibility
+        # table, while the camelCase field is what Agent-facing tools expose.
+        result["joint_review_id"] = str(joint_review_id)
+        result["jointReviewId"] = str(joint_review_id)
+        result["review_id"] = str(joint_review_id)
+        result["reviewId"] = str(joint_review_id)
+    return result
+
+
+def deserialize_joint_review_issue(
+    row: Mapping[str, Any],
+    *,
+    joint_review_id: str | None = None,
+) -> dict[str, Any]:
+    """Read a compatibility-table issue as a normalized ReviewIssue."""
+    raw_chapters = row.get("chapter_numbers")
+    try:
+        chapter_numbers = json.loads(raw_chapters or "[]") if isinstance(raw_chapters, str) else raw_chapters
+    except (TypeError, json.JSONDecodeError):
+        chapter_numbers = []
+    return normalize_joint_review_issue(
+        {
+            **dict(row),
+            "chapter_numbers": chapter_numbers,
+        },
+        issue_id=str(row.get("id") or "") or None,
+        joint_review_id=joint_review_id or str(row.get("joint_review_id") or "") or None,
+    )
 
 
 class JointReviewService:
@@ -40,6 +140,24 @@ class JointReviewService:
         Returns:
             Joint review result with score, verdict, issues
         """
+        if (
+            isinstance(start_chapter, bool)
+            or isinstance(end_chapter, bool)
+            or not isinstance(start_chapter, int)
+            or not isinstance(end_chapter, int)
+            or start_chapter < 1
+            or end_chapter < 1
+        ):
+            raise ValueError("chapter range must use positive integers")
+        if end_chapter < start_chapter:
+            raise ValueError("end chapter must not precede start chapter")
+        book = self.db.fetchone(
+            "SELECT id, project_id FROM books WHERE id=? AND project_id=?",
+            (book_id, project_id),
+        )
+        if book is None:
+            raise ValueError("book does not belong to project")
+
         # Get chapters content.
         chapters = []
         for num in range(start_chapter, end_chapter + 1):
@@ -183,21 +301,20 @@ class JointReviewService:
                 review_text = review_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             review_data = json.loads(review_text)
         except json.JSONDecodeError as exc:
-            logger.warning("Joint review JSON parse failed: %s", exc)
-            review_data = {
-                "overall_score": 0,
-                "verdict": "error",
-                "summary": f"联合审查返回格式异常: {exc}",
-                "issues": [{"type": "error", "description": "LLM返回的JSON格式无法解析"}],
-            }
+            # A malformed model artifact is not a valid review.  Do not
+            # persist an error-shaped review and report the task as completed.
+            raise ValueError("joint review returned invalid JSON") from exc
         except Exception as exc:
             logger.error("Joint review failed: %s", exc)
             raise
+
+        self._validate_review_data(review_data)
 
         # Save to database.
         review_id = generate_id()
         now = datetime.now().isoformat()
 
+        normalized_issues: list[dict[str, Any]] = []
         with self.db.transaction() as conn:
             conn.execute(
                 """INSERT INTO joint_reviews(id, project_id, book_id, start_chapter, end_chapter,
@@ -214,31 +331,78 @@ class JointReviewService:
 
             # Save issues.
             for issue in review_data.get("issues", []):
+                issue_id = generate_id()
+                normalized = normalize_joint_review_issue(
+                    issue,
+                    issue_id=issue_id,
+                    joint_review_id=review_id,
+                )
                 conn.execute(
                     """INSERT INTO joint_review_issues(id, joint_review_id, chapter_numbers,
                        dimension, severity, description, suggestion, priority, created_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        generate_id(), review_id,
-                        json.dumps(issue.get("chapter_numbers", [])),
-                        issue.get("dimension", ""),
-                        issue.get("severity", "major"),
-                        issue.get("description", ""),
-                        issue.get("suggestion", ""),
-                        issue.get("priority", 5),
+                        issue_id, review_id,
+                        json.dumps(normalized["chapter_numbers"]),
+                        normalized["dimension"],
+                        normalized["severity"],
+                        normalized["description"],
+                        normalized["suggestion"],
+                        normalized["priority"],
                         now,
                     ),
                 )
+                normalized_issues.append(normalized)
 
         return {
             "id": review_id,
             "overall_score": review_data.get("overall_score", 0),
             "verdict": review_data.get("verdict", "fail"),
             "summary": review_data.get("summary", ""),
-            "issues": review_data.get("issues", []),
+            "issues": normalized_issues,
             "start_chapter": start_chapter,
             "end_chapter": end_chapter,
         }
+
+    @staticmethod
+    def _validate_review_data(review_data: Any) -> None:
+        """Reject malformed model output before it reaches the review tables."""
+        if not isinstance(review_data, dict):
+            raise ValueError("joint review returned a JSON object")
+        score = review_data.get("overall_score")
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 100:
+            raise ValueError("joint review overall_score must be between 0 and 100")
+        if review_data.get("verdict") not in {"pass", "fail"}:
+            raise ValueError("joint review verdict must be pass or fail")
+        issues = review_data.get("issues")
+        if not isinstance(issues, list) or any(not isinstance(issue, dict) for issue in issues):
+            raise ValueError("joint review issues must be an array of objects")
+        for issue in issues:
+            normalize_joint_review_issue(issue)
+
+    def _load_issues(self, review_id: str) -> list[dict[str, Any]]:
+        rows = self.db.fetchall(
+            """SELECT * FROM joint_review_issues
+               WHERE joint_review_id=?
+               ORDER BY priority DESC""",
+            (review_id,),
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                result.append(deserialize_joint_review_issue(row, joint_review_id=review_id))
+            except ValueError:
+                # Preserve visibility of an already-persisted legacy row, but
+                # never turn corruption into an actionable, falsely shaped
+                # ReviewIssue.  New writes are rejected by the validator above.
+                result.append({
+                    **dict(row),
+                    "chapter_numbers": [],
+                    "status": "open",
+                    "source": "joint_review",
+                    "invalid": True,
+                })
+        return result
 
     def get_joint_reviews(self, project_id: str) -> list[dict[str, Any]]:
         """Get all joint reviews for a project."""
@@ -250,19 +414,7 @@ class JointReviewService:
         )
 
         for review in reviews:
-            issues = self.db.fetchall(
-                """SELECT * FROM joint_review_issues
-                   WHERE joint_review_id=?
-                   ORDER BY priority DESC""",
-                (review["id"],),
-            )
-            review["issues"] = issues
-            # Parse chapter_numbers JSON.
-            for issue in issues:
-                try:
-                    issue["chapter_numbers"] = json.loads(issue["chapter_numbers"])
-                except (json.JSONDecodeError, TypeError):
-                    issue["chapter_numbers"] = []
+            review["issues"] = self._load_issues(str(review["id"]))
 
         return reviews
 
@@ -275,17 +427,6 @@ class JointReviewService:
         if not review:
             return None
 
-        issues = self.db.fetchall(
-            """SELECT * FROM joint_review_issues
-               WHERE joint_review_id=?
-               ORDER BY priority DESC""",
-            (review_id,),
-        )
-        review["issues"] = issues
-        for issue in issues:
-            try:
-                issue["chapter_numbers"] = json.loads(issue["chapter_numbers"])
-            except (json.JSONDecodeError, TypeError):
-                issue["chapter_numbers"] = []
+        review["issues"] = self._load_issues(str(review_id))
 
         return review

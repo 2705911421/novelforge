@@ -204,9 +204,20 @@ class WritingPipeline:
         owner = task.get("lease_owner")
         return owner if isinstance(owner, str) and owner else None
 
-    def _checkpoint(self, task: dict[str, Any], stage: str, state: dict[str, Any]) -> None:
+    def _checkpoint(
+        self,
+        task: dict[str, Any],
+        stage: str,
+        state: dict[str, Any],
+        *,
+        workflow_state: Optional[str] = None,
+    ) -> None:
         self.runtime.checkpoint(
-            task["id"], stage, state, lease_owner=self._lease_owner(task)
+            task["id"],
+            stage,
+            state,
+            lease_owner=self._lease_owner(task),
+            workflow_state=workflow_state,
         )
 
     def _transition(
@@ -434,8 +445,8 @@ class WritingPipeline:
                     and int(direct_number) == chapter_number
                 ):
                     return value
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                logger.debug("project chapter count probe failed; falling back to mapping length: %s", exc)
             for key in ("chapters", "chapter_plans", "chapterPlans", "items", "entries", "plans"):
                 nested = value.get(key)
                 if isinstance(nested, dict):
@@ -1298,7 +1309,19 @@ class WritingPipeline:
             "edgeTypes": plan_edge_types,
             "provenanceKind": "storyflow_chapter_intent",
         }
-        return {"text": plan_text, "items": [plan_item, *source_items]}
+        return {
+            "text": plan_text,
+            "items": [plan_item, *source_items],
+            "chapterIntent": {
+                "source": "storyflow",
+                "nodeId": selected_plan_id,
+                "title": str(plan_node.get("title") or selected_plan_id),
+                "chapterNumber": chapter_number,
+                "intent": deepcopy(intent),
+                "sourceNodeIds": source_ids,
+                "edgeTypes": plan_edge_types,
+            },
+        }
 
     def _build_context(self, task: dict, ctx: dict) -> dict:
         """Assemble the writing context from multiple sources."""
@@ -1307,6 +1330,20 @@ class WritingPipeline:
         chapter_number = ctx["chapter_number"]
         context_parts: list[str] = []
         manifest_items: list[dict[str, Any]] = []
+        author_intent_snapshot: dict[str, Any] = {}
+        story_bible_snapshot: dict[str, Any] = {}
+        planning_snapshot: dict[str, Any] = {}
+        chapter_intent_snapshot: dict[str, Any] = {}
+
+        # Keep the Canon base explicit even when no chapter has been
+        # committed yet. A stale derived state is not presented as a valid
+        # Canon snapshot; the diagnostic remains in provenance instead.
+        canonical_state = self.story_repo.read_story_state(book_id)
+        canon_commit = (
+            canonical_state.get("last_commit_id")
+            if not bool(canonical_state.get("stale"))
+            else None
+        )
 
         # Style and author constraints are durable project truth, not an
         # inferred label in Context View.  Add them only when the current
@@ -1325,6 +1362,13 @@ class WritingPipeline:
                     style_profile = json.loads(style_profile)
                 except json.JSONDecodeError:
                     style_profile = {}
+            author_intent_snapshot = {
+                "source": "projects",
+                "projectId": project_id,
+                "intent": author_intent,
+                "writingStyle": writing_style,
+                "styleProfile": deepcopy(style_profile) if isinstance(style_profile, dict) else {},
+            }
             style_lines: list[str] = []
             if writing_style:
                 style_lines.append(writing_style[:4_000])
@@ -1367,6 +1411,8 @@ class WritingPipeline:
         if storyflow_plan_context.get("text"):
             context_parts.append(str(storyflow_plan_context["text"]))
             manifest_items.extend(storyflow_plan_context.get("items") or [])
+        if isinstance(storyflow_plan_context.get("chapterIntent"), dict):
+            chapter_intent_snapshot = deepcopy(storyflow_plan_context["chapterIntent"])
         if storyflow_plan_context.get("warning"):
             ctx.setdefault("context_warnings", []).append(storyflow_plan_context["warning"])
 
@@ -1379,27 +1425,58 @@ class WritingPipeline:
             strict=bool(ctx.get("strict_planning")),
         )
         if bible:
-            try:
-                bible_data = bible["payload_data"]
-                steps = bible_data.get("steps", {})
-                summary_parts = []
-                for key in ("world", "core_conflict", "protagonist", "power_system", "voice"):
-                    if key in steps:
-                        val = steps[key]
-                        text = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else str(val)
-                        summary_parts.append(f"【{key}】{text[:500]}")
-                if summary_parts:
-                    context_parts.append("## Story Bible\n" + "\n".join(summary_parts))
-                    manifest_items.append({
-                        "sourceType": "story_bible",
-                        "sourceId": bible.get("id"),
-                        "label": "published planning snapshot",
-                        "included": True,
-                        "contentChars": len(context_parts[-1]),
-                        "reason": "chapter plan and immutable planning snapshot",
-                    })
-            except (json.JSONDecodeError, TypeError):
-                pass
+            bible_data = bible.get("payload_data")
+            if not isinstance(bible_data, dict):
+                raise WritingPipelineError(
+                    "PLANNING_SNAPSHOT_INVALID",
+                    "published planning snapshot payload must be an object",
+                )
+            steps = bible_data.get("steps")
+            if not isinstance(steps, dict):
+                raise WritingPipelineError(
+                    "PLANNING_SNAPSHOT_INVALID",
+                    "published planning snapshot steps must be an object",
+                )
+            story_bible_snapshot = {
+                "source": "story_bible_snapshots",
+                "snapshotId": bible.get("id"),
+                "version": bible.get("version"),
+                "status": bible.get("status"),
+                "checksum": bible.get("checksum"),
+                "payload": deepcopy(bible_data),
+            }
+            summary_parts = []
+            for key in ("world", "core_conflict", "protagonist", "power_system", "voice"):
+                if key in steps:
+                    val = steps[key]
+                    text = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else str(val)
+                    summary_parts.append(f"【{key}】{text[:500]}")
+            if summary_parts:
+                context_parts.append("## Story Bible\n" + "\n".join(summary_parts))
+                manifest_items.append({
+                    "sourceType": "story_bible",
+                    "sourceId": bible.get("id"),
+                    "label": "published planning snapshot",
+                    "included": True,
+                    "contentChars": len(context_parts[-1]),
+                    "reason": "chapter plan and immutable planning snapshot",
+                })
+
+        chapter_plan = ctx.get("chapter_plan")
+        planning_snapshot = {
+            "source": "published_snapshot" if bible else "chapter_plan",
+            "snapshotId": ctx.get("planning_snapshot_id") or (bible or {}).get("id"),
+            "version": ctx.get("planning_snapshot_version") or (bible or {}).get("version"),
+            "checksum": (bible or {}).get("checksum"),
+            "chapterNumber": chapter_number,
+            "chapterPlan": deepcopy(chapter_plan) if isinstance(chapter_plan, dict) else {},
+        }
+        if not chapter_intent_snapshot:
+            chapter_intent_snapshot = {
+                "source": "chapter_plan",
+                "chapterNumber": chapter_number,
+                "chapterPlan": deepcopy(chapter_plan) if isinstance(chapter_plan, dict) else {},
+            }
 
         # Imported planning documents are durable source material. They are
         # deliberately kept separate from the editable forecast canvas: the
@@ -1507,6 +1584,13 @@ class WritingPipeline:
         if graph_context.get("warning"):
             ctx.setdefault("context_warnings", []).append(graph_context["warning"])
 
+        memory_evidence = [
+            deepcopy(item)
+            for item in manifest_items
+            if isinstance(item, dict)
+            and str(item.get("sourceType") or "") in {"narrative_memory", "rag_chunk"}
+        ]
+
         # Compile the assembled sections through one deterministic budget seam.
         # The existing source manifest remains for compatibility; compiledItems
         # records the exact selection and ranges used by this run.
@@ -1565,6 +1649,12 @@ class WritingPipeline:
             "bookId": book_id,
             "chapterNumber": chapter_number,
             "chapterId": ctx.get("chapter_id") or self._get_chapter_id(book_id, chapter_number),
+            "authorIntent": author_intent_snapshot,
+            "storyBible": story_bible_snapshot,
+            "canonCommit": canon_commit,
+            "planning": planning_snapshot,
+            "chapterIntent": chapter_intent_snapshot,
+            "memoryEvidence": memory_evidence,
             "items": manifest_items,
             "compiledItems": compiled_items,
             "excludedItems": bundle.excluded,
@@ -1589,6 +1679,16 @@ class WritingPipeline:
                 "constraints": {
                     "status": "included" if any(item.get("sourceType") == "constraints" for item in manifest_items) else "not_available",
                 },
+            },
+            "provenance": {
+                "contextAuthority": "Host.WritingPipeline",
+                "canonicalState": {
+                    "stateVersion": canonical_state.get("state_version"),
+                    "lastCommitId": canonical_state.get("last_commit_id"),
+                    "stale": bool(canonical_state.get("stale")),
+                },
+                "planningSnapshotId": planning_snapshot.get("snapshotId"),
+                "planningSnapshotVersion": planning_snapshot.get("version"),
             },
         }
         self._decorate_context_manifest(ctx["context_manifest"], context_parts)
@@ -1619,10 +1719,21 @@ class WritingPipeline:
             if runtime is not None:
                 try:
                     embedder = RoutedEmbeddingProvider(runtime.repository)
+                    bind_runtime = getattr(embedder, "bind_runtime", None)
+                    if callable(bind_runtime):
+                        runtime_adapter = self.model_manager
+                        if not callable(getattr(runtime_adapter, "embed", None)):
+                            runtime_adapter = runtime
+                        bind_runtime(runtime_adapter)
                     model_key = f"narrative-memory:{embedder.model_key}"
-                except Exception:
+                except Exception as exc:
                     # No embedding route is a supported degraded mode.  The
                     # durable projection remains queryable through BM25.
+                    logger.info(
+                        "embedding route unavailable; using BM25 fallback: %s",
+                        exc,
+                        exc_info=exc,
+                    )
                     embedder = None
             memory_retriever = DurableHybridRetriever(
                 self.db, model_key=model_key, embedder=embedder
@@ -1672,6 +1783,17 @@ class WritingPipeline:
                     "reason": "canonical memory or durable RAG result selected for chapter planning",
                     "provenance": result.get("provenance") or result.get("metadata", {}).get("provenance", {}),
                 } for result in chunks)
+                ctx["context_manifest"]["memoryEvidence"] = [
+                    deepcopy(item)
+                    for item in ctx["context_manifest"].get("items", [])
+                    if isinstance(item, dict)
+                    and str(item.get("sourceType") or "") in {"narrative_memory", "rag_chunk"}
+                ]
+                ctx["context_manifest"].setdefault("provenance", {})["retrieval"] = {
+                    "canonicalMemoryResults": len(memory_chunks),
+                    "referenceResults": len(document_results.get("results", [])),
+                    "embeddingModel": model_key if embedder is not None else None,
+                }
                 assembled_context = "\n\n".join(ctx.get("context_parts", []))
                 ctx["context_manifest"]["contextChars"] = len(assembled_context)
                 ctx["context_manifest"]["contextSha256"] = hashlib.sha256(assembled_context.encode("utf-8")).hexdigest()
@@ -1702,7 +1824,12 @@ class WritingPipeline:
             plan=plan_text,
             context=context_text,
         )
-        self._checkpoint(task, "PLAN_CHAPTER", {"stage": "PLAN_CHAPTER", "context": {**ctx, "planning": True}})
+        self._checkpoint(
+            task,
+            "PLAN_CHAPTER",
+            {"stage": "PLAN_CHAPTER", "context": {**ctx, "planning": True}},
+            workflow_state="COMPUTE_PLANNED",
+        )
         try:
             response = self.model_manager.chat(
                 [{"role": "user", "content": prompt}],
@@ -1711,6 +1838,7 @@ class WritingPipeline:
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
                 prompt_registry=prompt_registry,
+                context_manifest=ctx.get("context_manifest"),
             )
             prompt_a1 = response.content.strip()
         except Exception as exc:
@@ -1752,7 +1880,12 @@ class WritingPipeline:
             "and mandatory continuity points. Do not write chapter prose and do not extract "
             "facts from a chapter that has not been written yet."
         )
-        self._checkpoint(task, "EXTRACT_REQUIREMENTS", {"stage": "EXTRACT_REQUIREMENTS", "context": {**ctx, "extracting": True}})
+        self._checkpoint(
+            task,
+            "EXTRACT_REQUIREMENTS",
+            {"stage": "EXTRACT_REQUIREMENTS", "context": {**ctx, "extracting": True}},
+            workflow_state="COMPUTE_PLANNED",
+        )
         try:
             response = self.model_manager.chat(
                 [{"role": "user", "content": prompt}],
@@ -1761,6 +1894,7 @@ class WritingPipeline:
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
                 prompt_registry=prompt_registry,
+                context_manifest=ctx.get("context_manifest"),
             )
             prompt_a2 = response.content.strip()
         except Exception as exc:
@@ -1792,7 +1926,12 @@ class WritingPipeline:
             prompt_a2=prompt_a2,
             plan=plan_text,
         )
-        self._checkpoint(task, "COMPOSE_WRITING_PROMPT", {"stage": "COMPOSE_WRITING_PROMPT", "context": {**ctx, "composing": True}})
+        self._checkpoint(
+            task,
+            "COMPOSE_WRITING_PROMPT",
+            {"stage": "COMPOSE_WRITING_PROMPT", "context": {**ctx, "composing": True}},
+            workflow_state="COMPUTE_PLANNED",
+        )
         try:
             response = self.model_manager.chat(
                 [{"role": "user", "content": prompt}],
@@ -1801,6 +1940,7 @@ class WritingPipeline:
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
                 prompt_registry=prompt_registry,
+                context_manifest=ctx.get("context_manifest"),
             )
             prompt_a = response.content.strip()
         except Exception as exc:
@@ -1967,10 +2107,15 @@ class WritingPipeline:
         )
         ctx["context_manifest"] = context_manifest
 
-        self._checkpoint(task, "GENERATE_DRAFT", {
-            "stage": "GENERATE_DRAFT",
-            "context": {**ctx, "generating": True},
-        })
+        self._checkpoint(
+            task,
+            "GENERATE_DRAFT",
+            {
+                "stage": "GENERATE_DRAFT",
+                "context": {**ctx, "generating": True},
+            },
+            workflow_state="GENERATING",
+        )
 
         try:
             response = self.model_manager.chat(
@@ -2005,6 +2150,188 @@ class WritingPipeline:
 
         return {"next_stage": "REVIEW", "context": ctx}
 
+    @staticmethod
+    def _clip_reviewer_text(value: Any, limit: int) -> tuple[str, bool]:
+        """Bound a reviewer section without silently changing its meaning."""
+        text = str(value or "")
+        if len(text) <= limit:
+            return text, False
+        marker = "\n[此审查输入已按边界截断]"
+        return f"{text[:max(0, limit - len(marker))]}{marker}", True
+
+    @classmethod
+    def _build_reviewer_input(
+        cls,
+        *,
+        content: str,
+        plan: dict[str, Any],
+        rubric: str,
+        context_parts: list[Any],
+        context_manifest: Optional[dict[str, Any]] = None,
+    ) -> tuple[str, dict[str, Any], dict[str, str]]:
+        """Build a fresh, bounded Reviewer input from durable evidence.
+
+        The Writer's A1/A2 prompts, intermediate reasoning, original alpha,
+        and any provider conversation are intentionally not inputs here.  The
+        exact rendered prompt is persisted by the model runtime; this manifest
+        records only the section boundary, source provenance, and isolation
+        policy needed to audit what the Reviewer was allowed to see.
+        """
+        canonical_parts: list[str] = []
+        intent_parts: list[str] = []
+        evidence_parts: list[str] = []
+        excluded_markers = (
+            "提示词 a1",
+            "提示词 a2",
+            "提示词 a（",
+            "本章创作链路",
+            "writer thread",
+            "writer history",
+        )
+        canonical_markers = (
+            "story bible",
+            "前文摘要",
+            "已确立的事实",
+            "canonical narrative memory",
+            "story graph",
+        )
+        intent_markers = ("storyflow chapter intent", "章节意图", "chapter intent")
+
+        for raw_part in context_parts or []:
+            part = str(raw_part or "").strip()
+            if not part:
+                continue
+            heading = part.splitlines()[0].strip().casefold()
+            if any(marker in heading for marker in excluded_markers):
+                continue
+            if any(marker in heading for marker in intent_markers):
+                intent_parts.append(part)
+            elif any(marker in heading for marker in canonical_markers):
+                canonical_parts.append(part)
+            else:
+                evidence_parts.append(part)
+
+        plan_text = json.dumps(plan or {}, ensure_ascii=False, indent=2)
+        if intent_parts:
+            plan_text = f"{plan_text}\n\n" + "\n\n".join(intent_parts)
+
+        section_values = {
+            "canon": cls._clip_reviewer_text(
+                "\n\n".join(canonical_parts) or "（未提供 Canon 片段；不得据此补造事实。）",
+                12_000,
+            ),
+            "intent": cls._clip_reviewer_text(plan_text, 8_000),
+            "draft": cls._clip_reviewer_text(content, 8_000),
+            "rubric": cls._clip_reviewer_text(rubric, 4_000),
+            "relevant_evidence": cls._clip_reviewer_text(
+                "\n\n".join(evidence_parts) or "（未提供额外相关证据。）",
+                12_000,
+            ),
+        }
+
+        prompt = (
+            "请仅根据以下隔离的审查输入评估当前 Draft。Reviewer 不继承 Writer 的完整 Thread 历史、"
+            "推理过程或中间提示词；如果输入没有证据，不要自行补造事实。\n\n"
+            f"## Canon\n{section_values['canon'][0]}\n\n"
+            f"## Intent\n{section_values['intent'][0]}\n\n"
+            f"## Draft\n{section_values['draft'][0]}\n\n"
+            f"## Rubric\n{section_values['rubric'][0]}\n\n"
+            f"## Relevant Evidence\n{section_values['relevant_evidence'][0]}\n\n"
+            "请以JSON格式返回审查结果，包含 overall_score、verdict、dimensions 和 issues。"
+            "issues 中包含 severity、dimension、description、location、suggestion。只返回JSON。"
+        )
+
+        source_items = (context_manifest or {}).get("items", [])
+        if not isinstance(source_items, list):
+            source_items = []
+        source_type_groups = {
+            "canon": {
+                "story_bible", "chapter_summary", "story_fact",
+                "narrative_memory", "story_graph", "story_graph_node",
+            },
+            "intent": {"planning_node", "chapter_plan"},
+            "relevant_evidence": set(),
+        }
+        all_source_types = {
+            str(item.get("sourceType"))
+            for item in source_items
+            if isinstance(item, dict) and item.get("sourceType")
+        }
+        source_ids_by_group: dict[str, list[str]] = {}
+        source_types_by_group: dict[str, list[str]] = {}
+        for section_id, grouped_types in source_type_groups.items():
+            if section_id == "relevant_evidence":
+                selected = all_source_types - source_type_groups["canon"] - source_type_groups["intent"]
+            else:
+                selected = grouped_types
+            matching = [
+                item for item in source_items
+                if isinstance(item, dict) and str(item.get("sourceType")) in selected
+            ]
+            source_ids_by_group[section_id] = sorted({
+                str(item.get("sourceId")) for item in matching if item.get("sourceId")
+            })
+            source_types_by_group[section_id] = sorted({
+                str(item.get("sourceType")) for item in matching if item.get("sourceType")
+            })
+
+        sections: list[dict[str, Any]] = []
+        titles = {
+            "canon": "Canon",
+            "intent": "Intent",
+            "draft": "Draft",
+            "rubric": "Rubric",
+            "relevant_evidence": "Relevant Evidence",
+        }
+        for section_id, (section_text, truncated) in section_values.items():
+            sections.append({
+                "id": section_id,
+                "title": titles[section_id],
+                "sourceTypes": source_types_by_group.get(section_id, []),
+                "sourceIds": source_ids_by_group.get(section_id, []),
+                "sourceChars": len(section_text) if not truncated else None,
+                "contentChars": len(section_text),
+                "maxChars": {
+                    "canon": 12_000,
+                    "intent": 8_000,
+                    "draft": 8_000,
+                    "rubric": 4_000,
+                    "relevant_evidence": 12_000,
+                }[section_id],
+                "truncated": truncated,
+                "sha256": hashlib.sha256(section_text.encode("utf-8")).hexdigest(),
+            })
+
+        writer_manifest = context_manifest if isinstance(context_manifest, dict) else {}
+        reviewer_manifest = {
+            "schemaVersion": 1,
+            "role": "reviewer",
+            "source": "writing_pipeline.REVIEW",
+            "allowedInputs": ["Canon", "Intent", "Draft", "Rubric", "Relevant Evidence"],
+            "sections": sections,
+            "isolation": {
+                "mode": "fresh_task_input",
+                "inheritsWriterThreadHistory": False,
+                "writerThreadHistorySource": None,
+                "excludedWriterArtifacts": [
+                    "prompt_a1", "prompt_a2", "prompt_a", "alpha_content",
+                    "writer_thread_messages", "writer_reasoning",
+                ],
+            },
+            "sourceContext": {
+                "source": writer_manifest.get("source"),
+                "schemaVersion": writer_manifest.get("schemaVersion"),
+                "contextSha256": writer_manifest.get("contextSha256"),
+                "itemCount": len(source_items),
+            },
+            "inputSha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "inputChars": len(prompt),
+        }
+        return prompt, reviewer_manifest, {
+            section_id: section_text
+            for section_id, (section_text, _truncated) in section_values.items()
+        }
+
     def _review(self, task: dict, ctx: dict) -> dict:
         """Review the generated draft."""
         project_id = ctx["project_id"]
@@ -2027,37 +2354,82 @@ class WritingPipeline:
 
         content = version["content"]
         plan = ctx.get("chapter_plan", {})
-        alpha_content = ctx.get("alpha_content", content)
         rubric = ctx.get("review_rubric", REVIEW_RUBRIC)
+
+        reviewer_prompt_input, reviewer_manifest, reviewer_sections = self._build_reviewer_input(
+            content=content,
+            plan=plan,
+            rubric=rubric,
+            context_parts=ctx.get("context_parts", []),
+            context_manifest=ctx.get("context_manifest"),
+        )
+        reviewer_manifest.update({
+            "projectId": project_id,
+            "bookId": book_id,
+            "chapterNumber": chapter_number,
+            "chapterId": chapter_id,
+        })
+        writer_manifest = ctx.get("context_manifest")
+        if isinstance(writer_manifest, dict):
+            # The Reviewer receives the same immutable evidence snapshots, but
+            # never the Writer's thread history or intermediate prompt chain.
+            for key in (
+                "authorIntent", "storyBible", "canonCommit", "planning",
+                "chapterIntent", "memoryEvidence",
+            ):
+                if key in writer_manifest:
+                    reviewer_manifest[key] = deepcopy(writer_manifest[key])
+            reviewer_manifest["provenance"] = {
+                "contextAuthority": "Host.WritingPipeline.Reviewer",
+                "sourceContext": {
+                    "source": writer_manifest.get("source"),
+                    "contextSha256": writer_manifest.get("contextSha256"),
+                    "bundleSchemaVersion": writer_manifest.get("schemaVersion"),
+                },
+                "isolation": "fresh_reviewer_input",
+            }
 
         # Build review prompt.
         review_prompt, review_system, prompt_key, prompt_version, prompt_registry = self._registered_prompt(
             "review", project_id,
             task=task,
             fallback_system="你是一位专业的小说审稿编辑，擅长从多个维度评估小说质量。",
-            fallback_user=(
-                f"请审查以下章节，从多个维度评估质量。\n\n## 提示词 A1\n{ctx.get('prompt_a1', '')}"
-                f"\n\n## 提示词 A2\n{ctx.get('prompt_a2', '')}\n\n## α（当前候选正文）\n{content[:8000]}"
-                f"\n\n## 原始 α\n{alpha_content[:8000]}\n\n## 章节计划\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n\n## 评分细则\n{rubric}\n\n"
-                "请以JSON格式返回审查结果，包含 overall_score、verdict、dimensions 和 issues。"
-                "issues 中包含 severity、dimension、description、location、suggestion。只返回JSON。"
-            ),
-            content=content[:8000],
-            plan=json.dumps(plan, ensure_ascii=False, indent=2),
+            fallback_user=reviewer_prompt_input,
+            content=f"## Draft\n{reviewer_sections['draft']}",
+            plan=f"## Intent\n{reviewer_sections['intent']}",
             extra=(
-                f"请返回 overall_score、verdict、dimensions、issues JSON。\n\n"
-                f"提示词 A1：{ctx.get('prompt_a1', '')}\n\n提示词 A2：{ctx.get('prompt_a2', '')}\n\n"
-                f"评分细则：{rubric}"
+                "## Canon\n"
+                f"{reviewer_sections['canon']}\n\n"
+                "## Rubric\n"
+                f"{reviewer_sections['rubric']}\n\n"
+                "## Relevant Evidence\n"
+                f"{reviewer_sections['relevant_evidence']}\n\n"
+                "请返回 overall_score、verdict、dimensions、issues JSON。"
             ),
+            canon=reviewer_sections["canon"],
+            intent=reviewer_sections["intent"],
+            draft=reviewer_sections["draft"],
+            rubric=reviewer_sections["rubric"],
+            evidence=reviewer_sections["relevant_evidence"],
         )
-        # Preserve the chain even when an author has customized the registered
-        # review template without adding the new variables.
-        review_prompt = (
-            f"{review_prompt}\n\n## 本章创作链路\n"
-            f"### 提示词 A1\n{ctx.get('prompt_a1', '')}\n\n"
-            f"### 提示词 A2\n{ctx.get('prompt_a2', '')}\n\n"
-            f"### α\n{alpha_content[:8000]}\n\n## 评分细则\n{rubric}"
+        required_reviewer_sections = (
+            "## Canon",
+            "## Intent",
+            "## Draft",
+            "## Rubric",
+            "## Relevant Evidence",
         )
+        if not all(marker in review_prompt for marker in required_reviewer_sections):
+            review_prompt = (
+                f"{review_prompt}\n\n## Isolated Reviewer Input\n{reviewer_prompt_input}"
+            )
+        reviewer_manifest["renderedPromptChars"] = len(review_prompt)
+        reviewer_manifest["renderedPromptSha256"] = hashlib.sha256(review_prompt.encode("utf-8")).hexdigest()
+        reviewer_manifest["systemPromptSha256"] = hashlib.sha256(review_system.encode("utf-8")).hexdigest()
+        ctx["reviewer_input"] = reviewer_manifest
+        if isinstance(ctx.get("context_manifest"), dict):
+            ctx["context_manifest"] = deepcopy(ctx["context_manifest"])
+            ctx["context_manifest"]["reviewerInput"] = deepcopy(reviewer_manifest)
 
         try:
             # Use chat_json() for more reliable JSON parsing when available.
@@ -2069,6 +2441,7 @@ class WritingPipeline:
                     prompt_key=prompt_key,
                     prompt_version=prompt_version,
                     prompt_registry=prompt_registry,
+                    context_manifest=reviewer_manifest,
                 )
                 if "error" in review_data and "raw" in review_data:
                     # chat_json() returned a parse error; try manual recovery.
@@ -2084,6 +2457,7 @@ class WritingPipeline:
                     prompt_key=prompt_key,
                     prompt_version=prompt_version,
                     prompt_registry=prompt_registry,
+                    context_manifest=reviewer_manifest,
                 )
                 review_text = response.content.strip()
                 if review_text.startswith("```"):
@@ -2131,7 +2505,10 @@ class WritingPipeline:
         elif isinstance(dimensions_dict, list):
             dimensions_list = dimensions_dict
 
-        # Save review using ReviewRepository for proper persistence.
+        # Save review using the single authoritative ReviewRepository boundary.
+        # A persistence failure must fail the durable task; falling back to the
+        # legacy StoryRepository would hide schema/transaction defects and make
+        # the review provenance depend on which repository happened to work.
         try:
             review_id = self.review_repo.save_review(
                 project_id=project_id,
@@ -2147,17 +2524,11 @@ class WritingPipeline:
             )
             ctx["review_id"] = review_id
         except Exception as exc:
-            logger.warning("Failed to save review to repository: %s", exc)
-            # Fallback to story_repo for backward compatibility.
-            fallback_review_id = self.story_repo.save_review(project_id, {
-                "chapter_number": chapter_number,
-                "chapter_version_id": ctx["draft_version_id"],
-                "overall_score": ctx["review_score"],
-                "verdict": review_data.get("verdict", "fail"),
-                "dimensions": dimensions_list,
-                "specific_issues": [i.get("description", "") for i in ctx["review_issues"]],
-            })
-            ctx["review_id"] = fallback_review_id
+            raise WritingPipelineError(
+                "REVIEW_PERSISTENCE_FAILED",
+                f"review persistence failed: {exc}",
+                retryable=True,
+            ) from exc
 
         return {"next_stage": "QUALITY_GATE", "context": ctx}
 
@@ -2309,10 +2680,15 @@ class WritingPipeline:
             f"## Current candidate\n{content[:8000]}"
         )
 
-        self._checkpoint(task, "REVISION", {
-            "stage": "REVISION",
-            "context": {**ctx, "revising": True},
-        })
+        self._checkpoint(
+            task,
+            "REVISION",
+            {
+                "stage": "REVISION",
+                "context": {**ctx, "revising": True},
+            },
+            workflow_state="REVISING",
+        )
 
         try:
             response = self.model_manager.chat(
@@ -2322,10 +2698,18 @@ class WritingPipeline:
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
                 prompt_registry=prompt_registry,
+                context_manifest=ctx.get("context_manifest"),
             )
             revised_content = response.content.strip()
         except Exception as exc:
             self._raise_model_failure(exc, "REVISION_ERROR", "revision failed")
+
+        if len(revised_content) < 100:
+            raise WritingPipelineError(
+                "REVISION_TOO_SHORT",
+                "generated revision is too short",
+                retryable=True,
+            )
 
         # Save as a new ChapterVersion.
         new_version = self.story_repo.append_chapter_version(
@@ -2380,11 +2764,12 @@ class WritingPipeline:
         try:
             response = self.model_manager.chat(
                 [{"role": "user", "content": extract_prompt}],
-                    system=extract_system,
+                system=extract_system,
                 task_type="fact-extraction",
                 prompt_key=prompt_key,
                 prompt_version=prompt_version,
                 prompt_registry=prompt_registry,
+                context_manifest=ctx.get("context_manifest"),
             )
             fact_text = response.content.strip()
             if fact_text.startswith("```"):

@@ -2178,17 +2178,22 @@ class StoryRepository:
             )
         return row
 
-    def apply_planning_synthesis(self, project_id: str, synthesis: dict[str, Any]) -> dict[str, Any]:
+    def apply_planning_synthesis(
+        self,
+        project_id: str,
+        synthesis: dict[str, Any],
+        *,
+        _conn: Any | None = None,
+    ) -> dict[str, Any]:
         """Persist the model's planning summary as the canonical read/write projection.
 
         Planning documents and Story Bible snapshots remain the source record.
         This method only updates the structured projections used by writing,
         review and Studio read views, and it preserves existing non-empty entity
-        fields when a later synthesis is less specific.
+        fields when a later synthesis is less specific.  ``_conn`` is reserved
+        for the Host-owned proposal acceptance path so the projection and its
+        decision share one transaction.
         """
-        book = self.book_for_project(project_id)
-        if not book:
-            raise KeyError(f"no authoritative book for project: {project_id}")
         world = dict(synthesis.get("world") or {})
         power = world.get("power_system") or {}
         if isinstance(power, dict):
@@ -2219,7 +2224,13 @@ class StoryRepository:
                 ) if isinstance(style.get(key), str) and style[key].strip()
             )
         now = datetime.now().isoformat()
-        with self.db.transaction() as conn:
+        transaction_context = nullcontext(_conn) if _conn is not None else self.db.transaction()
+        with transaction_context as conn:
+            book = conn.execute(
+                "SELECT * FROM books WHERE project_id=? ORDER BY created_at LIMIT 1", (project_id,)
+            ).fetchone()
+            if not book:
+                raise KeyError(f"no authoritative book for project: {project_id}")
             conn.execute(
                 """UPDATE projects SET author_intent=?, writing_style=?, style_profile=?,
                    world_setting=?, updated_at=? WHERE id=?""",

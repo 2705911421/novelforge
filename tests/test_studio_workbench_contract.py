@@ -82,6 +82,11 @@ def test_continuous_page_watcher_cannot_survive_navigation_or_stop_listening():
     assert "pageTimeout(()=>pollTask(id,signal)" in INDEX
 
 
+def test_continuous_start_does_not_enqueue_after_policy_save_failure():
+    assert "保存连续创作参数失败：" in INDEX
+    assert "toast('保存连续创作参数失败：'+(e.message||'未知错误'),'error');" in INDEX
+
+
 def test_legacy_page_async_work_obeys_workspace_abort_and_cleanup_boundary():
     assert "function pageTimeout(callback, delay, signal)" in INDEX
     assert "function pageSleep(delay, signal)" in INDEX
@@ -113,6 +118,33 @@ def test_ai_runtime_page_exposes_persisted_runtime_center_and_compute_policy():
         "Tool Gateway catalog",
     ):
         assert marker in ENHANCEMENTS
+    assert "compute-escalation-requests" in INDEX
+
+
+def test_first_use_runtime_selection_is_host_bound_and_fail_closed_until_ready():
+    for marker in (
+        "Welcome to NovelForge",
+        "Choose Intelligence Runtime",
+        "Continue with ChatGPT",
+        "No API key required",
+        "data-runtime-onboarding",
+        "runtimeOnboardingAction",
+        "runtimeOpenApiSetup",
+        "未 Ready 的 Runtime 不会被 Scheduler 静默使用",
+        "data-runtime-first-use",
+        "runtimeDashboardSetupCard",
+    ):
+        assert marker in ENHANCEMENTS
+    assert "item?.installation?.state === 'ready'" in ENHANCEMENTS
+
+
+def test_first_use_runtime_setup_is_reachable_without_an_active_book():
+    assert "const globalSetup = meta.id === 'more' && meta.page === 'agent-config';" in SHELL_JS
+    assert "!S.book && !globalSetup" in SHELL_JS
+    assert "return '/runtime'" in SHELL_JS
+    assert "bookId: null, meta: { id: 'more', page: 'agent-config'" in SHELL_JS
+    assert '@app.get("/runtime", response_class=HTMLResponse)' in STUDIO
+    assert '@app.get("/agent-config", response_class=HTMLResponse)' in STUDIO
 
 
 def test_shell_keeps_more_functionality_out_of_the_primary_workspace_tree():

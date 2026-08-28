@@ -7,6 +7,7 @@ import logging
 from typing import Optional, Dict, List
 from enum import Enum
 
+from .client import require_legacy_llm_client
 from .gateway import ModelGateway, LLMResponse, get_gateway
 from .agent_prompts import compose_agent_prompt
 
@@ -68,8 +69,9 @@ class ModelRouter:
         return compose_agent_prompt(self._contract_role(role), system)
     
     def chat(self, role: AgentRole, messages: List[Dict], 
-             system: str = "", **kwargs) -> LLMResponse:
+              system: str = "", **kwargs) -> LLMResponse:
         """按角色调用聊天"""
+        require_legacy_llm_client("ModelRouter.chat")
         provider_name = self.get_provider_name(role)
         logger.debug(f"路由 {role.value} -> {provider_name}")
         return self.gateway.chat(provider_name, messages, self._effective_system(role, system), **kwargs)
@@ -77,6 +79,7 @@ class ModelRouter:
     def chat_json(self, role: AgentRole, messages: List[Dict],
                   system: str = "", **kwargs) -> Dict:
         """按角色调用聊天，返回JSON"""
+        require_legacy_llm_client("ModelRouter.chat_json")
         provider_name = self.get_provider_name(role)
         logger.debug(f"路由 {role.value} -> {provider_name} (JSON)")
         return self.gateway.chat_json(provider_name, messages, self._effective_system(role, system), **kwargs)
@@ -84,6 +87,7 @@ class ModelRouter:
     def chat_stream(self, role: AgentRole, messages: List[Dict],
                     system: str = "", **kwargs):
         """按角色流式聊天"""
+        require_legacy_llm_client("ModelRouter.chat_stream")
         provider_name = self.get_provider_name(role)
         logger.debug(f"路由 {role.value} -> {provider_name} (stream)")
         return self.gateway.chat_stream(provider_name, messages, self._effective_system(role, system), **kwargs)

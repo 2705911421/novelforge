@@ -71,6 +71,42 @@ class PlotWorkspaceRepository:
             return graph, revision
         return self._normalize_graph(graph), int(row.get("revision") or 1)
 
+    def preview_delta(
+        self,
+        book_id: str,
+        delta: dict[str, Any],
+        expected_revision: Optional[int] = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], int, bool]:
+        """Apply a canvas delta to an in-memory copy without persisting it.
+
+        ``load`` deliberately performs lazy workspace initialization and source
+        reconciliation for the normal authoring path.  A preview must be
+        side-effect free, so it reads the source graph and persisted overlay
+        directly and reports whether a workspace row already exists.
+        """
+        if not isinstance(delta, dict):
+            raise PlotWorkspaceError("plot delta must be an object")
+        row = self.db.fetchone("SELECT * FROM plot_workspaces WHERE book_id=?", (book_id,))
+        source = self.build_source_graph(book_id)
+        if row is None:
+            current_revision = 1
+            current = self._normalize_graph(source)
+            workspace_initialized = False
+        else:
+            persisted = _json_load(row.get("graph"), source)
+            current = self._normalize_graph(self._merge_source(persisted, source))
+            current_revision = int(row.get("revision") or 1)
+            workspace_initialized = True
+        if expected_revision is not None and int(expected_revision) != current_revision:
+            raise PlotRevisionConflict(int(expected_revision), current_revision)
+
+        preview = deepcopy(current)
+        if isinstance(delta.get("graph"), dict):
+            preview = self._normalize_graph(delta["graph"])
+        else:
+            self._apply_operations(preview, delta.get("operations", []))
+        return current, preview, current_revision, workspace_initialized
+
     def build_source_graph(self, book_id: str) -> dict[str, Any]:
         book = self.db.fetchone("SELECT id, title, genre FROM books WHERE id=?", (book_id,))
         if not book:
@@ -214,33 +250,56 @@ class PlotWorkspaceRepository:
         return {"version": 1, "bookId": book_id, "title": book.get("title") or book_id,
                 "nodes": nodes, "edges": edges, "generatedAt": datetime.now().isoformat()}
 
-    def apply_delta(self, book_id: str, delta: dict[str, Any], expected_revision: Optional[int] = None) -> tuple[dict[str, Any], int]:
+    def apply_delta(
+        self,
+        book_id: str,
+        delta: dict[str, Any],
+        expected_revision: Optional[int] = None,
+        *,
+        _connection: Any | None = None,
+    ) -> tuple[dict[str, Any], int]:
+        """Apply a revisioned overlay delta, optionally inside a Host transaction."""
         if not isinstance(delta, dict):
             raise PlotWorkspaceError("plot delta must be an object")
+        if _connection is not None:
+            return self._apply_delta_on_connection(
+                _connection, book_id, delta, expected_revision
+            )
         with self.db.transaction() as conn:
-            row = conn.execute("SELECT * FROM plot_workspaces WHERE book_id=?", (book_id,)).fetchone()
-            if row is None:
-                raise PlotWorkspaceError("plot workspace is not initialized")
-            actual = int(row["revision"] or 1)
-            if expected_revision is not None and int(expected_revision) != actual:
-                raise PlotRevisionConflict(int(expected_revision), actual)
-            graph = self._normalize_graph(_json_load(row["graph"], {}))
-            if isinstance(delta.get("graph"), dict):
-                graph = self._normalize_graph(delta["graph"])
-            else:
-                self._apply_operations(graph, delta.get("operations", []))
-            graph["updatedAt"] = datetime.now().isoformat()
-            next_revision = actual + 1
-            encoded = json.dumps(graph, ensure_ascii=False)
-            conn.execute(
-                "UPDATE plot_workspaces SET revision=?, graph=?, updated_at=CURRENT_TIMESTAMP WHERE book_id=?",
-                (next_revision, encoded, book_id),
+            return self._apply_delta_on_connection(
+                conn, book_id, delta, expected_revision
             )
-            workspace_id = row["id"]
-            conn.execute(
-                "INSERT INTO plot_workspace_revisions(id, workspace_id, revision, graph) VALUES (?, ?, ?, ?)",
-                (generate_id(), workspace_id, next_revision, encoded),
-            )
+
+    def _apply_delta_on_connection(
+        self,
+        conn: Any,
+        book_id: str,
+        delta: dict[str, Any],
+        expected_revision: Optional[int],
+    ) -> tuple[dict[str, Any], int]:
+        row = conn.execute("SELECT * FROM plot_workspaces WHERE book_id=?", (book_id,)).fetchone()
+        if row is None:
+            raise PlotWorkspaceError("plot workspace is not initialized")
+        actual = int(row["revision"] or 1)
+        if expected_revision is not None and int(expected_revision) != actual:
+            raise PlotRevisionConflict(int(expected_revision), actual)
+        graph = self._normalize_graph(_json_load(row["graph"], {}))
+        if isinstance(delta.get("graph"), dict):
+            graph = self._normalize_graph(delta["graph"])
+        else:
+            self._apply_operations(graph, delta.get("operations", []))
+        graph["updatedAt"] = datetime.now().isoformat()
+        next_revision = actual + 1
+        encoded = json.dumps(graph, ensure_ascii=False)
+        conn.execute(
+            "UPDATE plot_workspaces SET revision=?, graph=?, updated_at=CURRENT_TIMESTAMP WHERE book_id=?",
+            (next_revision, encoded, book_id),
+        )
+        workspace_id = row["id"]
+        conn.execute(
+            "INSERT INTO plot_workspace_revisions(id, workspace_id, revision, graph) VALUES (?, ?, ?, ?)",
+            (generate_id(), workspace_id, next_revision, encoded),
+        )
         return graph, next_revision
 
     @overload

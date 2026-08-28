@@ -30,3 +30,7 @@ pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportMissingImports = true
 reportMissingTypeStubs = false
+# Resolve third-party imports from the project's own virtual environment so
+# pytest/fastapi imports in tests do not surface as phantom errors.
+venvPath = "."
+venv = ".venv"
