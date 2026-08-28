@@ -910,8 +910,8 @@
 
 > 最后审计：2026-08-08 (High-End Audit)。数据经过源码验证、测试验证和静态分析。
 > **注意**: 本文件中的 Phase 状态和历史完成度都是开发方声明，不是验收结论。
-> 当前可执行验证仅覆盖 `spec/features/*.yaml` 中的 5 个合同；详见
-> `docs/high-end-audit/` 目录下的独立运行证据。
+> 当前可执行验证仅覆盖 `spec/features/*.yaml` 中的 5 个合同；历史 High-End Audit
+> 目录属于一次性审计材料，已在本次清理中归档，不作为当前验证入口。
 > **历史验证**: 2026-08-13 851 tests passed in 269.40s, ruff clean, pyright 0 errors, 5/5 合同特征 VERIFIED
 > **功能矩阵更新**: NOT_STARTED 从 57 降至 37，TESTED 从 21 增至 41
 > **历史回归**: 2026-08-13 `851 passed in 269.40s`, `ruff check .` 通过，`pyright src tests` 为 0 errors/warnings
