@@ -1,5 +1,6 @@
 """Phase 7: Story Bible workspace, draft/confirm/publish state machine, and AI suggestion task."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -133,6 +134,20 @@ def test_publish_updates_project_truth(repo, bible_db):
     assert project["world_setting"] is not None
 
 
+def test_publish_persists_explicit_voice_style_profile(repo, bible_db):
+    for _, key in STORY_BIBLE_STEPS:
+        payload = {key: f"value for {key}"}
+        if key == "voice":
+            payload = {"summary": "restrained voice", "styleProfile": {"rhythm": "short paragraphs"}}
+        repo.save_draft("proj", key, payload)
+        repo.confirm("proj", key)
+
+    repo.publish("proj")
+    project = bible_db.fetchone("SELECT style_profile FROM projects WHERE id='proj'")
+    assert project is not None
+    assert json.loads(project["style_profile"]) == {"rhythm": "short paragraphs"}
+
+
 def test_save_suggestion_does_not_change_confirmed_step(repo):
     repo.save_draft("proj", "intent", {"theme": "mystery"})
     repo.confirm("proj", "intent")
@@ -182,6 +197,59 @@ def test_api_get_story_bible_creates_workspace(studio_client):
     data = resp.json()
     assert data["workspace"]["status"] == "draft"
     assert len(data["steps"]) == 25
+
+
+def test_api_book_settings_stage_planning_fields_without_projection_write(studio_client, bible_db, tmp_path):
+    client, _, project_id = studio_client
+    response = client.put(
+        f"/api/v1/books/{project_id}",
+        json={
+            "title": "Renamed API Project",
+            "genre": "mystery",
+            "targetVolumes": 3,
+            "writingStyle": "克制、具体。",
+            "authorIntent": "让每次选择都留下代价。",
+            "styleProfile": {"rhythm": "short paragraphs"},
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["storyBibleDrafted"] == ["intent", "voice"]
+
+    project = bible_db.fetchone(
+        "SELECT name, genre, target_volumes, author_intent, writing_style, style_profile "
+        "FROM projects WHERE id=?",
+        (project_id,),
+    )
+    assert project is not None
+    assert project["name"] == "Renamed API Project"
+    assert project["genre"] == "mystery"
+    assert project["target_volumes"] == 3
+    assert project["author_intent"] in (None, "")
+    assert project["writing_style"] in (None, "")
+    assert json.loads(project["style_profile"] or "{}") == {}
+
+    bible = StoryBibleRepository(bible_db).get(project_id)
+    assert bible is not None
+    steps = {step["step_key"]: step for step in bible["steps"]}
+    assert steps["intent"]["draft"] == "让每次选择都留下代价。"
+    assert steps["voice"]["draft"] == {
+        "summary": "克制、具体。",
+        "styleProfile": {"rhythm": "short paragraphs"},
+    }
+
+    truth = client.get(f"/api/v1/books/{project_id}/truth")
+    assert truth.status_code == 200
+    assert truth.json()["authorIntent"] == "让每次选择都留下代价。"
+    assert not (
+        tmp_path / "projects" / project_id / "control" / "author_intent.json"
+    ).exists()
+
+    direct_truth = client.put(
+        f"/api/v1/books/{project_id}/truth/author_intent",
+        json={"content": "通过沉默制造悬念。"},
+    )
+    assert direct_truth.status_code == 200
+    assert client.get(f"/api/v1/books/{project_id}/truth").json()["authorIntent"] == "通过沉默制造悬念。"
 
 
 def test_api_save_and_confirm_step(studio_client):

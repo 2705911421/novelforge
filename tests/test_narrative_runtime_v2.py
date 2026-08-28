@@ -5,15 +5,18 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from src.core.database import Database
 from src.core.generation_attempts import GenerationAttemptStore
 from src.core.narrative_health import NarrativeHealthService
+from src.core.project import ProjectManager
 from src.core.story_repository import StoryRepository
 from src.llm.gateway import LLMResponse
 from src.llm.model_runtime import CredentialStore, ModelRepository, PersistentModelRuntime
 from src.pipeline.context_compiler import ContextBudgetExceeded, ContextCompiler, ContextSection
 from src.ingestion.canonical_import import CanonicalImportService
+from src.review.review_repository import ReviewRepository
 
 
 def _repo(tmp_path: Path) -> tuple[Database, StoryRepository, str, str]:
@@ -32,7 +35,7 @@ def _accept(repo: StoryRepository, book_id: str, number: int, content: str, stat
         version["chapter_id"], chapter_version_id=version["version_id"],
         facts=[{"fact_type": "event", "content": f"fact-{number}"}], state_changes=state,
     )
-    return repo.accept_story_commit(commit_id)
+    return repo.accept_story_commit_legacy(commit_id, reason="runtime v2 fixture")
 
 
 def test_event_lifecycle_is_authority_after_mutable_status_changes(tmp_path: Path):
@@ -70,7 +73,7 @@ def test_full_world_projection_rebuild_is_deterministic(tmp_path: Path):
         "foreshadows": [{"title": "The hidden key", "description": "return"}],
     }
     commit_id = repo.create_story_commit(version["chapter_id"], chapter_version_id=version["version_id"], facts=[], state_changes=state)
-    repo.accept_story_commit(commit_id)
+    repo.accept_story_commit_legacy(commit_id, reason="runtime v2 fixture")
     first = repo.rebuild_all(book_id)
     for table in ("story_facts", "story_projections", "story_states", "narrative_memory"):
         db.execute(f"DELETE FROM {table} WHERE book_id=?", (book_id,))
@@ -141,6 +144,29 @@ def test_context_compiler_fails_closed_for_hard_constraints():
     assert exc_info.value.code == "CONTEXT_BUDGET_EXCEEDED"
 
 
+def test_context_compiler_keeps_current_canon_as_p0_before_optional_retrieval():
+    bundle = ContextCompiler.compile([
+        ContextSection("optional retrieval that should be excluded", "rag_chunk"),
+        ContextSection("current canon", "story_fact"),
+    ], budget_tokens=5)
+
+    assert bundle.text == "current canon"
+    assert bundle.sections[0]["sourceType"] == "story_fact"
+    assert bundle.sections[0]["priority"] == ContextCompiler.PRIORITY_VALUES["P0"]
+    assert bundle.sections[0]["hardConstraint"] is True
+    assert bundle.excluded[0]["sourceType"] == "rag_chunk"
+
+
+def test_context_compiler_accepts_named_priority_bands_and_canonical_aliases():
+    section = ContextCompiler.from_manifest(
+        "rules", {"sourceType": "world-rules", "priority": "P3"}
+    )
+
+    assert section.priority == ContextCompiler.PRIORITY_VALUES["P0"]
+    assert section.hard_constraint is True
+    assert section.authority_class == "published_canon_plan"
+
+
 def test_canonical_import_proposal_does_not_mutate_until_author_accepts(tmp_path: Path):
     db, repo, project_id, book_id = _repo(tmp_path)
     service = CanonicalImportService(db, repo)
@@ -154,10 +180,58 @@ def test_canonical_import_proposal_does_not_mutate_until_author_accepts(tmp_path
     }])
     assert proposed["status"] == "proposed"
     assert db.count("story_commits") == 0
-    accepted = service.accept(proposed["id"])
+    waiting = service.accept(proposed["id"])
+    assert waiting["status"] == "proposed"
+    assert waiting["report"]["stage"] == "review_required"
+    pending = waiting["report"]["pendingCommits"]
+    assert len(pending) == 1
+    assert db.count("story_commits", "status='accepted'") == 0
+    review_id = ReviewRepository(db).save_review(
+        project_id,
+        1,
+        {"overall_score": 96, "passed": True, "verdict": "pass", "issues": []},
+        chapter_version_id=pending[0]["chapterVersionId"],
+    )
+    accepted = service.accept(
+        proposed["id"], review_ids={pending[0]["commitId"]: review_id}, author_confirmed=True
+    )
     assert accepted["status"] == "accepted"
     assert db.count("story_commits", "status='accepted'") == 1
     assert db.count("narrative_events", "event_type='CanonicalImportAccepted'") == 1
+
+
+def test_legacy_canon_import_route_stages_chapters_without_mutating_target(tmp_path: Path, monkeypatch):
+    db = Database(str(tmp_path / "legacy-canon-route.db"))
+    repository = StoryRepository(db, workspace_root=tmp_path)
+    manager = ProjectManager(str(tmp_path), repository=repository)
+    source_id = repository.create_native_project("Source", "fantasy")
+    target_id = repository.create_native_project("Target", "fantasy")
+    source_book = repository.book_for_project(source_id)
+    target_book = repository.book_for_project(target_id)
+    assert source_book is not None and target_book is not None
+    repository.append_chapter_version(
+        source_book["id"], 1, "A chapter that must be reviewed before import.",
+    )
+
+    from src.web import studio
+    monkeypatch.setattr(studio, "story_repository", repository)
+    monkeypatch.setattr(studio, "project_mgr", manager)
+
+    before_target_chapters = db.count("chapters", "book_id=?", (target_book["id"],))
+    with TestClient(studio.app) as client:
+        response = client.post(
+            f"/api/v1/books/{target_id}/import/canon",
+            json={"fromBookId": source_id},
+        )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["canonicalMutation"] is False
+    assert payload["requiresAuthorReview"] is True
+    assert payload["imported"] == []
+    assert payload["canonicalImport"]["status"] == "proposed"
+    assert db.count("chapters", "book_id=?", (target_book["id"],)) == before_target_chapters
+    assert db.count("story_commits", "status='accepted'") == 0
 
 
 def test_narrative_health_reports_sql_sources(tmp_path: Path):
@@ -167,3 +241,35 @@ def test_narrative_health_reports_sql_sources(tmp_path: Path):
     assert health["canonicalAuthority"] == "sqlite.narrative_events"
     assert health["metrics"]["canon"]["canonicalSource"] == "sqlite.narrative_events"
     assert health["metrics"]["replay"]["value"]["match"] is True
+
+
+def test_narrative_health_surfaces_failed_rag_even_when_route_is_configured(tmp_path: Path):
+    db, repo, _project_id, book_id = _repo(tmp_path)
+    _accept(repo, book_id, 1, "health rag", {"state": "ok"})
+    db.execute(
+        "INSERT INTO model_providers(id, name, provider_type, enabled, config) VALUES (?, ?, ?, TRUE, ?)",
+        ("health-provider", "Health provider", "custom", "{}"),
+    )
+    db.execute(
+        """INSERT INTO models(
+               id, provider_id, name, model_id, enabled, capabilities, config
+           ) VALUES (?, ?, ?, ?, TRUE, ?, ?)""",
+        ("health-model", "health-provider", "Health model", "health-model", "[]", "{}"),
+    )
+    db.execute(
+        "INSERT INTO agent_model_routes(agent_role, model_id) VALUES (?, ?)",
+        ("embedding", "health-model"),
+    )
+    db.execute(
+        """INSERT INTO embedding_projections(
+               id, book_id, source_type, source_id, source_version, content,
+               content_checksum, model_key, status, projection_version, provenance
+           ) VALUES (?, ?, 'reference_chunk', ?, '1', ?, 'checksum', ?, 'failed', 'durable-rag-v2', '{}')""",
+        ("failed-reference-health", book_id, "reference-chunk-1", "reference content", "health-model"),
+    )
+
+    health = NarrativeHealthService(db).health(book_id)
+
+    assert health["metrics"]["rag"]["status"] == "degraded"
+    assert "rag" in health["degradedMetrics"]
+    assert health["metrics"]["rag"]["value"]["bySourceType"]["reference_chunk"]["failed"] == 1

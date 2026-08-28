@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+import pytest
+
 from src.core.config import Config
 from src.core.database import Database, generate_id
 from src.core.project import ProjectManager
@@ -23,6 +25,9 @@ from src.core.task_worker import PersistentTaskWorker
 from src.creation.task_handlers import LegacyTaskHandlers
 from src.story_graph import StoryGraphProjector
 from src.story_graph import StoryFlowPlanningService
+from src.storyflow.planning import SimulationAdoptionService, SimulationChapterIntentService
+from src.storyflow.simulation import SimulationRepository, SimulationRun
+from src.storyflow.world import WorldSnapshotBuilder, WorldSnapshotRepository
 
 
 class DeterministicStoryFlowModel:
@@ -67,6 +72,31 @@ class DeterministicStoryFlowModel:
         else:
             response.content = "A deterministic StoryFlow chapter with enough prose for review. " * 12
         return response
+
+
+class FailOnceStoryFlowModel(DeterministicStoryFlowModel):
+    """Provider-shaped model that fails one resumable stage, then recovers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_once = False
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        task_type: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if task_type == "plan-chapter" and not self.failed_once:
+            self.failed_once = True
+            from src.llm.model_runtime import ModelConfigurationError
+
+            raise ModelConfigurationError(
+                "PROVIDER_TRANSIENT",
+                "provider returned 503 during chapter planning",
+            )
+        return super().chat(messages, task_type=task_type, **kwargs)
 
 
 def test_storyflow_worker_acceptance_reprojects_canon_into_graph(tmp_path: Path) -> None:
@@ -146,6 +176,84 @@ def test_storyflow_worker_acceptance_reprojects_canon_into_graph(tmp_path: Path)
     )
     assert snapshot is not None
     assert snapshot["source_commit_id"] == commit["id"]
+
+
+def test_simulation_adoption_provider_failure_retries_from_durable_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """A provider failure leaves the adoption task resumable without Canon side effects."""
+    database = Database(str(tmp_path / "simulation-to-canon-retry.db"))
+    repository = StoryRepository(database)
+    runtime = TaskRuntime(database)
+    manager = ProjectManager(str(tmp_path), repository=repository)
+    project = manager.create_project("Simulation to Canon retry", "fantasy")
+    book = database.fetchone("SELECT id FROM books WHERE project_id=?", (project.id,))
+    assert book is not None
+    book_id = str(book["id"])
+
+    snapshot = WorldSnapshotRepository(database).create(WorldSnapshotBuilder(database).build(book_id))
+    simulations = SimulationRepository(database)
+    simulations.create_run(SimulationRun(
+        "simulation-to-canon-retry-run", book_id, snapshot.snapshot_id, "Simulation retry",
+    ))
+    adoption = SimulationAdoptionService(database).propose(
+        "simulation-to-canon-retry-run",
+        title="Carry the retry outcome",
+        summary="Retry the adopted future after one provider outage.",
+        payload={"goals": ["recover after provider outage"], "requiredCharacters": []},
+    )
+    adopted = SimulationAdoptionService(database).adopt(adoption.id)
+    intent = SimulationChapterIntentService(
+        database, manager.get_project_dir(project.id),
+    ).create(adopted.id, chapter_number=1)
+    task = runtime.enqueue(
+        "write-next",
+        project_id=project.id,
+        book_id=book_id,
+        data={
+            "chapter_number": 1,
+            "context": "Use the adopted Simulation outcome after a provider retry.",
+            "plan": intent.to_dict(),
+            "storyflow_plan_node_id": adopted.planning_node_id,
+            "simulation_adoption_id": adopted.id,
+        },
+        idempotency_key=f"simulation-to-canon-retry:{adopted.id}:1",
+    )
+    model = FailOnceStoryFlowModel()
+    handlers = LegacyTaskHandlers(
+        manager, model, Config(project_path=str(tmp_path)), runtime,
+    ).mapping()
+
+    failed = asyncio.run(
+        PersistentTaskWorker(runtime, handlers, retry_delay_seconds=0).execute_once(
+            "simulation-to-canon-retry-worker-1"
+        )
+    )
+    assert failed is not None
+    assert failed["status"] == "queued"
+    assert failed["error_code"] == "PROVIDER_TRANSIENT"
+    checkpoint = runtime.latest_checkpoint(task["id"])
+    assert checkpoint is not None
+    assert checkpoint["stage"] == "PLAN_CHAPTER"
+    assert database.count("story_commits") == 0
+    assert database.count("narrative_events") == 0
+
+    recovered = asyncio.run(
+        PersistentTaskWorker(runtime, handlers, retry_delay_seconds=0).execute_once(
+            "simulation-to-canon-retry-worker-2"
+        )
+    )
+    assert recovered is not None and recovered["status"] == "completed"
+    assert recovered["result"]["completed"] is True
+    assert recovered["result"]["story_commit_id"]
+    resumed_checkpoint = runtime.latest_checkpoint(task["id"])
+    assert resumed_checkpoint is not None
+    assert resumed_checkpoint["stage"] == "DONE"
+    commit = database.fetchone(
+        "SELECT status FROM story_commits WHERE id=?",
+        (recovered["result"]["story_commit_id"],),
+    )
+    assert commit is not None and commit["status"] == "accepted"
 
 
 def test_storyflow_worker_result_can_reconcile_planning_overlay_after_canon_acceptance(
@@ -237,3 +345,124 @@ def test_storyflow_worker_result_can_reconcile_planning_overlay_after_canon_acce
     assert fulfilled_revision == revision + 1
     projected = next(node for node in graph["nodes"] if node["id"] == plan_node["id"])
     assert projected["status"] == "accepted"
+
+
+def test_simulation_adoption_chapter_intent_reaches_story_commit_through_worker(tmp_path: Path) -> None:
+    """The explicit Simulation handoff is consumed by the existing write pipeline."""
+    database = Database(str(tmp_path / "simulation-to-canon.db"))
+    repository = StoryRepository(database)
+    runtime = TaskRuntime(database)
+    manager = ProjectManager(str(tmp_path), repository=repository)
+    project = manager.create_project("Simulation to Canon", "fantasy")
+    book = database.fetchone("SELECT id FROM books WHERE project_id=?", (project.id,))
+    assert book is not None
+    book_id = str(book["id"])
+
+    snapshot = WorldSnapshotRepository(database).create(WorldSnapshotBuilder(database).build(book_id))
+    simulations = SimulationRepository(database)
+    simulations.create_run(SimulationRun(
+        "simulation-to-canon-run", book_id, snapshot.snapshot_id, "Simulation handoff",
+    ))
+    adoption = SimulationAdoptionService(database).propose(
+        "simulation-to-canon-run", title="Carry the sandbox outcome",
+        summary="Use the adopted future as the next chapter premise.",
+        payload={"goals": ["carry the adopted future"], "requiredCharacters": []},
+    )
+    adopted = SimulationAdoptionService(database).adopt(adoption.id)
+    intent = SimulationChapterIntentService(
+        database, manager.get_project_dir(project.id),
+    ).create(adopted.id, chapter_number=1)
+    before = {
+        table: int((database.fetchone(f"SELECT COUNT(*) AS count FROM {table}") or {"count": 0})["count"])
+        for table in ("story_facts", "story_states", "narrative_events", "story_commits")
+    }
+
+    task = runtime.enqueue(
+        "write-next", project_id=project.id, book_id=book_id,
+        data={
+            "chapter_number": 1,
+            "context": "Use the adopted Simulation outcome as the chapter premise.",
+            "plan": intent.to_dict(),
+            "storyflow_plan_node_id": adopted.planning_node_id,
+            "simulation_adoption_id": adopted.id,
+        },
+        idempotency_key=f"simulation-to-canon:{adopted.id}:1",
+    )
+    model = DeterministicStoryFlowModel()
+    handlers = LegacyTaskHandlers(
+        manager, model, Config(project_path=str(tmp_path)), runtime,
+    ).mapping()
+    outcome = asyncio.run(
+        PersistentTaskWorker(runtime, handlers, retry_delay_seconds=0).execute_once(
+            "simulation-to-canon-worker"
+        )
+    )
+    assert outcome is not None and outcome["status"] == "completed"
+    assert outcome["result"]["completed"] is True
+    assert outcome["result"]["story_commit_id"]
+    assert outcome["result"]["storyflow_plan_node_id"] == adopted.planning_node_id
+    assert outcome["result"]["storyflow_plan_status"] == "ACCEPTED"
+    assert {"review", "fact-extraction"} <= set(model.task_types)
+
+    graph, _ = StoryFlowPlanningService(database).load(book_id)
+    adopted_node = next(node for node in graph["nodes"] if node["id"] == adopted.planning_node_id)
+    assert adopted_node["status"] == "accepted"
+
+    after = {
+        table: int((database.fetchone(f"SELECT COUNT(*) AS count FROM {table}") or {"count": 0})["count"])
+        for table in before
+    }
+    assert after["story_commits"] == before["story_commits"] + 1
+    assert after["story_facts"] > before["story_facts"]
+    commit = database.fetchone("SELECT status FROM story_commits WHERE id=?", (outcome["result"]["story_commit_id"],))
+    assert commit is not None and commit["status"] == "accepted"
+    completed_task = runtime.get(task["id"])
+    assert completed_task is not None
+    assert completed_task["result"]["story_commit_id"] == outcome["result"]["story_commit_id"]
+
+
+def test_simulation_adoption_recovers_after_planning_write_before_catalog_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash between the overlay and catalog writes must not duplicate nodes."""
+    database = Database(str(tmp_path / "simulation-adoption-recovery.db"))
+    repository = StoryRepository(database)
+    project = ProjectManager(str(tmp_path), repository=repository).create_project(
+        "Simulation adoption recovery", "fantasy"
+    )
+    book = database.fetchone("SELECT id FROM books WHERE project_id=?", (project.id,))
+    assert book is not None
+    snapshot = WorldSnapshotRepository(database).create(
+        WorldSnapshotBuilder(database).build(str(book["id"]))
+    )
+    simulations = SimulationRepository(database)
+    simulations.create_run(SimulationRun(
+        "simulation-adoption-recovery-run", str(book["id"]), snapshot.snapshot_id, "Recovery",
+    ))
+    adoption = SimulationAdoptionService(database).propose(
+        "simulation-adoption-recovery-run", title="Recover this adoption",
+        summary="The planning write may finish before the catalog status update.", payload={},
+    )
+
+    original_execute = database.execute
+
+    def fail_catalog_update(sql: str, params: tuple = ()):
+        if str(sql).startswith("UPDATE simulation_adoptions SET status='ADOPTED'"):
+            raise RuntimeError("simulated process interruption after planning write")
+        return original_execute(sql, params)
+
+    monkeypatch.setattr(database, "execute", fail_catalog_update)
+    with pytest.raises(RuntimeError, match="process interruption"):
+        SimulationAdoptionService(database).adopt(adoption.id)
+
+    monkeypatch.setattr(database, "execute", original_execute)
+    recovered = SimulationAdoptionService(database).adopt(adoption.id)
+
+    assert recovered.status == "ADOPTED"
+    assert recovered.planning_node_id == f"planning:simulation-adoption:{adoption.id}"
+    graph, _ = StoryFlowPlanningService(database).load(str(book["id"]))
+    matches = [
+        node for node in graph["nodes"]
+        if node.get("id") == recovered.planning_node_id
+    ]
+    assert len(matches) == 1

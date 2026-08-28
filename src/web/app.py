@@ -1,12 +1,22 @@
-"""Legacy-compatible FastAPI routes backed by the durable Studio runtime."""
+"""Legacy-compatible FastAPI routes backed by the durable Studio runtime.
 
+COMPATIBILITY_ONLY: this surface exists so pre-Studio clients keep working.
+New routes belong in ``src.web.studio``.  The single HTML surface is
+``static/index.html``; no second dashboard page is maintained here.
+"""
+
+import logging
 import os
+import secrets
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, FileResponse
     from pydantic import BaseModel
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
 except ImportError:
     raise ImportError("需要安装 fastapi 和 uvicorn: pip install fastapi uvicorn")
 
@@ -17,8 +27,99 @@ from ..core.story_repository import StoryRepository
 from ..core.task_runtime import TaskRuntime, TaskStateError
 from ..creation.continuous_service import ContinuousWritingService
 from ..llm.model_runtime import build_model_runtime
+from ..runtime.approvals import is_host_approval_actor
+from ..runtime.auth import (
+    RequestPrincipalUnavailable,
+    bind_request_principal,
+    configured_api_principal,
+    current_request_principal,
+    request_actor,
+    reset_request_principal,
+)
+from ..runtime.control_plane import ControlCommand, ControlPlane
 
 app = FastAPI(title="NovelForge", description="AI小说创作平台")
+logger = logging.getLogger(__name__)
+
+# Keep the legacy-compatible surface under the same deployment boundary as
+# Studio. The configured bearer key represents one Host principal; route
+# payloads cannot replace that identity after authentication.
+_NOVELFORGE_API_KEY = os.environ.get("NOVELFORGE_API_KEY")
+_NOVELFORGE_DEPLOYMENT_MODE = os.environ.get(
+    "NOVELFORGE_DEPLOYMENT_MODE",
+    os.environ.get("NOVELFORGE_ENV", "development"),
+).strip().lower()
+_NOVELFORGE_AUTH_REQUIRED = bool(_NOVELFORGE_API_KEY) or _NOVELFORGE_DEPLOYMENT_MODE in {
+    "production", "prod", "staging",
+}
+_MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    """Fail-closed bearer-key protection for the legacy HTTP surface."""
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/api/health":
+            return await call_next(request)
+        if not _NOVELFORGE_AUTH_REQUIRED:
+            return await call_next(request)
+        if not _NOVELFORGE_API_KEY:
+            return JSONResponse({"error": "AUTH_CONFIGURATION_MISSING"}, status_code=503)
+        authorization = request.headers.get("Authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        if token and secrets.compare_digest(token, _NOVELFORGE_API_KEY):
+            principal = configured_api_principal()
+            if (
+                request.method.upper() in _MUTATING_HTTP_METHODS
+                and request.url.path.startswith("/api/v1/")
+                and not is_host_approval_actor(principal)
+            ):
+                return JSONResponse(
+                    {
+                        "error": {
+                            "code": "HOST_PRINCIPAL_REQUIRED",
+                            "message": "state-changing API requests require a Host principal",
+                        }
+                    },
+                    status_code=403,
+                )
+            principal_token = bind_request_principal(request, principal)
+            try:
+                return await call_next(request)
+            finally:
+                reset_request_principal(principal_token)
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+
+def _require_host_principal(request: Request) -> str:
+    """Resolve the authenticated Host actor for compatibility mutations."""
+    try:
+        actor = request_actor(
+            request,
+            "studio",
+            auth_required=_NOVELFORGE_AUTH_REQUIRED,
+        )
+    except RequestPrincipalUnavailable as exc:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "AUTHENTICATED_PRINCIPAL_REQUIRED",
+                "message": "authenticated Host principal is unavailable",
+            },
+        ) from exc
+    if not is_host_approval_actor(actor):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "HOST_PRINCIPAL_REQUIRED",
+                "message": "this compatibility action requires a Host principal",
+            },
+        )
+    return actor
+
+
+if _NOVELFORGE_AUTH_REQUIRED:
+    app.add_middleware(APIKeyMiddleware)
 
 # 全局实例
 workspace_root = Path(os.environ.get("NOVELFORGE_ROOT", Path.cwd())).resolve()
@@ -26,15 +127,100 @@ config = Config(project_path=str(workspace_root))
 story_repository = StoryRepository(Database(str(workspace_root / "projects" / "novelforge.db")))
 project_mgr = ProjectManager(str(workspace_root), repository=story_repository)
 task_runtime = TaskRuntime(story_repository.db)
+_model_runtime_error: str | None = None
 try:
-    model_runtime = build_model_runtime(story_repository.db, workspace_root)
-except Exception:
+    _model_repository, _persistent_model_runtime, model_runtime = build_model_runtime(
+        story_repository.db, workspace_root
+    )
+except Exception as exc:
     model_runtime = None
+    _model_runtime_error = f"{type(exc).__name__}: {exc}"
+    logger.exception(
+        "Model runtime initialization failed; model-dependent legacy routes are unavailable"
+    )
+
+
+def _require_model_runtime():
+    """Fail closed when startup could not construct the Host model runtime."""
+    if model_runtime is not None:
+        return model_runtime
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": "MODEL_RUNTIME_UNAVAILABLE",
+            "message": "Model runtime is unavailable; inspect server logs for the startup failure.",
+        },
+    )
+
+
+@asynccontextmanager
+async def legacy_lifespan(_app):
+    """Keep the compatibility surface on the same durable startup boundary."""
+    task_runtime.recover_expired_leases()
+    projection = story_repository.ensure_projection_freshness()
+    app.state.projection = projection
+    try:
+        yield
+    finally:
+        app.state.projection = None
+
+
+# ``app`` is created before the legacy-compatible globals so imports remain
+# cheap and test fixtures can replace the database seam.  Install the
+# lifespan after those globals exist; FastAPI's router owns the active context.
+app.router.lifespan_context = legacy_lifespan
 
 
 def _config_int(section: str, key: str, default: int) -> int:
     value = config.get(section, key, default=default)
     return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _authoritative_book_id(project_id: str) -> str:
+    """Resolve the durable book scope used by worker-facing legacy routes."""
+    book = story_repository.book_for_project(project_id)
+    if not book:
+        raise HTTPException(409, "项目没有 authoritative book")
+    return str(book["id"])
+
+
+def _enqueue_host_task(
+    task_type: str,
+    *,
+    project_id: str | None = None,
+    book_id: str | None = None,
+    chapter_number: int | None = None,
+    data: dict | None = None,
+    stage: str = "queued",
+    idempotency_key: str | None = None,
+    initiated_by: str | None = None,
+    initial_status: str = "queued",
+) -> dict:
+    """Submit compatibility API work through the Host CommandBus."""
+    task_data = dict(data or {})
+    request_principal = current_request_principal()
+    actor = str(
+        request_principal
+        or initiated_by
+        or task_data.get("initiatedBy")
+        or task_data.get("initiated_by")
+        or task_data.get("source")
+        or "system"
+    ).strip() or "system"
+    return ControlPlane(task_runtime).commands.dispatch(
+        "task.enqueue",
+        {
+            "taskType": task_type,
+            "projectId": project_id,
+            "bookId": book_id,
+            "chapterNumber": chapter_number,
+            "data": task_data,
+            "stage": stage,
+            "idempotencyKey": idempotency_key,
+            "initialStatus": initial_status,
+        },
+        actor=actor,
+    )
 
 
 class CreateProjectRequest(BaseModel):
@@ -66,10 +252,24 @@ class ExportRequest(BaseModel):
     approved_only: bool = False
 
 
+_STUDIO_SHELL_PATH = Path(__file__).parent / "static" / "index.html"
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    """首页"""
-    return DASHBOARD_HTML
+    """Serve the unified Studio shell (the single maintained HTML surface)."""
+    if not _STUDIO_SHELL_PATH.exists():
+        raise HTTPException(
+            503,
+            "Studio shell asset missing: src/web/static/index.html is required to serve the Studio UI.",
+        )
+    return HTMLResponse(_STUDIO_SHELL_PATH.read_text(encoding="utf-8"))
+
+
+@app.get("/api/health")
+async def liveness_check():
+    """Minimal public liveness probe without database or runtime details."""
+    return {"status": "ok", "service": "novelforge-legacy"}
 
 
 @app.get("/api/projects")
@@ -79,8 +279,9 @@ async def list_projects():
 
 
 @app.post("/api/projects")
-async def create_project(req: CreateProjectRequest):
+async def create_project(req: CreateProjectRequest, request: Request):
     """创建项目"""
+    _require_host_principal(request)
     project = project_mgr.create_project(req.name, req.genre, config)
     return {"id": project.id, "name": project.name, "message": "项目创建成功"}
 
@@ -95,20 +296,24 @@ async def get_project(project_id: str):
 
 
 @app.post("/api/projects/{project_id}/wizard")
-async def run_wizard(project_id: str, req: WizardRequest):
+async def run_wizard(project_id: str, req: WizardRequest, request: Request):
     """Queue world setup; HTTP never executes generation itself."""
+    actor = _require_host_principal(request)
     project = project_mgr.load_project(project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
-    task = task_runtime.enqueue(
-        "world-bootstrap", project_id=project_id, book_id=project_id, data={"brief": req.user_input}
+    book_id = _authoritative_book_id(project_id)
+    task = _enqueue_host_task(
+        "world-bootstrap", project_id=project_id, book_id=book_id,
+        data={"brief": req.user_input}, initiated_by=actor,
     )
     return {"taskId": task["id"], "status": task["status"], "message": "世界观任务已排队"}
 
 
 @app.post("/api/projects/{project_id}/write")
-async def write_chapter(project_id: str, req: WriteRequest):
+async def write_chapter(project_id: str, req: WriteRequest, request: Request):
     """Queue chapter generation; a persistent worker owns execution."""
+    actor = _require_host_principal(request)
     project = project_mgr.load_project(project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
@@ -116,11 +321,12 @@ async def write_chapter(project_id: str, req: WriteRequest):
     if not book:
         raise HTTPException(409, "项目没有 authoritative book")
     requested_chapter = req.chapter if req.chapter > 0 else project.get_latest_chapter_number() + 1
-    task = task_runtime.enqueue(
+    task = _enqueue_host_task(
         "write-next",
         project_id=project_id,
         book_id=book["id"],
         data={"chapter_number": requested_chapter, "context": req.context, "count": 1},
+        initiated_by=actor,
     )
     return {
         "taskId": task["id"], "status": task["status"], "chapter": requested_chapter,
@@ -129,8 +335,9 @@ async def write_chapter(project_id: str, req: WriteRequest):
 
 
 @app.post("/api/projects/{project_id}/continuous")
-async def continuous_mode(project_id: str, req: ContinuousRequest):
+async def continuous_mode(project_id: str, req: ContinuousRequest, request: Request):
     """Queue continuous creation; do not host it in FastAPI's event loop."""
+    actor = _require_host_principal(request)
     project = project_mgr.load_project(project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
@@ -142,14 +349,18 @@ async def continuous_mode(project_id: str, req: ContinuousRequest):
         raise HTTPException(422, "start_chapter must be positive")
     if req.count < 5 or req.count > 200:
         raise HTTPException(422, "count must be between 5 and 200")
+    runtime = _require_model_runtime()
     try:
         task = ContinuousWritingService(
             story_repository.db,
-            model_runtime,
+            runtime,
             story_repository,
             task_runtime,
             score_threshold=_config_int("review", "pass_score", 93),
             max_revisions=_config_int("review", "max_revision_rounds", 3),
+            enqueue_task=lambda task_type, **kwargs: _enqueue_host_task(
+                task_type, initiated_by=actor, **kwargs
+            ),
         ).start_continuous(
             project_id,
             book["id"],
@@ -173,6 +384,47 @@ async def get_task(task_id: str):
     if not task:
         raise HTTPException(404, "任务不存在")
     return task
+
+
+async def _legacy_task_control(task_id: str, operation: str, request: Request):
+    """Expose task controls through the Host command boundary.
+
+    The legacy surface remains compatibility-only, but its mutations must
+    still produce the same durable command receipt and control-event evidence
+    as the Studio surface.  The command handler delegates to the existing
+    ``TaskRuntime`` state machine; it does not introduce another lifecycle.
+    """
+    try:
+        command = ControlCommand(
+            f"task.{operation}",
+            {"taskId": task_id},
+            actor=_require_host_principal(request),
+        )
+        return await ControlPlane(task_runtime).dispatch_async(command)
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    except TaskStateError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/tasks/{task_id}/pause")
+async def pause_task(task_id: str, request: Request):
+    return await _legacy_task_control(task_id, "pause", request)
+
+
+@app.post("/api/tasks/{task_id}/resume")
+async def resume_task(task_id: str, request: Request):
+    return await _legacy_task_control(task_id, "resume", request)
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str, request: Request):
+    return await _legacy_task_control(task_id, "cancel", request)
+
+
+@app.post("/api/tasks/{task_id}/retry")
+async def retry_task(task_id: str, request: Request):
+    return await _legacy_task_control(task_id, "retry", request)
 
 
 @app.get("/api/projects/{project_id}/export")
@@ -202,8 +454,6 @@ async def get_mindmap(project_id: str):
     path = gen.generate_from_project(project, str(vis_dir))
 
     return FileResponse(path, media_type="text/html")
-
-
 @app.get("/api/projects/{project_id}/timeline")
 async def get_timeline(project_id: str):
     """获取时间轴"""
@@ -217,217 +467,3 @@ async def get_timeline(project_id: str):
     path = gen.generate_html(project, str(vis_dir / "timeline.html"))
 
     return FileResponse(path, media_type="text/html")
-
-
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NovelForge - AI小说创作平台</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif;
-               background: #0d1117; color: #c9d1d9; min-height: 100vh; }
-        .header { background: linear-gradient(135deg, #161b22, #1f2937);
-                  padding: 30px; text-align: center; border-bottom: 2px solid #e94560; }
-        .header h1 { color: #e94560; font-size: 32px; }
-        .header p { color: #8b949e; margin-top: 8px; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 30px; }
-        .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px;
-               padding: 24px; margin-bottom: 20px; transition: all 0.3s; }
-        .card:hover { border-color: #58a6ff; transform: translateY(-2px);
-                     box-shadow: 0 5px 20px rgba(88,166,255,0.15); }
-        .card h3 { color: #58a6ff; margin-bottom: 12px; }
-        .btn { display: inline-block; padding: 10px 24px; border-radius: 8px;
-              border: none; cursor: pointer; font-size: 14px; font-weight: bold;
-              transition: all 0.3s; text-decoration: none; }
-        .btn-primary { background: #e94560; color: white; }
-        .btn-primary:hover { background: #c73e54; }
-        .btn-secondary { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
-        .btn-secondary:hover { border-color: #58a6ff; }
-        input, textarea { width: 100%; padding: 12px; background: #0d1117;
-                         border: 1px solid #30363d; border-radius: 8px;
-                         color: #c9d1d9; font-size: 14px; margin: 8px 0; }
-        input:focus, textarea:focus { outline: none; border-color: #58a6ff; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; }
-        .stat { text-align: center; padding: 20px; }
-        .stat .number { font-size: 36px; color: #e94560; font-weight: bold; }
-        .stat .label { color: #8b949e; margin-top: 8px; }
-        .project-item { display: flex; justify-content: space-between; align-items: center;
-                       padding: 16px; border-bottom: 1px solid #21262d; }
-        .project-item:last-child { border-bottom: none; }
-        .actions { display: flex; gap: 8px; }
-        #result { margin-top: 20px; padding: 20px; background: #161b22;
-                 border-radius: 12px; border: 1px solid #30363d; display: none; }
-        .warning { background: #2d1b00; border: 1px solid #bb8009; color: #e3b341;
-                  padding: 16px; border-radius: 8px; margin: 16px 0; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>📖 NovelForge</h1>
-        <p>AI小说创作平台 - 融合 inkOS 与 webnovel-writer 精华</p>
-    </div>
-    <div class="container">
-        <div class="grid">
-            <div class="card">
-                <h3>🆕 创建新项目</h3>
-                <input type="text" id="projectName" placeholder="小说名称">
-                <input type="text" id="projectGenre" placeholder="类型（如：玄幻修仙、都市异能）">
-                <button class="btn btn-primary" onclick="createProject()">创建项目</button>
-            </div>
-            <div class="card">
-                <h3>🌍 世界观向导</h3>
-                <input type="text" id="wizardProjectId" placeholder="项目ID">
-                <textarea id="wizardInput" rows="4" placeholder="描述你的小说设定..."></textarea>
-                <button class="btn btn-primary" onclick="runWizard()">构建世界观</button>
-            </div>
-            <div class="card">
-                <h3>✍️ 创作章节</h3>
-                <input type="text" id="writeProjectId" placeholder="项目ID">
-                <input type="number" id="writeChapter" placeholder="章节号（留空自动+1）">
-                <button class="btn btn-primary" onclick="writeChapter()">创作</button>
-            </div>
-            <div class="card">
-                <h3>🔄 连续创作模式</h3>
-                <div class="warning">
-                    ⚠️ 连续创作模式由于AI的反复审核与修订会消耗海量token
-                </div>
-                <input type="text" id="contProjectId" placeholder="项目ID">
-                <input type="number" id="contCount" placeholder="章数(5-200)" value="10">
-                <button class="btn btn-primary" onclick="startContinuous()">开始连续创作</button>
-            </div>
-        </div>
-        <div class="card">
-            <h3>📚 项目列表</h3>
-            <div id="projectList">加载中...</div>
-        </div>
-        <div id="result"></div>
-    </div>
-    <script>
-        async function api(method, path, body) {
-            const opts = { method, headers: {'Content-Type': 'application/json'} };
-            if (body) opts.body = JSON.stringify(body);
-            const res = await fetch('/api' + path, opts);
-            const payload = await res.json();
-            if (!res.ok) throw new Error(payload.detail || payload.message || `请求失败 (${res.status})`);
-            return payload;
-        }
-        function showResult(title, details) {
-            const resultDiv = document.getElementById('result');
-            resultDiv.style.display = 'block';
-            resultDiv.replaceChildren();
-            const h3 = document.createElement('h3');
-            h3.textContent = title;
-            const pre = document.createElement('pre');
-            pre.textContent = JSON.stringify(details, null, 2);
-            resultDiv.append(h3, pre);
-        }
-        async function monitorTask(taskId, label) {
-            try {
-                const task = await api('GET', `/tasks/${encodeURIComponent(taskId)}`);
-                const checkpoint = task.checkpoint;
-                const state = checkpoint && checkpoint.state ? checkpoint.state : {};
-                const details = {
-                    taskId: task.id,
-                    status: task.status,
-                    stage: task.stage,
-                    message: state.message,
-                    checkpoint: checkpoint,
-                    errorCode: task.error_code,
-                    error: task.error,
-                    result: task.result,
-                };
-                showResult(`${label}：${task.status}`, details);
-                if (['queued', 'running', 'cancelling'].includes(task.status)) {
-                    window.setTimeout(() => monitorTask(taskId, label), 1000);
-                }
-            } catch (error) {
-                showResult(`${label}：无法读取任务状态`, {error: error.message, taskId});
-            }
-        }
-        async function loadProjects() {
-            const projects = await api('GET', '/projects');
-            const div = document.getElementById('projectList');
-            if (!projects.length) { div.innerHTML = '<p style="color:#8b949e">暂无项目</p>'; return; }
-            div.innerHTML = '';
-            projects.forEach(p => {
-                const item = document.createElement('div');
-                item.className = 'project-item';
-                const info = document.createElement('div');
-                const strong = document.createElement('strong');
-                strong.textContent = p.name;
-                const span = document.createElement('span');
-                span.style.color = '#8b949e';
-                span.textContent = `(${p.genre})`;
-                const small = document.createElement('small');
-                small.style.color = '#8b949e';
-                small.textContent = `ID: ${p.id} | ${p.chapters}章`;
-                info.appendChild(strong);
-                info.appendChild(document.createTextNode(' '));
-                info.appendChild(span);
-                info.appendChild(document.createElement('br'));
-                info.appendChild(small);
-                const actions = document.createElement('div');
-                actions.className = 'actions';
-                actions.innerHTML = `
-                    <a class="btn btn-secondary" href="/api/projects/${encodeURIComponent(p.id)}/mindmap" target="_blank">思维导图</a>
-                    <a class="btn btn-secondary" href="/api/projects/${encodeURIComponent(p.id)}/timeline" target="_blank">时间轴</a>
-                    <a class="btn btn-secondary" href="/api/projects/${encodeURIComponent(p.id)}/export?format=docx">导出DOCX</a>
-                `;
-                item.appendChild(info);
-                item.appendChild(actions);
-                div.appendChild(item);
-            });
-        }
-        async function createProject() {
-            const name = document.getElementById('projectName').value;
-            const genre = document.getElementById('projectGenre').value;
-            if (!name) return alert('请输入小说名称');
-            try {
-                const res = await api('POST', '/projects', {name, genre});
-                alert(res.message + '\\n项目ID: ' + res.id);
-                loadProjects();
-            } catch (error) {
-                alert(error.message);
-            }
-        }
-        async function runWizard() {
-            const id = document.getElementById('wizardProjectId').value;
-            const input = document.getElementById('wizardInput').value;
-            if (!id || !input) return alert('请填写项目ID和设定描述');
-            try {
-                const res = await api('POST', `/projects/${encodeURIComponent(id)}/wizard`, {project_id: id, user_input: input});
-                monitorTask(res.taskId, '世界观构建任务');
-            } catch (error) {
-                showResult('世界观构建任务：未能入队', {error: error.message});
-            }
-        }
-        async function writeChapter() {
-            const id = document.getElementById('writeProjectId').value;
-            const chapter = parseInt(document.getElementById('writeChapter').value) || 0;
-            if (!id) return alert('请填写项目ID');
-            try {
-                const res = await api('POST', `/projects/${encodeURIComponent(id)}/write`, {project_id: id, chapter});
-                monitorTask(res.taskId, `第${res.chapter}章写作任务`);
-            } catch (error) {
-                showResult('章节写作任务：未能入队', {error: error.message});
-            }
-        }
-        async function startContinuous() {
-            const id = document.getElementById('contProjectId').value;
-            const count = parseInt(document.getElementById('contCount').value) || 10;
-            if (!id) return alert('请填写项目ID');
-            if (!confirm(`确认开始连续创作${count}章？这将消耗大量token。`)) return;
-            try {
-                const res = await api('POST', `/projects/${encodeURIComponent(id)}/continuous`, {project_id: id, count});
-                monitorTask(res.taskId, '连续创作任务');
-            } catch (error) {
-                showResult('连续创作任务：未能入队', {error: error.message});
-            }
-        }
-        loadProjects();
-    </script>
-</body>
-</html>"""

@@ -15,6 +15,24 @@ from ..creation.continuous_service import ContinuousWritingService
 console = Console()
 
 
+def _print_server_banner(host: str, port: int) -> None:
+    """Print the Studio banner without making service startup encoding-bound."""
+    panel = Panel(
+        f"[bold green]🚀 NovelForge Studio 启动中[/]\n\n"
+        f"可视化界面: [cyan]http://{host}:{port}[/]\n"
+        "[dim]涵盖世界观向导 / 章节工作台 / 连续创作 / 双重门禁审查 /\n"
+        "联合审查 / 思维导图 / 时间轴 / 伏笔追踪 / 导出交付 等全部功能[/]",
+        border_style="green",
+    )
+    try:
+        console.print(panel)
+    except UnicodeEncodeError:
+        # Windows redirected/legacy consoles may advertise GBK and reject the
+        # emoji or other non-encodable glyphs.  The banner is optional; the
+        # HTTP service must still start and expose a machine-readable endpoint.
+        click.echo(f"NovelForge Studio starting: http://{host}:{port}")
+
+
 def get_managers(project_path=None):
     """获取管理器实例"""
     from ..core.config import Config
@@ -29,6 +47,47 @@ def get_managers(project_path=None):
     project_mgr = ProjectManager(str(root), repository=StoryRepository(database))
     _model_repository, _model_runtime, model_mgr = build_model_runtime(database, root)
     return config, project_mgr, model_mgr
+
+
+def _enqueue_host_task(
+    database,
+    task_type: str,
+    *,
+    project_id: str | None = None,
+    book_id: str | None = None,
+    chapter_number: int | None = None,
+    data: dict[str, Any] | None = None,
+    stage: str = "queued",
+    idempotency_key: str | None = None,
+    initiated_by: str | None = None,
+    initial_status: str = "queued",
+) -> dict[str, Any]:
+    """Submit a CLI gesture through the same durable Host command seam as Studio."""
+    from ..core.task_runtime import TaskRuntime
+    from ..runtime.control_plane import ControlPlane
+
+    task_data = dict(data or {})
+    actor = str(
+        initiated_by
+        or task_data.get("initiatedBy")
+        or task_data.get("initiated_by")
+        or task_data.get("source")
+        or "system"
+    ).strip() or "system"
+    return ControlPlane(TaskRuntime(database)).commands.dispatch(
+        "task.enqueue",
+        {
+            "taskType": task_type,
+            "projectId": project_id,
+            "bookId": book_id,
+            "chapterNumber": chapter_number,
+            "data": task_data,
+            "stage": stage,
+            "idempotencyKey": idempotency_key,
+            "initialStatus": initial_status,
+        },
+        actor=actor,
+    )
 
 
 @click.group()
@@ -57,14 +116,17 @@ def init(ctx, name, genre, import_file):
 
     # 如果有导入文件
     if import_file:
-        from ..core.task_runtime import TaskRuntime
         from ..wizard.guided_setup import WorldWizard
         wizard = WorldWizard(cast(Any, model_mgr), project_mgr)
         content = wizard.import_world_file(import_file)
         console.print(f"📄 已导入设定文件: {import_file}")
         console.print(f"[dim]{content[:200]}...[/]")
-        task = TaskRuntime(project_mgr.story_repository.db).enqueue(
-            "world-bootstrap", project_id=project.id, book_id=project.id, data={"brief": content}
+        book = project_mgr.story_repository.book_for_project(project.id)
+        if not book:
+            raise click.ClickException("项目没有 authoritative book")
+        task = _enqueue_host_task(
+            project_mgr.story_repository.db,
+            "world-bootstrap", project_id=project.id, book_id=book["id"], data={"brief": content}
         )
         console.print(f"✅ 世界观构建任务已排队 [dim](ID: {task['id']})[/]")
 
@@ -87,8 +149,10 @@ def ingest(ctx, project_id, file_path, doc_type):
     if not project:
         raise click.ClickException(f"项目不存在: {project_id}")
 
-    from ..core.task_runtime import TaskRuntime
     from ..ingestion.service import DEFAULT_MAX_BYTES, DocumentIngestionError, DocumentRepository
+    book = project_mgr.story_repository.book_for_project(project.id)
+    if not book:
+        raise click.ClickException("项目没有 authoritative book")
 
     try:
         if file_path.stat().st_size > DEFAULT_MAX_BYTES:
@@ -97,8 +161,9 @@ def ingest(ctx, project_id, file_path, doc_type):
         document, deduplicated = document_repository.create_upload(
             project.id, file_path.name, file_path.read_bytes(), doc_type=doc_type
         )
-        task = TaskRuntime(project_mgr.story_repository.db).enqueue(
-            "ingest-document", project_id=project.id, book_id=project.id, data={"document_id": document["id"]},
+        task = _enqueue_host_task(
+            project_mgr.story_repository.db,
+            "ingest-document", project_id=project.id, book_id=book["id"], data={"document_id": document["id"]},
             idempotency_key=f"ingest-document:{document['id']}:{document['source_fingerprint']}",
         )
         document_repository.mark_task(document["id"], task["id"])
@@ -163,16 +228,21 @@ def wizard(ctx, project_id, user_input):
         console.print(f"[red]项目不存在: {project_id}[/]")
         return
 
-    from ..core.task_runtime import TaskRuntime
-
     console.print(Panel("[bold cyan]🌍 世界观构建向导[/]", border_style="cyan"))
 
     if not user_input:
         console.print("请描述你的小说设定（包括世界观、角色、势力、地图等）:")
         user_input = console.input("> ")
 
-    task = TaskRuntime(project_mgr.story_repository.db).enqueue(
-        "world-bootstrap", project_id=project.id, book_id=project.id, data={"brief": user_input}
+    book = project_mgr.story_repository.book_for_project(project.id)
+    if not book:
+        raise click.ClickException(f"项目没有 authoritative book: {project.id}")
+    task = _enqueue_host_task(
+        project_mgr.story_repository.db,
+        "world-bootstrap",
+        project_id=project.id,
+        book_id=book["id"],
+        data={"brief": user_input},
     )
     console.print(f"\n✅ 世界观构建任务已排队 [dim](ID: {task['id']})[/]")
     console.print("运行 [cyan]novelforge worker[/] 以执行任务；状态会保存在 SQLite 中。")
@@ -194,12 +264,12 @@ def write(ctx, project_id, chapter, context):
 
     if chapter == 0:
         chapter = project.get_latest_chapter_number() + 1
-    from ..core.task_runtime import TaskRuntime
     book = project_mgr.story_repository.book_for_project(project.id)
     if not book:
         console.print(f"[red]项目没有 authoritative book: {project.id}[/]")
         return
-    task = TaskRuntime(project_mgr.story_repository.db).enqueue(
+    task = _enqueue_host_task(
+        project_mgr.story_repository.db,
         "write-next", project_id=project.id, book_id=book["id"],
         data={"chapter_number": chapter, "context": context, "count": 1},
     )
@@ -256,6 +326,9 @@ def continuous(ctx, project_id, start, count, context):
             project_mgr.story_repository,
             runtime,
             joint_review_interval=configured_interval,
+            enqueue_task=lambda task_type, **kwargs: _enqueue_host_task(
+                project_mgr.story_repository.db, task_type, **kwargs
+            ),
         ).start_continuous(project.id, book["id"], start, count, context)
     except (TaskStateError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -478,13 +551,7 @@ def bible_publish(ctx):
 def serve(ctx, host, port):
     """启动 Web Studio 可视化界面（对标 inkOS）"""
     import uvicorn
-    console.print(Panel(
-        f"[bold green]🚀 NovelForge Studio 启动中[/]\n\n"
-        f"可视化界面: [cyan]http://{host}:{port}[/]\n"
-        f"[dim]涵盖世界观向导 / 章节工作台 / 连续创作 / 双重门禁审查 /\n"
-        f"联合审查 / 思维导图 / 时间轴 / 伏笔追踪 / 导出交付 等全部功能[/]",
-        border_style="green"
-    ))
+    _print_server_banner(host, port)
     uvicorn.run("src.web.studio:app", host=host, port=port)
 
 

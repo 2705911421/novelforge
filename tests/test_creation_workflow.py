@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from src.core.config import Config
 from src.core.database import Database
+from src.core.models import Character, Faction, Location
 from src.core.project import ProjectManager
 from src.core.story_repository import StoryRepository
 from src.core.task_runtime import TaskRuntime
@@ -61,6 +62,20 @@ def test_planning_import_is_durable_and_generates_read_only_views(tmp_path, monk
             },
         )
         assert language.status_code == 200
+        pre_publish = db.fetchone(
+            "SELECT writing_style, style_profile FROM projects WHERE id=?", (book_id,)
+        )
+        assert pre_publish is not None
+        assert pre_publish["writing_style"] in (None, "")
+        assert json.loads(pre_publish["style_profile"] or "{}") == {}
+        draft_voice = db.fetchone(
+            """SELECT draft FROM story_bible_steps
+               WHERE workspace_id=(SELECT id FROM story_bible_workspaces WHERE project_id=?)
+                 AND step_key='voice'""",
+            (book_id,),
+        )
+        assert draft_voice is not None
+        assert "rawGuidance" in json.loads(draft_voice["draft"])["styleProfile"]
         views = client.get(f"/api/v1/books/{book_id}/planning-views")
         assert views.status_code == 200
         assert len(views.json()["views"]) == 4
@@ -88,6 +103,70 @@ def test_planning_import_is_durable_and_generates_read_only_views(tmp_path, monk
     assert {row["filename"] for row in sources} == {"玖安余陈_故事圣经_总整理_20260621.md", "语言规划_玖安余陈.md"}
     assert any("记忆与真相" in row["content"] for row in sources)
     assert db.count("story_architecture_views", "project_id=?", (book_id,)) == 4
+
+
+def test_planning_reads_do_not_materialize_views_or_queue_synthesis(tmp_path, monkeypatch):
+    studio, db, _repository, _manager, runtime = _studio_workspace(tmp_path, monkeypatch)
+    with TestClient(studio.app) as client:
+        created = client.post(
+            "/api/v1/books/create",
+            json={"title": "只读规划读取", "genre": "软科幻", "creationMode": "planned"},
+        )
+        assert created.status_code == 200
+        book_id = created.json()["id"]
+
+        before_views = db.count("story_architecture_views", "project_id=?", (book_id,))
+        preview = client.get(f"/api/v1/books/{book_id}/planning-views")
+        assert preview.status_code == 200
+        assert len(preview.json()["views"]) == 4
+        assert all(item["persisted"] is False for item in preview.json()["views"])
+        assert db.count("story_architecture_views", "project_id=?", (book_id,)) == before_views
+
+        source = client.post(
+            f"/api/v1/books/{book_id}/planning-sources/text",
+            json={
+                "filename": "story.md",
+                "sourceType": "story_bible",
+                "content": "# 核心冲突\n\n记忆与真相。",
+            },
+        )
+        assert source.status_code == 200
+        bible = studio.get_story_bible_repository()
+        for _, step_key in STORY_BIBLE_STEPS:
+            bible.confirm(book_id, step_key)
+        bible.publish(book_id)
+
+        before_tasks = db.count("tasks", "project_id=?", (book_id,))
+        summary = client.get(f"/api/v1/books/{book_id}/planning-summary")
+        assert summary.status_code == 200
+        assert summary.json()["status"] == "not_started"
+        assert summary.json()["taskId"] is None
+        assert db.count("tasks", "project_id=?", (book_id,)) == before_tasks
+        assert runtime.list(project_id=book_id, limit=20) == []
+
+
+def test_authoritative_legacy_project_save_upserts_entities_without_composite_unique_indexes(tmp_path, monkeypatch):
+    _studio, db, repository, manager, _runtime = _studio_workspace(tmp_path, monkeypatch)
+    project = manager.create_project("兼容项目写入")
+    project.characters["测试角色"] = Character(
+        name="测试角色", description="角色描述", personality="克制", background="背景"
+    )
+    project.factions["测试势力"] = Faction(
+        name="测试势力", description="势力描述", leader="领袖", goals=["目标"]
+    )
+    project.locations["测试地点"] = Location(
+        name="测试地点", description="地点描述", type="city", significance="重要"
+    )
+
+    manager.save_project(project)
+    manager.save_project(project)
+
+    book = repository.book_for_project(project.id)
+    assert book is not None
+    book_id = book["id"]
+    assert db.count("characters", "book_id=? AND name=?", (book_id, "测试角色")) == 1
+    assert db.count("factions", "book_id=? AND name=?", (book_id, "测试势力")) == 1
+    assert db.count("locations", "book_id=? AND name=?", (book_id, "测试地点")) == 1
 
 
 def test_thought_http_entry_persists_answer_and_queues_follow_up(tmp_path, monkeypatch):

@@ -59,7 +59,7 @@ class TestStoryStateContract:
         chapter = story_repo.append_chapter_version(book_id, 1, "test")
         chapter_id = chapter["chapter_id"]
         commit_id = story_repo.create_story_commit(chapter_id, facts=[{"type": "character", "content": "A", "entities": ["A"]}], state_changes=[])
-        result = story_repo.accept_story_commit(commit_id)
+        result = story_repo.accept_story_commit_legacy(commit_id, reason="contract fixture")
         assert result["accepted"] is True
         state = story_repo.read_story_state(book_id)
         assert state is not None

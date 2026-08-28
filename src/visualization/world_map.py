@@ -64,28 +64,28 @@ class WorldMapGenerator:
             children.setdefault(node["parentId"], []).append(node)
 
         if not rows:
-            return {"nodes": [], "edges": []}
+            return {"nodes": [], "edges": [], "layoutWarnings": []}
 
         # A stable tree layout makes the map useful on first open and remains
-        # readable when an author has hundreds of locations.
+        # readable when an author has hundreds of locations.  ``parent_id`` is
+        # legacy, user-editable data and does not have a database-level cycle
+        # constraint, so layout must treat a cycle as a broken visual edge
+        # instead of recursing forever.
         x_step = 250
         y_step = 145
         next_x = 0
+        layout_warnings: list[dict[str, str]] = []
+        warning_keys: set[tuple[str, str, str]] = set()
 
-        def layout(parent_id: Optional[str], depth: int) -> float:
-            nonlocal next_x
-            child_rows = children.get(parent_id, [])
-            if not child_rows:
-                return next_x * x_step
-            positions = []
-            for child in child_rows:
-                positions.append(layout(child["id"], depth + 1))
-            center = (positions[0] + positions[-1]) / 2
-            return center
+        def warn(code: str, node_id: str, parent_id: str) -> None:
+            key = (code, node_id, parent_id)
+            if key not in warning_keys:
+                warning_keys.add(key)
+                layout_warnings.append({"code": code, "nodeId": node_id, "parentId": parent_id})
 
         roots = children.get(None, []) + children.get("", [])
         if not roots:
-            roots = [rows[0]]
+            roots = [node_by_id[str(rows[0]["id"])]]
         root_ids = {node["id"] for node in roots}
         for row in rows:
             if row["id"] not in root_ids and row.get("parent_id") not in node_by_id:
@@ -93,12 +93,24 @@ class WorldMapGenerator:
                 root_ids.add(row["id"])
 
         positioned: set[str] = set()
+        raw_positions: dict[str, float] = {}
 
-        def assign(node: dict[str, Any], depth: int) -> float:
+        def assign(node: dict[str, Any], depth: int, path: set[str]) -> float:
             nonlocal next_x
+            node_id = str(node["id"])
+            if node_id in positioned:
+                return raw_positions[node_id]
+            path.add(node_id)
             child_rows = children.get(node["id"], [])
-            if child_rows:
-                positions = [assign(child, depth + 1) for child in child_rows]
+            positions: list[float] = []
+            for child in child_rows:
+                child_id = str(child["id"])
+                if child_id in path:
+                    warn("LOCATION_HIERARCHY_CYCLE", child_id, node_id)
+                    continue
+                positions.append(assign(child, depth + 1, path))
+            path.remove(node_id)
+            if positions:
                 x = (positions[0] + positions[-1]) / 2
             else:
                 x = next_x * x_step
@@ -106,13 +118,14 @@ class WorldMapGenerator:
             node["x"] = x + 180
             node["y"] = 120 + depth * y_step
             positioned.add(node["id"])
+            raw_positions[node_id] = x
             return x
 
         for root in roots:
-            assign(root, 0)
+            assign(root, 0, set())
         for node in node_by_id.values():
             if node["id"] not in positioned:
-                assign(node, 0)
+                assign(node, 0, set())
         nodes = list(node_by_id.values())
         for node in nodes:
             parent_id = node.get("parentId")
@@ -131,15 +144,23 @@ class WorldMapGenerator:
                         "label": row.get("relationship_type") or "连接",
                         "description": row.get("description") or "", "kind": "connection",
                     })
-        return {"nodes": nodes, "edges": edges}
+        return {"nodes": nodes, "edges": edges, "layoutWarnings": layout_warnings}
 
     @staticmethod
     def _render_html(title: str, graph: dict[str, Any]) -> str:
-        payload = json.dumps(graph, ensure_ascii=False).replace("</script>", "<\\/script>")
+        # Escape HTML-sensitive characters before embedding JSON in a script
+        # element.  Escaping only the exact lowercase ``</script>`` sequence
+        # is insufficient because HTML tag matching is case-insensitive.
+        payload = (
+            json.dumps(graph, ensure_ascii=False)
+            .replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+        )
         safe_title = html.escape(title)
         return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{safe_title} · 世界观地图</title>
+<title>{safe_title} · 世界观地图</title><link rel="icon" href="data:,">
 <style>
 *{{box-sizing:border-box}} body{{margin:0;background:#08111f;color:#dbeafe;font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;overflow:hidden}}
 .top{{height:64px;padding:14px 20px;display:flex;align-items:center;gap:14px;border-bottom:1px solid #263852;background:#0d1a2b}}

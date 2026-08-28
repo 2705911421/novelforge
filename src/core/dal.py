@@ -1,6 +1,10 @@
-"""
-NovelForge 数据访问层
-封装数据库操作，提供高级API
+"""Legacy data-access compatibility layer.
+
+The durable Narrative Runtime owns Canon writes through ``StoryRepository``.
+The classes in this module remain for older library callers and ordinary
+metadata reads, but their Story Fact/Story Commit mutations must not silently
+become Canon.  Legacy facts are explicitly unverified and legacy commits stay
+pending until a caller crosses the repository's review/author boundary.
 """
 
 import json
@@ -405,18 +409,22 @@ class ForeshadowDAL:
 
 
 class StoryFactDAL:
-    """Story Fact 数据访问"""
+    """Legacy Story Fact access; writes are never native Canon facts."""
     
     def __init__(self):
         self.db = get_db()
     
     def create(self, data: Dict) -> str:
-        """创建 Story Fact"""
+        """Store a compatibility fact without manufacturing Canon provenance."""
         fact_id = generate_id()
-        data['id'] = fact_id
-        if 'entities' in data and isinstance(data['entities'], list):
-            data['entities'] = json.dumps(data['entities'])
-        self.db.insert('story_facts', data)
+        payload = dict(data)
+        payload['id'] = fact_id
+        payload.pop('commit_id', None)
+        payload['source'] = 'legacy_dal'
+        payload['verification_status'] = 'unverified'
+        if 'entities' in payload and isinstance(payload['entities'], list):
+            payload['entities'] = json.dumps(payload['entities'])
+        self.db.insert('story_facts', payload)
         return fact_id
     
     def create_batch(self, facts: List[Dict]) -> List[str]:
@@ -538,21 +546,29 @@ class ReviewDAL:
 
 
 class StoryCommitDAL:
-    """Story Commit 数据访问"""
+    """Legacy StoryCommit access; lifecycle acceptance is repository-owned."""
     
     def __init__(self):
         self.db = get_db()
     
     def create(self, data: Dict) -> str:
-        """创建 Story Commit"""
+        """Create only a pending compatibility row.
+
+        Passing ``status='accepted'`` here must not bypass review, event
+        creation, or author confirmation.  The row can only enter Canon via
+        the explicit ``StoryRepository`` seam.
+        """
         commit_id = generate_id()
-        data['id'] = commit_id
-        
+        payload = dict(data)
+        payload['id'] = commit_id
+        payload['status'] = 'pending'
+        payload.pop('accepted_at', None)
+
         for field in ['facts_extracted', 'state_changes']:
-            if field in data and isinstance(data[field], (dict, list)):
-                data[field] = json.dumps(data[field])
-        
-        self.db.insert('story_commits', data)
+            if field in payload and isinstance(payload[field], (dict, list)):
+                payload[field] = json.dumps(payload[field])
+
+        self.db.insert('story_commits', payload)
         return commit_id
     
     def get(self, commit_id: str) -> Optional[Dict]:
@@ -578,10 +594,13 @@ class StoryCommitDAL:
     
     def update(self, commit_id: str, data: Dict) -> bool:
         """更新 Story Commit"""
+        if any(field in data for field in ('status', 'accepted_at', 'rejection_reason', 'event_hash')):
+            raise ValueError("StoryCommit lifecycle is owned by StoryRepository")
+        payload = dict(data)
         for field in ['facts_extracted', 'state_changes']:
-            if field in data and isinstance(data[field], (dict, list)):
-                data[field] = json.dumps(data[field])
-        rows = self.db.update('story_commits', data, 'id = ?', (commit_id,))
+            if field in payload and isinstance(payload[field], (dict, list)):
+                payload[field] = json.dumps(payload[field])
+        rows = self.db.update('story_commits', payload, 'id = ?', (commit_id,))
         return rows > 0
 
 

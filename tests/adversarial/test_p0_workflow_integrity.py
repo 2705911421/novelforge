@@ -23,6 +23,7 @@ from src.llm.model_runtime import (
     PersistentMultiModelManager,
 )
 from src.pipeline.writing_pipeline import WritingPipeline, WritingPipelineError
+from src.review.review_repository import ReviewRepository
 
 
 class DeterministicModel:
@@ -152,6 +153,26 @@ def test_continuous_workflow_does_not_count_rejected_chapter_as_completed(writin
     assert child["status"] == "needs_author_decision"
 
 
+def test_continuous_recovery_does_not_promote_empty_completed_child(writing_deps):
+    database, repository, runtime, project_id, book_id = writing_deps
+    service = ContinuousWritingService(database, DeterministicModel(), repository, runtime)
+    parent = runtime.enqueue(
+        "continuous", project_id=project_id, book_id=book_id,
+        data={"start_chapter": 1, "count": 1},
+    )
+
+    recovered = service._execute_chapter_child(
+        parent,
+        {"id": "historical-empty-child", "status": "completed", "result": {}},
+    )
+
+    assert recovered == {
+        "completed": False,
+        "recovered": True,
+        "error": "completed child has no valid committed result",
+    }
+
+
 def test_studio_write_next_persists_pipeline_chapter_number(tmp_path, monkeypatch):
     """The Studio enqueue seam must provide the chapter contract the worker consumes."""
     from src.web import studio
@@ -212,7 +233,15 @@ def test_persistent_model_manager_routes_pipeline_chat_and_records_role(tmp_path
 
 def test_authoritative_committed_status_survives_compatibility_readback(writing_deps):
     database, repository, _runtime, project_id, book_id = writing_deps
-    repository.append_chapter_version(book_id, 1, "Committed chapter")
+    version = repository.append_chapter_version(book_id, 1, "Committed chapter")
+    chapter = database.fetchone(
+        "SELECT id FROM chapters WHERE book_id=? AND number=1", (book_id,)
+    )
+    assert chapter is not None
+    commit_id = repository.create_story_commit(
+        chapter["id"], chapter_version_id=version["version_id"],
+    )
+    repository.accept_story_commit_legacy(commit_id, reason="status readback fixture")
     repository.transition_chapter_status(project_id, 1, "drafted")
     repository.transition_chapter_status(project_id, 1, "approved")
     repository.transition_chapter_status(project_id, 1, "committed")
@@ -260,7 +289,41 @@ def test_continuous_replay_reuses_completed_idempotent_child(writing_deps):
     )
     claimed_child = runtime.claim_by_id(child["id"], "continuous-worker")
     assert claimed_child is not None
-    runtime.transition(child["id"], "completed", result={"completed": True, "word_count": 321})
+
+    # A replayable completed child must already have crossed the real
+    # Review -> StoryCommit -> Canon acceptance boundary.  Directly marking a
+    # child complete without that evidence is intentionally rejected by
+    # TaskRuntime and would make this test validate a forbidden bypass.
+    version = repository.append_chapter_version(book_id, 1, "Recovered chapter text.")
+    chapter_id = database.fetchone(
+        "SELECT id FROM chapters WHERE book_id=? AND number=1", (book_id,)
+    )["id"]
+    review_id = ReviewRepository(database).save_review(
+        project_id,
+        1,
+        {"overall_score": 95, "passed": True, "verdict": "pass", "dimensions": [], "issues": []},
+        chapter_version_id=version["version_id"],
+    )
+    commit_id = repository.create_story_commit(
+        chapter_id,
+        facts=[{"fact_type": "event", "content": "The replayed chapter was accepted."}],
+        state_changes={"chapter": 1},
+        review_score=95,
+        chapter_version_id=version["version_id"],
+        review_id=review_id,
+    )
+    repository.accept_story_commit(commit_id)
+    child_result = {
+        "completed": True,
+        "story_commit_id": commit_id,
+        "word_count": 321,
+    }
+    runtime.checkpoint(
+        child["id"],
+        "DONE",
+        {"stage": "DONE", "context": child_result},
+    )
+    runtime.transition(child["id"], "completed", result=child_result)
 
     result = ContinuousWritingService(
         database, DeterministicModel(), repository, runtime
@@ -368,7 +431,7 @@ def test_edit_invalidates_superseded_facts_and_replay_excludes_them(writing_deps
         facts=[{"fact_type": "event", "content": "A killed B"}],
         state_changes={"B": "dead"},
     )
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="workflow fixture")
 
     repository.append_chapter_version(book_id, 1, "B escaped")
 
@@ -393,7 +456,7 @@ def test_story_commit_backup_runs_after_commit_and_is_readable(writing_deps, tmp
         chapter_id, chapter_version_id=version["version_id"], facts=[{"content": "saved"}]
     )
 
-    result = repository.accept_story_commit(commit_id)
+    result = repository.accept_story_commit_legacy(commit_id, reason="backup fixture")
 
     assert result["backup"]["created"] is True
     from src.core.backup import BackupManager

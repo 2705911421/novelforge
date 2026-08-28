@@ -7,6 +7,10 @@ human-readable, durable projections from the authoritative store.
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+
 from fastapi.testclient import TestClient
 
 from src.core.config import Config
@@ -14,8 +18,10 @@ from src.core.database import Database
 from src.core.project import ProjectManager
 from src.core.story_repository import StoryRepository
 from src.core.task_runtime import TaskRuntime
+from src.core.task_worker import PersistentTaskWorker
 from src.creation.task_handlers import LegacyTaskHandlers
 from src.planning.creation_workflow import CreationWorkflowRepository
+from src.planning.planning_synthesis import PlanningSynthesisAuthority
 from src.planning.story_bible import STORY_BIBLE_STEPS, StoryBibleRepository
 from src.review.review_repository import ReviewRepository
 
@@ -45,6 +51,12 @@ class SynthesisModel:
         return Response()
 
 
+class FailingSynthesisModel:
+    def chat(self, messages, **kwargs):
+        del messages, kwargs
+        raise RuntimeError("planning provider unavailable")
+
+
 def _seed_planning(tmp_path):
     db = Database(str(tmp_path / "studio.db"))
     repository = StoryRepository(db)
@@ -66,7 +78,7 @@ def _seed_planning(tmp_path):
     return db, repository, manager, project.id
 
 
-def test_planning_synthesis_persists_readable_world_and_entities(tmp_path):
+def test_planning_synthesis_requires_author_acceptance_before_projection_apply(tmp_path):
     db, repository, manager, project_id = _seed_planning(tmp_path)
     runtime = TaskRuntime(db)
     handlers = LegacyTaskHandlers(
@@ -76,6 +88,8 @@ def test_planning_synthesis_persists_readable_world_and_entities(tmp_path):
 
     book = repository.book_for_project(project_id)
     assert book is not None
+    initial_world = db.fetchone("SELECT world_setting FROM projects WHERE id=?", (project_id,))
+    assert initial_world is not None
     task = runtime.enqueue(
         "planning-synthesis",
         project_id=project_id,
@@ -87,13 +101,74 @@ def test_planning_synthesis_persists_readable_world_and_entities(tmp_path):
     result = handlers.planning_synthesis(claimed)
 
     assert result["generatedBy"] == "ai"
+    assert result["applied"] is False
+    assert result["proposalStatus"] == "PROPOSED"
+    proposal = db.fetchone(
+        "SELECT proposal_type, status, task_id FROM agent_proposals WHERE id=?",
+        (result["proposalId"],),
+    )
+    assert proposal == {
+        "proposal_type": "planning_synthesis",
+        "status": "PROPOSED",
+        "task_id": task["id"],
+    }
     world = db.fetchone("SELECT world_setting FROM projects WHERE id=?", (project_id,))
     assert world is not None
-    assert "记忆" in world["world_setting"]
-    assert '"content"' not in world["world_setting"]
+    assert world["world_setting"] == initial_world["world_setting"]
+    character_count = db.fetchone("SELECT COUNT(*) AS count FROM characters WHERE book_id=?", (book["id"],))
+    assert character_count is not None
+    assert character_count["count"] == 0
+
+    authority = PlanningSynthesisAuthority(repository)
+    with pytest.raises(ValueError, match="author confirmation"):
+        authority.accept(result["proposalId"], project_id, actor="studio", author_confirmed=False)
+    with pytest.raises(ValueError, match="author-facing Host"):
+        authority.accept(result["proposalId"], project_id, actor="codex", author_confirmed=True)
+    proposal_status = db.fetchone("SELECT status FROM agent_proposals WHERE id=?", (result["proposalId"],))
+    assert proposal_status is not None
+    assert proposal_status["status"] == "PROPOSED"
+
+    accepted = authority.accept(
+        result["proposalId"], project_id, actor="studio", author_confirmed=True,
+    )
+    assert accepted["status"] == "ACCEPTED"
+    assert accepted["applied"] is True
+    event = db.fetchone(
+        "SELECT name FROM control_events WHERE id=?", (accepted["controlEventId"],)
+    )
+    assert event == {"name": "planning.synthesis.accepted"}
     character = db.fetchone("SELECT name FROM characters WHERE book_id=?", (book["id"],))
     assert character is not None
     assert character["name"] == "陈遥"
+
+
+def test_degraded_planning_synthesis_is_not_reported_as_completed(tmp_path):
+    db, repository, manager, project_id = _seed_planning(tmp_path)
+    runtime = TaskRuntime(db)
+    handlers = LegacyTaskHandlers(
+        manager, FailingSynthesisModel(), Config(project_path=str(tmp_path)), runtime
+    ).mapping()
+    worker = PersistentTaskWorker(runtime, handlers, retry_delay_seconds=0)
+    book = repository.book_for_project(project_id)
+    assert book is not None
+    task = runtime.enqueue(
+        "planning-synthesis",
+        project_id=project_id,
+        book_id=book["id"],
+        data={},
+    )
+
+    result = asyncio.run(worker.execute_once("degraded-synthesis-worker"))
+
+    assert result is not None
+    assert result["status"] == "needs_author_decision"
+    assert result["error_code"] == "TASK_INCOMPLETE"
+    assert result["result"]["completed"] is False
+    assert result["result"]["degraded"] is True
+    proposal = db.fetchone(
+        "SELECT status FROM agent_proposals WHERE task_id=?", (task["id"],)
+    )
+    assert proposal == {"status": "PROPOSED"}
 
 
 def test_analytics_uses_latest_persisted_review(tmp_path, monkeypatch):

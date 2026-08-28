@@ -7,19 +7,22 @@ import asyncio
 import base64
 import binascii
 import contextlib
-from copy import deepcopy
 import io
 import json
+import hashlib
+import logging
 import os
 import posixpath
 import re
+import secrets
 import tarfile
+import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Dict, cast
+from typing import Any, Optional, Dict, Sequence, cast
 
 try:
     from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Header, Request
@@ -28,7 +31,7 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, ConfigDict, Field
 except ImportError:
     raise ImportError("需要安装 fastapi uvicorn python-multipart: pip install fastapi uvicorn python-multipart")
 
@@ -42,12 +45,20 @@ from src.core.database import Database
 from src.core.story_repository import ChapterStateError, ChapterVersionConflict, StoryRepository
 from src.core.narrative_health import NarrativeHealthService
 from src.core.task_runtime import TaskRuntime, TaskStateError
+from src.context.bundles import ContextBundleStore
 from src.core.task_worker import PersistentTaskWorker
 from src.creation.task_handlers import LegacyTaskHandlers
 from src.creation.continuous_service import ContinuousWritingService
 from src.core.legacy_migration import LegacyMigrationError, LegacyMigrationService
-from src.core.models import StoryProject, Chapter
-from src.llm.model_runtime import CredentialStore, ModelConfigurationError, ModelRepository, build_model_runtime
+from src.core.models import StoryProject
+from src.llm.model_runtime import (
+    CredentialStore,
+    ModelConfigurationError,
+    ModelRepository,
+    PersistentModelRuntime,
+    PersistentMultiModelManager,
+    build_model_runtime,
+)
 from src.ingestion.service import DocumentIngestionError, DocumentRepository, DEFAULT_MAX_BYTES, SUPPORTED_SUFFIXES
 from src.ingestion.draft_import import DraftImportError, DraftImportRepository
 from src.ingestion.canonical_import import CanonicalImportError, CanonicalImportService
@@ -66,8 +77,19 @@ from src.story_graph import (
     StoryGraphProjector,
     semantic_edge_options,
 )
+from src.storyflow.analysis import (BranchComparisonService, SimulationAnalyst,
+                                    SimulationCausalityService, SimulationGraphProjector,
+                                    SimulationOutcomeClusterService, SimulationEventDetailService)
+from src.storyflow.interaction import CharacterChatService, SimulationSurveyService
+from src.storyflow.planning import SimulationAdoptionService, SimulationChapterIntentService
+from src.storyflow.simulation import (ActionType, NarrativeAction, PerceptionBuilder, SimulationBranch,
+                                      SimulationIntervention, SimulationRepository, SimulationRoundEngine,
+                                      SimulationRun, SimulationRunStatus, SimulationTaskHandlers,
+                                      AgentScheduler, SimulationBudgetController, SimulationProviderAssignment,
+                                      SimulationConfigurationGenerator, SimulationRunDeletedError)
+from src.storyflow.world import (WorldSnapshotBuilder, WorldSnapshotRepository,
+                                  compare_snapshot_with_canon)
 from src.pipeline.control_surface import ChapterIntent, ControlSurface
-from src.pipeline.story_system import StorySystem
 from src.translation.service import TranslationError, TranslationStore
 from src.interactive_film.service import InteractiveFilmError, InteractiveFilmStore
 from src.planning.plot_workspace import PlotRevisionConflict, PlotWorkspaceError, PlotWorkspaceRepository
@@ -78,9 +100,9 @@ from src.planning.creation_workflow import (
     CreationWorkflowRepository,
     build_architecture_views,
     build_imported_story_bible_payloads,
-    build_style_profile,
     decode_text,
 )
+from src.planning.planning_synthesis import PlanningSynthesisAuthority
 from src.integrations import (
     ExtensionConfigurationError,
     MCPServerRepository,
@@ -91,6 +113,82 @@ from src.integrations import (
     parse_skill_files,
     parse_skill_upload,
 )
+from src.compute.scheduler import (
+    BudgetBroker,
+    CapabilityRegistry,
+    CapabilityTier,
+    ComputePolicyStore,
+    ComputeScheduler,
+)
+from src.compute.telemetry import ComputeTelemetryStore
+from src.runtime.api_runtime import ApiModelRuntime
+from src.runtime.auth import (
+    RequestPrincipalUnavailable,
+    bind_request_principal,
+    configured_api_principal,
+    current_request_principal,
+    request_actor,
+    reset_request_principal,
+)
+from src.runtime.cli import ClaudeCodeRuntime, GeminiCliRuntime, LocalCliRuntime
+from src.runtime.codex import CodexRuntime
+from src.runtime.approvals import ApprovalEngine, is_author_approval_actor, is_host_approval_actor
+from src.runtime.catalog import RuntimeCatalogClient
+from src.runtime.control_plane import (
+    ControlCommand,
+    ControlCommandInProgress,
+    ControlCommandRejected,
+    ControlCommandWorker,
+    ControlPlane,
+    EventBus,
+    TaskOrchestrator,
+)
+from src.runtime.persistence import AgentRunStore, AgentTaskStore, ComputePlanStore, ControlEventStore, ProposalStore
+from src.runtime.contracts import RuntimeCapabilities
+from src.runtime.events import RuntimeEventStore
+from src.runtime.registry import (
+    AcquisitionType,
+    InstallState,
+    ManifestCatalog,
+    ManifestVerifier,
+    RuntimeManifest,
+    RuntimeManager,
+    RuntimeRegistry,
+    RuntimeSource,
+    VerificationResult,
+)
+from src.runtime.errors import RuntimeUnavailable
+from src.runtime.plugins import PluginBus, PluginDescriptor, PluginKind
+from src.runtime.router import RuntimeRouter
+from src.runtime.studio_chat import (
+    StudioChatService,
+    StudioChatTaskHandler,
+    StudioChatValidationError,
+)
+from src.runtime.tool_gateway import PermissionEngine, ToolGateway
+from src.runtime.domain_tools import (
+    register_compute_tools,
+    register_narrative_tools,
+    register_story_authority_tools,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _configured_runtime_catalog() -> ManifestCatalog:
+    """Build a catalog importer from the host's explicit trust-root config."""
+    raw_keys = os.environ.get("NOVELFORGE_RUNTIME_CATALOG_KEYS", "").strip()
+    if not raw_keys:
+        raise RuntimeUnavailable(
+            "trusted runtime catalog keys are not configured; refusing unsigned/untrusted catalog import"
+        )
+    try:
+        keys = json.loads(raw_keys)
+    except json.JSONDecodeError as exc:
+        raise RuntimeUnavailable("NOVELFORGE_RUNTIME_CATALOG_KEYS is not valid JSON") from exc
+    if not isinstance(keys, dict) or not keys:
+        raise RuntimeUnavailable("NOVELFORGE_RUNTIME_CATALOG_KEYS must be a non-empty key map")
+    return ManifestCatalog(ManifestVerifier(trusted_public_keys=keys))
 
 # ========== 全局实例 ==========
 # Tests and isolated deployments can point the complete Studio process at a
@@ -99,9 +197,114 @@ workspace_root = Path(os.environ.get("NOVELFORGE_ROOT", Path.cwd())).resolve()
 config = Config(project_path=str(workspace_root))
 story_repository = StoryRepository(Database(str(workspace_root / "projects" / "novelforge.db")))
 project_mgr = ProjectManager(str(workspace_root), repository=story_repository)
-task_runtime = TaskRuntime(story_repository.db)
+_default_task_runtime = TaskRuntime(story_repository.db)
+
+
+class _StudioTaskRuntimeProxy(TaskRuntime):
+    """Keep Studio task persistence aligned with the active repository.
+
+    Studio tests and embedded deployments can replace ``story_repository`` at
+    runtime.  A module-global TaskRuntime bound to the import-time database
+    would otherwise enqueue or recover work in the default workspace.  The
+    proxy keeps the public module seam stable while selecting a runtime for
+    the currently active repository database.
+    """
+
+    def __init__(self, default_runtime: TaskRuntime):
+        self._default_runtime = default_runtime
+        self._runtimes: dict[int, TaskRuntime] = {id(default_runtime.db): default_runtime}
+        self._control_planes: dict[int, ControlPlane] = {}
+
+    def _target(self) -> TaskRuntime:
+        repository = globals().get("story_repository")
+        database = getattr(repository, "db", self._default_runtime.db)
+        if database is self._default_runtime.db:
+            return self._default_runtime
+        key = id(database)
+        runtime = self._runtimes.get(key)
+        if runtime is None or runtime.db is not database:
+            runtime = TaskRuntime(database)
+            self._runtimes[key] = runtime
+        return runtime
+
+    def enqueue(
+        self,
+        task_type: str,
+        *,
+        project_id: Optional[str] = None,
+        book_id: Optional[str] = None,
+        chapter_number: Optional[int] = None,
+        data: Optional[dict[str, Any]] = None,
+        stage: str = "queued",
+        idempotency_key: Optional[str] = None,
+        initiated_by: Optional[str] = None,
+        initial_status: str = "queued",
+    ) -> dict[str, Any]:
+        """Submit Studio-facing work through the durable Host command seam.
+
+        Child workflow code receives a concrete ``TaskRuntime`` and continues
+        to enqueue its own recovery tasks directly.  The module-level Studio
+        entry point, however, represents a UI/application command and must
+        leave a durable ``CommandBus`` receipt before creating the task.
+        """
+        target = self._target()
+        database = target.db
+        key = id(database)
+        plane = _runtime_plane_cache.get(key)
+        control_plane = None
+        if plane is not None and plane.get("db") is database:
+            candidate = plane.get("controlPlane")
+            if isinstance(candidate, ControlPlane):
+                control_plane = candidate
+        if control_plane is None:
+            control_plane = self._control_planes.get(key)
+        if control_plane is None or control_plane.task_runtime.db is not database:
+            control_plane = ControlPlane(target)
+            self._control_planes[key] = control_plane
+
+        task_data = dict(data or {})
+        request_principal = current_request_principal()
+        if request_principal:
+            # The authenticated middleware principal is the Host source of
+            # truth.  Never let payload metadata or a compatibility argument
+            # replace it while a request is in flight.
+            actor = request_principal
+        elif initiated_by is not None:
+            actor = str(initiated_by).strip() or "system"
+        else:
+            actor = str(
+                task_data.get("initiatedBy")
+                or task_data.get("initiated_by")
+                or task_data.get("source")
+                or "system"
+            ).strip() or "system"
+        return control_plane.commands.dispatch(
+            "task.enqueue",
+            {
+                "taskType": task_type,
+                "projectId": project_id,
+                "bookId": book_id,
+                "chapterNumber": chapter_number,
+                "data": task_data,
+                "stage": stage,
+                "idempotencyKey": idempotency_key,
+                "initialStatus": initial_status,
+            },
+            actor=actor,
+        )
+
+    @property
+    def db(self):
+        return self._target().db
+
+    def __getattr__(self, name: str):
+        return getattr(self._target(), name)
+
+
+task_runtime = _StudioTaskRuntimeProxy(_default_task_runtime)
 legacy_migration = LegacyMigrationService(project_mgr.projects_dir, story_repository.db)
 model_repository, model_runtime, model_mgr = build_model_runtime(story_repository.db, workspace_root)
+_default_model_repository = model_repository
 document_repository = DocumentRepository(story_repository.db, workspace_root)
 bible_repository = StoryBibleRepository(story_repository.db)
 review_repository = ReviewRepository(story_repository.db)
@@ -112,22 +315,74 @@ skill_repository.seed_builtins()
 mcp_server_repository = MCPServerRepository(story_repository.db)
 draft_import_repository = DraftImportRepository(story_repository.db)
 canonical_import_service = CanonicalImportService(story_repository.db, story_repository)
-studio_daemon_state: dict[str, Any] = {"task": None, "stop_event": None, "worker_id": None}
+studio_daemon_state: dict[str, Any] = {
+    "task": None, "control_task": None, "stop_event": None,
+    "worker_id": None, "projection": None,
+}
+_runtime_plane_cache: dict[int, dict[str, Any]] = {}
+_model_runtime_bindings: dict[int, tuple[Database, ModelRepository, Any, PersistentMultiModelManager]] = {}
+_RUNTIME_CAPABILITY_CACHE_TTL_SECONDS = 5.0
+
+
+async def _invalidate_runtime_plane(database: Database) -> None:
+    """Rebuild the cached Host plane after a runtime lifecycle mutation."""
+    plane = _runtime_plane_cache.pop(id(database), None)
+    if not isinstance(plane, dict):
+        return
+    router = plane.get("router")
+    if router is not None:
+        with contextlib.suppress(Exception):
+            await router.shutdown()
+
+
+def _invalidate_runtime_capability_cache(database: Database) -> None:
+    """Drop only observational capability caches after model configuration changes."""
+    plane = _runtime_plane_cache.get(id(database))
+    if not isinstance(plane, dict) or plane.get("db") is not database:
+        return
+    plane.pop("runtimeHealthCache", None)
+    plane.pop("capabilityCache", None)
+    manager = plane.get("modelManager") or get_active_model_manager(database)
+    manager_runtime = getattr(manager, "runtime", None)
+    repository = getattr(manager_runtime, "repository", None)
+    refresh = getattr(manager, "refresh_api_capabilities", None)
+    if repository is None or getattr(repository, "db", None) is not database or not callable(refresh):
+        return
+    try:
+        refresh()
+    except Exception as exc:
+        # Configuration persistence already succeeded.  Keep the read cache
+        # invalidated and make a stale scheduler catalog observable rather
+        # than turning a successful save/delete into an opaque HTTP failure.
+        logger.warning(
+            "runtime API capability refresh failed after model configuration change: %s",
+            exc,
+            exc_info=exc,
+        )
 
 # ========== FastAPI应用 ==========
 @asynccontextmanager
 async def app_lifespan(_app):
     """Recover durable work and supervise the default Studio worker."""
     task_runtime.recover_expired_leases()
+    # Canon projections are a readiness prerequisite.  The repair is
+    # idempotent and transactional for the core ledger, so an interrupted
+    # process can restart and resume the same check before accepting work.
+    studio_daemon_state["projection"] = story_repository.ensure_projection_freshness()
     disabled = os.environ.get("NOVELFORGE_DISABLE_STUDIO_WORKER", "").lower() in {"1", "true", "yes"}
     if not disabled:
         stop_event = asyncio.Event()
         worker_id = f"studio-{os.getpid()}"
+        control_worker = get_runtime_plane().get("commandWorker")
         studio_daemon_state.update(
             stop_event=stop_event,
             worker_id=worker_id,
             task=asyncio.create_task(
-                task_worker.run_forever(worker_id=worker_id, stop_event=stop_event)
+                _get_studio_task_worker().run_forever(worker_id=worker_id, stop_event=stop_event)
+            ),
+            control_task=(
+                asyncio.create_task(control_worker.run_forever(stop_event=stop_event))
+                if control_worker is not None else None
             ),
         )
     try:
@@ -143,7 +398,34 @@ async def app_lifespan(_app):
                 worker_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await worker_task
-        studio_daemon_state.update(task=None, stop_event=None, worker_id=None)
+        control_task = studio_daemon_state.get("control_task")
+        if control_task is not None:
+            try:
+                await asyncio.wait_for(control_task, timeout=5)
+            except asyncio.TimeoutError:
+                control_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await control_task
+        # Runtime capability/auth probes may have started an App Server even
+        # when no task was executed.  Close every cached Host router at the
+        # application boundary so a browser read cannot leak a child process.
+        routers = [getattr(get_active_model_manager(), "_router", None)]
+        routers.extend(
+            plane.get("router")
+            for plane in tuple(_runtime_plane_cache.values())
+            if isinstance(plane, dict)
+        )
+        seen: set[int] = set()
+        for router in routers:
+            if router is None or id(router) in seen:
+                continue
+            seen.add(id(router))
+            with contextlib.suppress(Exception):
+                await router.shutdown()
+        _runtime_plane_cache.clear()
+        studio_daemon_state.update(
+            task=None, control_task=None, stop_event=None, worker_id=None, projection=None
+        )
 
 app = FastAPI(
     title="NovelForge Studio",
@@ -161,23 +443,109 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API Key 认证中间件（可通过环境变量启用）
+# API key authentication is optional for local development, but explicit
+# production/staging modes fail closed when the key is missing.  Query-string
+# credentials are deliberately unsupported because reverse proxies and access
+# logs commonly retain URLs.
 _NOVELFORGE_API_KEY = os.environ.get("NOVELFORGE_API_KEY")
+_NOVELFORGE_DEPLOYMENT_MODE = os.environ.get(
+    "NOVELFORGE_DEPLOYMENT_MODE",
+    os.environ.get("NOVELFORGE_ENV", "development"),
+).strip().lower()
+_NOVELFORGE_AUTH_REQUIRED = bool(_NOVELFORGE_API_KEY) or _NOVELFORGE_DEPLOYMENT_MODE in {
+    "production", "prod", "staging",
+}
+_MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Skip auth for static files, health check, and SSE
+        # Keep only the minimal liveness endpoint and static assets public.
         path = request.url.path
-        if (path.startswith("/static") or path == "/api/health"
-                or path == "/api/v1/events" or not _NOVELFORGE_API_KEY):
+        if path.startswith("/static") or path == "/api/health":
             return await call_next(request)
+        if not _NOVELFORGE_AUTH_REQUIRED:
+            return await call_next(request)
+        if not _NOVELFORGE_API_KEY:
+            return JSONResponse({"error": "AUTH_CONFIGURATION_MISSING"}, status_code=503)
         auth = request.headers.get("Authorization", "")
-        if auth == f"Bearer {_NOVELFORGE_API_KEY}" or request.query_params.get("api_key") == _NOVELFORGE_API_KEY:
-            return await call_next(request)
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if token and secrets.compare_digest(token, _NOVELFORGE_API_KEY):
+            principal = configured_api_principal()
+            if (
+                request.method.upper() in _MUTATING_HTTP_METHODS
+                and request.url.path.startswith("/api/v1/")
+                and not is_host_approval_actor(principal)
+            ):
+                return JSONResponse(
+                    {
+                        "error": {
+                            "code": "HOST_PRINCIPAL_REQUIRED",
+                            "message": "state-changing API requests require a Host principal",
+                        }
+                    },
+                    status_code=403,
+                )
+            principal_token = bind_request_principal(request, principal)
+            try:
+                return await call_next(request)
+            finally:
+                reset_request_principal(principal_token)
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
-if _NOVELFORGE_API_KEY:
+if _NOVELFORGE_AUTH_REQUIRED:
     app.add_middleware(APIKeyMiddleware)
+
+
+def _request_actor(request: Request, requested_actor: str | None = None) -> str:
+    """Use middleware identity for authenticated authority decisions.
+
+    Body actor fields remain accepted for local compatibility only.  An
+    authenticated request is always audited and authorized as the principal
+    established by the bearer middleware.
+    """
+    try:
+        return request_actor(
+            request,
+            requested_actor,
+            auth_required=_NOVELFORGE_AUTH_REQUIRED,
+        )
+    except RequestPrincipalUnavailable as exc:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "AUTHENTICATED_PRINCIPAL_REQUIRED",
+                "message": "authenticated Host principal is unavailable",
+            },
+        ) from exc
+
+
+def _require_host_principal(request: Request) -> str:
+    """Require an authenticated principal allowed to mutate Host state."""
+    actor = _request_actor(request, "studio")
+    if not is_host_approval_actor(actor):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "HOST_PRINCIPAL_REQUIRED",
+                "message": "this Runtime Plane action requires a Host principal",
+            },
+        )
+    return actor
+
+
+def _require_author_principal(request: Request) -> str:
+    """Require an authenticated author-facing principal for narrative decisions."""
+    actor = _request_actor(request, "author")
+    if not is_author_approval_actor(actor):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "AUTHOR_PRINCIPAL_REQUIRED",
+                "message": "this narrative decision requires an author-facing Host principal",
+            },
+        )
+    return actor
+
 
 # ========== 请求/响应模型 ==========
 
@@ -193,6 +561,29 @@ class BookCreateRequest(BaseModel):
     creationMode: Optional[str] = None
     requireProviderConfigured: bool = False
 
+
+class ControlCommandRequest(BaseModel):
+    """Authenticated Studio envelope for a host-owned domain command."""
+
+    name: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    actor: str = "studio"
+    commandId: Optional[str] = None
+    queue: bool = False
+
+
+class ControlQueryRequest(BaseModel):
+    """Read-only Control Plane query envelope."""
+
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ComputePolicyRequest(BaseModel):
+    """Select one host-owned, user-facing Compute Strategy."""
+
+    strategy: str
+
+
 class WriteNextRequest(BaseModel):
     context: str = ""
     words: int = 0
@@ -202,6 +593,31 @@ class WriteNextRequest(BaseModel):
 class AuthorCandidateDecisionRequest(BaseModel):
     decision: str
     reason: str = ""
+
+
+class ReviewedStoryCommitAcceptanceRequest(BaseModel):
+    commitId: str
+    reviewId: str
+    authorConfirmed: bool = False
+
+
+class AgentProposalDecisionRequest(BaseModel):
+    decision: str
+    reason: str = ""
+    successorProposalId: str | None = None
+    actor: str = "studio"
+
+
+class WorldBootstrapProposalAcceptanceRequest(BaseModel):
+    authorConfirmed: bool = False
+    reason: str = ""
+    actor: str = "studio"
+
+
+class PlanningSynthesisAcceptanceRequest(BaseModel):
+    authorConfirmed: bool = False
+    reason: str = ""
+    actor: str = "studio"
 
 
 class AgentRequest(BaseModel):
@@ -315,6 +731,7 @@ class GraphDeltaRequest(BaseModel):
 class PlotDeltaRequest(BaseModel):
     delta: dict[str, Any]
     expectedRevision: Optional[int] = None
+    proposalId: Optional[str] = None
 
 class PlotBranchApplyRequest(BaseModel):
     branch: dict[str, Any]
@@ -347,13 +764,16 @@ class StoryFlowPlanningNodeRequest(BaseModel):
     status: str = "PLANNED"
     metadata: dict[str, Any] = Field(default_factory=dict)
     source: str = "author"
+    nodeId: Optional[str] = None
     expectedRevision: Optional[int] = None
     anchorNodeId: Optional[str] = None
     anchorEdgeType: Optional[str] = None
+    anchorEdgeId: Optional[str] = None
     anchorLabel: str = ""
     anchorSourcePort: Optional[str] = None
     anchorTargetPort: Optional[str] = None
     anchorMetadata: dict[str, Any] = Field(default_factory=dict)
+    proposalId: Optional[str] = None
 
 
 class StoryFlowPlanningEdgeRequest(BaseModel):
@@ -367,7 +787,9 @@ class StoryFlowPlanningEdgeRequest(BaseModel):
     sourcePort: Optional[str] = None
     targetPort: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    edgeId: Optional[str] = None
     expectedRevision: Optional[int] = None
+    proposalId: Optional[str] = None
 
 
 class StoryFlowIntentRequest(BaseModel):
@@ -442,13 +864,226 @@ class NodeImageGenerateRequest(BaseModel):
 class MigrationConfirmRequest(BaseModel):
     fingerprint: str
 
+
+class SimulationRunCreateRequest(BaseModel):
+    snapshotId: str
+    name: str
+    maxRounds: int = Field(1, ge=1, le=1000)
+    seed: int = 0
+    description: str = ""
+    purpose: str = ""
+    cohortId: Optional[str] = None
+    configuration: dict[str, Any] = Field(default_factory=dict)
+
+
+class SimulationReplicateRequest(BaseModel):
+    count: int = Field(1, ge=1, le=20)
+    namePrefix: Optional[str] = None
+    seedStart: Optional[int] = None
+
+
+class SimulationHistoryRequest(BaseModel):
+    reason: str = ""
+
+
+class SimulationStatusRequest(BaseModel):
+    status: str
+
+
+class SimulationBranchCreateRequest(BaseModel):
+    parentRunId: str
+    forkSequence: int = Field(0, ge=0)
+    name: str
+
+
+class SimulationInterventionRequest(BaseModel):
+    kind: str
+    rationale: str
+    author: Optional[str] = None
+    stateDelta: dict[str, Any] = Field(default_factory=dict)
+    roundNumber: Optional[int] = Field(None, ge=0)
+
+
+class SimulationActionRequest(BaseModel):
+    actionType: str
+    actorId: str
+    actorType: str = "character"
+    targetIds: list[str] = Field(default_factory=list)
+    location: Optional[str] = None
+    intent: str = ""
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    preconditions: dict[str, Any] = Field(default_factory=dict)
+    effects: dict[str, Any] = Field(default_factory=dict)
+    confidence: float = Field(1.0, ge=0, le=1)
+    reasoningSummary: str = ""
+    sourceGenerationRun: Optional[str] = None
+    actionId: Optional[str] = None
+
+
+class SimulationRoundRequest(BaseModel):
+    roundNumber: Optional[int] = Field(None, ge=1)
+    actions: list[SimulationActionRequest] = Field(default_factory=list)
+    decisionMode: str = "explicit"
+    agentIds: list[str] = Field(default_factory=list)
+    decisionRole: str = "planner"
+
+
+class SimulationBudgetUpdateRequest(BaseModel):
+    maxGenerationCalls: Optional[int] = Field(None, ge=0)
+    maxTokens: Optional[int] = Field(None, ge=0)
+    maxCost: Optional[float] = Field(None, ge=0)
+    estimatedTokensPerCall: Optional[int] = Field(None, ge=1)
+    costPer1KTokens: Optional[float] = Field(None, ge=0)
+
+
+class SimulationConfigurationRequest(BaseModel):
+    configuration: dict[str, Any] = Field(default_factory=dict)
+    replace: bool = False
+
+
+class SimulationConfigurationGenerateRequest(BaseModel):
+    replace: bool = False
+
+
+class SimulationAdoptionRequest(BaseModel):
+    title: str
+    summary: str = ""
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class SimulationAdoptionEditRequest(BaseModel):
+    title: str
+    summary: str = ""
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class SimulationAdoptRequest(BaseModel):
+    expectedRevision: Optional[int] = Field(None, ge=0)
+
+
+class SimulationChapterIntentRequest(BaseModel):
+    chapterNumber: int = Field(..., ge=1)
+
+
+class SimulationWritingTaskRequest(BaseModel):
+    chapterNumber: int = Field(..., ge=1)
+    context: str = ""
+    count: int = Field(1, ge=1, le=1)
+
+
+class SimulationAnalysisRequest(BaseModel):
+    kind: str = "run-summary"
+    title: Optional[str] = None
+
+
+class SimulationAnalystQueryRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    tool: Optional[str] = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class SimulationCharacterChatRequest(BaseModel):
+    prompt: str
+
+
+class SimulationSurveyRequest(BaseModel):
+    question: str
+    agentIds: Optional[list[str]] = None
+
+
+class SimulationSurveyRunRequest(BaseModel):
+    name: Optional[str] = None
+    seed: Optional[int] = None
+    configuration: dict[str, Any] = Field(default_factory=dict)
+
+
+def _simulation_chapter_intents_for_proposal(book: dict[str, Any], proposal_id: str) -> list[dict[str, Any]]:
+    """Read durable ChapterIntent control documents linked to an adoption."""
+    project_id = str(book.get("project_id") or book.get("id") or "")
+    if not project_id:
+        return []
+    runtime_dir = get_active_project_manager().get_project_dir(project_id) / "control" / "runtime"
+    if not runtime_dir.is_dir():
+        return []
+    intents: list[dict[str, Any]] = []
+    for path in sorted(runtime_dir.glob("chapter-*.intent.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        provenance = data.get("provenance")
+        if not isinstance(provenance, list):
+            continue
+        if any(isinstance(item, dict) and item.get("proposalId") == proposal_id for item in provenance):
+            intents.append(data)
+    return intents
+
+
+def _simulation_writing_tasks_for_proposal(book: dict[str, Any], proposal_id: str) -> list[dict[str, Any]]:
+    """Return book-scoped durable write-next task summaries for an adoption."""
+    project_id = str(book.get("project_id") or book.get("id") or "")
+    if not project_id:
+        return []
+    tasks: list[dict[str, Any]] = []
+    for task in task_runtime.list(project_id=project_id, limit=200):
+        if task.get("type") != "write-next":
+            continue
+        raw_data = task.get("data")
+        data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
+        if data.get("simulation_adoption_id") != proposal_id:
+            continue
+        tasks.append({
+            "id": task.get("id") or task.get("taskId"),
+            "type": task.get("type"),
+            "status": task.get("status"),
+            "stage": task.get("stage"),
+            "workflowState": task.get("workflowState"),
+            "progressPercent": task.get("progressPercent", task.get("progress", 0)),
+            "chapterNumber": task.get("chapterNumber") or data.get("chapter_number"),
+            "error": task.get("error"),
+            "updatedAt": task.get("updated_at") or task.get("updatedAt"),
+        })
+    return tasks
+
+
+def _simulation_adoption_record(
+    item: Any, *, chapter_intents: list[dict[str, Any]] | None = None,
+    writing_tasks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Expose the structured simulation-to-planning handoff contract."""
+    return {
+        "id": item.id,
+        "runId": item.simulation_run_id,
+        "title": item.title,
+        "summary": item.summary,
+        "status": item.status,
+        "payload": dict(item.payload),
+        "sourceSimulationId": item.source_simulation_id,
+        "sourceBranchId": item.source_branch_id,
+        "sourceEventRange": item.source_event_range,
+        "proposedPlanningNodes": list(item.proposed_planning_nodes),
+        "proposedPlotThreads": list(item.proposed_plot_threads),
+        "proposedCharacterGoals": list(item.proposed_character_goals),
+        "proposedForeshadows": list(item.proposed_foreshadows),
+        "proposedChapterIntents": list(item.proposed_chapter_intents),
+        "provenance": item.provenance,
+        "planningNodeId": item.planning_node_id,
+        "planningRevision": item.planning_revision,
+        "chapterIntents": list(chapter_intents or []),
+        "writingTasks": list(writing_tasks or []),
+        "createdAt": item.created_at.isoformat(),
+        "canonicalMutation": False,
+    }
+
 TRANSLATION_UPLOAD_MAX_BYTES = 8 * 1024 * 1024
 
 def get_translation_store() -> TranslationStore:
-    return TranslationStore(workspace_root / "translations")
+    return TranslationStore(_active_workspace_root_for(story_repository.db) / "translations")
 
 def get_interactive_film_store() -> InteractiveFilmStore:
-    return InteractiveFilmStore(workspace_root)
+    return InteractiveFilmStore(_active_workspace_root_for(story_repository.db))
 
 def raise_interactive_http(exc: InteractiveFilmError) -> None:
     status = {
@@ -475,10 +1110,42 @@ sessions: Dict[str, Dict] = {}
 # ========== 辅助函数 ==========
 
 def get_project(project_id: str) -> StoryProject:
-    project = project_mgr.load_project(project_id)
+    project = get_active_project_manager().load_project(project_id)
     if not project:
         raise HTTPException(404, f"项目不存在: {project_id}")
     return project
+
+
+def require_authoritative_project(project_id: str, operation: str = "write") -> None:
+    """Keep Studio mutations on SQLite-backed projects.
+
+    Unmigrated ``project.json`` workspaces remain readable so their data can be
+    inspected and explicitly imported. They must not be silently mutated by a
+    modern route, because that would recreate a second file-backed source of
+    truth after the Narrative OS migration boundary.
+    """
+    resolved_project_id = project_id
+    if not story_repository.is_authoritative_project(resolved_project_id):
+        # Newer book-scoped routes accept either a project id or a public book
+        # id.  Resolve the latter before applying the same authority policy;
+        # otherwise a valid SQLite book id would be rejected simply because it
+        # is not itself a projects.id value.
+        book = story_repository.db.fetchone(
+            "SELECT project_id FROM books WHERE id = ?", (project_id,)
+        )
+        if book:
+            resolved_project_id = str(book["project_id"])
+    if story_repository.is_authoritative_project(resolved_project_id):
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "LEGACY_PROJECT_READ_ONLY",
+            "message": f"{operation} requires an authoritative SQLite project; migrate the legacy project first",
+            "projectId": resolved_project_id,
+            "migrationPreflight": f"/api/v1/projects/{resolved_project_id}/migration/preflight",
+        },
+    )
 
 
 def get_authoritative_book_id(project_id: str) -> str:
@@ -495,7 +1162,86 @@ def get_story_graph_projector() -> StoryGraphProjector:
 
 def get_storyflow_planning_service() -> StoryFlowPlanningService:
     """Bind StoryFlow authoring to the existing revisioned plot workspace."""
-    return StoryFlowPlanningService(story_repository.db)
+    return StoryFlowPlanningService(story_repository.db, task_runtime=task_runtime)
+
+
+def get_simulation_repository() -> SimulationRepository:
+    return SimulationRepository(story_repository.db)
+
+
+def _simulation_capability_idempotency_key(task_type: str, book_id: str, data: dict[str, Any]) -> str:
+    """Build a bounded, deterministic key for one Simulation capability request."""
+    payload = json.dumps(
+        {"taskType": task_type, "bookId": book_id, "data": data},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return f"{task_type}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+async def _execute_simulation_capability_task(
+    book: dict[str, Any],
+    task_type: str,
+    data: dict[str, Any],
+    *,
+    initiated_by: str | None = None,
+) -> dict[str, Any]:
+    """Persist and execute one Analyst/Chat/Survey operation.
+
+    The HTTP layer deliberately does not call a provider-facing service
+    directly.  A fresh worker is used only for the targeted task, while the
+    same row remains recoverable by the normal Studio daemon after a process
+    interruption or lease expiry.
+    """
+    task = task_runtime.enqueue(
+        task_type,
+        project_id=str(book.get("project_id") or book["id"]),
+        book_id=str(book["id"]),
+        data=data,
+        initiated_by=initiated_by or current_request_principal() or "system",
+        idempotency_key=_simulation_capability_idempotency_key(task_type, str(book["id"]), data),
+    )
+    if task.get("status") not in {"completed", "failed", "cancelled", "needs_author_decision"}:
+        worker = PersistentTaskWorker(
+            task_runtime,
+            SimulationTaskHandlers(
+                story_repository.db,
+                model_manager=get_active_model_manager(story_repository.db),
+            ).mapping(),
+            retry_delay_seconds=0,
+        )
+        worker_id = f"studio-simulation-capability-{uuid.uuid4().hex}"
+        executed = await worker.execute_task(task["id"], worker_id)
+        if executed is not None:
+            task = executed
+        else:
+            # Another process may have won the lease.  Read the durable row
+            # for a short bounded window before reporting an in-flight task.
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                current = task_runtime.get(task["id"])
+                if current is None:
+                    break
+                task = current
+                if task.get("status") in {"completed", "failed", "cancelled", "needs_author_decision"}:
+                    break
+    return task
+
+
+def _simulation_capability_response(task: dict[str, Any]) -> dict[str, Any]:
+    """Return the completed handler payload or an observable task failure."""
+    status = task.get("status")
+    if status != "completed":
+        code = task.get("error_code") or "SIMULATION_CAPABILITY_IN_PROGRESS"
+        message = task.get("error") or "simulation capability task is still in progress"
+        status_code = 422 if status in {"failed", "needs_author_decision"} else 409
+        raise HTTPException(status_code=status_code, detail={
+            "code": code, "message": message, "taskId": task.get("id"), "taskStatus": status,
+        })
+    result = task.get("result")
+    payload = dict(result) if isinstance(result, dict) else {}
+    payload.setdefault("taskId", task.get("id"))
+    payload.setdefault("taskStatus", status)
+    return payload
 
 
 def resolve_story_graph_book(value: str) -> dict[str, Any]:
@@ -512,8 +1258,8 @@ def resolve_story_graph_book(value: str) -> dict[str, Any]:
     except HTTPException as exc:
         # A newly created project may not have its first authoritative book
         # yet. StoryFlow should still open with a truthful empty projection.
-        if exc.status_code == 409 and project_mgr.load_project(value):
-            project = project_mgr.load_project(value)
+        if exc.status_code == 409 and get_active_project_manager().load_project(value):
+            project = get_active_project_manager().load_project(value)
             return {
                 "id": value,
                 "project_id": value,
@@ -579,11 +1325,702 @@ def get_story_bible_repository() -> StoryBibleRepository:
     return StoryBibleRepository(story_repository.db)
 
 
+def get_review_repository() -> ReviewRepository:
+    """Bind Review reads to the active Studio database in isolated runs."""
+    if getattr(review_repository, "db", None) is story_repository.db:
+        return review_repository
+    return ReviewRepository(story_repository.db)
+
+
+def get_document_repository() -> DocumentRepository:
+    """Bind document ingestion reads/writes to the active Studio database."""
+    candidate = globals().get("document_repository")
+    active_root = _active_workspace_root_for(story_repository.db)
+    candidate_root = _component_workspace_root(candidate, "workspace_root")
+    if (
+        getattr(candidate, "db", None) is story_repository.db
+        and (candidate_root is None or candidate_root == active_root)
+    ):
+        return cast(DocumentRepository, candidate)
+    return DocumentRepository(
+        story_repository.db,
+        active_root,
+    )
+
+
+def get_plot_workspace_repository() -> PlotWorkspaceRepository:
+    """Bind the StoryFlow overlay to the active authoritative database."""
+    if getattr(plot_workspace_repository, "db", None) is story_repository.db:
+        return plot_workspace_repository
+    return PlotWorkspaceRepository(story_repository.db)
+
+
 def get_model_repository() -> ModelRepository:
     """Bind model readiness to the active Studio database in isolated runs."""
-    if getattr(model_repository, "db", None) is story_repository.db:
-        return model_repository
-    return ModelRepository(story_repository.db, CredentialStore(workspace_root))
+    candidate = globals().get("model_repository")
+    # Preserve the established injection seam used by embedded deployments
+    # and isolated tests when they explicitly replace only this repository.
+    if candidate is not None and candidate is not globals().get("_default_model_repository"):
+        return cast(ModelRepository, candidate)
+    active_root = _active_workspace_root_for(story_repository.db)
+    candidate_root = _model_repository_workspace_root(candidate)
+    if (
+        getattr(candidate, "db", None) is story_repository.db
+        and (candidate_root is None or candidate_root == active_root)
+    ):
+        return cast(ModelRepository, candidate)
+    return ModelRepository(
+        story_repository.db,
+        CredentialStore(active_root),
+    )
+
+
+def _active_workspace_root_for(database: Database) -> Path:
+    """Resolve filesystem services from the active repository, not import time."""
+    active_repository = globals().get("story_repository")
+    repository_root = (
+        getattr(active_repository, "workspace_root", None)
+        if getattr(active_repository, "db", None) is database
+        else None
+    )
+    if repository_root is not None:
+        return Path(repository_root).resolve()
+    db_path = getattr(database, "db_path", None)
+    if db_path is not None:
+        resolved_db_path = Path(db_path).resolve()
+        if resolved_db_path.parent.name == "projects":
+            return resolved_db_path.parent.parent
+        return resolved_db_path.parent
+    return Path(workspace_root).resolve()
+
+
+def _component_workspace_root(component: Any, attribute: str) -> Optional[Path]:
+    """Read a component's filesystem root without breaking test doubles."""
+    raw_root = getattr(component, attribute, None)
+    if raw_root is None:
+        return None
+    try:
+        return Path(raw_root).resolve()
+    except (AttributeError, TypeError, ValueError, OSError):
+        return None
+
+
+def _model_repository_workspace_root(repository: Any) -> Optional[Path]:
+    """Recover the workspace root represented by a CredentialStore."""
+    credentials = getattr(repository, "credentials", None)
+    secret_root = getattr(credentials, "root", None)
+    if secret_root is None:
+        return None
+    try:
+        # CredentialStore stores secrets below ``<workspace>/.novelforge-secrets``.
+        return Path(secret_root).resolve().parent
+    except (AttributeError, TypeError, ValueError, OSError):
+        return None
+
+
+def get_active_config() -> Config:
+    """Bind project settings to the active StoryRepository workspace."""
+    candidate = globals().get("config")
+    active_root = _active_workspace_root_for(story_repository.db)
+    if candidate is None:
+        return Config(project_path=str(active_root))
+    try:
+        candidate_root = Path(candidate.project_path).resolve()
+    except (AttributeError, TypeError, ValueError, OSError):
+        # Embedded/test deployments may replace the config with a compatible
+        # object that intentionally has no project_path attribute.
+        return candidate
+    if candidate_root == active_root:
+        return candidate
+    return Config(project_path=str(active_root))
+
+
+def _active_model_runtime_components_for(
+    database: Database,
+) -> tuple[ModelRepository, Any, PersistentMultiModelManager]:
+    """Return one model runtime/manager tuple for the active authoritative DB."""
+    active_root = _active_workspace_root_for(database)
+    current_runtime = globals().get("model_runtime")
+    current_runtime_repository = getattr(current_runtime, "repository", None)
+    current_runtime_root = _model_repository_workspace_root(current_runtime_repository)
+    if (
+        current_runtime is not None
+        and
+        getattr(current_runtime_repository, "db", None) is database
+        and (current_runtime_root is None or current_runtime_root == active_root)
+    ):
+        current_repository = globals().get("model_repository")
+        if getattr(current_repository, "db", None) is not database:
+            current_repository = current_runtime_repository
+        current_manager = globals().get("model_mgr")
+        manager_runtime = getattr(current_manager, "runtime", None)
+        manager_repository = getattr(manager_runtime, "repository", None)
+        if (
+            manager_runtime is current_runtime
+            or getattr(manager_repository, "db", None) is database
+        ):
+            manager = cast(PersistentMultiModelManager, current_manager)
+        else:
+            manager = PersistentMultiModelManager(cast(PersistentModelRuntime, current_runtime))
+        return (
+            cast(ModelRepository, current_repository),
+            cast(PersistentModelRuntime, current_runtime),
+            manager,
+        )
+
+    cache_key = id(database)
+    cached = _model_runtime_bindings.get(cache_key)
+    cached_root = _model_repository_workspace_root(cached[1]) if cached is not None else None
+    if (
+        cached is not None
+        and cached[0] is database
+        and (cached_root is None or cached_root == active_root)
+    ):
+        return cached[1], cached[2], cached[3]
+
+    bound = build_model_runtime(database, active_root)
+    _model_runtime_bindings[cache_key] = (database, bound[0], bound[1], bound[2])
+    return bound
+
+
+def get_active_project_manager(database: Optional[Database] = None) -> ProjectManager:
+    """Bind project/file projections to the active StoryRepository workspace."""
+    active_repository = globals().get("story_repository")
+    active_database = database or getattr(active_repository, "db", None)
+    candidate = globals().get("project_mgr")
+    candidate_repository = getattr(candidate, "story_repository", None)
+    active_root = _active_workspace_root_for(active_database) if active_database is not None else None
+    candidate_root = _component_workspace_root(candidate, "base_dir")
+    if (
+        active_database is not None
+        and getattr(candidate_repository, "db", None) is active_database
+        and (candidate_root is None or candidate_root == active_root)
+    ):
+        return cast(ProjectManager, candidate)
+    if active_database is None or active_repository is None:
+        return cast(ProjectManager, candidate)
+    return ProjectManager(
+        str(active_root),
+        repository=active_repository,
+    )
+
+
+def get_legacy_migration_service() -> LegacyMigrationService:
+    """Bind legacy migration to the active project directory and DB."""
+    active_manager = get_active_project_manager()
+    if (
+        getattr(legacy_migration, "db", None) is story_repository.db
+        and Path(legacy_migration.projects_dir).resolve()
+        == Path(active_manager.projects_dir).resolve()
+    ):
+        return legacy_migration
+    return LegacyMigrationService(active_manager.projects_dir, story_repository.db)
+
+
+def get_active_model_manager(database: Optional[Database] = None) -> Any:
+    """Bind worker-facing model calls to the active Host database."""
+    active_database = database or story_repository.db
+    candidate = globals().get("model_mgr")
+    candidate_runtime = getattr(candidate, "runtime", None)
+    candidate_repository = getattr(candidate_runtime, "repository", None)
+    active_root = _active_workspace_root_for(active_database)
+    candidate_root = _model_repository_workspace_root(candidate_repository)
+    if (
+        getattr(candidate_repository, "db", None) is active_database
+        and (candidate_root is None or candidate_root == active_root)
+    ):
+        return candidate
+    # Test and embedded deployments may intentionally provide a lightweight
+    # provider double without a PersistentModelRuntime.  It is safe to honor
+    # that explicit replacement for the currently active repository.
+    if (
+        candidate_runtime is None
+        and getattr(globals().get("story_repository"), "db", None) is active_database
+    ):
+        return candidate
+    return _active_model_runtime_components_for(active_database)[2]
+
+
+def get_persistent_model_runtime():
+    """Return the API adapter's current-db model runtime."""
+    return _active_model_runtime_components_for(story_repository.db)[1]
+
+
+def _synchronize_builtin_api_runtime(registry: RuntimeRegistry, runtime: ApiModelRuntime) -> None:
+    """Make the built-in API gate usable before the first capabilities request.
+
+    External runtimes intentionally remain explicit-connect operations because
+    probing them can start vendor processes.  The API adapter is host-owned,
+    synchronous, and credential-backed, so its durable Registry state can be
+    refreshed while constructing the Host plane.  A failed probe is recorded
+    as unavailable and never promoted to READY.
+    """
+    installation = registry.get_installation("api")
+    manifest = registry.get_manifest("api")
+    if installation is None or manifest is None:
+        return
+    if installation.state in {InstallState.BROKEN, InstallState.INCOMPATIBLE, InstallState.NEEDS_UPDATE}:
+        return
+    try:
+        registry.mark_verified(
+            "api",
+            VerificationResult(True, version=manifest.version, checks=("builtin-manifest",)),
+        )
+        auth = runtime.authenticate_sync()
+        if auth.status not in {"authenticated", "ready"}:
+            # Keep a freshly discovered built-in row as INSTALLED when there
+            # is no provider yet; discovery is observational and existing
+            # clients use that state to distinguish installation from auth.
+            # Once authentication had previously been observed, clear that
+            # stale evidence explicitly.
+            if installation.state is not InstallState.INSTALLED:
+                registry.mark_authenticated("api", auth)
+            return
+        registry.mark_authenticated("api", auth)
+        capabilities = RuntimeCapabilities(
+            runtime_type="api",
+            streaming=False,
+            sessions=False,
+            tools=False,
+            approvals=False,
+            pause_resume=False,
+            models=tuple(runtime.get_models_sync()),
+            integration_grade="B",
+        )
+        registry.mark_capability_verified("api", capabilities)
+        registry.mark_health("api", healthy=True)
+    except Exception as exc:
+        logger.warning("built-in API runtime readiness probe failed: %s", exc, exc_info=exc)
+        try:
+            registry.set_error("api", str(exc))
+        except Exception as state_error:
+            logger.warning("could not persist built-in API runtime failure: %s", state_error, exc_info=state_error)
+
+
+def get_runtime_plane() -> dict[str, Any]:
+    """Bind Control/Compute/Runtime Plane read models to Studio's active DB."""
+    database = story_repository.db
+    active_workspace_root = _active_workspace_root_for(database)
+    cache_key = id(database)
+    cached = _runtime_plane_cache.get(cache_key)
+    if (
+        cached is not None
+        and cached.get("db") is database
+        and cached.get("workspaceRoot") == active_workspace_root
+    ):
+        return cached
+    if cached is not None and cached.get("db") is database:
+        # A repository can keep the same Database object while moving the
+        # filesystem workspace (common in embedded/test deployments).  Do
+        # not let the old Runtime/Compute plane retain stale cwd or secrets.
+        _runtime_plane_cache.pop(cache_key, None)
+
+    registry = RuntimeRegistry(database)
+    registry.register_manifest(RuntimeManifest(
+        runtime_type="api",
+        display_name="NovelForge API Model Gateway",
+        version="1",
+        protocol="novelforge-model-gateway",
+        acquisition=AcquisitionType.BUILTIN,
+        capabilities={"generationRuns": True, "streaming": False, "sessions": False},
+        source="novelforge",
+        source_kind=RuntimeSource.BUILTIN,
+        integration_grade="A",
+        platforms={"windows": {"mode": "native"}, "linux": {"mode": "native"}, "darwin": {"mode": "native"}},
+        verification={"type": "builtin"},
+        authentication={"type": "api-key-vault"},
+        compatibility={"minimumVersion": "1", "maximumTestedVersion": "1", "testedVersions": ["1"]},
+    ))
+    registry.register_manifest(RuntimeManifest(
+        runtime_type="codex-app-server",
+        display_name="Codex App Server",
+        version="0.147.0",
+        protocol="jsonrpc-stdio",
+        acquisition=AcquisitionType.SYSTEM,
+        executable="codex",
+        command=("codex", "app-server"),
+        capabilities={"streaming": True, "sessions": True, "tools": True, "approvals": True},
+        source="openai",
+        source_kind=RuntimeSource.SYSTEM,
+        integration_grade="S",
+        platforms={"windows": {"mode": "native"}, "linux": {"mode": "native"}, "darwin": {"mode": "native"}},
+        verification={"type": "executable", "versionCommand": ["codex", "--version"]},
+        authentication={"type": "harness-managed", "protocol": "account/read"},
+        compatibility={"minimumVersion": "0.100.0", "maximumTestedVersion": "0.147.0", "testedVersions": ["0.147.0"]},
+    ))
+    registry.register_manifest(RuntimeManifest(
+        runtime_type="claude-code",
+        display_name="Claude Code",
+        version="2.1.237",
+        protocol="structured-cli",
+        acquisition=AcquisitionType.EXTERNAL,
+        executable="claude",
+        capabilities={"streaming": False, "sessions": False, "tools": False, "approvals": False},
+        source="anthropic",
+        source_kind=RuntimeSource.EXTERNAL,
+        integration_grade="C",
+        platforms={"windows": {"mode": "native"}, "linux": {"mode": "native"}, "darwin": {"mode": "native"}},
+        verification={"type": "executable", "versionCommand": ["claude", "--version"]},
+        authentication={"type": "vendor-managed", "command": ["claude", "auth", "status"]},
+        compatibility={"minimumVersion": "2.0.0", "maximumTestedVersion": "2.1.237", "testedVersions": ["2.1.237"]},
+    ))
+    registry.register_manifest(RuntimeManifest(
+        runtime_type="gemini-cli",
+        display_name="Gemini CLI",
+        version="0.56.0",
+        protocol="structured-cli",
+        acquisition=AcquisitionType.PACKAGE_MANAGER,
+        executable="gemini",
+        capabilities={"streaming": False, "sessions": False, "tools": False, "approvals": False},
+        source="google",
+        source_kind=RuntimeSource.SYSTEM,
+        integration_grade="C",
+        platforms={"windows": {"mode": "native"}, "linux": {"mode": "native"}, "darwin": {"mode": "native"}},
+        verification={"type": "executable", "versionCommand": ["gemini", "--version"]},
+        authentication={"type": "vendor-managed", "command": ["gemini", "--list-sessions"]},
+        compatibility={"minimumVersion": "0.50.0", "maximumTestedVersion": "0.56.0", "testedVersions": ["0.56.0"]},
+        dependencies=(
+            {"name": "node", "required": True, "minimumVersion": "16"},
+            {"name": "npm", "required": True, "minimumVersion": "8"},
+        ),
+        installer={"command": ["npm", "install", "-g", "@google/gemini-cli"]},
+    ))
+    local_manifest = RuntimeManifest(
+        runtime_type="local-runtime",
+        display_name="Local Runtime",
+        version="1",
+        protocol="structured-cli",
+        acquisition=AcquisitionType.EXTERNAL,
+        executable="ollama",
+        capabilities={"streaming": False, "sessions": False, "tools": False, "approvals": False},
+        source="novelforge",
+        source_kind=RuntimeSource.CUSTOM,
+        integration_grade="C",
+        platforms={"windows": {"mode": "native"}, "linux": {"mode": "native"}, "darwin": {"mode": "native"}},
+        verification={"type": "executable", "versionCommand": ["ollama", "--version"]},
+        authentication={"type": "local-no-auth"},
+        compatibility={"minimumVersion": "1", "maximumTestedVersion": "1"},
+    )
+    if registry.get_manifest("local-runtime") is None:
+        registry.register_manifest(local_manifest)
+    local_manifest = registry.get_manifest("local-runtime") or local_manifest
+    for runtime_type in ("api", "codex-app-server", "claude-code", "gemini-cli", "local-runtime"):
+        installation = registry.get_installation(runtime_type)
+        if installation is None or installation.state.value == "not_installed":
+            registry.discover(runtime_type)
+
+    runs = AgentRunStore(database)
+    plans = ComputePlanStore(database)
+    persistent_model_runtime = get_persistent_model_runtime()
+    active_model_manager = get_active_model_manager(database)
+    api_runtime = ApiModelRuntime(persistent_model_runtime, runs)
+    _synchronize_builtin_api_runtime(registry, api_runtime)
+    approval_engine = ApprovalEngine(db=database)
+    permission_engine = PermissionEngine()
+    tool_gateway = ToolGateway(
+        approval_engine=approval_engine,
+        permission_engine=permission_engine,
+    )
+    register_story_authority_tools(tool_gateway, story_repository)
+    register_narrative_tools(
+        tool_gateway,
+        story_repository,
+        story_bible=get_story_bible_repository(),
+        reviews=get_review_repository(),
+    )
+    codex_installation = registry.get_installation("codex-app-server")
+    claude_installation = registry.get_installation("claude-code")
+    gemini_installation = registry.get_installation("gemini-cli")
+    local_installation = registry.get_installation("local-runtime")
+    codex_command = ("codex", "app-server")
+    if codex_installation is not None and codex_installation.path:
+        # Registry discovery/install records the resolved executable path. Do
+        # not silently fall back to PATH when a managed or custom Codex
+        # installation was selected by the user.
+        codex_command = (codex_installation.path, *codex_command[1:])
+    codex_runtime = CodexRuntime(
+        runs,
+        command=codex_command,
+        cwd=active_workspace_root,
+        tool_gateway=tool_gateway,
+    )
+    claude_runtime = None
+    gemini_runtime = None
+    local_runtime = None
+    if claude_installation is not None and claude_installation.state is not InstallState.NOT_INSTALLED:
+        claude_runtime = ClaudeCodeRuntime(
+            runs,
+            cwd=active_workspace_root,
+            executable=claude_installation.path or "claude",
+        )
+    if gemini_installation is not None and gemini_installation.state is not InstallState.NOT_INSTALLED:
+        gemini_runtime = GeminiCliRuntime(
+            runs,
+            cwd=active_workspace_root,
+            executable=gemini_installation.path or "gemini",
+        )
+    if local_installation is not None and local_installation.state is not InstallState.NOT_INSTALLED:
+        raw_local_command = local_manifest.command
+        if not raw_local_command and isinstance(local_manifest.installer, dict):
+            raw_local_command = local_manifest.installer.get("runtimeCommand", ())
+        if isinstance(raw_local_command, Sequence) and not isinstance(raw_local_command, (str, bytes)):
+            local_command = tuple(str(item) for item in raw_local_command if str(item).strip())
+            if local_command:
+                local_runtime = LocalCliRuntime(
+                    runs,
+                    cwd=active_workspace_root,
+                    command_prefix=local_command,
+                )
+    capabilities = CapabilityRegistry()
+    runtime_adapters: dict[str, Any] = {"api": api_runtime}
+    def capability_health(runtime_type: str) -> str:
+        installation = registry.get_installation(runtime_type)
+        if installation is not None and installation.state is InstallState.READY:
+            return "ready"
+        return "unavailable"
+
+    for model in api_runtime.get_models_sync():
+        capabilities.register_model(
+            model, capability=CapabilityTier.C2, health=capability_health("api"), tags=("api",),
+        )
+    if codex_installation is not None and codex_installation.state is not InstallState.NOT_INSTALLED:
+        runtime_adapters["codex-app-server"] = codex_runtime
+        for model in codex_runtime._models:
+            capabilities.register_model(
+                model, capability=CapabilityTier.C4, health=capability_health("codex-app-server"),
+                tags=("codex", "session"),
+            )
+    if claude_runtime is not None:
+        runtime_adapters["claude-code"] = claude_runtime
+        for model in claude_runtime._models:
+            capabilities.register_model(
+                model, capability=CapabilityTier.C3, health=capability_health("claude-code"),
+                tags=("claude", "cli"),
+            )
+    if gemini_runtime is not None:
+        runtime_adapters["gemini-cli"] = gemini_runtime
+        for model in gemini_runtime._models:
+            capabilities.register_model(
+                model, capability=CapabilityTier.C3, health=capability_health("gemini-cli"),
+                tags=("gemini", "cli"),
+            )
+    if local_runtime is not None:
+        runtime_adapters["local-runtime"] = local_runtime
+        for model in local_runtime._models:
+            capabilities.register_model(
+                model, capability=CapabilityTier.C3, health=capability_health("local-runtime"),
+                tags=("local", "cli"),
+            )
+    plugin_bus = PluginBus()
+    for runtime_type, runtime in runtime_adapters.items():
+        manifest = registry.get_manifest(runtime_type)
+        if manifest is None:
+            continue
+        plugin_bus.register(
+            PluginDescriptor(
+                plugin_id=f"runtime.{runtime_type}",
+                kind=PluginKind.RUNTIME,
+                display_name=manifest.display_name,
+                version=manifest.version,
+                source_kind=manifest.source_kind.value,
+                capabilities=manifest.capabilities,
+                metadata={
+                    "protocol": manifest.protocol,
+                    "integrationGrade": manifest.integration_grade,
+                    "runtimeType": runtime_type,
+                },
+            ),
+            runtime,
+            # These are host-owned adapter implementations.  The vendor
+            # source remains visible in the descriptor, but it does not grant
+            # the vendor arbitrary Python execution inside NovelForge.
+            trusted=True,
+        )
+    # API models are registered from the persisted provider catalog at plane
+    # construction time.  The capabilities endpoint performs a later
+    # vendor/credential refresh; the adapter still exists when no provider has
+    # been configured, but no fake model is added.
+    policy_store = ComputePolicyStore(database, scope="studio")
+    policy = policy_store.load()
+    scheduler = ComputeScheduler(
+        capabilities,
+        policy=policy,
+        budget=BudgetBroker(total=10_000, critical_reserve=1_000, db=database, scope="studio"),
+    )
+    events = EventBus(ControlEventStore(database))
+    router = RuntimeRouter(
+        scheduler,
+        runs=runs,
+        plans=plans,
+        event_bus=events,
+        runtime_readiness=registry.require_ready,
+    )
+    for runtime_type, runtime in runtime_adapters.items():
+        router.register(runtime_type, runtime)
+    # The legacy synchronous manager and the Control Plane must converge on
+    # one router for the active database.  Otherwise a worker call could use
+    # a second scheduler/runtime registry that the Studio audit endpoints do
+    # not observe.
+    if getattr(active_model_manager, "runtime", None) is getattr(api_runtime, "runtime", None):
+        active_model_manager.attach_runtime_router(router)
+    plane_task_runtime = TaskRuntime(database)
+    orchestrator = TaskOrchestrator(plane_task_runtime, router)
+    control_plane = ControlPlane(
+        plane_task_runtime,
+        events=events,
+        approvals=approval_engine,
+        permissions=permission_engine,
+        orchestrator=orchestrator,
+        tools=tool_gateway,
+    )
+    register_compute_tools(
+        tool_gateway,
+        control_plane.request_compute_escalation_from_agent,
+    )
+    command_worker = ControlCommandWorker(
+        control_plane.commands,
+        worker_id=f"studio-control-{os.getpid()}",
+    )
+    runtime_manager = RuntimeManager(registry, runtime_adapters=runtime_adapters)
+    cached = {
+        "db": database,
+        "workspaceRoot": active_workspace_root,
+        "registry": registry,
+        "installer": runtime_manager,
+        "runtimeManager": runtime_manager,
+        "agentTasks": AgentTaskStore(database),
+        "runs": runs,
+        "plans": plans,
+        "api": api_runtime,
+        "modelManager": active_model_manager,
+        "codex": codex_runtime,
+        "claude": claude_runtime,
+        "gemini": gemini_runtime,
+        "local": local_runtime,
+        "runtimeAdapters": runtime_adapters,
+        "plugins": plugin_bus,
+        "capabilities": capabilities,
+        "computePolicyStore": policy_store,
+        "scheduler": scheduler,
+        "router": router,
+        "orchestrator": orchestrator,
+        "controlPlane": control_plane,
+        "commandWorker": command_worker,
+        "events": events,
+        "tools": tool_gateway,
+        "permissions": permission_engine,
+        "approvals": approval_engine,
+    }
+    _runtime_plane_cache[cache_key] = cached
+    return cached
+
+
+async def refresh_runtime_capabilities(plane: dict[str, Any]) -> None:
+    """Refresh runtime observations without making the cache an authority.
+
+    Runtime verification/authentication can start vendor processes, so repeated
+    read-model requests use a short-lived in-memory observation cache.  Every
+    cache hit still reads the durable Registry and fails closed for anything
+    that is not persisted as READY.  Scheduler readiness remains wired to
+    ``registry.require_ready``; these caches only avoid duplicate probes.
+    """
+    now = time.monotonic()
+    health_cache = plane.get("runtimeHealthCache")
+    capability_cache = plane.get("capabilityCache")
+    try:
+        cache_fresh = (
+            isinstance(health_cache, dict)
+            and isinstance(capability_cache, dict)
+            and float(health_cache.get("expiresAt", 0)) > now
+            and float(capability_cache.get("expiresAt", 0)) > now
+        )
+    except (TypeError, ValueError):
+        cache_fresh = False
+    if cache_fresh and isinstance(health_cache, dict):
+        cached_health = health_cache.get("health", {})
+        if not isinstance(cached_health, dict):
+            cached_health = {}
+        # Registry is the authority on every request.  A runtime that was
+        # disconnected or broken after the observation is never advertised by
+        # this stale-but-bounded read cache.
+        for runtime_type in plane["runtimeAdapters"]:
+            installation = plane["registry"].get_installation(runtime_type)
+            if installation is None or installation.state is not InstallState.READY:
+                plane["capabilities"].set_runtime_health(runtime_type, "unavailable")
+                continue
+            health = cached_health.get(runtime_type, "unavailable")
+            plane["capabilities"].set_runtime_health(
+                runtime_type, "ready" if health == "ready" else "unavailable",
+            )
+        return
+
+    plane["capabilities"].clear_runtime("api")
+    observed_health: dict[str, str] = {}
+    for model in await plane["api"].get_models():
+        installation = plane["registry"].get_installation("api")
+        health = "ready" if installation is not None and installation.state is InstallState.READY else "unavailable"
+        observed_health["api"] = health
+        plane["capabilities"].register_model(
+            model, capability=CapabilityTier.C2, health=health, tags=("api",),
+        )
+    for runtime_type, runtime in plane["runtimeAdapters"].items():
+        installation = plane["registry"].get_installation(runtime_type)
+        if installation is None or installation.state.value in {
+            "not_installed", "broken", "incompatible", "needs_update", "installing", "repairing",
+        }:
+            plane["capabilities"].set_runtime_health(runtime_type, "unavailable")
+            observed_health[runtime_type] = "unavailable"
+            continue
+        try:
+            verification = plane["installer"].installer(runtime_type).verify()
+            if not verification.verified:
+                plane["registry"].set_error(runtime_type, verification.reason or "runtime verification failed")
+                plane["capabilities"].set_runtime_health(runtime_type, "unavailable")
+                observed_health[runtime_type] = "unavailable"
+                continue
+            plane["registry"].mark_verified(runtime_type, verification)
+            compatibility = plane["registry"].compatibility(runtime_type, verification.version)
+            if not compatibility.compatible:
+                plane["registry"].mark_incompatible(runtime_type, compatibility.reason or "runtime version is incompatible")
+                plane["capabilities"].set_runtime_health(runtime_type, "unavailable")
+                observed_health[runtime_type] = "unavailable"
+                continue
+            auth = await runtime.authenticate()
+            plane["registry"].mark_authenticated(runtime_type, auth)
+            if auth.status not in {"authenticated", "ready"}:
+                plane["capabilities"].set_runtime_health(runtime_type, "unavailable")
+                observed_health[runtime_type] = "unavailable"
+                continue
+            capability = await runtime.get_capabilities()
+            plane["registry"].mark_capability_verified(runtime_type, capability)
+            plane["registry"].mark_health(runtime_type, healthy=True)
+            plane["capabilities"].set_runtime_health(runtime_type, "ready")
+            observed_health[runtime_type] = "ready"
+        except Exception as exc:
+            plane["capabilities"].set_runtime_health(runtime_type, "unavailable")
+            observed_health[runtime_type] = "unavailable"
+            try:
+                plane["registry"].set_error(runtime_type, str(exc))
+            except Exception as persistence_error:
+                logger.warning(
+                    "runtime capability refresh could not persist failure for %s: %s",
+                    runtime_type,
+                    persistence_error,
+                    exc_info=persistence_error,
+                )
+    observed_at = time.monotonic()
+    expires_at = observed_at + _RUNTIME_CAPABILITY_CACHE_TTL_SECONDS
+    plane["runtimeHealthCache"] = {
+        "observedAt": observed_at,
+        "expiresAt": expires_at,
+        "health": observed_health,
+    }
+    plane["capabilityCache"] = {
+        "observedAt": observed_at,
+        "expiresAt": expires_at,
+        "runtimeTypes": sorted(plane["runtimeAdapters"]),
+        "apiModelCount": sum(1 for item in plane["capabilities"].snapshot() if item["runtimeType"] == "api"),
+    }
 
 
 def get_planning_readiness(book_id: str, project: Optional[StoryProject] = None) -> dict[str, Any]:
@@ -601,6 +2038,53 @@ def get_planning_readiness(book_id: str, project: Optional[StoryProject] = None)
         # strict UI-created workflows can never bypass the planning checks.
         trusted_import=bool(metadata.get("planningCompleted") and not metadata.get("enforceProviderGate")),
     )
+
+
+def _story_bible_text(value: Any) -> str:
+    """Render a Story Bible draft value for legacy read-model consumers."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(item for item in (_story_bible_text(entry) for entry in value) if item.strip())
+    if isinstance(value, dict):
+        for key in ("summary", "content", "description", "text", "value", "name"):
+            rendered = _story_bible_text(value.get(key))
+            if rendered.strip():
+                return rendered
+    return "" if value is None else str(value)
+
+
+def _story_bible_draft_read_model(book_id: str) -> dict[str, Any]:
+    """Expose only explicit Story Bible drafts, never fabricate a new workspace."""
+    bible = get_story_bible_repository().get(book_id)
+    if not bible:
+        return {"status": None, "intent": None, "writingStyle": None, "styleProfile": None}
+    steps = {step["step_key"]: step for step in bible.get("steps", [])}
+    intent_step = steps.get("intent") or {}
+    voice_step = steps.get("voice") or {}
+    intent_draft = intent_step.get("draft")
+    voice_draft = voice_step.get("draft")
+    intent = (
+        _story_bible_text(intent_draft)
+        if intent_step.get("status") != "empty" and intent_draft not in (None, "", {}, [])
+        else None
+    )
+    writing_style = (
+        _story_bible_text(voice_draft)
+        if voice_step.get("status") != "empty" and voice_draft not in (None, "", {}, [])
+        else None
+    )
+    style_profile = None
+    if isinstance(voice_draft, dict):
+        candidate = voice_draft.get("styleProfile", voice_draft.get("style_profile"))
+        if isinstance(candidate, dict):
+            style_profile = candidate
+    return {
+        "status": (bible.get("workspace") or {}).get("status"),
+        "intent": intent,
+        "writingStyle": writing_style,
+        "styleProfile": style_profile,
+    }
 
 
 REQUIRED_CREATION_MODEL_ROLES = ("planner", "writer", "reviewer", "reviser", "fact_extraction")
@@ -721,7 +2205,45 @@ def _refresh_architecture_views(book_id: str) -> list[dict[str, Any]]:
     return repo.save_architecture_views(book_id, views, source_manifest=manifest)
 
 
-def _queue_planning_synthesis(book_id: str, source: str) -> dict[str, Any]:
+def _preview_architecture_views(book_id: str) -> list[dict[str, Any]]:
+    """Build an unpersisted planning read model for a cold GET.
+
+    Projection materialization belongs to an explicit import/publish/generate
+    command.  A read request may still show the same four empty or partially
+    populated views, but it must not create a Story Bible workspace or write a
+    projection row as a side effect.
+    """
+    repo = get_creation_workflow()
+    bible = get_story_bible_repository().get(book_id) or {}
+    steps = {step["step_key"]: step.get("draft") for step in bible.get("steps", [])}
+    sources = repo.list_sources(book_id)
+    projections = build_architecture_views(book_id, steps, sources)
+    manifest = projections.get("mindmap", {}).get("sourceManifest", [])
+    ordered_types = ("mindmap", "timeline", "plot_workflow", "character_relationships")
+    return [
+        {
+            "id": f"preview:{book_id}:{view_type}",
+            "project_id": book_id,
+            "snapshot_id": None,
+            "view_type": view_type,
+            "version": 0,
+            "payload": projections[view_type],
+            "source_manifest": manifest,
+            "generated_by": "planning-materials-projection-preview",
+            "readonly": 1,
+            "readOnly": True,
+            "persisted": False,
+        }
+        for view_type in ordered_types
+    ]
+
+
+def _queue_planning_synthesis(
+    book_id: str,
+    source: str,
+    *,
+    initiated_by: str | None = None,
+) -> dict[str, Any]:
     """Queue one durable understanding pass for the current Story Bible."""
     bible = get_story_bible_repository().get(book_id)
     workspace = (bible or {}).get("workspace") or {}
@@ -748,6 +2270,7 @@ def _queue_planning_synthesis(book_id: str, source: str) -> dict[str, Any]:
         project_id=book_id,
         book_id=get_authoritative_book_id(book_id),
         data={"source": source},
+        initiated_by=initiated_by or current_request_principal() or "system",
         idempotency_key=idempotency_key,
     )
     readiness = get_planning_readiness(book_id)
@@ -765,6 +2288,7 @@ def _queue_planning_synthesis(book_id: str, source: str) -> dict[str, Any]:
 
 def _prepare_planning_materials(book_id: str) -> dict[str, Any]:
     """Project imported material into all 25 reviewable drafts without publishing."""
+    require_authoritative_project(book_id, "planning material preparation")
     repo = get_creation_workflow()
     sources = repo.list_sources(book_id)
     story_source = next((item for item in sources if item.get("source_type") == "story_bible"), None)
@@ -788,16 +2312,6 @@ def _prepare_planning_materials(book_id: str) -> dict[str, Any]:
         # left as drafts so the author must inspect and confirm every step in
         # order; no import path may silently publish Story Bible truth.
         bible_repo.save_draft(book_id, step_key, payloads[step_key], source="ai")
-    project = get_project(book_id)
-    if language_source:
-        style_profile, writing_style = build_style_profile(
-            language_source.get("content") or "", language_source.get("filename") or "language-plan.md"
-        )
-        merged_profile = dict(project.style_profile or {})
-        merged_profile.update(style_profile)
-        project.style_profile = merged_profile
-        project.writing_style = writing_style
-        project_mgr.save_project(project)
     views = _refresh_architecture_views(book_id)
     workflow = repo.set_status(
         book_id,
@@ -809,7 +2323,7 @@ def _prepare_planning_materials(book_id: str) -> dict[str, Any]:
             "architectureViewCount": len(views),
         },
     )
-    readiness = get_planning_readiness(book_id, project)
+    readiness = get_planning_readiness(book_id)
     workflow = repo.set_status(book_id, "ready" if readiness["ready"] else "planning", metadata={"planningReadiness": readiness})
     return {
         "prepared": True,
@@ -820,7 +2334,11 @@ def _prepare_planning_materials(book_id: str) -> dict[str, Any]:
     }
 
 
-def _apply_planning_materials(book_id: str) -> dict[str, Any]:
+def _apply_planning_materials(
+    book_id: str,
+    *,
+    initiated_by: str | None = None,
+) -> dict[str, Any]:
     """Compatibility path: prepare, then explicitly publish imported material."""
     repo = get_creation_workflow()
     workflow = repo.get(book_id) or {}
@@ -843,7 +2361,11 @@ def _apply_planning_materials(book_id: str) -> dict[str, Any]:
             "architectureViewCount": len(views),
         },
     )
-    synthesis_task = _queue_planning_synthesis(book_id, "planning-materials-complete")
+    synthesis_task = _queue_planning_synthesis(
+        book_id,
+        "planning-materials-complete",
+        initiated_by=initiated_by,
+    )
     workflow = repo.get(book_id) or workflow
     return {
         "published": published,
@@ -855,10 +2377,10 @@ def _apply_planning_materials(book_id: str) -> dict[str, Any]:
     }
 
 def get_memory(project_id: str) -> MemorySystem:
-    return MemorySystem(project_mgr.get_project_dir(project_id))
+    return MemorySystem(get_active_project_manager().get_project_dir(project_id))
 
 def get_control_surface(project_id: str) -> ControlSurface:
-    return ControlSurface(project_mgr.get_project_dir(project_id))
+    return ControlSurface(get_active_project_manager().get_project_dir(project_id))
 
 
 def storyflow_chapter_intent_model(intent: dict[str, Any]) -> ChapterIntent:
@@ -878,21 +2400,19 @@ def storyflow_chapter_intent_model(intent: dict[str, Any]) -> ChapterIntent:
     )
 
 
-def get_story_system(project_id: str) -> StorySystem:
-    return StorySystem(project_mgr.get_project_dir(project_id))
-
-def validate_project_id(project_id: str) -> bool:
-    return bool(re.match(r'^[a-zA-Z0-9\-]+$', project_id))
+def validate_project_id(project_id: object) -> bool:
+    return isinstance(project_id, str) and bool(re.fullmatch(r"[A-Za-z0-9-]+", project_id))
 
 
 def config_int(section: str, key: str, default: int) -> int:
     """Read a legacy untyped config value without leaking it into typed code."""
-    value = config.get(section, key, default=default)
+    value = get_active_config().get(section, key, default=default)
     return value if isinstance(value, int) and not isinstance(value, bool) else default
 
 
 def enqueue_continuous_task(
-    project_id: str, book_id: str, start: int, count: int, context: str
+    project_id: str, book_id: str, start: int, count: int, context: str,
+    *, initiated_by: str | None = None,
 ) -> dict[str, Any]:
     """Queue one exclusive continuous session through the shared service."""
     workflow = get_creation_workflow().get(project_id) or {}
@@ -900,12 +2420,20 @@ def enqueue_continuous_task(
     try:
         return ContinuousWritingService(
             story_repository.db,
-            model_mgr,
+            get_active_model_manager(story_repository.db),
             story_repository,
             task_runtime,
             joint_review_interval=config_int("continuous", "joint_review_interval", 5),
             score_threshold=config_int("review", "pass_score", 93),
             max_revisions=config_int("review", "max_revision_rounds", 3),
+            # The production proxy submits the parent through CommandBus;
+            # isolated tests/deployments that inject a concrete TaskRuntime
+            # must retain its exclusive enqueue_continuous transaction.
+            enqueue_task=(
+                task_runtime.enqueue
+                if isinstance(task_runtime, _StudioTaskRuntimeProxy)
+                else None
+            ),
         ).start_continuous(
             project_id,
             book_id,
@@ -913,6 +2441,7 @@ def enqueue_continuous_task(
             count,
             context,
             strict_planning=strict_planning,
+            initiated_by=initiated_by,
         )
     except TaskStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -923,12 +2452,270 @@ def enqueue_continuous_task(
 def _studio_backup_manager():
     """Bind backup operations to this Studio's authoritative DB and workspace."""
     from src.core.backup import BackupManager
-    return BackupManager(story_repository.db, workspace_root)
+    return BackupManager(story_repository.db, _active_workspace_root_for(story_repository.db))
 
 
-task_worker = PersistentTaskWorker(
-    task_runtime, LegacyTaskHandlers(project_mgr, model_mgr, config, task_runtime).mapping()
-)
+def _require_backup_project(project_id: Any) -> str:
+    """Validate a backup scope before touching the filesystem."""
+    if not isinstance(project_id, str) or not validate_project_id(project_id):
+        raise HTTPException(400, "invalid backup project id")
+    if not story_repository.db.fetchone("SELECT id FROM projects WHERE id=?", (project_id,)):
+        raise HTTPException(404, f"项目不存在: {project_id}")
+    return project_id
+
+
+def _resolve_backup_project(project_id: Any = None) -> str:
+    """Resolve the default project or fail closed when no project exists."""
+    if project_id is None or (isinstance(project_id, str) and not project_id.strip()):
+        project = story_repository.db.fetchone(
+            "SELECT id FROM projects ORDER BY updated_at DESC, id LIMIT 1"
+        )
+        if not project:
+            raise HTTPException(400, "没有可用的项目")
+        return str(project["id"])
+    return _require_backup_project(project_id)
+
+
+task_handlers = LegacyTaskHandlers(project_mgr, model_mgr, config, task_runtime).mapping()
+task_handlers.update(SimulationTaskHandlers(story_repository.db, model_manager=model_mgr).mapping())
+_default_task_worker = PersistentTaskWorker(task_runtime, task_handlers)
+task_worker = _default_task_worker
+_studio_task_worker_bindings: dict[int, dict[str, Any]] = {}
+
+
+def _get_studio_task_worker() -> PersistentTaskWorker:
+    """Return a worker whose handlers share the active Host authority.
+
+    The public ``task_worker`` name remains an override seam for tests and
+    embedded deployments.  When it is untouched, Studio rebuilds the worker
+    binding only when the active repository or one of its managers changes;
+    this prevents a dynamic task-runtime proxy from pairing a new DB with
+    import-time project/model handlers.
+    """
+    candidate_worker = globals().get("task_worker")
+    if candidate_worker is not _default_task_worker:
+        return cast(PersistentTaskWorker, candidate_worker)
+
+    active_repository = globals().get("story_repository")
+    database = getattr(active_repository, "db", None)
+    if not isinstance(database, Database):
+        return _default_task_worker
+    active_root = _active_workspace_root_for(database)
+
+    project_candidate = globals().get("project_mgr")
+    project_repository = getattr(project_candidate, "story_repository", None)
+    project_root = _component_workspace_root(project_candidate, "base_dir")
+    project_source = (
+        project_candidate
+        if getattr(project_repository, "db", None) is database
+        and (project_root is None or project_root == active_root)
+        else None
+    )
+    model_candidate = globals().get("model_mgr")
+    model_runtime_candidate = getattr(model_candidate, "runtime", None)
+    model_repository_candidate = getattr(model_runtime_candidate, "repository", None)
+    model_root = _model_repository_workspace_root(model_repository_candidate)
+    model_source = (
+        model_candidate
+        if (
+            (
+                getattr(model_repository_candidate, "db", None) is database
+                and (model_root is None or model_root == active_root)
+            )
+            or (
+                model_runtime_candidate is None
+                and getattr(active_repository, "db", None) is database
+            )
+        )
+        else None
+    )
+    config_candidate = globals().get("config")
+    try:
+        config_project_path = getattr(config_candidate, "project_path", None)
+        config_root = Path(config_project_path).resolve() if config_project_path is not None else None
+    except (AttributeError, TypeError, ValueError, OSError):
+        config_root = None
+    config_source = config_candidate if config_root == active_root else None
+    runtime_candidate = globals().get("task_runtime")
+    runtime_source = (
+        None if isinstance(runtime_candidate, _StudioTaskRuntimeProxy) else runtime_candidate
+    )
+
+    cache_key = id(database)
+    binding = _studio_task_worker_bindings.get(cache_key)
+    if (
+        binding is not None
+        and binding.get("db") is database
+        and binding.get("repository") is active_repository
+        and binding.get("workspaceRoot") == active_root
+        and binding.get("projectSource") is project_source
+        and binding.get("modelSource") is model_source
+        and binding.get("configSource") is config_source
+        and binding.get("runtimeSource") is runtime_source
+    ):
+        return binding["worker"]
+
+    if project_source is not None:
+        active_project_manager = project_source
+    elif (
+        binding is not None
+        and binding.get("repository") is active_repository
+        and binding.get("workspaceRoot") == active_root
+    ):
+        active_project_manager = binding["projectManager"]
+    else:
+        active_project_manager = get_active_project_manager(database)
+
+    active_model_manager = (
+        model_source
+        if model_source is not None
+        else get_active_model_manager(database)
+    )
+    if config_source is not None:
+        active_config = config_source
+    elif (
+        binding is not None
+        and binding.get("repository") is active_repository
+        and binding.get("workspaceRoot") == active_root
+    ):
+        active_config = binding["config"]
+    else:
+        active_config = Config(project_path=str(active_root))
+
+    active_runtime: TaskRuntime
+    if isinstance(runtime_candidate, _StudioTaskRuntimeProxy):
+        active_runtime = runtime_candidate._target()
+    elif getattr(runtime_candidate, "db", None) is database:
+        active_runtime = cast(TaskRuntime, runtime_candidate)
+    else:
+        active_runtime = TaskRuntime(database)
+
+    active_handlers = LegacyTaskHandlers(
+        active_project_manager,
+        active_model_manager,
+        active_config,
+        active_runtime,
+    ).mapping()
+    active_handlers.update(
+        SimulationTaskHandlers(
+            database,
+            model_manager=active_model_manager,
+        ).mapping()
+    )
+    chat_handler = StudioChatTaskHandler(get_studio_chat_service())
+    active_handlers.update({"chat": chat_handler, "thought-clarify": chat_handler})
+    worker = PersistentTaskWorker(active_runtime, active_handlers)
+    _studio_task_worker_bindings[cache_key] = {
+        "db": database,
+        "repository": active_repository,
+        "workspaceRoot": active_root,
+        "projectSource": project_source,
+        "modelSource": model_source,
+        "configSource": config_source,
+        "runtimeSource": runtime_source,
+        "projectManager": active_project_manager,
+        "config": active_config,
+        "worker": worker,
+    }
+    return worker
+
+_STUDIO_TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "needs_author_decision"}
+
+
+async def _execute_studio_task(
+    task_type: str,
+    *,
+    project_id: Optional[str],
+    book_id: Optional[str],
+    data: dict[str, Any],
+    worker_label: str,
+    stage: str = "queued",
+    idempotency_key: Optional[str] = None,
+    initiated_by: Optional[str] = None,
+) -> dict[str, Any]:
+    """Run one immediate HTTP operation through the durable Worker seam.
+
+    Some historical endpoints are synchronous for the browser, but their
+    provider work must still have the same durable Task/AgentTask/AgentRun
+    provenance as background creation work.  The targeted claim is safe when
+    the normal daemon is active; if it wins the lease first, this boundary
+    returns the durable row after a short bounded wait instead of invoking a
+    provider a second time.
+    """
+    task = task_runtime.enqueue(
+        task_type,
+        project_id=project_id,
+        book_id=book_id,
+        data=data,
+        stage=stage,
+        idempotency_key=idempotency_key,
+        initiated_by=str(
+            initiated_by
+            or data.get("initiatedBy")
+            or data.get("initiated_by")
+            or data.get("source")
+            or "studio"
+        ).strip() or "studio",
+    )
+    if task.get("status") in _STUDIO_TERMINAL_TASK_STATUSES:
+        return task
+
+    worker_id = f"{worker_label}-{uuid.uuid4().hex}"
+    executed = await _get_studio_task_worker().execute_task(task["id"], worker_id)
+    if executed is not None:
+        return executed
+
+    # Another durable worker may have claimed the same task.  Do not race it
+    # with a second model call; observe the persisted result for a bounded
+    # window and let the caller retry/poll when the provider is still running.
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        current = task_runtime.get(task["id"])
+        if current is None:
+            break
+        task = current
+        if task.get("status") in _STUDIO_TERMINAL_TASK_STATUSES:
+            break
+    return task
+
+
+def _studio_task_payload(task: dict[str, Any], operation: str) -> dict[str, Any]:
+    """Expose a completed task result or an observable durable failure."""
+    status = task.get("status")
+    if status == "completed":
+        result = task.get("result")
+        if not isinstance(result, dict):
+            raise HTTPException(
+                500,
+                detail={
+                    "code": "TASK_RESULT_INVALID",
+                    "message": f"{operation} completed without an object result",
+                    "taskId": task.get("id"),
+                },
+            )
+        payload = dict(result)
+        payload.setdefault("taskId", task.get("id"))
+        payload.setdefault("taskStatus", status)
+        return payload
+
+    code = str(task.get("error_code") or "TASK_IN_PROGRESS")
+    message = str(task.get("error") or f"{operation} has not completed")
+    if status in {"failed", "needs_author_decision"}:
+        http_status = 503 if code in {
+            "MODEL_CONFIGURATION", "MODEL_AUTHENTICATION", "MODEL_CREDENTIAL_UNAVAILABLE",
+            "AUTHENTICATION_REQUIRED", "NETWORK", "PROVIDER_TRANSIENT",
+        } else 422 if status == "needs_author_decision" else 500
+    else:
+        http_status = 409
+    raise HTTPException(
+        http_status,
+        detail={
+            "code": code,
+            "message": message,
+            "taskId": task.get("id"),
+            "taskStatus": status,
+        },
+    )
 
 # ========== 首页 ==========
 
@@ -936,25 +2723,69 @@ STATIC_DIR = Path(__file__).parent / "static"
 INDEX_HTML_PATH = STATIC_DIR / "index.html"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+
+def _studio_shell_response() -> HTMLResponse:
+    """Serve the single Studio shell document.
+
+    The inline fallback page was removed: there is exactly one Studio HTML
+    surface (``static/index.html``).  A missing asset is a deployment error,
+    not a reason to render a stale duplicate page.
+    """
+    if not INDEX_HTML_PATH.exists():
+        raise HTTPException(
+            503,
+            detail="Studio shell asset missing: src/web/static/index.html is required to serve the Studio UI.",
+        )
+    return HTMLResponse(INDEX_HTML_PATH.read_text(encoding="utf-8"))
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # 优先使用全新的 inkOS 对标 SPA；缺失时回退到内置演示页
-    if INDEX_HTML_PATH.exists():
-        return HTMLResponse(INDEX_HTML_PATH.read_text(encoding="utf-8"))
-    return STUDIO_HTML
+    return _studio_shell_response()
+
+
+@app.get("/runtime", response_class=HTMLResponse)
+@app.get("/agent-config", response_class=HTMLResponse)
+async def global_runtime_workspace():
+    """Serve the shell for global Runtime setup without an active book."""
+    return _studio_shell_response()
+
+
+@app.get("/project/{book_id}", response_class=HTMLResponse)
+@app.get("/project/{book_id}/{workspace}", response_class=HTMLResponse)
+@app.get("/project/{book_id}/more/{more_page}", response_class=HTMLResponse)
+async def project_workspace(
+    book_id: str, workspace: str | None = None, more_page: str | None = None,
+):
+    """Serve the Studio shell for first-class workspace deep links.
+
+    Workspace routing is intentionally client-owned so existing API contracts
+    and the legacy page adapters stay unchanged. The server still needs to
+    return the SPA document on refresh, otherwise a copied workspace URL would
+    be a 404 before the browser router can restore project context.
+    """
+    return _studio_shell_response()
 
 # ========== v1 API - 书籍管理 ==========
 
 @app.get("/api/v1/books")
 async def list_books():
     """列出所有书籍"""
-    projects = project_mgr.list_projects()
+    projects = get_active_project_manager().list_projects()
     books = []
     for p in projects:
-        project = project_mgr.load_project(p["id"])
+        project = get_active_project_manager().load_project(p["id"])
         if project:
+            authoritative_book = story_repository.book_for_project(p["id"])
             books.append({
+                # ``id`` remains the project-scoped identifier used by the
+                # legacy Studio pages.  Expose both boundaries explicitly so
+                # new StoryFlow callers do not have to infer the mapping.
                 "id": p["id"],
+                "projectId": p["id"],
+                "authoritativeBookId": (
+                    str(authoritative_book["id"]) if authoritative_book else None
+                ),
                 "title": p["name"],
                 "genre": p["genre"],
                 "status": "active",
@@ -975,13 +2806,17 @@ async def get_book(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    authoritative_book = story_repository.book_for_project(project.id)
     planning_readiness = get_planning_readiness(book_id, project)
     workflow = get_creation_workflow().get(book_id)
     workflow_metadata = (workflow or {}).get("metadata") or {}
     thought_session = get_creation_workflow().get_thought_session(book_id)
     source_count = len(get_creation_workflow().list_sources(book_id))
+    story_bible_draft = _story_bible_draft_read_model(book_id)
     return {
         "id": project.id,
+        "projectId": project.id,
+        "authoritativeBookId": str(authoritative_book["id"]) if authoritative_book else None,
         "title": project.name,
         "genre": project.genre,
         "status": "active",
@@ -1007,6 +2842,10 @@ async def get_book(book_id: str):
         "styleProfile": project.style_profile,
         "styleGuidance": project.style_guidance(),
         "authorIntent": project.author_intent,
+        "authorIntentDraft": story_bible_draft["intent"],
+        "writingStyleDraft": story_bible_draft["writingStyle"],
+        "styleProfileDraft": story_bible_draft["styleProfile"],
+        "storyBibleStatus": story_bible_draft["status"],
         "creationWorkflow": workflow,
         "planningReadiness": planning_readiness,
         "planningSummary": workflow_metadata.get("planningSummary"),
@@ -1021,8 +2860,9 @@ async def get_book(book_id: str):
     }
 
 @app.post("/api/v1/books/create")
-async def create_book(req: BookCreateRequest):
+async def create_book(req: BookCreateRequest, request: Request):
     """创建新书"""
+    actor = _require_author_principal(request)
     if req.chapterWords < 1 or req.targetChapters < 1 or req.targetVolumes < 1:
         raise HTTPException(422, "chapterWords, targetChapters, and targetVolumes must be positive")
     creation_mode = (req.creationMode or "planned").strip().lower()
@@ -1039,10 +2879,10 @@ async def create_book(req: BookCreateRequest):
                 "modelReadiness": provider_readiness,
             },
         )
-    project = project_mgr.create_project(
+    project = get_active_project_manager().create_project(
         req.title,
         req.genre,
-        config,
+        get_active_config(),
         target_chapters=req.targetChapters,
         target_volumes=req.targetVolumes,
         chapter_word_target=req.chapterWords,
@@ -1071,7 +2911,8 @@ async def create_book(req: BookCreateRequest):
     if req.brief and creation_mode == "planned":
         authoritative_book_id = get_authoritative_book_id(project.id)
         task = task_runtime.enqueue(
-            "world-bootstrap", project_id=project.id, book_id=authoritative_book_id, data={"brief": req.brief}
+            "world-bootstrap", project_id=project.id, book_id=authoritative_book_id,
+            data={"brief": req.brief}, initiated_by=actor,
         )
 
     return {
@@ -1095,7 +2936,12 @@ async def creation_preflight(mode: str = Query("planned"), bookId: str = Query("
     if normalized_mode not in CREATION_MODES:
         raise HTTPException(422, "mode must be planned, thought, or draft-import")
     if bookId:
-        get_project(bookId)
+        # The Studio shell stores the project id while public StoryFlow APIs
+        # also expose the authoritative book id.  Readiness is read-only, so
+        # accept either identifier through the same resolver used by the
+        # simulation/graph routes instead of making the parameter name an
+        # accidental 404 boundary.
+        resolve_story_graph_book(bookId)
     readiness = get_model_setup_readiness()
     return {
         "mode": normalized_mode,
@@ -1112,7 +2958,20 @@ async def get_creation_workflow_state(book_id: str):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
     repo = get_creation_workflow()
-    workflow = repo.get(book_id) or repo.ensure(book_id)
+    workflow = repo.get(book_id)
+    if workflow is None and not story_repository.is_authoritative_project(book_id):
+        # A legacy project is readable, but initializing a SQLite workflow row
+        # here would turn a GET into an implicit migration/write operation.
+        return {
+            "workflow": None,
+            "planningReadiness": get_planning_readiness(book_id),
+            "sources": [],
+            "thoughtSession": None,
+            "architectureViews": [],
+            "readOnly": True,
+            "legacyProject": True,
+        }
+    workflow = workflow or repo.ensure(book_id)
     return {
         "workflow": workflow,
         "planningReadiness": get_planning_readiness(book_id),
@@ -1122,7 +2981,16 @@ async def get_creation_workflow_state(book_id: str):
     }
 
 
-def _planning_source_result(book_id: str, source_type: str, filename: str, content: str, confirm_steps: bool) -> dict[str, Any]:
+def _planning_source_result(
+    book_id: str,
+    source_type: str,
+    filename: str,
+    content: str,
+    confirm_steps: bool,
+    *,
+    initiated_by: str | None = None,
+) -> dict[str, Any]:
+    require_authoritative_project(book_id, "planning source import")
     repo = get_creation_workflow()
     try:
         existing_workflow = repo.get(book_id)
@@ -1150,14 +3018,6 @@ def _planning_source_result(book_id: str, source_type: str, filename: str, conte
                 )
                 for _, key in STORY_BIBLE_STEPS:
                     get_story_bible_repository().save_draft(book_id, key, payloads[key], source="ai")
-                if language:
-                    project = get_project(book_id)
-                    profile, writing_style = build_style_profile(language.get("content") or "", language.get("filename") or "language-plan.md")
-                    merged = dict(project.style_profile or {})
-                    merged.update(profile)
-                    project.style_profile = merged
-                    project.writing_style = writing_style
-                    project_mgr.save_project(project)
                 _refresh_architecture_views(book_id)
         completed = None
         if confirm_steps:
@@ -1167,7 +3027,10 @@ def _planning_source_result(book_id: str, source_type: str, filename: str, conte
                 completed["reviewRequired"] = True
                 completed["message"] = "严格创作流程不会自动确认或发布 25 步清单，请逐步审阅后再发布。"
             else:
-                completed = _apply_planning_materials(book_id)
+                completed = _apply_planning_materials(
+                    book_id,
+                    initiated_by=initiated_by,
+                )
         return {
             "source": {key: value for key, value in source.items() if key != "content"},
             "workflow": repo.get(book_id),
@@ -1181,21 +3044,35 @@ def _planning_source_result(book_id: str, source_type: str, filename: str, conte
 
 
 @app.post("/api/v1/books/{book_id}/planning-sources/text")
-async def import_planning_source_text(book_id: str, body: PlanningSourceTextRequest):
+async def import_planning_source_text(
+    book_id: str,
+    body: PlanningSourceTextRequest,
+    request: Request,
+):
     """Import a UTF-8/Markdown planning document through a testable JSON path."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "planning source import")
     require_model_setup(book_id)
     source_type = (body.sourceType or "reference").strip().lower()
     if source_type not in SOURCE_TYPES:
         raise HTTPException(422, "sourceType must be story_bible, language_plan, or reference")
-    return _planning_source_result(book_id, source_type, body.filename, body.content, body.confirmSteps)
+    actor = _require_author_principal(request)
+    return _planning_source_result(
+        book_id,
+        source_type,
+        body.filename,
+        body.content,
+        body.confirmSteps,
+        initiated_by=actor,
+    )
 
 
 @app.post("/api/v1/books/{book_id}/planning-sources")
 async def import_planning_source_file(
     book_id: str,
+    request: Request,
     file: UploadFile = File(...),
     sourceType: str = Form("reference"),
     confirmSteps: bool = Form(False),
@@ -1204,25 +3081,36 @@ async def import_planning_source_file(
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "planning source import")
     require_model_setup(book_id)
     source_type = (sourceType or "reference").strip().lower()
     if source_type not in SOURCE_TYPES:
         raise HTTPException(422, "sourceType must be story_bible, language_plan, or reference")
+    actor = _require_author_principal(request)
     data = await file.read()
     try:
         content = decode_text(data)
     except CreationWorkflowError as exc:
         raise _creation_http_error(exc) from exc
-    return _planning_source_result(book_id, source_type, file.filename or "planning-material.md", content, confirmSteps)
+    return _planning_source_result(
+        book_id,
+        source_type,
+        file.filename or "planning-material.md",
+        content,
+        confirmSteps,
+        initiated_by=actor,
+    )
 
 
 @app.post("/api/v1/books/{book_id}/planning-sources/complete")
-async def complete_planning_sources(book_id: str):
+async def complete_planning_sources(book_id: str, request: Request):
     """Explicitly adopt imported planning documents as the complete Story Bible."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "planning source completion")
     require_model_setup(book_id)
+    actor = _require_author_principal(request)
     try:
         workflow = get_creation_workflow().get(book_id) or {}
         if (workflow.get("metadata") or {}).get("enforceProviderGate"):
@@ -1230,12 +3118,13 @@ async def complete_planning_sources(book_id: str):
             prepared["reviewRequired"] = True
             prepared["message"] = "严格创作流程不会自动确认或发布 25 步清单，请到世界观向导逐步审阅。"
             return prepared
-        result = _apply_planning_materials(book_id)
+        result = _apply_planning_materials(book_id, initiated_by=actor)
         task = task_runtime.enqueue(
             "planning-views-generate",
             project_id=book_id,
             book_id=get_authoritative_book_id(book_id),
             data={"source": "planning-complete"},
+            initiated_by=actor,
             idempotency_key=f"planning-views:auto:{book_id}:{result['workflow'].get('updated_at')}",
         )
         result["aiTaskId"] = task["id"]
@@ -1247,12 +3136,14 @@ async def complete_planning_sources(book_id: str):
 
 
 @app.post("/api/v1/books/{book_id}/planning-sources/prepare")
-async def prepare_planning_sources(book_id: str):
+async def prepare_planning_sources(book_id: str, request: Request):
     """Prepare the full 25-step review surface without confirming or publishing it."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "planning source preparation")
     require_model_setup(book_id)
+    actor = _require_author_principal(request)
     try:
         return _prepare_planning_materials(book_id)
     except CreationWorkflowError as exc:
@@ -1263,14 +3154,20 @@ async def prepare_planning_sources(book_id: str):
 
 @app.get("/api/v1/books/{book_id}/planning-views")
 async def get_planning_views(book_id: str):
-    """Return the four auto-generated, read-only planning projections."""
+    """Return the four auto-generated, read-only planning projections.
+
+    A cold read is rendered from current inputs in memory.  Persistence is
+    reserved for explicit planning import/publish/generate commands.
+    """
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
     repo = get_creation_workflow()
     views = repo.get_architecture_views(book_id)
     if not views:
-        views = _refresh_architecture_views(book_id)
+        if not story_repository.is_authoritative_project(book_id):
+            return {"views": [], "readOnly": True, "sourceManifest": [], "legacyProject": True}
+        views = _preview_architecture_views(book_id)
     return {"views": views, "readOnly": True, "sourceManifest": views[0].get("source_manifest", []) if views else []}
 
 
@@ -1298,20 +3195,20 @@ async def get_planning_summary(book_id: str):
                 "summary": None,
                 "sourceCount": 0,
             }
-        workflow = repo.ensure(book_id)
+        # A missing workflow row is a recoverable read-model gap.  Do not
+        # repair it from GET or queue work as the implicit ``system`` actor.
+        workflow = {"metadata": {}}
     metadata = workflow.get("metadata") or {}
     summary = metadata.get("planningSummary")
+    proposal_id = metadata.get("planningSynthesisProposalId")
+    proposal = (
+        ProposalStore(story_repository.db).get(str(proposal_id))
+        if isinstance(proposal_id, str) and proposal_id else None
+    )
     task_id = metadata.get("planningSynthesisTaskId")
     task = task_runtime.get(task_id) if isinstance(task_id, str) else None
-    if summary is None:
-        sources = repo.list_sources(book_id)
-        bible = get_story_bible_repository().get(book_id)
-        published = ((bible or {}).get("workspace") or {}).get("published_snapshot_id")
-        if sources and published:
-            task = _queue_planning_synthesis(book_id, "planning-summary-read")
-            task_id = task["id"]
-            workflow = repo.get(book_id) or workflow
-            metadata = workflow.get("metadata") or {}
+    # Summary generation is an explicit POST command.  In particular, a
+    # polling GET must never enqueue work or mutate workflow metadata.
     decision = None
     if task:
         for event in reversed(task_runtime.events(task["id"])):
@@ -1331,31 +3228,79 @@ async def get_planning_summary(book_id: str):
         "decision": decision,
         "summary": summary,
         "sourceCount": len(repo.list_sources(book_id)),
+        "proposal": proposal,
+        "proposalId": proposal.get("id") if proposal else proposal_id,
+        "proposalStatus": (
+            proposal.get("status") if proposal else metadata.get("planningSynthesisProposalStatus")
+        ),
+        "applied": bool(metadata.get("planningSynthesisApplied", False)),
     }
 
 
 @app.post("/api/v1/books/{book_id}/planning-summary/generate")
-async def generate_planning_summary(book_id: str):
+async def generate_planning_summary(book_id: str, request: Request):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "planning summary generation")
     require_model_setup(book_id)
-    task = _queue_planning_synthesis(book_id, "manual-refresh")
+    actor = _require_author_principal(request)
+    task = _queue_planning_synthesis(book_id, "manual-refresh", initiated_by=actor)
     return {"taskId": task["id"], "status": task["status"]}
 
 
+@app.post("/api/v1/books/{book_id}/planning-summary/proposals/{proposal_id}/accept")
+async def accept_planning_summary(
+    book_id: str,
+    proposal_id: str,
+    body: PlanningSynthesisAcceptanceRequest,
+    request: Request,
+):
+    """Accept one planning synthesis through the author-owned Host boundary."""
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "无效的项目ID")
+    get_project(book_id)
+    require_authoritative_project(book_id, "planning summary acceptance")
+    actor = _require_author_principal(request)
+    try:
+        result = PlanningSynthesisAuthority(story_repository).accept(
+            proposal_id,
+            book_id,
+            actor=actor,
+            author_confirmed=body.authorConfirmed,
+            reason=body.reason,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "bookId": book_id,
+        "proposal": result,
+        "proposalId": proposal_id,
+        "proposalStatus": result.get("status"),
+        "applied": bool(result.get("applied")),
+        "canonicalMutation": False,
+    }
+
+
 @app.post("/api/v1/books/{book_id}/planning-views/generate")
-async def generate_planning_views(book_id: str):
+async def generate_planning_views(book_id: str, request: Request):
     """Queue an AI refinement while keeping the deterministic projections durable."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "planning view generation")
     require_model_setup(book_id)
+    actor = _require_author_principal(request)
     task = task_runtime.enqueue(
         "planning-views-generate",
         project_id=book_id,
         book_id=get_authoritative_book_id(book_id),
         data={},
+        initiated_by=actor,
         idempotency_key=f"planning-views:{book_id}:{datetime.now().strftime('%Y%m%d%H%M%S')}",
     )
     return {"taskId": task["id"], "status": task["status"]}
@@ -1376,11 +3321,13 @@ async def get_thought_session(book_id: str, optional: bool = Query(False)):
 
 
 @app.post("/api/v1/books/{book_id}/thought-session/respond")
-async def respond_to_thought(book_id: str, body: ThoughtResponseRequest):
+async def respond_to_thought(book_id: str, body: ThoughtResponseRequest, request: Request):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "thought-session response")
     require_model_setup(book_id)
+    actor = _require_author_principal(request)
     repo = get_creation_workflow()
     try:
         session = repo.append_thought_turn(book_id, "user", body.answer)
@@ -1389,6 +3336,7 @@ async def respond_to_thought(book_id: str, body: ThoughtResponseRequest):
             project_id=book_id,
             book_id=get_authoritative_book_id(book_id),
             data={"session_id": session["id"]},
+            initiated_by=actor,
             idempotency_key=f"thought-clarify:{book_id}:{len(session.get('turns') or [])}",
         )
         return {"taskId": task["id"], "status": task["status"], "session": session}
@@ -1397,11 +3345,13 @@ async def respond_to_thought(book_id: str, body: ThoughtResponseRequest):
 
 
 @app.post("/api/v1/books/{book_id}/thought-session/framework")
-async def generate_thought_framework(book_id: str):
+async def generate_thought_framework(book_id: str, request: Request):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "thought-session framework")
     require_model_setup(book_id)
+    actor = _require_author_principal(request)
     repo = get_creation_workflow()
     session = repo.get_thought_session(book_id)
     if not session:
@@ -1411,17 +3361,20 @@ async def generate_thought_framework(book_id: str):
         project_id=book_id,
         book_id=get_authoritative_book_id(book_id),
         data={"session_id": session["id"]},
+        initiated_by=actor,
         idempotency_key=f"thought-framework:{book_id}:{session.get('updated_at')}",
     )
     return {"taskId": task["id"], "status": task["status"]}
 
 
 @app.post("/api/v1/books/{book_id}/forecast-imports")
-async def record_forecast_import(book_id: str, body: ForecastImportRequest):
+async def record_forecast_import(book_id: str, body: ForecastImportRequest, request: Request):
     """Audit the explicit one-click adoption of a forecast branch."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "forecast import")
+    _require_author_principal(request)
     try:
         return get_creation_workflow().record_forecast_import(
             book_id,
@@ -1443,32 +3396,73 @@ async def list_forecast_imports(book_id: str):
     return {"imports": items, "count": len(items)}
 
 @app.delete("/api/v1/books/{book_id}")
-async def delete_book(book_id: str):
+async def delete_book(book_id: str, request: Request):
     """删除书籍"""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
-    project_mgr.delete_project(book_id)
+    get_project(book_id)
+    require_authoritative_project(book_id, "book deletion")
+    _require_author_principal(request)
+    get_active_project_manager().delete_project(book_id)
     return {"message": "项目已删除"}
 
 class UpdateBookRequest(BaseModel):
     title: str | None = None
     genre: str | None = None
-    author_intent: str | None = None
+    target_volumes: int | None = Field(default=None, alias="targetVolumes", gt=0)
+    writing_style: str | None = Field(default=None, alias="writingStyle")
+    style_profile: dict[str, Any] | None = Field(default=None, alias="styleProfile")
+    author_intent: str | None = Field(default=None, alias="authorIntent")
+
+    model_config = ConfigDict(populate_by_name=True)
 
 @app.put("/api/v1/books/{book_id}")
-async def update_book(book_id: str, data: UpdateBookRequest):
+async def update_book(book_id: str, data: UpdateBookRequest, request: Request):
     """更新书籍设置"""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "book update")
+    _require_author_principal(request)
+    project_metadata_changed = False
     if data.title is not None:
         project.name = data.title
+        project_metadata_changed = True
     if data.genre is not None:
         project.genre = data.genre
-    if data.author_intent is not None:
-        project.author_intent = data.author_intent
-    project_mgr.save_project(project)
-    return {"message": "更新成功"}
+        project_metadata_changed = True
+    if data.target_volumes is not None:
+        project.target_volumes = data.target_volumes
+        project_metadata_changed = True
+
+    drafted_steps: list[str] = []
+    if data.author_intent is not None or data.writing_style is not None or data.style_profile is not None:
+        bible_repository_for_update = get_story_bible_repository()
+        bible_repository_for_update.ensure(book_id)
+        if data.author_intent is not None:
+            bible_repository_for_update.save_draft(book_id, "intent", data.author_intent, source="author")
+            drafted_steps.append("intent")
+        if data.writing_style is not None or data.style_profile is not None:
+            profile = (
+                data.style_profile
+                if data.style_profile is not None
+                else dict(project.style_profile or {})
+            )
+            summary = data.writing_style if data.writing_style is not None else project.writing_style
+            voice_payload = {"summary": summary or "", "styleProfile": profile}
+            bible_repository_for_update.save_draft(book_id, "voice", voice_payload, source="author")
+            drafted_steps.append("voice")
+
+    if project_metadata_changed:
+        get_active_project_manager().save_project(project)
+    result: dict[str, Any] = {"message": "更新成功"}
+    if drafted_steps:
+        result.update({
+            "storyBibleDrafted": drafted_steps,
+            "requiresStoryBiblePublish": True,
+            "message": "项目设置已保存；规划内容已进入 Story Bible 草稿，发布前不会改变 Canon",
+        })
+    return result
 
 # ========== v1 API - 章节管理 ==========
 
@@ -1481,7 +3475,7 @@ async def get_chapter(book_id: str, num: int):
     if num not in project.chapters:
         raise HTTPException(404, f"章节{num}不存在")
     ch = project.chapters[num]
-    content = project_mgr.load_chapter_content(book_id, num)
+    content = get_active_project_manager().load_chapter_content(book_id, num)
     return {
         "number": ch.number,
         "title": ch.title,
@@ -1540,11 +3534,15 @@ async def diff_chapter_versions(
 
 
 @app.post("/api/v1/books/{book_id}/chapters/{num}/versions/{version}/restore")
-async def restore_chapter_version(book_id: str, num: int, version: int, data: dict):
+async def restore_chapter_version(
+    book_id: str, num: int, version: int, data: dict, request: Request
+):
     """Restore historical text by appending a new version, never overwriting history."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "chapter version restore")
+    _require_author_principal(request)
     base_version = data.get("baseVersion")
     if base_version is not None and (
         isinstance(base_version, bool) or not isinstance(base_version, int) or base_version < 1
@@ -1581,7 +3579,7 @@ async def get_chapter_workspace(book_id: str, num: int):
     trace = control.load_context_trace(num)
 
     ch = project.chapters.get(num)
-    content = project_mgr.load_chapter_content(book_id, num) if ch else ""
+    content = get_active_project_manager().load_chapter_content(book_id, num) if ch else ""
     authoritative_book_id = get_authoritative_book_id(book_id)
     chapter_row = story_repository.db.fetchone(
         "SELECT id FROM chapters WHERE book_id=? AND number=?",
@@ -1607,28 +3605,19 @@ async def get_chapter_workspace(book_id: str, num: int):
     }
 
 @app.put("/api/v1/books/{book_id}/chapters/{num}")
-async def update_chapter(book_id: str, num: int, data: dict):
+async def update_chapter(book_id: str, num: int, data: dict, request: Request):
     """更新章节内容"""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "chapter update")
+    _require_author_principal(request)
     current_chapter = project.chapters.get(num)
     if current_chapter is None:
         require_complete_planning(book_id)
-    if not project_mgr.story_repository.is_authoritative_project(book_id):
-        if num not in project.chapters:
-            project.chapters[num] = Chapter(number=num)
-        ch = project.chapters[num]
-        if "content" in data:
-            ch.content = data["content"]
-            ch.word_count = len(data["content"])
-        if "title" in data:
-            ch.title = data["title"]
-        project_mgr.save_project(project)
-        return {"message": "章节更新成功", "version": 0}
     try:
         current_content = current_chapter.content if current_chapter is not None else ""
-        result = project_mgr.story_repository.save_chapter_content(
+        result = get_active_project_manager().story_repository.save_chapter_content(
             book_id, num, data.get("content", current_content), title=data.get("title", ""),
             expected_version=data.get("baseVersion"), status=data.get("status"),
         )
@@ -1644,37 +3633,41 @@ async def update_chapter(book_id: str, num: int, data: dict):
     }
 
 @app.delete("/api/v1/books/{book_id}/chapters/{num}")
-async def delete_chapter(book_id: str, num: int):
+async def delete_chapter(book_id: str, num: int, request: Request):
     """删除章节"""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
-    if not project_mgr.delete_chapter(book_id, num):
+    require_authoritative_project(book_id, "chapter deletion")
+    _require_author_principal(request)
+    if not get_active_project_manager().delete_chapter(book_id, num):
         raise HTTPException(404, f"章节{num}不存在")
     return {"message": "章节已删除"}
 
 # ========== v1 API - 创作操作 ==========
 
 @app.post("/api/v1/books/{book_id}/write-next")
-async def write_next_chapter(book_id: str, req: WriteNextRequest):
+async def write_next_chapter(book_id: str, req: WriteNextRequest, request: Request):
     """写下一章（后台执行）"""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)  # Preserve the legacy 404 behaviour before enqueueing.
+    require_authoritative_project(book_id, "chapter generation")
     require_complete_planning(book_id)
+    actor = _require_author_principal(request)
     authoritative_book_id = get_authoritative_book_id(book_id)
     chapter_number = project.get_latest_chapter_number() + 1
     workflow = get_creation_workflow().get(book_id) or {}
     strict_planning = bool((workflow.get("metadata") or {}).get("requireCompletePlanning"))
     run_config = ContinuousWritingService(
         story_repository.db,
-        model_mgr,
+        get_active_model_manager(story_repository.db),
         story_repository,
         task_runtime,
         score_threshold=config_int("review", "pass_score", 93),
         max_revisions=config_int("review", "max_revision_rounds", 3),
     ).capture_run_configuration(book_id, strict_planning=strict_planning)
-    task = task_runtime.enqueue("write-next", project_id=book_id, book_id=authoritative_book_id, data={
+    task = task_runtime.enqueue("write-next", project_id=book_id, book_id=authoritative_book_id, initiated_by=actor, data={
         "chapter_number": chapter_number,
         "context": req.context, "words": req.words, "count": req.count,
         **run_config,
@@ -1685,68 +3678,78 @@ async def write_next_chapter(book_id: str, req: WriteNextRequest):
     }
 
 @app.post("/api/v1/books/{book_id}/draft")
-async def draft_chapter(book_id: str, req: WriteNextRequest):
+async def draft_chapter(book_id: str, req: WriteNextRequest, request: Request):
     """Queue draft generation; the persistent worker owns model execution."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "draft generation")
     require_complete_planning(book_id)
+    actor = _require_author_principal(request)
     ch_num = project.get_latest_chapter_number() + 1
-    task = task_runtime.enqueue("draft-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={
+    task = task_runtime.enqueue("draft-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), initiated_by=actor, data={
         "chapter": ch_num, "context": req.context,
     })
     return {"taskId": task["id"], "chapter": ch_num, "message": "草稿任务已排队", "status": task["status"]}
 
 @app.post("/api/v1/books/{book_id}/audit/{chapter}")
-async def audit_chapter(book_id: str, chapter: int):
+async def audit_chapter(book_id: str, chapter: int, request: Request):
     """Queue review so HTTP never calls a provider directly."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "chapter review")
+    actor = _require_author_principal(request)
     if chapter not in project.chapters:
         raise HTTPException(404, f"章节{chapter}不存在")
 
-    task = task_runtime.enqueue("audit-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={"chapter": chapter})
+    task = task_runtime.enqueue("audit-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), initiated_by=actor, data={"chapter": chapter})
     return {"taskId": task["id"], "chapter": chapter, "message": "审查任务已排队", "status": task["status"]}
 
 @app.post("/api/v1/books/{book_id}/revise/{chapter}")
-async def revise_chapter(book_id: str, chapter: int):
+async def revise_chapter(book_id: str, chapter: int, request: Request):
     """Queue revision and re-review through the durable worker."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "chapter revision")
     require_complete_planning(book_id)
+    actor = _require_author_principal(request)
     if chapter not in project.chapters:
         raise HTTPException(404, f"章节{chapter}不存在")
 
     ch = project.chapters[chapter]
     if not ch.review:
         raise HTTPException(400, "章节未审查，无法修订")
-    task = task_runtime.enqueue("revise-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={"chapter": chapter})
+    task = task_runtime.enqueue("revise-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), initiated_by=actor, data={"chapter": chapter})
     return {"taskId": task["id"], "chapter": chapter, "message": "修订任务已排队", "status": task["status"]}
 
 @app.post("/api/v1/books/{book_id}/plan")
-async def plan_chapter(book_id: str, req: WriteNextRequest):
+async def plan_chapter(book_id: str, req: WriteNextRequest, request: Request):
     """Queue model-based chapter planning."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "chapter planning")
     require_complete_planning(book_id)
+    actor = _require_author_principal(request)
     ch_num = project.get_latest_chapter_number() + 1
-    task = task_runtime.enqueue("plan-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={
+    task = task_runtime.enqueue("plan-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), initiated_by=actor, data={
         "chapter": ch_num, "context": req.context,
     })
     return {"taskId": task["id"], "chapterNumber": ch_num, "message": "章节规划任务已排队", "status": task["status"]}
 
 @app.post("/api/v1/books/{book_id}/compose")
-async def compose_chapter(book_id: str, req: WriteNextRequest):
+async def compose_chapter(book_id: str, req: WriteNextRequest, request: Request):
     """Queue model-based planning and context composition."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "chapter context composition")
     require_complete_planning(book_id)
+    actor = _require_author_principal(request)
     ch_num = project.get_latest_chapter_number() + 1
-    task = task_runtime.enqueue("compose-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={
+    task = task_runtime.enqueue("compose-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), initiated_by=actor, data={
         "chapter": ch_num, "context": req.context,
     })
     return {"taskId": task["id"], "chapterNumber": ch_num, "message": "上下文编排任务已排队", "status": task["status"]}
@@ -1779,13 +3782,15 @@ async def consolidate_chapters(book_id: str):
     }
 
 @app.post("/api/v1/books/{book_id}/rewrite/{chapter}")
-async def rewrite_chapter(book_id: str, chapter: int, req: WriteNextRequest):
+async def rewrite_chapter(book_id: str, chapter: int, req: WriteNextRequest, request: Request):
     """Queue a chapter rewrite instead of writing in the HTTP request."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "chapter rewrite")
     require_complete_planning(book_id)
-    task = task_runtime.enqueue("rewrite-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={
+    actor = _require_author_principal(request)
+    task = task_runtime.enqueue("rewrite-chapter", project_id=book_id, book_id=get_authoritative_book_id(book_id), initiated_by=actor, data={
         "chapter": chapter, "context": req.context,
     })
     return {"taskId": task["id"], "chapter": chapter, "message": "重写任务已排队", "status": task["status"]}
@@ -1793,12 +3798,14 @@ async def rewrite_chapter(book_id: str, chapter: int, req: WriteNextRequest):
 # ========== v1 API - 导出 ==========
 
 @app.post("/api/v1/books/{book_id}/export-save")
-async def export_save(book_id: str, req: ExportRequest):
+async def export_save(book_id: str, req: ExportRequest, request: Request):
     """导出并保存"""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
-    exporter = Exporter(str(project_mgr.get_project_dir(book_id) / "exports"))
+    require_authoritative_project(book_id, "book export")
+    _require_author_principal(request)
+    exporter = Exporter(str(get_active_project_manager().get_project_dir(book_id) / "exports"))
     path = exporter.export(project, req.format, approved_only=req.approvedOnly)
     report_path = exporter.export_review_report(project)
     return {
@@ -1922,12 +3929,13 @@ async def get_truth_files(book_id: str):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
     control = get_control_surface(book_id)
-
-    author_intent = control.load_author_intent()
     current_focus = control.load_current_focus()
+    author_intent = _story_bible_draft_read_model(book_id)["intent"]
+    if author_intent is None:
+        author_intent = project.author_intent or ""
 
     return {
-        "authorIntent": author_intent.to_markdown(),
+        "authorIntent": author_intent,
         "currentFocus": current_focus.to_markdown(),
         "worldSetting": project.world.__dict__,
         "characters": {k: v.__dict__ for k, v in project.characters.items()},
@@ -1937,18 +3945,28 @@ async def get_truth_files(book_id: str):
     }
 
 @app.put("/api/v1/books/{book_id}/truth/{file}")
-async def update_truth_file(book_id: str, file: str, data: dict):
+async def update_truth_file(book_id: str, file: str, data: dict, request: Request):
     """更新真相文件"""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
-    control = get_control_surface(book_id)
+    require_authoritative_project(book_id, "truth file update")
+    _require_author_principal(request)
 
     if file == "author_intent":
-        from src.pipeline.control_surface import AuthorIntent
-        intent = AuthorIntent(content=data.get("content", ""))
-        control.save_author_intent(intent)
+        content = data.get("content", "")
+        if not isinstance(content, str):
+            raise HTTPException(422, "author intent content must be text")
+        bible_repository_for_update = get_story_bible_repository()
+        bible_repository_for_update.ensure(book_id)
+        bible_repository_for_update.save_draft(book_id, "intent", content, source="author")
+        return {
+            "message": "作者意图已保存为 Story Bible 草稿；发布前不会改变 Canon",
+            "storyBibleDrafted": ["intent"],
+            "requiresStoryBiblePublish": True,
+        }
     elif file == "current_focus":
+        control = get_control_surface(book_id)
         from src.pipeline.control_surface import CurrentFocus
         focus = CurrentFocus(content=data.get("content", ""))
         control.save_current_focus(focus)
@@ -1958,15 +3976,17 @@ async def update_truth_file(book_id: str, file: str, data: dict):
 # ========== v1 API - 世界观向导 ==========
 
 @app.post("/api/v1/books/{book_id}/wizard")
-async def run_wizard(book_id: str, data: dict):
-    """Queue world building; provider work belongs to the persistent worker."""
+async def run_wizard(book_id: str, data: dict, request: Request):
+    """Queue world proposal generation; author confirmation remains separate."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "world bootstrap")
+    actor = _require_author_principal(request)
     task = task_runtime.enqueue("world-bootstrap", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={
         "brief": data.get("userInput", ""),
-    })
-    return {"taskId": task["id"], "message": "世界观构建任务已排队", "status": task["status"]}
+    }, initiated_by=actor)
+    return {"taskId": task["id"], "message": "世界观提案任务已排队，需作者确认后发布", "status": task["status"]}
 
 # ========== v1 API - 思维导图和时间轴 ==========
 
@@ -1978,9 +3998,9 @@ async def get_mindmap(book_id: str):
     project = get_project(book_id)
     # Touch the durable canvas so newly-created timeline/relationship rows are
     # reflected in the visualization after a browser refresh.
-    plot_workspace_repository.load(get_authoritative_book_id(book_id))
+    get_plot_workspace_repository().load(get_authoritative_book_id(book_id))
     gen = MindMapGenerator()
-    vis_dir = project_mgr.get_project_dir(book_id) / "visualizations"
+    vis_dir = get_active_project_manager().get_project_dir(book_id) / "visualizations"
     path = gen.generate_from_project(project, str(vis_dir))
     return FileResponse(path, media_type="text/html")
 
@@ -1990,9 +4010,9 @@ async def get_timeline(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
-    plot_workspace_repository.load(get_authoritative_book_id(book_id))
+    get_plot_workspace_repository().load(get_authoritative_book_id(book_id))
     gen = TimelineGenerator()
-    vis_dir = project_mgr.get_project_dir(book_id) / "visualizations"
+    vis_dir = get_active_project_manager().get_project_dir(book_id) / "visualizations"
     path = gen.generate_html(project, str(vis_dir / "timeline.html"))
     return FileResponse(path, media_type="text/html")
 
@@ -2004,7 +4024,7 @@ async def get_world_map(book_id: str):
         raise HTTPException(400, "invalid project id")
     project = get_project(book_id)
     authoritative_book_id = get_authoritative_book_id(book_id)
-    vis_dir = project_mgr.get_project_dir(book_id) / "visualizations"
+    vis_dir = get_active_project_manager().get_project_dir(book_id) / "visualizations"
     path = WorldMapGenerator(story_repository.db).generate_html(
         authoritative_book_id, str(vis_dir / "world-map.html"), title=project.name
     )
@@ -2034,26 +4054,60 @@ async def get_plot_canvas(book_id: str):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
     try:
-        graph, revision = plot_workspace_repository.load(get_authoritative_book_id(book_id))
+        graph, revision = get_plot_workspace_repository().load(get_authoritative_book_id(book_id))
         return {"graph": graph, "revision": revision}
     except PlotWorkspaceError as exc:
         raise _plot_http_error(exc) from exc
 
 
 @app.post("/api/v1/books/{book_id}/plot-canvas/delta")
-async def apply_plot_canvas_delta(book_id: str, body: PlotDeltaRequest):
-    """Apply author edits to the plot canvas with optimistic revision control."""
+async def apply_plot_canvas_delta(
+    book_id: str,
+    body: PlotDeltaRequest,
+    request: Request,
+):
+    """Apply an author-confirmed StoryFlow proposal with optimistic revision control."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "StoryFlow plot delta")
+    actor = _require_author_principal(request)
     try:
-        get_storyflow_planning_service().validate_delta(
-            get_authoritative_book_id(book_id), body.delta
-        )
-        graph, revision = plot_workspace_repository.apply_delta(
-            get_authoritative_book_id(book_id), body.delta, expected_revision=body.expectedRevision
-        )
-        return {"graph": graph, "revision": revision}
+        service = get_storyflow_planning_service()
+        authoritative_book_id = get_authoritative_book_id(book_id)
+        proposal_id = body.proposalId
+        if proposal_id:
+            result = service.apply_proposal(
+                authoritative_book_id,
+                proposal_id,
+                expected_revision=body.expectedRevision,
+                decided_by=actor,
+            )
+        else:
+            # Compatibility clients that call the legacy write endpoint still
+            # receive the complete Host Proposal/AgentTask audit chain.  The
+            # endpoint itself is the explicit author command, so it confirms
+            # the freshly prepared proposal immediately.
+            preview = service.preview_delta(
+                authoritative_book_id,
+                body.delta,
+                expected_revision=body.expectedRevision,
+                persist=True,
+                initiated_by=actor,
+            )
+            result = service.apply_proposal(
+                authoritative_book_id,
+                preview["proposal"]["proposalId"],
+                expected_revision=body.expectedRevision,
+                decided_by=actor,
+            )
+        return {
+            "graph": result["graph"],
+            "revision": result["revision"],
+            "proposal": result.get("proposal"),
+            "task": result.get("task"),
+            "canonicalMutation": False,
+        }
     except StoryFlowPlanningError as exc:
         raise HTTPException(
             status_code=422,
@@ -2063,14 +4117,48 @@ async def apply_plot_canvas_delta(book_id: str, body: PlotDeltaRequest):
         raise _plot_http_error(exc) from exc
 
 
+@app.post("/api/v1/books/{book_id}/story-graph/planning/preview")
+async def preview_storyflow_planning_delta(
+    book_id: str,
+    body: PlotDeltaRequest,
+    request: Request,
+):
+    """Record a proposal-backed StoryFlow diff without changing the overlay or Canon."""
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "invalid project id")
+    get_project(book_id)
+    require_authoritative_project(book_id, "StoryFlow planning preview")
+    actor = _require_author_principal(request)
+    try:
+        return get_storyflow_planning_service().preview_delta(
+            get_authoritative_book_id(book_id),
+            body.delta,
+            expected_revision=body.expectedRevision,
+            persist=True,
+            initiated_by=actor,
+        )
+    except StoryFlowPlanningError as exc:
+        status = 409 if "revision conflict" in str(exc).lower() else 422
+        raise HTTPException(
+            status_code=status,
+            detail={"code": "STORYFLOW_PLANNING_PREVIEW", "message": str(exc)},
+        ) from exc
+
+
 @app.post("/api/v1/books/{book_id}/plot-canvas/apply-branch")
-async def apply_plot_canvas_branch(book_id: str, body: PlotBranchApplyRequest):
+async def apply_plot_canvas_branch(
+    book_id: str,
+    body: PlotBranchApplyRequest,
+    request: Request,
+):
     """Commit an AI forecast as a draft branch on the canvas, not as chapter truth."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "StoryFlow forecast branch")
+    _require_author_principal(request)
     try:
-        graph, revision, candidate_branch = plot_workspace_repository.apply_branch(
+        graph, revision, candidate_branch = get_plot_workspace_repository().apply_branch(
             get_authoritative_book_id(book_id), body.branch, body.sourceNodeId,
             expected_revision=body.expectedRevision,
             return_metadata=True,
@@ -2105,13 +4193,19 @@ async def apply_plot_canvas_branch(book_id: str, body: PlotBranchApplyRequest):
 
 
 @app.post("/api/v1/books/{book_id}/plot-canvas/apply-candidate-set")
-async def apply_plot_canvas_candidate_set(book_id: str, body: PlotCandidateSetApplyRequest):
+async def apply_plot_canvas_candidate_set(
+    book_id: str,
+    body: PlotCandidateSetApplyRequest,
+    request: Request,
+):
     """Import one forecast response atomically as a planning-only candidate set."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "StoryFlow candidate set")
+    _require_author_principal(request)
     try:
-        graph, revision, candidate_set, imported = plot_workspace_repository.apply_candidate_set_with_audit(
+        graph, revision, candidate_set, imported = get_plot_workspace_repository().apply_candidate_set_with_audit(
             get_authoritative_book_id(book_id),
             book_id,
             body.branches,
@@ -2218,8 +4312,13 @@ async def import_storyflow_recoverable_candidate_task(
     book_id: str,
     task_id: str,
     body: StoryFlowCandidateTaskImportRequest,
+    request: Request,
 ):
     """Re-import a completed forecast result without invoking a model."""
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "invalid project id")
+    require_authoritative_project(book_id, "StoryFlow candidate recovery")
+    _require_author_principal(request)
     book = resolve_story_graph_book(book_id)
     task = task_runtime.get(task_id)
     if task is None:
@@ -2284,7 +4383,7 @@ async def import_storyflow_recoverable_candidate_task(
             "branchCount": branch.get("branchCount") or min(len(raw_branches), 8),
         })
     try:
-        graph, revision, candidate_set, imported = plot_workspace_repository.apply_candidate_set_with_audit(
+        graph, revision, candidate_set, imported = get_plot_workspace_repository().apply_candidate_set_with_audit(
             authoritative_book_id,
             book_id,
             branches,
@@ -2313,18 +4412,20 @@ async def get_plot_canvas_context(book_id: str, node_id: str):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
     try:
-        return plot_workspace_repository.node_context(get_authoritative_book_id(book_id), node_id)
+        return get_plot_workspace_repository().node_context(get_authoritative_book_id(book_id), node_id)
     except PlotWorkspaceError as exc:
         raise _plot_http_error(exc) from exc
 
 # ========== v1 API - 连续创作 ==========
 
 @app.post("/api/v1/books/{book_id}/continuous")
-async def start_continuous(book_id: str, data: dict):
+async def start_continuous(book_id: str, data: dict, request: Request):
     """启动连续创作模式"""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "continuous writing")
+    actor = _require_author_principal(request)
     require_complete_planning(book_id)
     authoritative_book_id = get_authoritative_book_id(book_id)
 
@@ -2336,7 +4437,14 @@ async def start_continuous(book_id: str, data: dict):
         raise HTTPException(status_code=422, detail="startChapter must be a positive integer")
     context = data.get("context", "")
 
-    task = enqueue_continuous_task(book_id, authoritative_book_id, start, count, context)
+    task = enqueue_continuous_task(
+        book_id,
+        authoritative_book_id,
+        start,
+        count,
+        context,
+        initiated_by=actor,
+    )
     return {"taskId": task["id"], "message": f"连续创作已排队: {count}章", "status": task["status"]}
 
 # ========== v1 API - 剧情推演 ==========
@@ -2399,11 +4507,13 @@ async def continuous_status(book_id: str):
 
 
 @app.post("/api/v1/books/{book_id}/forecast")
-async def create_forecast(book_id: str, req: ForecastRequest):
+async def create_forecast(book_id: str, req: ForecastRequest, request: Request):
     """Queue a model-backed forecast and return its durable task id."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "StoryFlow forecast")
+    actor = _require_author_principal(request)
     if isinstance(req.branchCount, bool) or not 1 <= req.branchCount <= 8:
         raise HTTPException(422, "branchCount must be between 1 and 8")
     if isinstance(req.currentChapter, bool) or req.currentChapter < 0:
@@ -2434,6 +4544,7 @@ async def create_forecast(book_id: str, req: ForecastRequest):
             "source_candidate_branch_id": req.sourceCandidateBranchId.strip(),
             "source_candidate_root_node_id": req.sourceCandidateRootNodeId.strip(),
         },
+        initiated_by=actor,
     )
     return {
         "taskId": task["id"],
@@ -2445,43 +4556,50 @@ async def create_forecast(book_id: str, req: ForecastRequest):
 
 @app.get("/api/v1/services")
 async def list_services():
-    return {"services": model_repository.configuration()["providers"]}
+    return {"services": get_model_repository().configuration()["providers"]}
 
 @app.get("/api/v1/services/config")
 async def get_service_config():
     """Return the authoritative setup without credential material."""
-    return model_repository.configuration()
+    return get_model_repository().configuration()
 
 @app.put("/api/v1/services/config")
-async def update_service_config(data: dict):
+async def update_service_config(data: dict, request: Request):
+    _require_host_principal(request)
     try:
-        configuration = model_repository.save_configuration(data)
+        configuration = get_model_repository().save_configuration(data)
     except ModelConfigurationError as exc:
         raise HTTPException(422, {"code": exc.code, "message": str(exc)}) from exc
+    _invalidate_runtime_capability_cache(story_repository.db)
     return {"message": "configuration saved", "configuration": configuration}
 
 @app.delete("/api/v1/services/providers/{provider_id}")
-async def delete_service_provider(provider_id: str):
+async def delete_service_provider(provider_id: str, request: Request):
+    _require_host_principal(request)
     try:
-        configuration = model_repository.delete_provider(provider_id)
+        configuration = get_model_repository().delete_provider(provider_id)
     except ModelConfigurationError as exc:
         status = 404 if exc.code == "MODEL_PROVIDER_NOT_FOUND" else 422
         raise HTTPException(status, {"code": exc.code, "message": str(exc)}) from exc
+    _invalidate_runtime_capability_cache(story_repository.db)
     return {"message": "供应商及其模型已删除", "configuration": configuration}
 
 @app.delete("/api/v1/services/models/{model_id}")
-async def delete_service_model(model_id: str):
+async def delete_service_model(model_id: str, request: Request):
+    _require_host_principal(request)
     try:
-        configuration = model_repository.delete_model(model_id)
+        configuration = get_model_repository().delete_model(model_id)
     except ModelConfigurationError as exc:
         status = 404 if exc.code == "MODEL_MODEL_NOT_FOUND" else 422
         raise HTTPException(status, {"code": exc.code, "message": str(exc)}) from exc
+    _invalidate_runtime_capability_cache(story_repository.db)
     return {"message": "模型已删除", "configuration": configuration}
 
 @app.post("/api/v1/services/{service}/test")
-async def test_service(service: str):
+async def test_service(service: str, request: Request):
     """Queue provider verification so the HTTP lifecycle has no model call."""
-    configuration = model_repository.configuration()
+    actor = _require_host_principal(request)
+    configuration = get_model_repository().configuration()
     provider_ids = {provider["id"] for provider in configuration["providers"]}
     provider_id = service
     if service in {"primary", "review"}:
@@ -2491,17 +4609,22 @@ async def test_service(service: str):
         provider_id = matched["providerId"] if matched else service
     elif service not in provider_ids:
         raise HTTPException(404, "unknown model provider")
-    task = task_runtime.enqueue("model-connection-test", data={"provider_id": provider_id})
+    task = task_runtime.enqueue(
+        "model-connection-test", data={"provider_id": provider_id}, initiated_by=actor
+    )
     return {"taskId": task["id"], "message": "模型连接测试已排队", "status": task["status"]}
 
 
 @app.post("/api/v1/services/{provider_id}/models/discover")
-async def discover_service_models(provider_id: str):
+async def discover_service_models(provider_id: str, request: Request):
     """Queue model catalog discovery without exposing credentials to the task payload."""
-    provider_ids = {provider["id"] for provider in model_repository.configuration()["providers"]}
+    actor = _require_host_principal(request)
+    provider_ids = {provider["id"] for provider in get_model_repository().configuration()["providers"]}
     if provider_id not in provider_ids:
         raise HTTPException(404, "unknown model provider")
-    task = task_runtime.enqueue("model-discovery", data={"provider_id": provider_id})
+    task = task_runtime.enqueue(
+        "model-discovery", data={"provider_id": provider_id}, initiated_by=actor
+    )
     return {"taskId": task["id"], "message": "模型列表获取已排队", "status": task["status"]}
 
 # ========== v1 API - 项目设置 ==========
@@ -2551,6 +4674,7 @@ async def list_skills(enabled_only: bool = Query(False), book_id: Optional[str] 
 @app.post("/api/v1/skills/import")
 async def import_skill(request: Request):
     """Import one standard SKILL.md package from GitHub, archive, or folder."""
+    _require_host_principal(request)
     try:
         content_type = request.headers.get("content-type", "").lower()
         package = None
@@ -2634,7 +4758,8 @@ async def import_skill(request: Request):
 
 
 @app.post("/api/v1/skills")
-async def create_skill(body: SkillSaveRequest):
+async def create_skill(body: SkillSaveRequest, request: Request):
+    _require_host_principal(request)
     try:
         return get_skill_repository().save(body.model_dump(exclude_none=True))
     except ExtensionConfigurationError as exc:
@@ -2642,7 +4767,8 @@ async def create_skill(body: SkillSaveRequest):
 
 
 @app.put("/api/v1/skills/{skill_id}")
-async def update_skill(skill_id: str, body: SkillSaveRequest):
+async def update_skill(skill_id: str, body: SkillSaveRequest, request: Request):
+    _require_host_principal(request)
     try:
         return get_skill_repository().save(body.model_dump(exclude_none=True), skill_id=skill_id)
     except ExtensionConfigurationError as exc:
@@ -2650,7 +4776,8 @@ async def update_skill(skill_id: str, body: SkillSaveRequest):
 
 
 @app.put("/api/v1/skills/{skill_id}/enabled")
-async def set_skill_enabled(skill_id: str, data: dict[str, Any]):
+async def set_skill_enabled(skill_id: str, data: dict[str, Any], request: Request):
+    _require_host_principal(request)
     try:
         return get_skill_repository().set_enabled(skill_id, data.get("enabled"))
     except ExtensionConfigurationError as exc:
@@ -2658,7 +4785,8 @@ async def set_skill_enabled(skill_id: str, data: dict[str, Any]):
 
 
 @app.delete("/api/v1/skills/{skill_id}")
-async def delete_skill(skill_id: str):
+async def delete_skill(skill_id: str, request: Request):
+    _require_host_principal(request)
     try:
         if not get_skill_repository().delete(skill_id):
             raise HTTPException(404, "skill not found")
@@ -2680,7 +4808,8 @@ async def list_mcp_servers(enabled_only: bool = Query(False), book_id: Optional[
 
 
 @app.post("/api/v1/mcp-servers")
-async def create_mcp_server(body: MCPServerSaveRequest):
+async def create_mcp_server(body: MCPServerSaveRequest, request: Request):
+    _require_host_principal(request)
     try:
         return get_mcp_server_repository().save(body.model_dump(exclude_none=True))
     except ExtensionConfigurationError as exc:
@@ -2688,7 +4817,8 @@ async def create_mcp_server(body: MCPServerSaveRequest):
 
 
 @app.put("/api/v1/mcp-servers/{server_id}")
-async def update_mcp_server(server_id: str, body: MCPServerSaveRequest):
+async def update_mcp_server(server_id: str, body: MCPServerSaveRequest, request: Request):
+    _require_host_principal(request)
     try:
         return get_mcp_server_repository().save(body.model_dump(exclude_none=True), server_id=server_id)
     except ExtensionConfigurationError as exc:
@@ -2696,7 +4826,8 @@ async def update_mcp_server(server_id: str, body: MCPServerSaveRequest):
 
 
 @app.put("/api/v1/mcp-servers/{server_id}/enabled")
-async def set_mcp_server_enabled(server_id: str, data: dict[str, Any]):
+async def set_mcp_server_enabled(server_id: str, data: dict[str, Any], request: Request):
+    _require_host_principal(request)
     try:
         return get_mcp_server_repository().set_enabled(server_id, data.get("enabled"))
     except ExtensionConfigurationError as exc:
@@ -2704,7 +4835,8 @@ async def set_mcp_server_enabled(server_id: str, data: dict[str, Any]):
 
 
 @app.post("/api/v1/mcp-servers/{server_id}/validate")
-async def validate_mcp_server(server_id: str):
+async def validate_mcp_server(server_id: str, request: Request):
+    _require_host_principal(request)
     try:
         return get_mcp_server_repository().validate(server_id)
     except ExtensionConfigurationError as exc:
@@ -2712,7 +4844,8 @@ async def validate_mcp_server(server_id: str):
 
 
 @app.delete("/api/v1/mcp-servers/{server_id}")
-async def delete_mcp_server(server_id: str):
+async def delete_mcp_server(server_id: str, request: Request):
+    _require_host_principal(request)
     if not get_mcp_server_repository().delete(server_id):
         raise HTTPException(404, "MCP server not found")
     return {"status": "deleted", "id": server_id}
@@ -2735,9 +4868,11 @@ async def get_project_extensions(book_id: str):
 
 
 @app.put("/api/v1/books/{book_id}/extensions")
-async def update_project_extensions(book_id: str, data: dict[str, Any]):
+async def update_project_extensions(book_id: str, data: dict[str, Any], request: Request):
     """Set or clear per-work Skill/MCP enablement overrides."""
+    _require_host_principal(request)
     get_project(book_id)
+    require_authoritative_project(book_id, "project extension update")
     for field, setter, clearer in (
         ("skills", get_skill_repository().set_project_enabled, get_skill_repository().clear_project_override),
         ("mcpServers", get_mcp_server_repository().set_project_enabled, get_mcp_server_repository().clear_project_override),
@@ -2759,32 +4894,35 @@ async def update_project_extensions(book_id: str, data: dict[str, Any]):
 @app.get("/api/v1/project")
 async def get_project_config():
     """获取项目配置"""
+    active_config = get_active_config()
     return {
-        "language": config.get("project", "language", default="zh"),
-        "chapterWordsMin": config.get("project", "chapter_words_min", default=2000),
-        "chapterWordsMax": config.get("project", "chapter_words_max", default=4000),
-        "passScore": config.get("review", "pass_score", default=93),
-        "maxRevisionRounds": config.get("review", "max_revision_rounds", default=3),
-        "jointReviewInterval": config.get("continuous", "joint_review_interval", default=5),
+        "language": active_config.get("project", "language", default="zh"),
+        "chapterWordsMin": active_config.get("project", "chapter_words_min", default=2000),
+        "chapterWordsMax": active_config.get("project", "chapter_words_max", default=4000),
+        "passScore": active_config.get("review", "pass_score", default=93),
+        "maxRevisionRounds": active_config.get("review", "max_revision_rounds", default=3),
+        "jointReviewInterval": active_config.get("continuous", "joint_review_interval", default=5),
     }
 
 @app.put("/api/v1/project")
-async def update_project_config(data: dict):
+async def update_project_config(data: dict, request: Request):
     """更新项目配置"""
+    _require_host_principal(request)
+    active_config = get_active_config()
     for key, value in data.items():
         if key == "language":
-            config.set("project", "language", value)
+            active_config.set("project", "language", value)
         elif key == "chapterWordsMin":
-            config.set("project", "chapter_words_min", value)
+            active_config.set("project", "chapter_words_min", value)
         elif key == "chapterWordsMax":
-            config.set("project", "chapter_words_max", value)
+            active_config.set("project", "chapter_words_max", value)
         elif key == "passScore":
-            config.set("review", "pass_score", value)
+            active_config.set("review", "pass_score", value)
         elif key == "maxRevisionRounds":
-            config.set("review", "max_revision_rounds", value)
+            active_config.set("review", "max_revision_rounds", value)
         elif key == "jointReviewInterval":
-            config.set("continuous", "joint_review_interval", value)
-    config.save()
+            active_config.set("continuous", "joint_review_interval", value)
+    active_config.save()
     return {"message": "配置更新成功"}
 
 # ========== v1 API - 题材管理 ==========
@@ -2867,11 +5005,13 @@ async def get_genre(genre_id: str):
 # ========== v1 API - 联合审查 ==========
 
 @app.post("/api/v1/books/{book_id}/joint-review")
-async def joint_review(book_id: str, data: dict):
+async def joint_review(book_id: str, data: dict, request: Request):
     """Queue a cross-chapter review; it may make several provider calls."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "joint review")
+    actor = _require_author_principal(request)
     authoritative_book_id = get_authoritative_book_id(book_id)
 
     start = data.get("startChapter", 1)
@@ -2888,7 +5028,7 @@ async def joint_review(book_id: str, data: dict):
 
     task = task_runtime.enqueue("joint-review", project_id=book_id, book_id=authoritative_book_id, data={
         "start": start, "end": end,
-    }, idempotency_key=f"joint-review:{book_id}:{start}:{end}:{project.updated_at}")
+    }, initiated_by=actor, idempotency_key=f"joint-review:{book_id}:{start}:{end}:{project.updated_at}")
     return {"taskId": task["id"], "message": "联合审查任务已排队", "status": task["status"]}
 
 # ========== v1 API - 事件流(SSE) ==========
@@ -2896,14 +5036,17 @@ async def joint_review(book_id: str, data: dict):
 @app.post("/api/v1/projects/{project_id}/migration/preflight")
 async def migration_preflight(project_id: str):
     try:
-        return legacy_migration.preflight(project_id)
+        return get_legacy_migration_service().preflight(project_id)
     except LegacyMigrationError as exc:
         raise HTTPException(404, str(exc)) from exc
 
 @app.post("/api/v1/projects/{project_id}/migration")
-async def migrate_project(project_id: str, request: MigrationConfirmRequest):
+async def migrate_project(
+    project_id: str, request: MigrationConfirmRequest, http_request: Request
+):
+    _require_host_principal(http_request)
     try:
-        return legacy_migration.migrate(project_id, request.fingerprint)
+        return get_legacy_migration_service().migrate(project_id, request.fingerprint)
     except LegacyMigrationError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -2912,11 +5055,618 @@ async def list_persistent_tasks(projectId: Optional[str] = Query(None), status: 
     return {"tasks": task_runtime.list(project_id=projectId, status=status)}
 
 
+@app.get("/api/v1/runtime/registry")
+async def runtime_registry_status():
+    """Expose observed runtime state, keeping manifest and readiness separate."""
+    plane = get_runtime_plane()
+    return {"runtimes": plane["registry"].list()}
+
+
+@app.get("/api/v1/plugins")
+async def plugin_catalog_status():
+    """Expose host-bound plugin metadata without exposing implementations."""
+    return {"plugins": get_runtime_plane()["plugins"].catalog()}
+
+
+@app.post("/api/v1/runtime/catalog/import")
+async def import_runtime_catalog(body: dict[str, Any], request: Request):
+    """Import a fully signed catalog; transport and execution stay separate."""
+    _require_host_principal(request)
+    plane = get_runtime_plane()
+    try:
+        manifests = _configured_runtime_catalog().import_into(plane["registry"], body)
+    except RuntimeUnavailable as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    await _invalidate_runtime_plane(plane["db"])
+    return {
+        "count": len(manifests),
+        "runtimes": [manifest.to_dict() for manifest in manifests],
+    }
+
+
+@app.post("/api/v1/runtime/catalog/fetch")
+async def fetch_runtime_catalog(body: dict[str, Any], request: Request = cast(Request, None)):
+    """Fetch and verify a remote catalog before importing any manifest."""
+    if request is None:
+        if _NOVELFORGE_AUTH_REQUIRED:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "AUTHENTICATED_PRINCIPAL_REQUIRED",
+                    "message": "authenticated Host principal is unavailable",
+                },
+            )
+    else:
+        _require_host_principal(request)
+    url = str(body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(422, "catalog url is required")
+    plane = get_runtime_plane()
+    try:
+        manifests = RuntimeCatalogClient().fetch_and_import(
+            url,
+            _configured_runtime_catalog(),
+            plane["registry"],
+        )
+    except RuntimeUnavailable as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (TypeError, ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    # Fetch follows the same cache-invalidation boundary as local import.
+    # Otherwise a newly verified Manifest is visible in the old Registry
+    # object but has no freshly constructed Host adapter/capability plane.
+    await _invalidate_runtime_plane(plane["db"])
+    return {
+        "count": len(manifests),
+        "url": url,
+        "runtimes": [manifest.to_dict() for manifest in manifests],
+    }
+
+
+@app.post("/api/v1/runtime/{runtime_type}/discover")
+async def discover_runtime(runtime_type: str, request: Request):
+    _require_host_principal(request)
+    plane = get_runtime_plane()
+    try:
+        installation = plane["installer"].discover(runtime_type)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    await _invalidate_runtime_plane(plane["db"])
+    return {"runtimeType": runtime_type, "installation": installation.to_dict()}
+
+
+@app.post("/api/v1/runtime/{runtime_type}/reconnect")
+async def reconnect_runtime(runtime_type: str, request: Request):
+    """Reconnect an observed runtime through its official Host adapter."""
+    _require_host_principal(request)
+    plane = get_runtime_plane()
+    try:
+        result = await plane["runtimeManager"].reconnect(runtime_type)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeUnavailable as exc:
+        if plane.get("db") is not None:
+            await _invalidate_runtime_plane(plane["db"])
+        raise HTTPException(409, str(exc)) from exc
+    if plane.get("db") is not None:
+        await _invalidate_runtime_plane(plane["db"])
+    return result
+
+
+@app.post("/api/v1/runtime/{runtime_type}/reauthenticate")
+async def reauthenticate_runtime(runtime_type: str, request: Request):
+    """Re-run the runtime's official authentication probe without scraping secrets."""
+    _require_host_principal(request)
+    plane = get_runtime_plane()
+    try:
+        result = await plane["runtimeManager"].reauthenticate(runtime_type)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RuntimeUnavailable as exc:
+        if plane.get("db") is not None:
+            await _invalidate_runtime_plane(plane["db"])
+        raise HTTPException(409, str(exc)) from exc
+    if plane.get("db") is not None:
+        await _invalidate_runtime_plane(plane["db"])
+    return result
+
+
+@app.get("/api/v1/runtime/{runtime_type}/diagnostics")
+async def runtime_diagnostics(runtime_type: str):
+    """Return manifest-safe plans and observed installer evidence."""
+    plane = get_runtime_plane()
+    try:
+        return plane["installer"].diagnostics(runtime_type)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/v1/runtime/{runtime_type}/install")
+async def install_runtime(
+    runtime_type: str,
+    request: Request,
+    body: dict[str, Any] | None = None,
+):
+    """Run only manifest-safe discovery/install actions; custom scripts stay blocked."""
+    _require_host_principal(request)
+    plane = get_runtime_plane()
+    try:
+        installation = plane["installer"].install(runtime_type, approved=bool((body or {}).get("approved")))
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await _invalidate_runtime_plane(plane["db"])
+    return {"runtimeType": runtime_type, "installation": installation.to_dict()}
+
+
+@app.post("/api/v1/runtime/{runtime_type}/repair")
+async def repair_runtime(
+    runtime_type: str,
+    request: Request,
+    body: dict[str, Any] | None = None,
+):
+    """Repair a registered runtime only after an explicit user approval."""
+    _require_host_principal(request)
+    plane = get_runtime_plane()
+    try:
+        installation = plane["installer"].repair(
+            runtime_type,
+            approved=bool((body or {}).get("approved")),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await _invalidate_runtime_plane(plane["db"])
+    return {"runtimeType": runtime_type, "installation": installation.to_dict()}
+
+
+@app.post("/api/v1/runtime/{runtime_type}/update")
+async def update_runtime(
+    runtime_type: str,
+    request: Request,
+    body: dict[str, Any] | None = None,
+):
+    """Use the same supervised installer boundary for an available update."""
+    _require_host_principal(request)
+    plane = get_runtime_plane()
+    try:
+        installation = plane["installer"].update(
+            runtime_type,
+            approved=bool((body or {}).get("approved")),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await _invalidate_runtime_plane(plane["db"])
+    return {"runtimeType": runtime_type, "installation": installation.to_dict()}
+
+
+@app.post("/api/v1/runtime/{runtime_type}/uninstall")
+async def uninstall_runtime(
+    runtime_type: str,
+    request: Request,
+    body: dict[str, Any] | None = None,
+):
+    """Remove a managed runtime registration only after explicit approval."""
+    _require_host_principal(request)
+    plane = get_runtime_plane()
+    try:
+        installation = plane["installer"].uninstall(
+            runtime_type,
+            approved=bool((body or {}).get("approved")),
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(409, str(exc)) from exc
+    await _invalidate_runtime_plane(plane["db"])
+    return {"runtimeType": runtime_type, "installation": installation.to_dict()}
+
+
+@app.get("/api/v1/runtime/capabilities")
+async def runtime_capabilities():
+    plane = get_runtime_plane()
+    await refresh_runtime_capabilities(plane)
+    return {"runtimes": await plane["router"].capability_snapshot()}
+
+
+@app.get("/api/v1/runtime/tools")
+async def runtime_tools():
+    return {"tools": get_runtime_plane()["tools"].catalog()}
+
+
+def _compute_policy_payload(plane: dict[str, Any]) -> dict[str, Any]:
+    policy = plane["scheduler"].policy
+    strategies = ComputePolicyStore.strategies()
+    strategy = next(item for item in strategies if item["id"] == policy.strategy)
+    return {
+        "capabilityTiers": [f"C{index}" for index in range(6)],
+        "taskTiers": [f"T{index}" for index in range(6)],
+        **policy.to_dict(),
+        "strategyName": strategy["name"],
+        "strategies": strategies,
+        "budget": plane["scheduler"].budget.snapshot() if plane["scheduler"].budget else None,
+    }
+
+
+@app.get("/api/v1/compute/policy")
+async def compute_policy():
+    return _compute_policy_payload(get_runtime_plane())
+
+
+@app.post("/api/v1/compute/policy")
+async def update_compute_policy(req: ComputePolicyRequest, request: Request):
+    _require_host_principal(request)
+    plane = get_runtime_plane()
+    try:
+        policy = plane["computePolicyStore"].save(req.strategy)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    # The RuntimeRouter holds this exact Scheduler instance; updating it here
+    # changes subsequent plans without creating a second runtime plane.
+    plane["scheduler"].policy = policy
+    return _compute_policy_payload(plane)
+
+
+@app.get("/api/v1/compute/telemetry")
+async def compute_telemetry(
+    limit: int = Query(200, ge=1, le=1000),
+    task_type: Optional[str] = Query(None, alias="taskType"),
+):
+    """Expose durable routing evidence without making it a scheduler authority."""
+    return ComputeTelemetryStore(get_runtime_plane()["db"]).snapshot(
+        limit=limit,
+        task_type=task_type.strip() if task_type and task_type.strip() else None,
+    )
+
+
+@app.post("/api/v1/control/commands")
+async def dispatch_control_command(req: ControlCommandRequest, request: Request):
+    """Dispatch an authenticated host command without exposing provider APIs."""
+    if not req.name.strip():
+        raise HTTPException(422, "command name is required")
+    command_id = req.commandId.strip() if req.commandId else None
+    if req.commandId is not None and not command_id:
+        raise HTTPException(422, "commandId must not be empty")
+    command = ControlCommand(
+        name=req.name.strip(),
+        payload=req.payload,
+        actor=_require_host_principal(request),
+        **({"command_id": command_id} if command_id else {}),
+    )
+    try:
+        control_plane = get_runtime_plane()["controlPlane"]
+        if req.queue:
+            result = control_plane.enqueue(command)
+            return {
+                "commandId": command.command_id,
+                "command": command.name,
+                "status": result.get("status"),
+                "receipt": result,
+            }
+        result = await control_plane.dispatch_async(command)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ControlCommandInProgress, ControlCommandRejected, TaskStateError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "commandId": command.command_id,
+        "command": command.name,
+        "result": result,
+    }
+
+
+@app.post("/api/v1/control/queries/{query_name:path}")
+async def dispatch_control_query(query_name: str, req: ControlQueryRequest):
+    """Execute a read-only Control Plane query through the same host seam."""
+    if not query_name.strip():
+        raise HTTPException(422, "query name is required")
+    try:
+        result = get_runtime_plane()["controlPlane"].queries.dispatch(query_name.strip(), req.payload)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"query": query_name.strip(), "result": result}
+
+
+@app.get("/api/v1/tasks/{task_id}/agent-task")
+async def task_agent_task(task_id: str):
+    task = task_runtime.get(task_id)
+    if task is None:
+        raise HTTPException(404, "task not found")
+    agent_task = get_runtime_plane()["agentTasks"].get_for_durable_task(task_id)
+    return {"agentTask": agent_task}
+
+
+@app.get("/api/v1/tasks/{task_id}/agent-runs")
+async def task_agent_runs(task_id: str):
+    if task_runtime.get(task_id) is None:
+        raise HTTPException(404, "task not found")
+    return {"runs": get_runtime_plane()["runs"].list_for_task(task_id)}
+
+
+@app.get("/api/v1/tasks/{task_id}/audit")
+async def task_audit(task_id: str):
+    """Return one read-only audit projection across the execution planes."""
+    if task_runtime.get(task_id) is None:
+        raise HTTPException(404, "task not found")
+    audit = get_runtime_plane()["runs"].audit_for_task(task_id)
+    if audit is None:
+        raise HTTPException(404, "task not found")
+    return {"audit": audit}
+
+
+@app.get("/api/v1/tasks/{task_id}/proposals")
+async def task_proposals(task_id: str):
+    """Return durable non-Canon proposals linked to a task."""
+    if task_runtime.get(task_id) is None:
+        raise HTTPException(404, "task not found")
+    return {
+        "taskId": task_id,
+        "proposals": ProposalStore(get_runtime_plane()["db"]).list_for_task(task_id),
+    }
+
+
+@app.post("/api/v1/tasks/{task_id}/proposals/{proposal_id}/decision")
+async def decide_task_proposal(
+    task_id: str,
+    proposal_id: str,
+    body: AgentProposalDecisionRequest,
+    request: Request,
+):
+    """Record a Host proposal decision without crossing the Canon boundary."""
+    decision = body.decision.strip().lower()
+    if decision not in {"accept", "reject", "supersede"}:
+        raise HTTPException(422, "decision must be accept, reject, or supersede")
+    payload: dict[str, Any] = {
+        "taskId": task_id,
+        "proposalId": proposal_id,
+        "reason": body.reason,
+    }
+    if body.successorProposalId:
+        payload["successorProposalId"] = body.successorProposalId
+    try:
+        return await get_runtime_plane()["controlPlane"].dispatch_async(
+            ControlCommand(
+                f"proposal.{decision}",
+                payload,
+                actor=_request_actor(request, body.actor),
+            )
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/v1/tasks/{task_id}/proposals/{proposal_id}/author-accept")
+async def accept_world_bootstrap_proposal(
+    task_id: str,
+    proposal_id: str,
+    body: WorldBootstrapProposalAcceptanceRequest,
+    request: Request,
+):
+    """Stage a world proposal into Story Bible drafts after author confirmation."""
+    task = task_runtime.get(task_id)
+    if task is None:
+        raise HTTPException(404, "task not found")
+    if task.get("type") != "world-bootstrap":
+        raise HTTPException(409, "only world bootstrap proposals use this acceptance endpoint")
+    project_id = task.get("project_id")
+    book_id = task.get("book_id")
+    if not isinstance(project_id, str) or not project_id:
+        raise HTTPException(409, "world bootstrap task has no project scope")
+    get_project(project_id)
+    require_authoritative_project(project_id, "world proposal acceptance")
+    actor = _require_author_principal(request)
+    try:
+        from src.wizard.world_bootstrap_service import WorldBootstrapProposalAuthority
+
+        result = WorldBootstrapProposalAuthority(story_repository.db).accept(
+            proposal_id,
+            project_id,
+            actor=actor,
+            author_confirmed=body.authorConfirmed,
+            reason=body.reason,
+            task_id=task_id,
+            book_id=str(book_id) if book_id else None,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "taskId": task_id,
+        "proposalId": proposal_id,
+        "proposal": result,
+        "proposalStatus": result.get("status"),
+        "stagedToStoryBible": bool(result.get("stagedToStoryBible")),
+        "canonicalMutation": False,
+        "nextAction": "review-story-bible",
+    }
+
+
+@app.get("/api/v1/tasks/{task_id}/context-bundles")
+async def task_context_bundles(task_id: str):
+    """Return the immutable context snapshots used by this task's AgentRuns."""
+    if task_runtime.get(task_id) is None:
+        raise HTTPException(404, "task not found")
+    runs = get_runtime_plane()["runs"].list_for_task(task_id)
+    run_ids_by_bundle: dict[str, list[str]] = {}
+    for run in runs:
+        bundle_id = run.get("context_bundle_id")
+        if bundle_id:
+            run_ids_by_bundle.setdefault(str(bundle_id), []).append(str(run["id"]))
+    store = ContextBundleStore(get_runtime_plane()["db"])
+    bundles: list[dict[str, Any]] = []
+    for bundle_id, run_ids in run_ids_by_bundle.items():
+        bundle = store.get(bundle_id)
+        if bundle is None:
+            continue
+        manifest = bundle.manifest()
+        manifest["agentRunIds"] = run_ids
+        bundles.append(manifest)
+    return {"bundles": bundles}
+
+
+@app.get("/api/v1/agent-runs/{agent_run_id}/context-bundle")
+async def agent_run_context_bundle(agent_run_id: str):
+    """Read one AgentRun's exact ContextBundle for provenance inspection."""
+    run = get_runtime_plane()["runs"].get(agent_run_id)
+    if run is None:
+        raise HTTPException(404, "agent run not found")
+    bundle_id = run.get("context_bundle_id")
+    bundle = ContextBundleStore(get_runtime_plane()["db"]).get(str(bundle_id)) if bundle_id else None
+    return {
+        "agentRunId": agent_run_id,
+        "contextBundleId": bundle_id,
+        "bundle": bundle.manifest() if bundle else None,
+    }
+
+
+@app.get("/api/v1/agent-runs/{agent_run_id}/tool-calls")
+async def agent_run_tool_calls(agent_run_id: str):
+    """Read tool-call audit entries projected from the AgentRun event ledger."""
+    run = get_runtime_plane()["runs"].get(agent_run_id)
+    if run is None:
+        raise HTTPException(404, "agent run not found")
+    return {"agentRunId": agent_run_id, "toolCalls": run.get("toolCalls", [])}
+
+
+@app.get("/api/v1/agent-runs/{agent_run_id}/proposals")
+async def agent_run_proposals(agent_run_id: str):
+    """Return proposals emitted by one AgentRun."""
+    run = get_runtime_plane()["runs"].get(agent_run_id)
+    if run is None:
+        raise HTTPException(404, "agent run not found")
+    return {
+        "agentRunId": agent_run_id,
+        "proposals": ProposalStore(get_runtime_plane()["db"]).list_for_run(agent_run_id),
+    }
+
+
+@app.get("/api/v1/agent-runs/{agent_run_id}/approvals")
+async def agent_run_approvals(agent_run_id: str):
+    """Read approval audit entries without exposing vendor approval logs."""
+    run = get_runtime_plane()["runs"].get(agent_run_id)
+    if run is None:
+        raise HTTPException(404, "agent run not found")
+    return {"agentRunId": agent_run_id, "approvals": run.get("approvals", [])}
+
+
+@app.get("/api/v1/tasks/{task_id}/domain-events")
+async def task_domain_events(
+    task_id: str,
+    after_event_id: int = Query(0, alias="afterId", ge=0),
+    limit: int = Query(200, ge=1, le=1000),
+    after_sequence: Optional[int] = Query(None, alias="afterSequence", ge=0),
+):
+    if task_runtime.get(task_id) is None:
+        raise HTTPException(404, "task not found")
+    event_store = RuntimeEventStore(task_runtime.db)
+    if after_sequence is not None:
+        # Keep the old per-run sequence query available for older clients.
+        # New callers must use afterId because sequence values restart per
+        # AgentRun and cannot represent a task-wide resume point.
+        rows = task_runtime.db.fetchall(
+            """SELECT de.* FROM domain_events AS de
+               JOIN agent_runs AS ar ON ar.id=de.agent_run_id
+               WHERE ar.task_id=? AND de.sequence>?
+               ORDER BY ar.started_at, de.sequence, de.id
+               LIMIT ?""",
+            (task_id, after_sequence, limit),
+        )
+        for row in rows:
+            try:
+                row["payload"] = json.loads(row.get("payload") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                row["payload"] = {}
+    else:
+        rows = event_store.domain_events_for_task(
+            task_id, after_id=after_event_id, limit=limit,
+        )
+    return {"events": rows}
+
+
+@app.get("/api/v1/tasks/{task_id}/ui-events/stream")
+async def task_ui_event_stream(
+    task_id: str,
+    after_event_id: int = Query(0, alias="afterId", ge=0),
+    last_event_id: Optional[str] = Header(None, alias="Last-Event-ID"),
+):
+    """Stream safe UI projections from the durable DomainEvent ledger."""
+    if task_runtime.get(task_id) is None:
+        raise HTTPException(404, "task not found")
+    cursor = _parse_event_cursor(last_event_id) if last_event_id is not None else after_event_id
+    event_store = RuntimeEventStore(task_runtime.db)
+
+    async def subscribe():
+        current_cursor = cursor
+        while True:
+            task = task_runtime.get(task_id)
+            if task is None:
+                return
+            events = event_store.ui_events_for_task(
+                task_id, after_id=current_cursor, limit=200
+            )
+            if events:
+                for event in events:
+                    current_cursor = max(current_cursor, int(event["eventId"]))
+                    payload = {**event, "taskStatus": task.get("status")}
+                    yield (
+                        f"id: {event['eventId']}\n"
+                        "event: ui_event\n"
+                        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    )
+                continue
+            if task.get("status") in _STUDIO_TERMINAL_TASK_STATUSES:
+                return
+            yield ": keep-alive\n\n"
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        subscribe(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/v1/tasks/{task_id}/compute-plans")
+async def task_compute_plans(task_id: str):
+    if task_runtime.get(task_id) is None:
+        raise HTTPException(404, "task not found")
+    agent_task = get_runtime_plane()["agentTasks"].get_for_durable_task(task_id)
+    if not agent_task:
+        return {"plans": []}
+    return {"plans": get_runtime_plane()["plans"].list(agent_task["id"])}
+
+
+@app.get("/api/v1/tasks/{task_id}/compute-escalation-requests")
+async def task_compute_escalation_requests(task_id: str):
+    if task_runtime.get(task_id) is None:
+        raise HTTPException(404, "task not found")
+    return {
+        "requests": get_runtime_plane()["controlPlane"].queries.dispatch(
+            "task.compute-escalation-requests", {"taskId": task_id}
+        )
+    }
+
+
 @app.get("/api/v1/tasks/{task_id}/generation-runs")
 async def task_generation_runs(task_id: str):
     if task_runtime.get(task_id) is None:
         raise HTTPException(404, "task not found")
-    return {"runs": model_repository.runs_for_task(task_id)}
+    return {"runs": get_model_repository().runs_for_task(task_id)}
 
 @app.get("/api/v1/tasks/{task_id}")
 async def get_task(task_id: str):
@@ -2928,9 +5678,14 @@ async def get_task(task_id: str):
     task["checkpoint"] = task_runtime.latest_checkpoint(task_id)
     return task
 
-def _task_control(task_id: str, operation: str):
+def _task_control(task_id: str, operation: str, actor: str = "studio"):
     try:
-        return getattr(task_runtime, operation)(task_id)
+        command = ControlCommand(
+            f"task.{operation}",
+            {"taskId": task_id},
+            actor=actor,
+        )
+        return get_runtime_plane()["controlPlane"].commands.dispatch(command)
     except KeyError as exc:
         raise HTTPException(404, "任务不存在") from exc
     except TaskStateError as exc:
@@ -2938,20 +5693,26 @@ def _task_control(task_id: str, operation: str):
 
 
 @app.post("/api/v1/tasks/{task_id}/start")
-async def start_task(task_id: str):
+async def start_task(task_id: str, request: Request):
     """Make the card's Start action explicit while preserving queue ownership."""
+    actor = _require_host_principal(request)
     task = task_runtime.get(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
     if task["status"] == "paused":
-        return _task_control(task_id, "resume")
-    if task["status"] in {"queued", "running"}:
+        return _task_control(task_id, "resume", actor)
+    if task["status"] in {"queued", "pending", "running"}:
         return task
     raise HTTPException(409, "只有排队或暂停中的任务可以开始")
 
 @app.post("/api/v1/tasks/{task_id}/author-decision")
-async def author_candidate_decision(task_id: str, req: AuthorCandidateDecisionRequest):
+async def author_candidate_decision(
+    task_id: str,
+    req: AuthorCandidateDecisionRequest,
+    request: Request,
+):
     """Continue a stopped writing task from an author's beta1 decision."""
+    actor = _require_author_principal(request)
     task = task_runtime.get(task_id)
     if not task:
         raise HTTPException(404, "浠诲姟涓嶅瓨鍦?")
@@ -2971,7 +5732,7 @@ async def author_candidate_decision(task_id: str, req: AuthorCandidateDecisionRe
         try:
             result = ContinuousWritingService(
                 story_repository.db,
-                model_mgr,
+                get_active_model_manager(story_repository.db),
                 story_repository,
                 task_runtime,
                 joint_review_interval=config_int("continuous", "joint_review_interval", 5),
@@ -3019,6 +5780,13 @@ async def author_candidate_decision(task_id: str, req: AuthorCandidateDecisionRe
         (book_id, chapter_number),
     )
     author_candidate = beta1
+    expected_version_id = context.get("draft_version_id")
+    if expected_version_id is not None:
+        if latest is None or str(latest.get("version_id")) != str(expected_version_id):
+            raise HTTPException(
+                409,
+                "章节候选版本已发生变化；请重新打开当前任务并由作者确认最新版本",
+            )
     if latest and isinstance(latest.get("content"), str):
         author_candidate = latest["content"]
         context.update({
@@ -3072,6 +5840,7 @@ async def author_candidate_decision(task_id: str, req: AuthorCandidateDecisionRe
             project_id=project_id,
             book_id=book_id,
             data=data,
+            initiated_by=actor,
             idempotency_key=f"author-decision:{task_id}:{decision}",
         )
     except TaskStateError as exc:
@@ -3086,20 +5855,28 @@ async def author_candidate_decision(task_id: str, req: AuthorCandidateDecisionRe
 
 
 @app.post("/api/v1/tasks/{task_id}/pause")
-async def pause_task(task_id: str):
-    return _task_control(task_id, "pause")
+async def pause_task(task_id: str, request: Request):
+    return _task_control(task_id, "pause", _require_host_principal(request))
 
 @app.post("/api/v1/tasks/{task_id}/resume")
-async def resume_task(task_id: str):
-    return _task_control(task_id, "resume")
+async def resume_task(task_id: str, request: Request):
+    return _task_control(task_id, "resume", _require_host_principal(request))
 
 @app.post("/api/v1/tasks/{task_id}/cancel")
-async def cancel_task(task_id: str):
-    return _task_control(task_id, "cancel")
+async def cancel_task(task_id: str, request: Request):
+    command = ControlCommand(
+        "task.cancel", {"taskId": task_id}, actor=_require_host_principal(request)
+    )
+    try:
+        return await get_runtime_plane()["controlPlane"].dispatch_async(command)
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    except TaskStateError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 @app.post("/api/v1/tasks/{task_id}/retry")
-async def retry_task(task_id: str):
-    return _task_control(task_id, "retry")
+async def retry_task(task_id: str, request: Request):
+    return _task_control(task_id, "retry", _require_host_principal(request))
 
 @app.get("/api/v1/tasks/{task_id}/events")
 async def task_events(task_id: str, last_event_id: Optional[str] = Header(None, alias="Last-Event-ID")):
@@ -3114,32 +5891,97 @@ async def task_events(task_id: str, last_event_id: Optional[str] = Header(None, 
             yield f"id: {event['id']}\nevent: {event['event_type']}\ndata: {json.dumps(event['payload'], ensure_ascii=False)}\n\n"
     return StreamingResponse(replay(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
+
+def _parse_event_cursor(last_event_id: Optional[str]) -> int:
+    try:
+        return int(last_event_id or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "Last-Event-ID must be an integer") from exc
+
+
+def _task_event_payload(task: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    """Build the stable, provider-neutral payload shared by task SSE feeds.
+
+    Keep the historical top-level task-event fields for existing Studio
+    clients, while also nesting the complete durable event under ``payload``
+    and exposing explicit event metadata for new subscribers.
+    """
+    payload = dict(event.get("payload") or {})
+    payload.update({
+        "id": task["id"],
+        "taskId": task["id"],
+        "status": task.get("status"),
+        "eventId": event["id"],
+        "sequence": event["sequence"],
+        "eventType": event["event_type"],
+        "payload": event["payload"],
+        "createdAt": event.get("created_at"),
+    })
+    return payload
+
+
+@app.get("/api/v1/tasks/{task_id}/events/stream")
+async def task_event_stream(
+    task_id: str,
+    last_event_id: Optional[str] = Header(None, alias="Last-Event-ID"),
+):
+    """Subscribe to one durable task without depending on process-local state."""
+    if task_runtime.get(task_id) is None:
+        raise HTTPException(404, "任务不存在")
+    after_id = _parse_event_cursor(last_event_id)
+
+    async def subscribe():
+        cursor = after_id
+        while True:
+            task = task_runtime.get(task_id)
+            if task is None:
+                return
+            events = task_runtime.events_since(after_id=cursor, task_id=task_id, limit=200)
+            if events:
+                for event in events:
+                    cursor = max(cursor, int(event["id"]))
+                    payload = _task_event_payload(task, event)
+                    yield (
+                        f"id: {event['id']}\n"
+                        f"event: task_progress\n"
+                        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    )
+                continue
+            if task.get("status") in _STUDIO_TERMINAL_TASK_STATUSES:
+                return
+            yield ": keep-alive\n\n"
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        subscribe(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/api/v1/events")
 async def event_stream(last_event_id: Optional[str] = Header(None, alias="Last-Event-ID")):
-    """Compatibility stream backed by persisted events rather than polling memory."""
-    try:
-        after_id = int(last_event_id or 0)
-    except ValueError as exc:
-        raise HTTPException(400, "Last-Event-ID must be an integer") from exc
+    """Cross-process task stream backed by one durable global event cursor."""
+    after_id = _parse_event_cursor(last_event_id)
+
     async def replay_all():
         cursor = after_id
         while True:
-            emitted = False
-            for task in task_runtime.list(limit=1000):
-                for event in task_runtime.events(task["id"], after_id=cursor):
-                    current = task_runtime.get(task["id"])
-                    if current is None:
-                        continue
+            events = task_runtime.events_since(after_id=cursor, limit=200)
+            if events:
+                for event in events:
                     cursor = max(cursor, int(event["id"]))
-                    payload = {
-                        "id": task["id"],
-                        "taskId": task["id"],
-                        "status": current["status"],
-                        **event["payload"],
+                    task = {
+                        "id": event["task_id"],
+                        "status": event.get("task_status"),
                     }
-                    emitted = True
-                    yield f"id: {event['id']}\nevent: task_progress\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            if not emitted:
+                    payload = _task_event_payload(task, event)
+                    yield (
+                        f"id: {event['id']}\n"
+                        f"event: task_progress\n"
+                        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    )
+            else:
                 yield ": keep-alive\n\n"
                 await asyncio.sleep(1)
     return StreamingResponse(replay_all(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
@@ -3166,8 +6008,9 @@ async def daemon_status():
 
 
 @app.post("/api/v1/daemon/start")
-async def start_daemon():
+async def start_daemon(request: Request):
     """Start a supervised worker without losing durable task state."""
+    _require_host_principal(request)
     if _daemon_is_running():
         return await daemon_status()
     stop_event = asyncio.Event()
@@ -3176,15 +6019,16 @@ async def start_daemon():
         stop_event=stop_event,
         worker_id=worker_id,
         task=asyncio.create_task(
-            task_worker.run_forever(worker_id=worker_id, stop_event=stop_event)
+            _get_studio_task_worker().run_forever(worker_id=worker_id, stop_event=stop_event)
         ),
     )
     return await daemon_status()
 
 
 @app.post("/api/v1/daemon/stop")
-async def stop_daemon():
+async def stop_daemon(request: Request):
     """Stop the worker at a safe polling boundary."""
+    _require_host_principal(request)
     worker_task = studio_daemon_state.get("task")
     stop_event = studio_daemon_state.get("stop_event")
     if worker_task is None or stop_event is None:
@@ -3247,9 +6091,10 @@ async def list_logs(limit: int = Query(100, ge=1, le=500)):
 
 
 @app.post("/api/v1/radar/scan")
-async def start_radar_scan():
+async def start_radar_scan(request: Request):
     """Queue a persisted genre/market scan using the configured model."""
-    projects = project_mgr.list_projects()
+    actor = _require_author_principal(request)
+    projects = get_active_project_manager().list_projects()
     if not projects:
         raise HTTPException(409, "create a project before starting a radar scan")
     project_id = projects[0]["id"]
@@ -3259,6 +6104,7 @@ async def start_radar_scan():
         project_id=project_id,
         book_id=authoritative_book_id,
         data={"requested_at": datetime.now().isoformat()},
+        initiated_by=actor,
     )
     return {"taskId": task["id"], "status": task["status"]}
 
@@ -3266,7 +6112,7 @@ async def start_radar_scan():
 @app.get("/api/v1/radar/history")
 async def radar_history(limit: int = Query(20, ge=1, le=100)):
     """Read the durable radar scan history written by completed tasks."""
-    history_dir = workspace_root / "output" / "radar"
+    history_dir = _active_workspace_root_for(story_repository.db) / "output" / "radar"
     items: list[dict[str, Any]] = []
     if history_dir.exists():
         for path in sorted(history_dir.glob("scan-*.json"), reverse=True)[:limit]:
@@ -3286,6 +6132,1382 @@ async def radar_history(limit: int = Query(20, ge=1, le=100)):
 
 def _split_graph_query(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in (value or "").split(",") if item.strip())
+
+
+def _simulation_snapshot_evidence(book_id: str, snapshot: Any) -> dict[str, Any]:
+    """Return immutable snapshot provenance plus a read-only Canon freshness check."""
+    current = WorldSnapshotBuilder(story_repository.db).build(book_id)
+    freshness = compare_snapshot_with_canon(
+        snapshot,
+        current_event_id=current.base_canon_event_id,
+        current_canon_hash=current.canon_hash,
+    )
+    return {
+        "snapshotId": snapshot.snapshot_id,
+        "snapshot": snapshot.to_record(),
+        "freshness": freshness,
+        "snapshotFreshness": freshness,
+        "currentCanon": {
+            "eventId": current.base_canon_event_id,
+            "baseCanonEventId": current.base_canon_event_id,
+            "canonHash": current.canon_hash,
+            "storyStateVersion": current.story_state_version,
+        },
+        "evidence": {
+            "baseCanonEventId": snapshot.base_canon_event_id,
+            "canonHash": snapshot.canon_hash,
+            "snapshotTime": snapshot.created_at.isoformat(),
+            "canonicalSource": "sqlite.narrative_events",
+            "canonicalMutation": False,
+        },
+        "canonicalMutation": False,
+    }
+
+
+@app.post("/api/v1/books/{book_id}/simulation/snapshots")
+async def create_simulation_snapshot(book_id: str):
+    require_authoritative_project(book_id, "simulation snapshot")
+    book = resolve_story_graph_book(book_id)
+    if book.get("_empty"):
+        raise HTTPException(409, detail={"code": "SIMULATION_CANON_REQUIRED", "message": "authoritative book is required"})
+    try:
+        snapshot = WorldSnapshotBuilder(story_repository.db).build(str(book["id"]))
+        snapshot = WorldSnapshotRepository(story_repository.db).create(snapshot)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_SNAPSHOT", "message": str(exc)}) from exc
+    return {"snapshotId": snapshot.snapshot_id, "snapshot": snapshot.to_record(), "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/snapshots/{snapshot_id}")
+async def get_simulation_snapshot(book_id: str, snapshot_id: str):
+    book = resolve_story_graph_book(book_id)
+    snapshot = WorldSnapshotRepository(story_repository.db).get(snapshot_id)
+    if snapshot is None or snapshot.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_SNAPSHOT_NOT_FOUND", "message": "book-scoped snapshot not found"})
+    try:
+        return _simulation_snapshot_evidence(str(book["id"]), snapshot)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_SNAPSHOT", "message": str(exc)}) from exc
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs")
+async def create_simulation_run(book_id: str, request: SimulationRunCreateRequest):
+    require_authoritative_project(book_id, "simulation run")
+    book = resolve_story_graph_book(book_id)
+    if book.get("_empty"):
+        raise HTTPException(409, detail={"code": "SIMULATION_CANON_REQUIRED", "message": "authoritative book is required"})
+    repository = get_simulation_repository()
+    snapshot = WorldSnapshotRepository(story_repository.db).get(request.snapshotId)
+    if snapshot is None or snapshot.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_SNAPSHOT_NOT_FOUND", "message": "book-scoped snapshot not found"})
+    configuration = dict(request.configuration)
+    try:
+        provider_assignment = SimulationProviderAssignment.from_configuration(configuration)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_PROVIDER_ASSIGNMENT", "message": str(exc)}) from exc
+    if "providerAssignment" in configuration or "provider_assignment" in configuration:
+        configuration.pop("provider_assignment", None)
+        configuration["providerAssignment"] = provider_assignment.to_record()
+    if request.cohortId:
+        configuration["simulationCohortId"] = request.cohortId.strip()
+    run = SimulationRun(uuid.uuid4().hex, str(book["id"]), snapshot.snapshot_id, request.name,
+                        max_rounds=request.maxRounds, seed=request.seed, description=request.description,
+                        purpose=request.purpose, configuration=configuration)
+    run = repository.create_run(run)
+    return {"runId": run.id, "status": run.status.value, "snapshotId": run.snapshot_id,
+            "baseCanonEventId": run.base_canon_event_id,
+            "branchParentId": run.branch_parent_id, "branchPointEventId": run.branch_point_event_id,
+            "configuration": dict(run.configuration), "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs")
+async def list_simulation_runs(book_id: str, limit: int = Query(100, ge=1, le=1000),
+                               includeArchived: bool = Query(False)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    runs = repository.list_runs(str(book["id"]), limit=limit, include_archived=includeArchived)
+    return {"runs": [
+        {"id": run.id, "snapshotId": run.snapshot_id, "name": run.name, "status": run.status.value,
+         "currentRound": run.current_round, "maxRounds": run.max_rounds, "seed": run.seed,
+         "baseCanonEventId": run.base_canon_event_id,
+         "branchParentId": run.branch_parent_id, "branchPointEventId": run.branch_point_event_id,
+         "simulationTime": run.simulation_time,
+         "description": run.description, "purpose": run.purpose,
+         "taskId": run.task_id,
+         "cohortId": SimulationOutcomeClusterService(repository).cohort_id(run),
+         "archived": repository.history_state(run.id)["archived"],
+         "deleted": repository.history_state(run.id)["deleted"],
+         "taskStatus": (task_runtime.get(run.task_id) or {}).get("status") if run.task_id else None,
+         "createdAt": run.created_at.isoformat(), "startedAt": run.started_at.isoformat() if run.started_at else None,
+         "pausedAt": run.paused_at.isoformat() if run.paused_at else None,
+         "completedAt": run.completed_at.isoformat() if run.completed_at else None}
+        for run in runs
+    ], "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/replicate")
+async def replicate_simulation_runs(book_id: str, run_id: str, request: SimulationReplicateRequest):
+    """Create author-requested repeat runs in one explicit outcome cohort."""
+    require_authoritative_project(book_id, "simulation run replication")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        source = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    if source.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    if repository.history_state(run_id)["archived"]:
+        raise HTTPException(409, detail={"code": "SIMULATION_RUN_ARCHIVED", "message": "archived runs cannot be replicated"})
+    cluster_service = SimulationOutcomeClusterService(repository)
+    cohort_id = cluster_service.cohort_id(source)
+    prefix = (request.namePrefix or f"{source.name} repeat").strip() or f"{source.name} repeat"
+    seed_start = request.seedStart if request.seedStart is not None else source.seed + 1
+    created: list[SimulationRun] = []
+    source_events = repository.events(run_id)
+    for offset in range(request.count):
+        child_id = uuid.uuid4().hex
+        name = f"{prefix} {offset + 1}" if request.count > 1 else prefix
+        configuration = json.loads(json.dumps(dict(source.configuration), ensure_ascii=True, sort_keys=True))
+        configuration["simulationCohortId"] = cohort_id
+        if source_events:
+            child = repository.create_branch(
+                run_id,
+                SimulationBranch(
+                    uuid.uuid4().hex, run_id, child_id, source_events[-1].sequence,
+                ),
+                name=name,
+                seed=seed_start + offset,
+            )
+            child = repository.update_configuration(child.id, configuration, replace=True)
+        else:
+            child = SimulationRun(
+                child_id, source.book_id, source.snapshot_id, name,
+                max_rounds=source.max_rounds, seed=seed_start + offset,
+                description=source.description, purpose=source.purpose,
+                created_by=source.created_by, configuration=configuration,
+            )
+            child = repository.create_run(child)
+        created.append(child)
+    return {
+        "sourceRunId": run_id,
+        "cohortId": cohort_id,
+        "runIds": [run.id for run in created],
+        "runs": [{"id": run.id, "name": run.name, "status": run.status.value,
+                  "snapshotId": run.snapshot_id, "seed": run.seed,
+                  "cohortId": cohort_id} for run in created],
+        "canonicalMutation": False,
+    }
+
+
+@app.get("/api/v1/books/{book_id}/simulation/outcomes")
+async def list_simulation_outcomes(book_id: str, cohortId: Optional[str] = Query(None),
+                                   includeArchived: bool = Query(False),
+                                   limit: int = Query(1000, ge=1, le=1000)):
+    """Return deterministic outcome clusters for one or all repeat cohorts."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    service = SimulationOutcomeClusterService(repository)
+    runs = repository.list_runs(str(book["id"]), limit=limit, include_archived=includeArchived)
+    if cohortId:
+        result = service.cluster_runs(runs, cohort_id=cohortId)
+    else:
+        cohort_ids = sorted({service.cohort_id(run) for run in runs})
+        summaries = [service.cluster_runs(runs, cohort_id=cohort) for cohort in cohort_ids]
+        result = {
+            "cohortId": None,
+            "cohorts": cohort_ids,
+            "clusters": [cluster for summary in summaries for cluster in summary["clusters"]],
+            "summaries": summaries,
+            "analyzedRunIds": [run_id for summary in summaries for run_id in summary["analyzedRunIds"]],
+            "skippedRunIds": [run_id for summary in summaries for run_id in summary["skippedRunIds"]],
+            "runCount": len(runs),
+            "clusterCount": sum(summary["clusterCount"] for summary in summaries),
+            "evidence": {
+                "source": "simulation_world_snapshot_plus_event_ledger",
+                "canonicalMutation": False,
+                "probabilityClaim": False,
+            },
+        }
+    return {**result, "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/outcomes")
+async def get_simulation_run_outcomes(book_id: str, run_id: str,
+                                      includeArchived: bool = Query(True)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    if run.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    result = SimulationOutcomeClusterService(repository).for_run(run_id, include_archived=includeArchived)
+    return {**result, "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/archive")
+async def archive_simulation_run(book_id: str, run_id: str, request: SimulationHistoryRequest):
+    require_authoritative_project(book_id, "simulation run archive")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        history = repository.archive_run(run_id, reason=request.reason)
+    except ValueError as exc:
+        code = "SIMULATION_RUN_ARCHIVE"
+        if "running" in str(exc):
+            code = "SIMULATION_RUN_MUST_STOP"
+        raise HTTPException(409, detail={"code": code, "message": str(exc)}) from exc
+    return {"runId": run_id, "history": history, "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/unarchive")
+async def unarchive_simulation_run(book_id: str, run_id: str, request: SimulationHistoryRequest):
+    require_authoritative_project(book_id, "simulation run unarchive")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        history = repository.unarchive_run(run_id, reason=request.reason)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    return {"runId": run_id, "history": history, "canonicalMutation": False}
+
+
+@app.delete("/api/v1/books/{book_id}/simulation/runs/{run_id}")
+async def delete_simulation_run(book_id: str, run_id: str, request: SimulationHistoryRequest):
+    """Soft-delete a run from History without deleting Sandbox evidence."""
+    require_authoritative_project(book_id, "simulation run deletion")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        history = repository.delete_run(run_id, reason=request.reason)
+    except ValueError as exc:
+        code = "SIMULATION_RUN_DELETE"
+        if "running" in str(exc):
+            code = "SIMULATION_RUN_MUST_STOP"
+        raise HTTPException(409, detail={"code": code, "message": str(exc)}) from exc
+    return {"runId": run_id, "history": history, "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/history")
+async def get_simulation_run_history(book_id: str, run_id: str,
+                                     limit: int = Query(100, ge=1, le=1000)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    if run.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    return {"runId": run_id, "history": repository.history_events(run_id, limit=limit),
+            "state": repository.history_state(run_id), "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/branches")
+async def list_simulation_branches(book_id: str, limit: int = Query(1000, ge=1, le=2000)):
+    """Return the persisted run/branch tree for this book.
+
+    Roots are ordinary simulation runs; every child edge comes from the
+    append-only ``simulation_branches`` record.  The endpoint is a read model
+    only and deliberately includes the same evidence marker as other sandbox
+    views so the UI cannot mistake a branch tree for Canon history.
+    """
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    runs = repository.list_runs(str(book["id"]), limit=limit)
+    rows = story_repository.db.fetchall(
+        """SELECT b.id, b.parent_run_id, b.branch_run_id, b.fork_sequence,
+                  b.parent_round, b.fork_snapshot_hash, b.created_at
+           FROM simulation_branches b
+           JOIN simulation_runs parent ON parent.id=b.parent_run_id
+           JOIN simulation_runs child ON child.id=b.branch_run_id
+           WHERE parent.book_id=? AND child.book_id=?
+           ORDER BY b.created_at ASC, b.id ASC""",
+        (str(book["id"]), str(book["id"])),
+    )
+    by_child = {row["branch_run_id"]: row for row in rows}
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    for run in reversed(runs):
+        branch = by_child.get(run.id)
+        node = {
+            "runId": run.id,
+            "name": run.name,
+            "status": run.status.value,
+            "currentRound": run.current_round,
+            "maxRounds": run.max_rounds,
+            "snapshotId": run.snapshot_id,
+            "parentRunId": branch["parent_run_id"] if branch else None,
+            "branchId": branch["id"] if branch else None,
+            "forkSequence": branch["fork_sequence"] if branch else None,
+            "parentRound": branch["parent_round"] if branch else None,
+            "forkSnapshotHash": branch["fork_snapshot_hash"] if branch else None,
+            "createdAt": run.created_at.isoformat(),
+            "isRoot": branch is None,
+        }
+        nodes.append(node)
+        if branch:
+            edges.append({
+                "branchId": branch["id"],
+                "parentRunId": branch["parent_run_id"],
+                "runId": run.id,
+                "forkSequence": branch["fork_sequence"],
+                "parentRound": branch["parent_round"],
+                "forkSnapshotHash": branch["fork_snapshot_hash"],
+                "createdAt": branch["created_at"],
+            })
+    return {
+        "bookId": str(book["id"]),
+        "nodes": nodes,
+        "edges": edges,
+        "evidence": {"source": "simulation_runs + simulation_branches", "canonicalMutation": False},
+        "canonicalMutation": False,
+    }
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}")
+async def get_simulation_run(book_id: str, run_id: str):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    if run.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    state = repository.recover(run_id)
+    events = repository.events(run_id)
+    snapshot = WorldSnapshotRepository(story_repository.db).get(run.snapshot_id)
+    if snapshot is None or snapshot.book_id != run.book_id:
+        raise HTTPException(404, detail={"code": "SIMULATION_SNAPSHOT_NOT_FOUND", "message": "run snapshot not found"})
+    snapshot_evidence = _simulation_snapshot_evidence(str(book["id"]), snapshot)
+    task = task_runtime.get(run.task_id) if run.task_id else None
+    history_state = repository.history_state(run_id)
+    outcome_service = SimulationOutcomeClusterService(repository)
+    chapter_row = story_repository.db.fetchone(
+        "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE book_id=?",
+        (str(book["id"]),),
+    )
+    next_chapter = int((chapter_row or {}).get("max_number") or 0) + 1
+    return {"run": {"id": run.id, "snapshotId": run.snapshot_id, "name": run.name, "status": run.status.value,
+                     "currentRound": run.current_round, "maxRounds": run.max_rounds, "seed": run.seed,
+                     "baseCanonEventId": run.base_canon_event_id,
+                     "branchParentId": run.branch_parent_id, "branchPointEventId": run.branch_point_event_id,
+                     "simulationTime": run.simulation_time,
+                     "description": run.description, "purpose": run.purpose,
+                     "configuration": dict(run.configuration), "createdAt": run.created_at.isoformat(),
+                     "startedAt": run.started_at.isoformat() if run.started_at else None,
+                     "pausedAt": run.paused_at.isoformat() if run.paused_at else None,
+                     "completedAt": run.completed_at.isoformat() if run.completed_at else None,
+                     "taskId": run.task_id},
+            "snapshot": snapshot_evidence["snapshot"],
+            "freshness": snapshot_evidence["freshness"],
+            "snapshotFreshness": snapshot_evidence["snapshotFreshness"],
+            "currentCanon": snapshot_evidence["currentCanon"],
+            "snapshotEvidence": snapshot_evidence["evidence"],
+            "task": task,
+            "history": history_state,
+            "cohortId": outcome_service.cohort_id(run),
+            "nextChapter": next_chapter, "stateHash": state.state_hash, "eventSequence": state.event_sequence,
+            "events": [{"id": event.id, "sequence": event.sequence, "round": event.round_number,
+                        "type": event.event_type, "actorId": event.actor_id,
+                        "sourceGenerationRunId": event.source_generation_run_id} for event in events],
+             "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/replay")
+async def rebuild_simulation_state(book_id: str, run_id: str):
+    """Rebuild the Sandbox state from the immutable snapshot and event ledger."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        state = repository.rebuild_simulation_state(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_REPLAY", "message": str(exc)}) from exc
+    return {
+        "runId": run_id,
+        "snapshotId": state.snapshot_id,
+        "eventSequence": state.event_sequence,
+        "stateHash": state.state_hash,
+        "state": dict(state.values),
+        "evidence": {
+            "source": "immutable_simulation_snapshot + simulation_event_ledger",
+            "rebuildable": True,
+            "canonicalMutation": False,
+        },
+        "canonicalMutation": False,
+    }
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/task")
+async def get_simulation_run_task(book_id: str, run_id: str):
+    """Read the persisted task binding for a run without exposing other books."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    if run.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    return {"runId": run_id, "taskId": run.task_id,
+            "task": task_runtime.get(run.task_id) if run.task_id else None,
+            "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/scheduler")
+async def get_simulation_scheduler(book_id: str, run_id: str,
+                                   roundNumber: Optional[int] = Query(None, ge=1),
+                                   limit: int = Query(1000, ge=1, le=5000)):
+    """Return persisted activation evidence or a deterministic next-round preview."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        round_number = roundNumber or (run.current_round + 1)
+        persisted = repository.agent_activations(run_id, round_number=round_number, limit=limit)
+        if persisted:
+            activations = persisted
+            source = "simulation_agent_activations"
+        else:
+            preview = AgentScheduler().schedule(
+                run, repository.recover(run_id), repository.events(run_id), round_number=round_number,
+            )
+            activations = [item.to_record() for item in preview][:limit]
+            source = "deterministic_scheduler_preview"
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_SCHEDULER", "message": str(exc)}) from exc
+    return {"runId": run_id, "roundNumber": round_number, "activations": activations,
+            "activeAgents": [item["agentId"] for item in activations if item.get("active")],
+            "evidence": {"source": source, "canonicalMutation": False},
+            "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/budget")
+async def get_simulation_budget(book_id: str, run_id: str,
+                                estimatedCalls: int = Query(0, ge=0, le=5000),
+                                limit: int = Query(1000, ge=1, le=5000)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        controller = SimulationBudgetController(repository, run, round_number=run.current_round + 1)
+        snapshot = controller.snapshot(estimated_calls=estimatedCalls)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_BUDGET", "message": str(exc)}) from exc
+    return {"runId": run_id, "runStatus": run.status.value, "budget": snapshot,
+            "ledger": repository.cost_ledger(run_id, limit=limit), "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/budget")
+async def update_simulation_budget(book_id: str, run_id: str, request: SimulationBudgetUpdateRequest):
+    require_authoritative_project(book_id, "simulation budget")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    values = request.model_dump(exclude_none=True)
+    if not values:
+        raise HTTPException(422, detail={"code": "SIMULATION_BUDGET", "message": "at least one budget value is required"})
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        configuration = dict(run.configuration)
+        existing = configuration.get("budget") or configuration.get("costControl") or {}
+        if not isinstance(existing, dict):
+            existing = {}
+        existing.update(values)
+        updated = repository.update_configuration(run_id, {"budget": existing})
+        controller = SimulationBudgetController(repository, updated, round_number=updated.current_round + 1)
+    except ValueError as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_BUDGET", "message": str(exc)}) from exc
+    return {"runId": run_id, "runStatus": updated.status.value,
+            "configuration": dict(updated.configuration), "budget": controller.snapshot(),
+            "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/configuration")
+async def update_simulation_configuration(book_id: str, run_id: str, request: SimulationConfigurationRequest):
+    """Persist author-edited environment setup before a Sandbox round runs."""
+    require_authoritative_project(book_id, "simulation configuration")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        updated = repository.update_configuration(
+            run_id, request.configuration, replace=request.replace,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_CONFIGURATION", "message": str(exc)}) from exc
+    return {
+        "runId": run_id,
+        "runStatus": updated.status.value,
+        "configuration": dict(updated.configuration),
+        "canonicalMutation": False,
+    }
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/configuration/generate")
+async def generate_simulation_configuration(
+    book_id: str, run_id: str, request: SimulationConfigurationGenerateRequest,
+):
+    """Preview or persist deterministic Environment Setup from the snapshot."""
+    require_authoritative_project(book_id, "simulation configuration generation")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        snapshot = WorldSnapshotRepository(story_repository.db).get(run.snapshot_id)
+        if snapshot is None or snapshot.book_id != run.book_id:
+            raise ValueError("simulation snapshot not found")
+        generated = SimulationConfigurationGenerator().generate(run, snapshot)
+        updated = repository.update_configuration(run_id, generated, replace=True) if request.replace else run
+    except ValueError as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_CONFIGURATION_GENERATE", "message": str(exc)}) from exc
+    return {
+        "runId": run_id,
+        "runStatus": updated.status.value,
+        "configuration": generated,
+        "persisted": bool(request.replace),
+        "evidence": {
+            "source": "immutable_simulation_world_snapshot",
+            "snapshotId": run.snapshot_id,
+            "canonicalMutation": False,
+        },
+        "canonicalMutation": False,
+    }
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/events")
+async def get_simulation_events(book_id: str, run_id: str, after_sequence: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    if run.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    events = [event for event in repository.events(run_id) if event.sequence > after_sequence][:limit]
+    return {"runId": run_id, "afterSequence": after_sequence, "events": [
+        {"id": event.id, "sequence": event.sequence, "round": event.round_number,
+         "simulationTime": event.simulation_time, "type": event.event_type,
+         "actorType": event.actor_type, "actorId": event.actor_id, "targetIds": event.target_ids,
+         "actionId": event.action_id, "sourceGenerationRunId": event.source_generation_run_id,
+         "location": event.payload.get("location") if isinstance(event.payload, dict) else None,
+         "payload": event.payload, "stateDelta": event.state_delta,
+         "visibilityScope": event.visibility_scope}
+        for event in events
+    ], "nextSequence": events[-1].sequence if events else after_sequence, "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/causal-trace")
+async def get_simulation_causal_trace(
+    book_id: str,
+    run_id: str,
+    event_id: Optional[str] = Query(None, alias="eventId"),
+    limit: int = Query(1000, ge=1, le=5000),
+):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        traces = SimulationCausalityService(repository).ensure_for_run(
+            run_id, event_id=event_id,
+        )[:limit]
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_CAUSAL_TRACE", "message": str(exc)}) from exc
+    event_ids = [item["eventId"] for item in traces]
+    return {
+        "runId": run_id,
+        "eventId": event_id,
+        "traces": traces,
+        "evidence": {
+            "source": "simulation_causal_traces",
+            "eventIds": event_ids,
+            "causalEvidence": True,
+            "canonicalMutation": False,
+        },
+        "canonicalMutation": False,
+    }
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/graph")
+async def get_simulation_graph(book_id: str, run_id: str, event_limit: int = Query(1000, ge=1, le=5000)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        graph = SimulationGraphProjector(repository).project(run_id, event_limit=event_limit)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_GRAPH", "message": str(exc)}) from exc
+    return graph.to_record()
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/events/stream")
+async def stream_simulation_events(
+    book_id: str,
+    run_id: str,
+    after_sequence: int = Query(0, ge=0),
+    last_event_id: Optional[str] = Header(None, alias="Last-Event-ID"),
+):
+    """Replay persisted simulation events for timeline clients.
+
+    This is deliberately a bounded replay stream. Clients reconnect with the
+    last sequence they received; live execution remains owned by the durable
+    runtime rather than by an HTTP request.
+    """
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"}) from exc
+    if run.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    if last_event_id is not None:
+        try:
+            after_sequence = int(last_event_id)
+        except ValueError as exc:
+            raise HTTPException(400, "Last-Event-ID must be an integer") from exc
+        if after_sequence < 0:
+            raise HTTPException(400, "Last-Event-ID must be non-negative")
+
+    async def replay():
+        # The bounded replay closes after the current ledger. Tell a native
+        # EventSource client how often it may reconnect for newly persisted
+        # events; without this directive a closed replay can cause a tight
+        # reconnect loop in the browser.
+        yield "retry: 3000\n\n"
+        for event in repository.events(run_id):
+            if event.sequence <= after_sequence:
+                continue
+            payload = {
+                "runId": run_id,
+                "id": event.id,
+                "sequence": event.sequence,
+                "round": event.round_number,
+                "simulationTime": event.simulation_time,
+                "type": event.event_type,
+                "actorType": event.actor_type,
+                "actorId": event.actor_id,
+                "targetIds": event.target_ids,
+                "actionId": event.action_id,
+                "sourceGenerationRunId": event.source_generation_run_id,
+                "location": event.payload.get("location") if isinstance(event.payload, dict) else None,
+                "payload": event.payload,
+                "stateDelta": event.state_delta,
+                "visibilityScope": event.visibility_scope,
+                "createdAt": event.created_at.isoformat(),
+                "canonicalMutation": False,
+            }
+            yield f"id: {event.sequence}\nevent: simulation_event\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        replay(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/events/{event_id}")
+async def get_simulation_event_detail(book_id: str, run_id: str, event_id: str):
+    """Return replayed, agent-scoped evidence for one Timeline event."""
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        return SimulationEventDetailService(repository).build(run_id, event_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_EVENT_DETAIL", "message": str(exc)}) from exc
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/agents")
+async def list_simulation_agents(book_id: str, run_id: str):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        state = repository.recover(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_AGENT_ROSTER", "message": str(exc)}) from exc
+    agents = []
+    for actor_type, key in (("character", "characters"), ("faction", "factions")):
+        values = state.values.get(key, {})
+        if not isinstance(values, dict):
+            continue
+        for agent_id, raw in sorted(values.items()):
+            actor = raw if isinstance(raw, dict) else {}
+            agents.append({
+                "id": str(agent_id), "type": actor_type,
+                "name": actor.get("name") or actor.get("identity") or str(agent_id),
+                "location": actor.get("location") or actor.get("territory"),
+                "alive": actor.get("alive", True),
+                "goals": actor.get("goals") or actor.get("current_priorities") or [],
+                "stateHash": state.state_hash,
+                "canonicalMutation": False,
+            })
+    return {"runId": run_id, "agents": agents, "stateHash": state.state_hash, "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/agents/{agent_id}")
+async def inspect_simulation_agent(book_id: str, run_id: str, agent_id: str, event_limit: int = Query(20, ge=1, le=100)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": str(exc)}) from exc
+    if run.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_RUN_NOT_FOUND", "message": "book-scoped run not found"})
+    state = repository.recover(run_id)
+    characters = state.values.get("characters", {})
+    factions = state.values.get("factions", {})
+    if not ((isinstance(characters, dict) and agent_id in characters) or
+            (isinstance(factions, dict) and agent_id in factions)):
+        raise HTTPException(404, detail={"code": "SIMULATION_AGENT_NOT_FOUND", "message": "agent not found in snapshot"})
+    events = repository.events(run_id)
+    memories = repository.memories.list_for_agent(run_id, agent_id, limit=event_limit)
+    perception = PerceptionBuilder().build(agent_id, state, events[-event_limit:], [
+        {"id": memory.id, "type": str(memory.memory_type), "content": memory.content,
+         "importance": memory.importance, "confidence": memory.confidence}
+        for memory in memories
+    ])
+    return {"runId": run_id, "agentId": agent_id, "perception": {
+        "identity": perception.identity, "currentState": perception.current_state,
+        "localWorld": perception.local_world, "knowledge": perception.knowledge,
+        "beliefs": perception.beliefs, "goals": perception.goals,
+        "relationships": perception.relationships, "observations": perception.observations,
+        "recentEvents": perception.recent_events, "recentMemory": perception.recent_memory,
+        "availableActions": perception.available_actions, "worldRules": perception.world_rules,
+    }, "stateHash": state.state_hash, "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/compare")
+async def compare_simulation_runs(book_id: str, left: str = Query(...), right: str = Query(...)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        if repository.get_run(left).book_id != str(book["id"]) or repository.get_run(right).book_id != str(book["id"]):
+            raise ValueError("runs do not belong to book")
+        result = BranchComparisonService(repository).compare(left, right)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_COMPARE", "message": str(exc)}) from exc
+    return {"leftRunId": result.left_run_id, "rightRunId": result.right_run_id,
+            "commonEventSequence": result.common_event_sequence, "leftStateHash": result.left_state_hash,
+            "rightStateHash": result.right_state_hash, "changedKeys": result.changed_keys,
+            "dimensionChanges": result.dimension_changes,
+            "leftOnlyEvents": result.left_only_events, "rightOnlyEvents": result.right_only_events,
+            "evidence": result.evidence}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/analysis")
+async def create_simulation_analysis(book_id: str, run_id: str, request: SimulationAnalysisRequest):
+    require_authoritative_project(book_id, "simulation analysis")
+    book = resolve_story_graph_book(book_id)
+    try:
+        run = get_simulation_repository().get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        report = SimulationAnalyst(story_repository.db).analyze_run(
+            run_id, kind=request.kind, title=request.title,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_ANALYSIS", "message": str(exc)}) from exc
+    return {"report": report.to_record(), "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/analysis")
+async def list_simulation_analysis(book_id: str, run_id: str, limit: int = Query(50, ge=1, le=200)):
+    book = resolve_story_graph_book(book_id)
+    simulations = get_simulation_repository()
+    try:
+        run = simulations.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        reports = SimulationAnalyst(story_repository.db).reports.list_for_run(run_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_ANALYSIS", "message": str(exc)}) from exc
+    return {"runId": run_id, "reports": [report.to_record() for report in reports], "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/analysis/query")
+async def query_simulation_analysis(book_id: str, run_id: str, request: SimulationAnalystQueryRequest):
+    """Run one whitelisted evidence tool and persist its grounded answer."""
+    require_authoritative_project(book_id, "simulation analysis query")
+    book = resolve_story_graph_book(book_id)
+    simulations = get_simulation_repository()
+    try:
+        run = simulations.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        arguments = dict(request.arguments)
+        for key in ("left_run_id", "right_run_id"):
+            candidate = arguments.get(key)
+            if candidate:
+                candidate_run = simulations.get_run(str(candidate))
+                if candidate_run.book_id != str(book["id"]):
+                    raise ValueError("analyst comparison run does not belong to book")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_ANALYST", "message": str(exc)}) from exc
+    task = await _execute_simulation_capability_task(book, "simulation-analyst-query", {
+        "runId": run_id,
+        "question": request.question,
+        "tool": request.tool,
+        "arguments": arguments,
+        "title": request.question[:200],
+    })
+    return _simulation_capability_response(task)
+
+
+@app.get("/api/v1/books/{book_id}/simulation/analysis/{report_id}")
+async def get_simulation_analysis(book_id: str, report_id: str):
+    book = resolve_story_graph_book(book_id)
+    report = SimulationAnalyst(story_repository.db).reports.get(report_id)
+    if report is None or report.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_ANALYSIS_NOT_FOUND", "message": "book-scoped report not found"})
+    return {"report": report.to_record(), "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/agents/{agent_id}/chat")
+async def simulation_character_chat(book_id: str, run_id: str, agent_id: str, request: SimulationCharacterChatRequest):
+    require_authoritative_project(book_id, "simulation character chat")
+    book = resolve_story_graph_book(book_id)
+    try:
+        run = get_simulation_repository().get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_CHARACTER_CHAT", "message": str(exc)}) from exc
+    task = await _execute_simulation_capability_task(book, "simulation-character-chat", {
+        "runId": run_id, "agentId": agent_id, "prompt": request.prompt,
+    })
+    return _simulation_capability_response(task)
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/agents/{agent_id}/chat")
+async def list_simulation_character_chat(book_id: str, run_id: str, agent_id: str, limit: int = Query(50, ge=1, le=200)):
+    book = resolve_story_graph_book(book_id)
+    try:
+        run = get_simulation_repository().get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        interactions = CharacterChatService(story_repository.db).interactions.list_for_agent(run_id, agent_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail={"code": "SIMULATION_CHARACTER_CHAT", "message": str(exc)}) from exc
+    return {"runId": run_id, "agentId": agent_id,
+            "interactions": [item.to_record() for item in interactions], "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/survey")
+async def conduct_simulation_survey(book_id: str, run_id: str, request: SimulationSurveyRequest):
+    require_authoritative_project(book_id, "simulation survey")
+    book = resolve_story_graph_book(book_id)
+    try:
+        run = get_simulation_repository().get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_SURVEY", "message": str(exc)}) from exc
+    task = await _execute_simulation_capability_task(book, "simulation-survey", {
+        "runId": run_id, "question": request.question, "agentIds": request.agentIds,
+    })
+    return _simulation_capability_response(task)
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/survey")
+async def list_simulation_surveys(book_id: str, run_id: str, limit: int = Query(50, ge=1, le=200)):
+    book = resolve_story_graph_book(book_id)
+    try:
+        run = get_simulation_repository().get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        surveys = SimulationSurveyService(story_repository.db).surveys.list_for_run(run_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_SURVEY", "message": str(exc)}) from exc
+    return {"runId": run_id, "surveys": [survey.to_record() for survey in surveys], "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/surveys/{survey_id}")
+async def get_simulation_survey(book_id: str, survey_id: str):
+    book = resolve_story_graph_book(book_id)
+    service = SimulationSurveyService(story_repository.db)
+    survey = service.surveys.get(survey_id)
+    if survey is None or survey.book_id != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_SURVEY_NOT_FOUND", "message": "book-scoped survey not found"})
+    scenario = service.scenario(survey_id)
+    return {"survey": survey.to_record(), "scenario": scenario, "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/surveys/{survey_id}/run")
+async def start_simulation_from_survey(
+    book_id: str, survey_id: str, request: SimulationSurveyRunRequest,
+):
+    """Fork the source Sandbox at its current ledger boundary for a survey scenario.
+
+    Survey responses become run-scoped configuration evidence. The source run
+    and Canon stay unchanged; the child is an ordinary READY Sandbox branch.
+    """
+    require_authoritative_project(book_id, "simulation survey run")
+    book = resolve_story_graph_book(book_id)
+    service = SimulationSurveyService(story_repository.db)
+    repository = get_simulation_repository()
+    try:
+        survey = service.surveys.get(survey_id)
+        if survey is None or survey.book_id != str(book["id"]):
+            raise ValueError("book-scoped survey not found")
+        scenario = service.scenario(survey_id)
+        source = repository.get_run(survey.simulation_run_id)
+        if source.book_id != str(book["id"]):
+            raise ValueError("survey source run does not belong to book")
+        configuration = json.loads(json.dumps(dict(source.configuration), ensure_ascii=True, sort_keys=True))
+        requested = request.configuration
+        if not isinstance(requested, dict):
+            raise ValueError("survey scenario configuration must be an object")
+        configuration.update(json.loads(json.dumps(requested, ensure_ascii=True, sort_keys=True)))
+        try:
+            assignment = SimulationProviderAssignment.from_configuration(configuration)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if "providerAssignment" in configuration or "provider_assignment" in configuration:
+            configuration.pop("provider_assignment", None)
+            configuration["providerAssignment"] = assignment.to_record()
+        configuration["surveyScenario"] = scenario
+        events = repository.events(source.id)
+        child_id = uuid.uuid4().hex
+        fork_sequence = events[-1].sequence if events else 0
+        child = repository.create_branch(
+            source.id,
+            SimulationBranch(uuid.uuid4().hex, source.id, child_id, fork_sequence),
+            name=(request.name or f"Survey scenario · {survey.question[:48]}").strip() or "Survey scenario",
+            seed=request.seed if request.seed is not None else source.seed + 1,
+        )
+        child = repository.update_configuration(child.id, configuration, replace=True)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_SURVEY_SCENARIO", "message": str(exc)}) from exc
+    return {
+        "surveyId": survey_id,
+        "sourceRunId": source.id,
+        "runId": child.id,
+        "status": child.status.value,
+        "snapshotId": child.snapshot_id,
+        "branchParentId": child.branch_parent_id,
+        "branchPointEventId": child.branch_point_event_id,
+        "forkSequence": fork_sequence,
+        "configuration": dict(child.configuration),
+        "scenario": scenario,
+        "canonicalMutation": False,
+    }
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/status")
+async def transition_simulation_run(book_id: str, run_id: str, request: SimulationStatusRequest):
+    require_authoritative_project(book_id, "simulation run status")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        current = repository.get_run(run_id)
+        if current.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        status = SimulationRunStatus(request.status.upper())
+        updated = repository.transition_run(run_id, status)
+    except ValueError as exc:
+        code = getattr(exc, "code", "SIMULATION_STATUS")
+        raise HTTPException(409, detail={"code": code, "message": str(exc)}) from exc
+    return {"runId": updated.id, "status": updated.status.value, "currentRound": updated.current_round,
+            "simulationTime": updated.simulation_time,
+            "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/branches")
+async def create_simulation_branch(book_id: str, request: SimulationBranchCreateRequest):
+    require_authoritative_project(book_id, "simulation branch")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        parent = repository.get_run(request.parentRunId)
+        if parent.book_id != str(book["id"]):
+            raise ValueError("parent run does not belong to book")
+        branch_id = uuid.uuid4().hex
+        child_id = uuid.uuid4().hex
+        branch = SimulationBranch(branch_id, request.parentRunId, child_id, request.forkSequence)
+        child = repository.create_branch(request.parentRunId, branch, name=request.name)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_BRANCH", "message": str(exc)}) from exc
+    metadata = story_repository.db.fetchone(
+        "SELECT parent_round, fork_snapshot_hash FROM simulation_branches WHERE id=?",
+        (branch.id,),
+    )
+    return {"branchId": branch.id, "parentRunId": branch.parent_run_id, "runId": child.id,
+            "forkSequence": branch.fork_sequence,
+            "parentRound": metadata["parent_round"] if metadata else None,
+            "forkSnapshotHash": metadata["fork_snapshot_hash"] if metadata else None,
+            "status": child.status.value, "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/interventions")
+async def intervene_simulation_run(book_id: str, run_id: str, request: SimulationInterventionRequest):
+    require_authoritative_project(book_id, "simulation intervention")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        intervention = SimulationIntervention(
+            run_id, request.kind, request.stateDelta, request.rationale,
+            author=request.author,
+        )
+        event = repository.intervene(intervention, round_number=request.roundNumber)
+    except ValueError as exc:
+        code = getattr(exc, "code", "SIMULATION_INTERVENTION")
+        raise HTTPException(409 if isinstance(exc, SimulationRunDeletedError) else 422,
+                            detail={"code": code, "message": str(exc)}) from exc
+    return {"runId": run_id, "interventionId": intervention.id, "eventId": event.id,
+            "sequence": event.sequence, "simulationTime": event.simulation_time,
+            "kind": intervention.kind, "author": intervention.author,
+            "canonicalMutation": False}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/interventions")
+async def list_simulation_interventions(book_id: str, run_id: str, limit: int = Query(100, ge=1, le=1000)):
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        interventions = repository.interventions(run_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_INTERVENTIONS", "message": str(exc)}) from exc
+    return {"runId": run_id, "interventions": interventions, "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/rounds")
+async def execute_simulation_round(book_id: str, run_id: str, request: SimulationRoundRequest):
+    """Execute a bounded synchronous sandbox preview.
+
+    This compatibility endpoint writes only Simulation ledger state, but it is
+    intentionally not restart-safe: callers that need lease, checkpoint,
+    retry, cancellation, or process-restart recovery must use
+    ``/round-tasks``.  The response states this boundary explicitly so a
+    legacy caller cannot mistake the preview for the durable worker path.
+    """
+    require_authoritative_project(book_id, "simulation round")
+    book = resolve_story_graph_book(book_id)
+    repository = get_simulation_repository()
+    try:
+        run = repository.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        if request.decisionMode.lower() != "explicit":
+            raise ValueError("provider decisions require a durable simulation round task")
+        actions: dict[str, NarrativeAction] = {}
+        for item in request.actions:
+            if item.actorId in actions:
+                raise ValueError(f"duplicate action actor: {item.actorId}")
+            action_name = item.actionType.upper()
+            try:
+                action_type: ActionType | str = ActionType(action_name)
+            except ValueError:
+                # Preserve an unsupported author action long enough for the
+                # same validator/rejection contract used by durable tasks.
+                action_type = action_name
+            actions[item.actorId] = NarrativeAction(
+                action_type=action_type, actor_id=item.actorId,
+                actor_type=item.actorType,
+                target_ids=tuple(item.targetIds), location=item.location, intent=item.intent,
+                arguments=item.arguments, preconditions=item.preconditions, effects=item.effects,
+                confidence=item.confidence, reasoning_summary=item.reasoningSummary,
+                source_generation_run=item.sourceGenerationRun, id=item.actionId,
+            )
+        result = SimulationRoundEngine(repository).run_round(
+            run_id, {agent_id: (lambda _perception, action=action: action)
+                     for agent_id, action in actions.items()}, round_number=request.roundNumber,
+        )
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_ROUND", "message": str(exc)}) from exc
+    return {"runId": result.run_id, "roundNumber": result.round_number, "status": result.run_status,
+            "actedAgents": result.acted_agents, "skippedAgents": result.skipped_agents,
+            "rejectedActions": result.rejected_actions, "eventIds": result.event_ids,
+            "checkpointId": result.checkpoint_id,
+            "simulationTime": repository.get_run(result.run_id).simulation_time,
+            "canonicalMutation": False,
+            "executionMode": "synchronous_preview",
+            "recoverable": False,
+            "durableTaskId": None,
+            "recoveryBoundary": "Use /round-tasks for lease/checkpoint/retry/cancel/restart recovery.",
+    }
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/round-tasks")
+async def enqueue_simulation_round_task(
+    book_id: str,
+    run_id: str,
+    request: SimulationRoundRequest,
+    http_request: Request,
+):
+    """Queue a durable simulation round for the persistent worker."""
+    require_authoritative_project(book_id, "simulation round task")
+    actor = _require_author_principal(http_request)
+    book = resolve_story_graph_book(book_id)
+    simulations = get_simulation_repository()
+    try:
+        run = simulations.get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        if run.status is not SimulationRunStatus.RUNNING:
+            raise ValueError(f"simulation run must be RUNNING, got {run.status}")
+        round_number = request.roundNumber or (run.current_round + 1)
+        if round_number <= run.current_round or round_number > run.max_rounds:
+            raise ValueError("simulation round number is outside the run bounds")
+        if request.decisionMode.lower() not in {"explicit", "provider"}:
+            raise ValueError("simulation decisionMode must be explicit or provider")
+        if request.decisionRole not in {"planner", "writer", "reviewer"}:
+            raise ValueError("simulation decisionRole is unsupported")
+        provider_assignment = SimulationProviderAssignment.from_configuration(run.configuration)
+        provider_assignment_record = provider_assignment.to_record()
+        actions = [item.model_dump(exclude_none=True) for item in request.actions]
+        fingerprint = hashlib.sha256(json.dumps(
+            {
+                "runId": run_id,
+                "roundNumber": round_number,
+                "actions": actions,
+                "decisionMode": request.decisionMode.lower(),
+                "agentIds": sorted(request.agentIds),
+                "decisionRole": request.decisionRole,
+                "providerAssignment": provider_assignment_record,
+            },
+            sort_keys=True, ensure_ascii=True,
+        ).encode("utf-8")).hexdigest()
+        idempotency_key = f"simulation-round:{run_id}:{round_number}:{fingerprint}"
+        bound_task = task_runtime.get(run.task_id) if run.task_id else None
+        if bound_task and bound_task.get("idempotency_key") == idempotency_key:
+            return {"taskId": bound_task["id"], "status": bound_task["status"], "runId": run_id,
+                    "roundNumber": round_number, "canonicalMutation": False}
+        if bound_task and bound_task.get("status") in {"queued", "running", "paused", "waiting_on_child", "cancelling"}:
+            raise ValueError(f"simulation run already has an active durable task: {bound_task['id']}")
+        task = task_runtime.enqueue(
+            "simulation-round", project_id=book.get("project_id") or str(book["id"]),
+            book_id=str(book["id"]),
+            data={"runId": run_id, "roundNumber": round_number, "actions": actions,
+                  "decisionMode": request.decisionMode.lower(), "agentIds": request.agentIds,
+                  "decisionRole": request.decisionRole, "providerAssignment": provider_assignment_record},
+            initiated_by=actor,
+            idempotency_key=idempotency_key,
+        )
+        try:
+            simulations.bind_task(run_id, task["id"])
+        except ValueError:
+            if task.get("status") == "queued":
+                try:
+                    task_runtime.cancel(task["id"])
+                except (KeyError, TaskStateError) as exc:
+                    logger.debug("simulation task cleanup found no cancellable task: %s", exc)
+            raise
+    except (ValueError, TaskStateError) as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_ROUND_TASK", "message": str(exc)}) from exc
+    return {"taskId": task["id"], "status": task["status"], "runId": run_id,
+            "roundNumber": round_number, "providerAssignment": provider_assignment_record,
+            "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/runs/{run_id}/adoptions")
+async def propose_simulation_adoption(book_id: str, run_id: str, request: SimulationAdoptionRequest):
+    require_authoritative_project(book_id, "simulation adoption proposal")
+    book = resolve_story_graph_book(book_id)
+    try:
+        run = get_simulation_repository().get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        proposal = SimulationAdoptionService(story_repository.db).propose(
+            run_id, title=request.title, summary=request.summary, payload=request.payload
+        )
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_ADOPTION", "message": str(exc)}) from exc
+    record = _simulation_adoption_record(proposal)
+    return {"proposalId": proposal.id, **record}
+
+
+@app.get("/api/v1/books/{book_id}/simulation/runs/{run_id}/adoptions")
+async def list_simulation_adoptions(book_id: str, run_id: str, limit: int = Query(100, ge=1, le=1000)):
+    book = resolve_story_graph_book(book_id)
+    try:
+        run = get_simulation_repository().get_run(run_id)
+        if run.book_id != str(book["id"]):
+            raise ValueError("simulation run does not belong to book")
+        proposals = SimulationAdoptionService(story_repository.db).list_for_run(run_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(404, detail={"code": "SIMULATION_ADOPTIONS", "message": str(exc)}) from exc
+    return {"runId": run_id, "proposals": [
+        _simulation_adoption_record(
+            item,
+            chapter_intents=_simulation_chapter_intents_for_proposal(book, item.id),
+            writing_tasks=_simulation_writing_tasks_for_proposal(book, item.id),
+        ) for item in proposals
+    ],
+            "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/adoptions/{proposal_id}/adopt")
+async def adopt_simulation_proposal(book_id: str, proposal_id: str, request: SimulationAdoptRequest):
+    require_authoritative_project(book_id, "simulation adoption")
+    book = resolve_story_graph_book(book_id)
+    row = story_repository.db.fetchone("SELECT book_id FROM simulation_adoptions WHERE id=?", (proposal_id,))
+    if row is None or str(row["book_id"]) != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_ADOPTION_NOT_FOUND", "message": "book-scoped proposal not found"})
+    try:
+        proposal = SimulationAdoptionService(story_repository.db).adopt(
+            proposal_id, expected_revision=request.expectedRevision
+        )
+    except ValueError as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_ADOPTION", "message": str(exc)}) from exc
+    record = _simulation_adoption_record(proposal)
+    return {"proposalId": proposal.id, **record}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/adoptions/{proposal_id}/edit")
+async def edit_simulation_proposal(book_id: str, proposal_id: str, request: SimulationAdoptionEditRequest):
+    require_authoritative_project(book_id, "simulation adoption edit")
+    book = resolve_story_graph_book(book_id)
+    row = story_repository.db.fetchone("SELECT book_id FROM simulation_adoptions WHERE id=?", (proposal_id,))
+    if row is None or str(row["book_id"]) != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_ADOPTION_NOT_FOUND", "message": "book-scoped proposal not found"})
+    try:
+        proposal = SimulationAdoptionService(story_repository.db).edit(
+            proposal_id, title=request.title, summary=request.summary, payload=request.payload,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_ADOPTION_EDIT", "message": str(exc)}) from exc
+    record = _simulation_adoption_record(proposal)
+    return {"proposalId": proposal.id, **record}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/adoptions/{proposal_id}/reject")
+async def reject_simulation_proposal(book_id: str, proposal_id: str):
+    require_authoritative_project(book_id, "simulation adoption rejection")
+    book = resolve_story_graph_book(book_id)
+    row = story_repository.db.fetchone("SELECT book_id FROM simulation_adoptions WHERE id=?", (proposal_id,))
+    if row is None or str(row["book_id"]) != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_ADOPTION_NOT_FOUND", "message": "book-scoped proposal not found"})
+    try:
+        proposal = SimulationAdoptionService(story_repository.db).reject(proposal_id)
+    except ValueError as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_ADOPTION_REJECT", "message": str(exc)}) from exc
+    return {"proposalId": proposal.id, "status": proposal.status, "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/adoptions/{proposal_id}/chapter-intent")
+async def create_simulation_chapter_intent(book_id: str, proposal_id: str, request: SimulationChapterIntentRequest):
+    require_authoritative_project(book_id, "simulation chapter intent")
+    book = resolve_story_graph_book(book_id)
+    row = story_repository.db.fetchone("SELECT book_id FROM simulation_adoptions WHERE id=?", (proposal_id,))
+    if row is None or str(row["book_id"]) != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_ADOPTION_NOT_FOUND", "message": "book-scoped proposal not found"})
+    try:
+        intent = SimulationChapterIntentService(
+            story_repository.db,
+            get_active_project_manager().get_project_dir(str(book.get("project_id") or book_id)),
+        ).create(proposal_id, chapter_number=request.chapterNumber)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "SIMULATION_CHAPTER_INTENT", "message": str(exc)}) from exc
+    return {"bookId": book["id"], "proposalId": proposal_id, "intent": intent.to_dict(),
+            "chapterIntents": [intent.to_dict()],
+            "savedTo": "control/runtime/chapter-intent", "canonicalMutation": False}
+
+
+@app.post("/api/v1/books/{book_id}/simulation/adoptions/{proposal_id}/writing-task")
+async def enqueue_simulation_writing_task(
+    book_id: str,
+    proposal_id: str,
+    request: SimulationWritingTaskRequest,
+    http_request: Request,
+):
+    """Queue the existing managed writing/review pipeline after adoption."""
+    require_authoritative_project(book_id, "simulation writing task")
+    actor = _require_author_principal(http_request)
+    book = resolve_story_graph_book(book_id)
+    row = story_repository.db.fetchone("SELECT * FROM simulation_adoptions WHERE id=?", (proposal_id,))
+    if row is None or str(row["book_id"]) != str(book["id"]):
+        raise HTTPException(404, detail={"code": "SIMULATION_ADOPTION_NOT_FOUND", "message": "book-scoped proposal not found"})
+    project_id = str(book.get("project_id") or book_id)
+    authoritative_book_id = str(book["id"])
+    try:
+        require_model_setup(project_id, force=True)
+        require_complete_planning(project_id)
+        intent = SimulationChapterIntentService(
+            story_repository.db, get_active_project_manager().get_project_dir(project_id),
+        ).create(proposal_id, chapter_number=request.chapterNumber)
+        next_chapter_row = story_repository.db.fetchone(
+            "SELECT COALESCE(MAX(number), 0) AS max_number FROM chapters WHERE book_id=?",
+            (authoritative_book_id,),
+        )
+        next_chapter = int((next_chapter_row or {}).get("max_number") or 0) + 1
+        if request.chapterNumber != next_chapter:
+            raise ValueError(f"writing task must target the next chapter ({next_chapter})")
+        active = story_repository.db.fetchone(
+            """SELECT id, status FROM tasks WHERE book_id=? AND type='write-next'
+               AND status IN ('queued', 'running', 'paused', 'waiting_on_child', 'cancelling')
+               ORDER BY created_at DESC LIMIT 1""", (authoritative_book_id,),
+        )
+        if active:
+            raise ValueError(f"chapter generation is already {active['status']}: {active['id']}")
+        workflow = get_creation_workflow().get(project_id) or {}
+        strict_planning = bool((workflow.get("metadata") or {}).get("requireCompletePlanning"))
+        run_config = ContinuousWritingService(
+            story_repository.db, get_active_model_manager(story_repository.db), story_repository, task_runtime,
+            score_threshold=config_int("review", "pass_score", 93),
+            max_revisions=config_int("review", "max_revision_rounds", 3),
+        ).capture_run_configuration(project_id, strict_planning=strict_planning)
+        task = task_runtime.enqueue(
+            "write-next", project_id=project_id, book_id=authoritative_book_id,
+            data={"chapter_number": request.chapterNumber, "context": request.context,
+                  "count": request.count, "plan": intent.to_dict(),
+                  # Carry the adopted Planning overlay through the durable
+                  # writing handoff.  The WritingPipeline uses this id only
+                  # after an accepted StoryCommit to mark the author-owned
+                  # intent fulfilled; it never lets Simulation write Canon.
+                  "storyflow_plan_node_id": intent.source_node_ids[0]
+                  if intent.source_node_ids else None,
+                  "simulation_adoption_id": proposal_id, **run_config},
+            initiated_by=actor,
+            idempotency_key=f"simulation-writing:{proposal_id}:{request.chapterNumber}",
+        )
+    except (ValueError, TaskStateError) as exc:
+        raise HTTPException(409, detail={"code": "SIMULATION_WRITING_TASK", "message": str(exc)}) from exc
+    return {"proposalId": proposal_id, "taskId": task["id"], "status": task["status"],
+            "chapterNumber": request.chapterNumber, "intent": intent.to_dict(),
+            "writingTasks": _simulation_writing_tasks_for_proposal(book, proposal_id),
+            "canonicalMutation": False}
 
 
 @app.get("/api/v1/books/{book_id}/story-graph")
@@ -3413,6 +7635,9 @@ async def get_narrative_health(book_id: str):
 @app.post("/api/v1/books/{book_id}/canonical-imports")
 async def propose_canonical_import(book_id: str, request: Request):
     """Persist an import manifest as proposals; no Canon mutation occurs here."""
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "invalid project id")
+    require_authoritative_project(book_id, "canonical import proposal")
     book = resolve_story_graph_book(book_id)
     body = await request.json()
     if not isinstance(body, dict):
@@ -3453,6 +7678,9 @@ async def get_canonical_import(book_id: str, import_id: str):
 
 @app.post("/api/v1/books/{book_id}/canonical-imports/{import_id}/items/{item_id}/edit")
 async def edit_canonical_import_item(book_id: str, import_id: str, item_id: str, request: Request):
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "invalid project id")
+    require_authoritative_project(book_id, "canonical import edit")
     book = resolve_story_graph_book(book_id)
     record = get_canonical_import_service().get(import_id)
     if record is None or record.get("project_id") != book["project_id"]:
@@ -3470,17 +7698,23 @@ async def edit_canonical_import_item(book_id: str, import_id: str, item_id: str,
 
 @app.post("/api/v1/books/{book_id}/canonical-imports/{import_id}/accept")
 async def accept_canonical_import(book_id: str, import_id: str, request: Request):
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "invalid project id")
+    require_authoritative_project(book_id, "canonical import acceptance")
     book = resolve_story_graph_book(book_id)
     record = get_canonical_import_service().get(import_id)
     if record is None or record.get("project_id") != book["project_id"]:
         raise HTTPException(404, "canonical import not found")
     body = await request.json()
     body = body if isinstance(body, dict) else {}
+    actor = _require_author_principal(request)
     try:
         result = get_canonical_import_service().accept(
             import_id,
             item_ids=body.get("itemIds"),
-            actor_id=str(body.get("actorId") or "author"),
+            actor_id=actor,
+            review_ids=body.get("reviewIds") if isinstance(body.get("reviewIds"), dict) else None,
+            author_confirmed=body.get("authorConfirmed") is True,
         )
     except CanonicalImportError as exc:
         raise HTTPException(422, detail={"code": exc.code, "message": str(exc)}) from exc
@@ -3567,6 +7801,7 @@ async def get_story_graph_layout_history(
 
 @app.post("/api/v1/books/{book_id}/story-graph/layout")
 async def save_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
+    require_authoritative_project(book_id, "Story Graph layout")
     book = resolve_story_graph_book(book_id)
     try:
         items = get_story_graph_projector().save_layout(str(book["id"]), body.view, body.items)
@@ -3578,6 +7813,7 @@ async def save_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
 
 @app.post("/api/v1/books/{book_id}/story-graph/layout/undo")
 async def undo_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
+    require_authoritative_project(book_id, "Story Graph layout undo")
     book = resolve_story_graph_book(book_id)
     try:
         result = get_story_graph_projector().undo_layout(str(book["id"]), body.view)
@@ -3588,6 +7824,7 @@ async def undo_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
 
 @app.post("/api/v1/books/{book_id}/story-graph/layout/redo")
 async def redo_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
+    require_authoritative_project(book_id, "Story Graph layout redo")
     book = resolve_story_graph_book(book_id)
     try:
         result = get_story_graph_projector().redo_layout(str(book["id"]), body.view)
@@ -3598,6 +7835,7 @@ async def redo_story_graph_layout(book_id: str, body: StoryFlowLayoutRequest):
 
 @app.post("/api/v1/books/{book_id}/story-graph/layout/auto")
 async def auto_layout_story_graph(book_id: str, body: StoryFlowLayoutRequest):
+    require_authoritative_project(book_id, "Story Graph auto layout")
     book = resolve_story_graph_book(book_id)
     try:
         result = get_story_graph_projector().auto_layout(str(book["id"]), view=body.view, focus=body.focus, depth=body.depth)
@@ -3791,6 +8029,7 @@ async def retry_story_graph_snapshot(
     body: StoryGraphSnapshotRetryRequest,
 ):
     """Retry only a provenance-safe accepted-commit projection capture."""
+    require_authoritative_project(book_id, "Story Graph snapshot retry")
     book = resolve_story_graph_book(book_id)
     try:
         result = get_story_graph_projector().retry_accepted_commit_snapshot(
@@ -4090,25 +8329,65 @@ async def get_storyflow_candidate_lineage(
 
 
 @app.post("/api/v1/books/{book_id}/story-graph/planning/node")
-async def create_storyflow_planning_node(book_id: str, body: StoryFlowPlanningNodeRequest):
+async def create_storyflow_planning_node(
+    book_id: str,
+    body: StoryFlowPlanningNodeRequest,
+    request: Request,
+):
+    require_authoritative_project(book_id, "StoryFlow planning node")
+    actor = _require_author_principal(request)
     book = resolve_story_graph_book(book_id)
+    service = get_storyflow_planning_service()
     try:
-        graph, revision, node = get_storyflow_planning_service().add_node(
-            str(book["id"]),
-            title=body.title,
-            summary=body.summary,
-            subtype=body.subtype,
-            status=body.status,
-            metadata=body.metadata,
-            source=body.source,
-            expected_revision=body.expectedRevision,
-            anchor_node_id=body.anchorNodeId,
-            anchor_edge_type=body.anchorEdgeType,
-            anchor_label=body.anchorLabel,
-            anchor_source_port=body.anchorSourcePort,
-            anchor_target_port=body.anchorTargetPort,
-            anchor_metadata=body.anchorMetadata,
-        )
+        authoritative_book_id = str(book["id"])
+        if body.proposalId:
+            result = service.apply_proposal(
+                authoritative_book_id,
+                body.proposalId,
+                expected_revision=body.expectedRevision,
+                decided_by=actor,
+            )
+            graph = result["graph"]
+            revision = result["revision"]
+            proposed_node = next(
+                (
+                    item
+                    for item in graph.get("nodes", [])
+                    if isinstance(item, dict) and str(item.get("id")) == str(body.nodeId or "")
+                ),
+                None,
+            )
+            node = proposed_node or {}
+        else:
+            preview = service.preview_node(
+                authoritative_book_id,
+                title=body.title,
+                summary=body.summary,
+                subtype=body.subtype,
+                status=body.status,
+                metadata=body.metadata,
+                source=body.source,
+                expected_revision=body.expectedRevision,
+                node_id=body.nodeId,
+                anchor_node_id=body.anchorNodeId,
+                anchor_edge_type=body.anchorEdgeType,
+                anchor_edge_id=body.anchorEdgeId,
+                anchor_label=body.anchorLabel,
+                anchor_source_port=body.anchorSourcePort,
+                anchor_target_port=body.anchorTargetPort,
+                anchor_metadata=body.anchorMetadata,
+                persist=True,
+                initiated_by=actor,
+            )
+            result = service.apply_proposal(
+                authoritative_book_id,
+                preview["proposal"]["proposalId"],
+                expected_revision=body.expectedRevision,
+                decided_by=actor,
+            )
+            graph = result["graph"]
+            revision = result["revision"]
+            node = preview["node"]
     except StoryFlowPlanningError as exc:
         status = 409 if "revision conflict" in str(exc).lower() else 422
         raise HTTPException(status_code=status, detail={"code": "STORYFLOW_PLANNING_NODE", "message": str(exc)}) from exc
@@ -4122,36 +8401,97 @@ async def create_storyflow_planning_node(book_id: str, body: StoryFlowPlanningNo
         ),
         None,
     )
-    return {"bookId": book_id, "revision": revision, "node": node, "anchorEdge": anchor_edge, "graph": graph}
+    return {
+        "bookId": book_id,
+        "revision": revision,
+        "node": node,
+        "anchorEdge": anchor_edge,
+        "graph": graph,
+        "proposal": result.get("proposal"),
+        "task": result.get("task"),
+        "canonicalMutation": False,
+    }
 
 
 @app.post("/api/v1/books/{book_id}/story-graph/planning/edge")
-async def create_storyflow_planning_edge(book_id: str, body: StoryFlowPlanningEdgeRequest):
+async def create_storyflow_planning_edge(
+    book_id: str,
+    body: StoryFlowPlanningEdgeRequest,
+    request: Request,
+):
+    require_authoritative_project(book_id, "StoryFlow planning edge")
+    actor = _require_author_principal(request)
     book = resolve_story_graph_book(book_id)
+    service = get_storyflow_planning_service()
     try:
-        graph, revision, edge = get_storyflow_planning_service().add_edge(
-            str(book["id"]),
-            source_node_id=body.sourceNodeId,
-            target_node_id=body.targetNodeId,
-            edge_type=body.edgeType,
-            label=body.label,
-            status=body.status,
-            weight=body.weight,
-            confidence=body.confidence,
-            source_port=body.sourcePort,
-            target_port=body.targetPort,
-            metadata=body.metadata,
-            expected_revision=body.expectedRevision,
-        )
+        authoritative_book_id = str(book["id"])
+        if body.proposalId:
+            result = service.apply_proposal(
+                authoritative_book_id,
+                body.proposalId,
+                expected_revision=body.expectedRevision,
+                decided_by=actor,
+            )
+            graph = result["graph"]
+            revision = result["revision"]
+            edge = next(
+                (
+                    item
+                    for item in graph.get("edges", [])
+                    if isinstance(item, dict) and str(item.get("id")) == str(body.edgeId or "")
+                ),
+                {},
+            )
+        else:
+            preview = service.preview_edge(
+                authoritative_book_id,
+                source_node_id=body.sourceNodeId,
+                target_node_id=body.targetNodeId,
+                edge_type=body.edgeType,
+                label=body.label,
+                status=body.status,
+                weight=body.weight,
+                confidence=body.confidence,
+                source_port=body.sourcePort,
+                target_port=body.targetPort,
+                metadata=body.metadata,
+                expected_revision=body.expectedRevision,
+                edge_id=body.edgeId,
+                persist=True,
+                initiated_by=actor,
+            )
+            result = service.apply_proposal(
+                authoritative_book_id,
+                preview["proposal"]["proposalId"],
+                expected_revision=body.expectedRevision,
+                decided_by=actor,
+            )
+            graph = result["graph"]
+            revision = result["revision"]
+            edge = preview["edge"]
     except StoryFlowPlanningError as exc:
         status = 409 if "revision conflict" in str(exc).lower() else 422
         raise HTTPException(status_code=status, detail={"code": "STORYFLOW_PLANNING_EDGE", "message": str(exc)}) from exc
-    return {"bookId": book_id, "revision": revision, "edge": edge, "graph": graph}
+    return {
+        "bookId": book_id,
+        "revision": revision,
+        "edge": edge,
+        "graph": graph,
+        "proposal": result.get("proposal"),
+        "task": result.get("task"),
+        "canonicalMutation": False,
+    }
 
 
 @app.post("/api/v1/books/{book_id}/story-graph/planning/intent")
-async def create_storyflow_chapter_intent(book_id: str, body: StoryFlowIntentRequest):
+async def create_storyflow_chapter_intent(
+    book_id: str,
+    body: StoryFlowIntentRequest,
+    request: Request,
+):
     """Turn a selected real StoryFlow into a durable Chapter Intent."""
+    require_authoritative_project(book_id, "StoryFlow chapter intent")
+    actor = _require_author_principal(request)
     book = resolve_story_graph_book(book_id)
     service = get_storyflow_planning_service()
     try:
@@ -4162,7 +8502,7 @@ async def create_storyflow_chapter_intent(book_id: str, body: StoryFlowIntentReq
                 expected_revision=body.expectedRevision,
             )
             model = storyflow_chapter_intent_model(intent)
-            project_dir = project_mgr.get_project_dir(str(book.get("project_id") or book_id))
+            project_dir = get_active_project_manager().get_project_dir(str(book.get("project_id") or book_id))
             ControlSurface(project_dir).save_chapter_intent(model)
             return {
                 "bookId": book_id,
@@ -4179,8 +8519,14 @@ async def create_storyflow_chapter_intent(book_id: str, body: StoryFlowIntentReq
 
 
 @app.post("/api/v1/books/{book_id}/story-graph/planning/generate")
-async def generate_storyflow_chapter(book_id: str, body: StoryFlowGenerateRequest):
+async def generate_storyflow_chapter(
+    book_id: str,
+    body: StoryFlowGenerateRequest,
+    request: Request,
+):
     """Save a Flow-derived intent and queue the existing managed writing pipeline."""
+    require_authoritative_project(book_id, "StoryFlow chapter generation")
+    actor = _require_author_principal(request)
     book = resolve_story_graph_book(book_id)
     authoritative_book_id = story_graph_authoritative_id(book)
     if not authoritative_book_id:
@@ -4244,7 +8590,7 @@ async def generate_storyflow_chapter(book_id: str, body: StoryFlowGenerateReques
     try:
         run_config = ContinuousWritingService(
             story_repository.db,
-            model_mgr,
+            get_active_model_manager(story_repository.db),
             story_repository,
             task_runtime,
             score_threshold=config_int("review", "pass_score", 93),
@@ -4258,7 +8604,7 @@ async def generate_storyflow_chapter(book_id: str, body: StoryFlowGenerateReques
             expected_revision=body.expectedRevision,
         )
         model = storyflow_chapter_intent_model(intent)
-        ControlSurface(project_mgr.get_project_dir(project_id)).save_chapter_intent(model)
+        ControlSurface(get_active_project_manager().get_project_dir(project_id)).save_chapter_intent(model)
         task = task_runtime.enqueue(
             "write-next",
             project_id=project_id,
@@ -4273,6 +8619,7 @@ async def generate_storyflow_chapter(book_id: str, body: StoryFlowGenerateReques
                 "storyflow_planning_revision": revision,
                 **run_config,
             },
+            initiated_by=actor,
         )
     except StoryFlowPlanningError as exc:
         status = 409 if "revision conflict" in str(exc).lower() else 422
@@ -4305,7 +8652,13 @@ async def generate_storyflow_chapter(book_id: str, body: StoryFlowGenerateReques
 
 
 @app.post("/api/v1/books/{book_id}/story-graph/planning/decision")
-async def decide_storyflow_candidate(book_id: str, body: StoryFlowCandidateDecisionRequest):
+async def decide_storyflow_candidate(
+    book_id: str,
+    body: StoryFlowCandidateDecisionRequest,
+    request: Request,
+):
+    require_authoritative_project(book_id, "StoryFlow candidate decision")
+    _require_author_principal(request)
     book = resolve_story_graph_book(book_id)
     try:
         graph, revision = get_storyflow_planning_service().decide(
@@ -4319,8 +8672,14 @@ async def decide_storyflow_candidate(book_id: str, body: StoryFlowCandidateDecis
 
 
 @app.post("/api/v1/books/{book_id}/story-graph/planning/reconcile")
-async def reconcile_storyflow_plan(book_id: str, body: StoryFlowReconcileRequest):
+async def reconcile_storyflow_plan(
+    book_id: str,
+    body: StoryFlowReconcileRequest,
+    request: Request,
+):
     """Retry a StoryFlow overlay update from a completed writing task result."""
+    require_authoritative_project(book_id, "StoryFlow plan reconciliation")
+    _require_author_principal(request)
     book = resolve_story_graph_book(book_id)
     try:
         graph, revision = get_storyflow_planning_service().reconcile_intent_from_task(
@@ -4344,8 +8703,14 @@ async def reconcile_storyflow_plan(book_id: str, body: StoryFlowReconcileRequest
 
 
 @app.post("/api/v1/books/{book_id}/story-graph/actions/analyze")
-async def analyze_storyflow_selection(book_id: str, body: StoryFlowAnalysisRequest):
+async def analyze_storyflow_selection(
+    book_id: str,
+    body: StoryFlowAnalysisRequest,
+    request: Request,
+):
     """Queue a model-backed analysis for the selected StoryFlow subgraph."""
+    require_authoritative_project(book_id, "StoryFlow analysis")
+    actor = _require_author_principal(request)
     book = resolve_story_graph_book(book_id)
     selected = [str(item).strip() for item in body.nodeIds if str(item).strip()]
     if not selected:
@@ -4366,6 +8731,7 @@ async def analyze_storyflow_selection(book_id: str, body: StoryFlowAnalysisReque
             "analysis_types": [str(item).strip() for item in body.analysisTypes if str(item).strip()],
             "context": body.context.strip(),
         },
+        initiated_by=actor,
         idempotency_key=f"storyflow-analyze:{book_id}:{','.join(selected[:24])}:{datetime.now().strftime('%Y%m%d%H%M%S')}",
     )
     return {"bookId": book_id, "taskId": task["id"], "status": task["status"], "persistedIn": "tasks.result"}
@@ -4529,11 +8895,11 @@ async def story_state(book_id: str):
 
 @app.get("/api/v1/doctor")
 async def run_doctor():
-    """运行诊断"""
+    """运行不泄露凭据的运行时诊断，并汇总最严重的检查状态。"""
     checks = []
 
     # Check the authoritative persisted model setup; never inspect or return raw keys.
-    providers = model_repository.configuration()["providers"]
+    providers = get_model_repository().configuration()["providers"]
     configured = sum(1 for provider in providers if provider["credentialConfigured"])
     if providers and configured == len(providers):
         checks.append({"name": "LLM配置", "status": "ok", "message": f"{len(providers)} 个 Provider 已配置凭据"})
@@ -4541,14 +8907,16 @@ async def run_doctor():
         checks.append({"name": "LLM配置", "status": "warning", "message": "Provider 或凭据未完整配置"})
 
     # 检查项目目录
-    projects_dir = workspace_root / "projects"
+    projects_dir = _active_workspace_root_for(story_repository.db) / "projects"
     if projects_dir.exists():
         project_count = len(list(projects_dir.iterdir()))
         checks.append({"name": "项目目录", "status": "ok", "message": f"共{project_count}个项目"})
     else:
         checks.append({"name": "项目目录", "status": "warning", "message": "项目目录不存在"})
 
-    return {"checks": checks, "status": "ok"}
+    statuses = {str(check.get("status", "warning")).lower() for check in checks}
+    status = "error" if "error" in statuses else "warning" if "warning" in statuses else "ok"
+    return {"checks": checks, "status": status}
 
 # ========== v1 API - 文风分析 ==========
 
@@ -4589,11 +8957,13 @@ async def analyze_style(req: StyleAnalyzeRequest):
 
 
 @app.post("/api/v1/books/{book_id}/style/import")
-async def import_style_profile(book_id: str, req: StyleImportRequest):
+async def import_style_profile(book_id: str, req: StyleImportRequest, request: Request):
     """Persist an analyzed style guide on the selected book."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     project = get_project(book_id)
+    require_authoritative_project(book_id, "style profile import")
+    _require_author_principal(request)
     profile = await analyze_style(StyleAnalyzeRequest(text=req.text, sourceName=req.sourceName))
     guide = (
         f"来源：{profile['sourceName']}；平均句长：{profile['avgSentenceLength']}；"
@@ -4601,15 +8971,42 @@ async def import_style_profile(book_id: str, req: StyleImportRequest):
         f"词汇多样性：{profile['vocabularyDiversity']}。"
         f"常见特征：{'、'.join(profile['topPatterns'] + profile['rhetoricalFeatures']) or '未检测到明显特征'}。"
     )
-    project.writing_style = guide
-    project.style_profile = {
+    style_profile = {
         **(project.style_profile if isinstance(project.style_profile, dict) else {}),
         "sourceName": profile["sourceName"],
         "metrics": profile,
         "sample": req.text[:4000],
     }
-    project_mgr.save_project(project)
-    return {"bookId": book_id, "writingStyle": guide, "styleProfile": project.style_profile, "profile": profile}
+    workflow_repo = get_creation_workflow()
+    existing_workflow = workflow_repo.get(book_id) or {}
+    workflow_repo.ensure(book_id, existing_workflow.get("mode", "planned"))
+    workflow_repo.add_source(
+        book_id,
+        "language_plan",
+        req.sourceName or "style-sample.txt",
+        req.text,
+        metadata={"sourceRole": "style_import", "analyzedAt": datetime.now().isoformat()},
+    )
+    get_story_bible_repository().ensure(book_id)
+    get_story_bible_repository().save_draft(
+        book_id,
+        "voice",
+        {"summary": guide, "styleProfile": style_profile},
+        source="author",
+    )
+    workflow_repo.set_status(
+        book_id,
+        "planning",
+        metadata={"styleImportDrafted": True, "styleImportSource": req.sourceName or "style-sample.txt"},
+    )
+    return {
+        "bookId": book_id,
+        "writingStyle": guide,
+        "styleProfile": style_profile,
+        "profile": profile,
+        "storyBibleDrafted": ["voice"],
+        "requiresStoryBiblePublish": True,
+    }
 
 # ========== v1 API - 文档摄取 ==========
 
@@ -4619,21 +9016,29 @@ def _document_http_error(exc: DocumentIngestionError) -> HTTPException:
 
 
 @app.post("/api/v1/books/{book_id}/documents")
-async def upload_document(book_id: str, file: UploadFile = File(...), docType: str = Form("auto")):
+async def upload_document(
+    book_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    docType: str = Form("auto"),
+):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "document upload")
+    actor = _require_author_principal(request)
     try:
         payload = await file.read(DEFAULT_MAX_BYTES + 1)
-        document, deduplicated = document_repository.create_upload(
+        document, deduplicated = get_document_repository().create_upload(
             book_id, file.filename or "", payload, doc_type=docType, mime_type=file.content_type
         )
         task = task_runtime.enqueue(
             "ingest-document", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={"document_id": document["id"]},
+            initiated_by=actor,
             idempotency_key=f"ingest-document:{document['id']}:{document['source_fingerprint']}",
         )
-        document_repository.mark_task(document["id"], task["id"])
-        document = document_repository.get(document["id"], project_id=book_id) or document
+        get_document_repository().mark_task(document["id"], task["id"])
+        document = get_document_repository().get(document["id"], project_id=book_id) or document
         return {"document": document, "documentId": document["id"], "taskId": task["id"],
                 "status": task["status"], "deduplicated": deduplicated}
     except DocumentIngestionError as exc:
@@ -4645,14 +9050,14 @@ async def list_documents(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
-    return {"documents": document_repository.list(book_id)}
+    return {"documents": get_document_repository().list(book_id)}
 
 
 @app.get("/api/v1/books/{book_id}/documents/{document_id}")
 async def get_document(book_id: str, document_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
-    document = document_repository.get(document_id, project_id=book_id)
+    document = get_document_repository().get(document_id, project_id=book_id)
     if document is None:
         raise HTTPException(404, "document not found")
     return {"document": document}
@@ -4662,26 +9067,29 @@ async def get_document(book_id: str, document_id: str):
 async def get_document_chunks(book_id: str, document_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
-    document = document_repository.get(document_id, project_id=book_id)
+    document = get_document_repository().get(document_id, project_id=book_id)
     if document is None:
         raise HTTPException(404, "document not found")
-    return {"documentId": document_id, "chunks": document_repository.chunks(document_id, project_id=book_id)}
+    return {"documentId": document_id, "chunks": get_document_repository().chunks(document_id, project_id=book_id)}
 
 
 @app.post("/api/v1/books/{book_id}/documents/{document_id}/retry")
-async def retry_document(book_id: str, document_id: str):
+async def retry_document(book_id: str, document_id: str, request: Request):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
-    document = document_repository.get(document_id, project_id=book_id)
+    require_authoritative_project(book_id, "document retry")
+    actor = _require_author_principal(request)
+    document = get_document_repository().get(document_id, project_id=book_id)
     if document is None:
         raise HTTPException(404, "document not found")
     try:
-        document = document_repository.reset_for_retry(document_id)
+        document = get_document_repository().reset_for_retry(document_id)
         task = task_runtime.enqueue(
             "ingest-document", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={"document_id": document_id},
+            initiated_by=actor,
             idempotency_key=f"ingest-document-retry:{document_id}:{document['updated_at']}",
         )
-        document_repository.mark_task(document_id, task["id"])
+        get_document_repository().mark_task(document_id, task["id"])
         return {"documentId": document_id, "taskId": task["id"], "status": task["status"]}
     except DocumentIngestionError as exc:
         raise _document_http_error(exc) from exc
@@ -4784,6 +9192,8 @@ async def create_draft_import(book_id: str, request: Request):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "draft import")
+    actor = _require_author_principal(request)
     require_model_setup(book_id)
     try:
         form = await request.form()
@@ -4806,7 +9216,7 @@ async def create_draft_import(book_id: str, request: Request):
             story_file = cast(UploadFile, story_upload)
             story_payload = await _read_upload(story_file, max_bytes=DEFAULT_MAX_BYTES)
             story_name = _safe_draft_relative_path(story_file.filename or "story-bible.md")
-            story_document, _ = document_repository.create_upload(
+            story_document, _ = get_document_repository().create_upload(
                 book_id, Path(story_name).name, story_payload, doc_type="world", mime_type=story_file.content_type,
                 metadata={"sourceRole": "story_bible", "relativePath": story_name, "priority": 100},
             )
@@ -4820,7 +9230,7 @@ async def create_draft_import(book_id: str, request: Request):
             outline_file = cast(UploadFile, outline_upload)
             outline_payload = await _read_upload(outline_file, max_bytes=DEFAULT_MAX_BYTES)
             outline_name = _safe_draft_relative_path(outline_file.filename or "story-outline.md")
-            outline_document, _ = document_repository.create_upload(
+            outline_document, _ = get_document_repository().create_upload(
                 book_id, Path(outline_name).name, outline_payload, doc_type="reference", mime_type=outline_file.content_type,
                 metadata={"sourceRole": "story_outline", "relativePath": outline_name, "priority": 95},
             )
@@ -4834,7 +9244,7 @@ async def create_draft_import(book_id: str, request: Request):
             language_file = cast(UploadFile, language_upload)
             language_payload = await _read_upload(language_file, max_bytes=DEFAULT_MAX_BYTES)
             language_name = _safe_draft_relative_path(language_file.filename or "language-plan.md")
-            language_document, _ = document_repository.create_upload(
+            language_document, _ = get_document_repository().create_upload(
                 book_id, Path(language_name).name, language_payload, doc_type="style", mime_type=language_file.content_type,
                 metadata={"sourceRole": "language_plan", "relativePath": language_name, "priority": 90},
             )
@@ -4866,7 +9276,7 @@ async def create_draft_import(book_id: str, request: Request):
 
         draft_document_ids: list[str] = []
         for relative, content in draft_entries:
-            document, _ = document_repository.create_upload(
+            document, _ = get_document_repository().create_upload(
                 book_id,
                 Path(relative).name,
                 content,
@@ -4887,6 +9297,7 @@ async def create_draft_import(book_id: str, request: Request):
             project_id=book_id,
             book_id=get_authoritative_book_id(book_id),
             data={"draft_import_id": record["id"]},
+            initiated_by=actor,
             idempotency_key=f"draft-import-analysis:{record['id']}",
         )
         draft_repo.set_task(record["id"], task["id"], project_id=book_id)
@@ -4925,11 +9336,17 @@ async def get_draft_import(book_id: str, import_id: str):
 
 
 @app.post("/api/v1/books/{book_id}/draft-imports/{import_id}/prepare-planning")
-async def prepare_draft_import_planning(book_id: str, import_id: str):
+async def prepare_draft_import_planning(
+    book_id: str,
+    import_id: str,
+    request: Request,
+):
     """Turn a completed folder analysis into reviewable 25-step planning drafts."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "draft import planning preparation")
+    _require_author_principal(request)
     require_model_setup(book_id)
     record = get_draft_import_repository().get(import_id, project_id=book_id)
     if record is None:
@@ -4965,11 +9382,17 @@ async def prepare_draft_import_planning(book_id: str, import_id: str):
 
 
 @app.post("/api/v1/books/{book_id}/draft-imports/{import_id}/adjustment-plan")
-async def create_draft_adjustment_plan(book_id: str, import_id: str):
+async def create_draft_adjustment_plan(
+    book_id: str,
+    import_id: str,
+    request: Request,
+):
     """Queue an author-reviewable continuation plan without mutating story state."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "draft adjustment planning")
+    actor = _require_author_principal(request)
     require_model_setup(book_id)
     repo = get_draft_import_repository()
     record = repo.get(import_id, project_id=book_id)
@@ -4983,6 +9406,7 @@ async def create_draft_adjustment_plan(book_id: str, import_id: str):
             project_id=book_id,
             book_id=get_authoritative_book_id(book_id),
             data={"draft_import_id": import_id},
+            initiated_by=actor,
             idempotency_key=f"draft-import-adjustment-plan:{import_id}:{record['updated_at']}",
         )
         repo.update_report(
@@ -4997,10 +9421,16 @@ async def create_draft_adjustment_plan(book_id: str, import_id: str):
 
 
 @app.post("/api/v1/books/{book_id}/draft-imports/{import_id}/retry")
-async def retry_draft_import(book_id: str, import_id: str):
+async def retry_draft_import(
+    book_id: str,
+    import_id: str,
+    request: Request,
+):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "draft import retry")
+    actor = _require_author_principal(request)
     require_model_setup(book_id)
     try:
         repo = get_draft_import_repository()
@@ -5010,6 +9440,7 @@ async def retry_draft_import(book_id: str, import_id: str):
             project_id=book_id,
             book_id=get_authoritative_book_id(book_id),
             data={"draft_import_id": import_id},
+            initiated_by=actor,
             idempotency_key=f"draft-import-analysis-retry:{import_id}:{record['updated_at']}",
         )
         repo.set_task(import_id, task["id"], project_id=book_id)
@@ -5044,13 +9475,57 @@ async def search_book_rag(
 
 # ========== v1 API - 兼容章节导入 ==========
 
-def _queue_world_bootstrap(project: StoryProject, brief: str) -> dict[str, Any]:
+def _stage_derived_creation_inputs(
+    project: StoryProject,
+    *,
+    entry: str,
+    intent: str,
+    sources: Sequence[tuple[str, str, str, dict[str, Any]]],
+) -> None:
+    """Keep compatibility creation modes on the durable planning boundary.
+
+    The project row is created by ``ProjectManager.create_project``.  Follow-up
+    material is deliberately stored as planning input and an author-owned Story
+    Bible draft; it must not be copied into the project's world/entity
+    projections before the later Proposal -> confirmation -> publish flow.
+    """
+    workflow_repo = get_creation_workflow()
+    workflow_repo.ensure(project.id, "planned", intent)
+    get_story_bible_repository().ensure(project.id)
+    get_story_bible_repository().save_draft(project.id, "intent", intent, source="author")
+    for source_type, filename, content, metadata in sources:
+        workflow_repo.add_source(
+            project.id,
+            source_type,
+            filename,
+            content,
+            metadata={"creationEntry": entry, **metadata},
+        )
+    workflow_repo.set_status(
+        project.id,
+        "planning",
+        metadata={
+            "creationEntry": entry,
+            "requireCompletePlanning": True,
+            "planningPrepared": False,
+            "planningCompleted": False,
+        },
+    )
+
+
+def _queue_world_bootstrap(
+    project: StoryProject,
+    brief: str,
+    *,
+    initiated_by: str | None = None,
+) -> dict[str, Any]:
     book_id = get_authoritative_book_id(project.id)
     task = task_runtime.enqueue(
         "world-bootstrap",
         project_id=project.id,
         book_id=book_id,
         data={"brief": brief[:12000]},
+        initiated_by=initiated_by or current_request_principal() or "system",
         idempotency_key=f"world-bootstrap:{project.id}",
     )
     return {"taskId": task["id"], "status": task["status"]}
@@ -5060,61 +9535,142 @@ def _queue_world_bootstrap(project: StoryProject, brief: str) -> dict[str, Any]:
 async def import_canon(book_id: str, req: CanonImportRequest):
     if not validate_project_id(book_id) or not validate_project_id(req.fromBookId):
         raise HTTPException(400, "invalid project id")
+    require_authoritative_project(book_id, "canonical chapter import")
     if book_id == req.fromBookId:
         raise HTTPException(400, "source and target books must differ")
-    source = get_project(req.fromBookId)
-    target = get_project(book_id)
-    target.world = deepcopy(source.world)
-    target.characters = deepcopy(source.characters)
-    target.factions = deepcopy(source.factions)
-    target.locations = deepcopy(source.locations)
-    target.foreshadowing = deepcopy(source.foreshadowing)
-    target.writing_style = source.writing_style
-    project_mgr.save_project(target)
-    return {"bookId": book_id, "fromBookId": req.fromBookId, "imported": ["world", "characters", "factions", "locations", "foreshadowing"]}
+    source_book = resolve_story_graph_book(req.fromBookId)
+    target_book = resolve_story_graph_book(book_id)
+    source = get_project(str(source_book["project_id"]))
+
+    # This legacy endpoint used to copy mutable project/entity fields directly
+    # into the target.  That bypassed CanonicalImportService and made an old
+    # route a hidden Canon write path.  Stage only immutable chapter proposals;
+    # the normal canonical-import review/StoryCommit flow remains the sole
+    # acceptance boundary.  World-building fields intentionally stay out of
+    # this compatibility route and must enter through Story Bible/Planning.
+    manifest: list[dict[str, Any]] = []
+    for number, chapter in sorted(source.chapters.items(), key=lambda item: int(item[0])):
+        content = str(getattr(chapter, "content", "") or "").strip()
+        if not content:
+            continue
+        manifest.append({
+            "itemType": "chapter",
+            "chapterNumber": int(number),
+            "proposedValue": {
+                "title": str(getattr(chapter, "title", "") or ""),
+                "content": content,
+                "facts": [],
+                "stateChanges": {},
+            },
+            "provenance": {
+                "sourceProjectId": str(source_book["project_id"]),
+                "sourceBookId": str(source_book["id"]),
+                "sourceChapterNumber": int(number),
+            },
+        })
+    if not manifest:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "CANON_IMPORT_NO_CHAPTERS",
+                "message": "source has no chapter content to stage; use Story Bible/Planning for world data",
+            },
+        )
+    try:
+        proposal = get_canonical_import_service().propose(
+            str(target_book["project_id"]),
+            manifest,
+            source_fingerprint=f"legacy-canon:{source_book['id']}:{len(manifest)}",
+        )
+    except CanonicalImportError as exc:
+        raise HTTPException(422, detail={"code": exc.code, "message": str(exc)}) from exc
+    return {
+        "bookId": book_id,
+        "authoritativeBookId": str(target_book["id"]),
+        "fromBookId": req.fromBookId,
+        "canonicalMutation": False,
+        "requiresAuthorReview": True,
+        "imported": [],
+        "canonicalImport": proposal,
+        "message": "chapter proposals staged; no Canon or mutable world state was changed",
+    }
 
 
 @app.post("/api/v1/fanfic/init")
-async def init_fanfic(req: FanficInitRequest):
+async def init_fanfic(req: FanficInitRequest, request: Request):
+    actor = _require_author_principal(request)
     if not req.title.strip() or not req.sourceText.strip():
         raise HTTPException(400, "title and sourceText are required")
-    project = project_mgr.create_project(req.title.strip(), req.genre, language=req.language)
-    project.author_intent = f"fanfic:{req.mode}\n{req.sourceText[:12000]}"
-    source_path = project_mgr.get_project_dir(project.id) / "attachments" / "fanfic-source.md"
+    project = get_active_project_manager().create_project(req.title.strip(), req.genre, language=req.language)
+    intent = f"fanfic:{req.mode}\n{req.sourceText[:12000]}"
+    source_path = get_active_project_manager().get_project_dir(project.id) / "attachments" / "fanfic-source.md"
     source_path.write_text(req.sourceText, encoding="utf-8")
-    project_mgr.save_project(project)
-    queued = _queue_world_bootstrap(project, project.author_intent)
+    _stage_derived_creation_inputs(
+        project,
+        entry="fanfic",
+        intent=intent,
+        sources=[(
+            "reference",
+            "fanfic-source.md",
+            req.sourceText,
+            {"sourceRole": "fanfic_source", "mode": req.mode},
+        )],
+    )
+    queued = _queue_world_bootstrap(project, intent, initiated_by=actor)
     return {"bookId": project.id, **queued}
 
 
 @app.post("/api/v1/spinoff/init")
-async def init_spinoff(req: SpinoffInitRequest):
+async def init_spinoff(req: SpinoffInitRequest, request: Request):
+    actor = _require_author_principal(request)
     if not req.title.strip() or not validate_project_id(req.parentBookId):
         raise HTTPException(400, "title and parentBookId are required")
     parent = get_project(req.parentBookId)
-    project = project_mgr.create_project(req.title.strip(), parent.genre, language=parent.language)
-    project.world = deepcopy(parent.world)
-    project.characters = deepcopy(parent.characters)
-    project.factions = deepcopy(parent.factions)
-    project.locations = deepcopy(parent.locations)
-    project.foreshadowing = deepcopy(parent.foreshadowing)
-    project.writing_style = parent.writing_style
-    project.author_intent = f"spinoff of {parent.name}\n{req.direction.strip()}"
-    project_mgr.save_project(project)
-    queued = _queue_world_bootstrap(project, project.author_intent)
+    project = get_active_project_manager().create_project(req.title.strip(), parent.genre, language=parent.language)
+    parent_snapshot = parent.to_dict()
+    parent_snapshot.pop("chapters", None)
+    parent_reference = json.dumps(parent_snapshot, ensure_ascii=False, default=str)
+    intent = f"spinoff of {parent.name}\n{req.direction.strip()}"
+    _stage_derived_creation_inputs(
+        project,
+        entry="spinoff",
+        intent=intent,
+        sources=[(
+            "reference",
+            f"spinoff-parent-{parent.id}.json",
+            parent_reference,
+            {"sourceRole": "parent_project", "parentProjectId": parent.id},
+        )],
+    )
+    queued = _queue_world_bootstrap(
+        project,
+        f"{intent}\n\n父作品参考（仅作为衍生设定输入，必须作者确认）：\n{parent_reference[:12000]}",
+        initiated_by=actor,
+    )
     return {"bookId": project.id, "parentBookId": req.parentBookId, **queued}
 
 
 @app.post("/api/v1/imitation/init")
-async def init_imitation(req: ImitationInitRequest):
+async def init_imitation(req: ImitationInitRequest, request: Request):
+    actor = _require_author_principal(request)
     if not req.title.strip() or not req.referenceText.strip() or not req.storyIdea.strip():
         raise HTTPException(400, "title, referenceText, and storyIdea are required")
-    project = project_mgr.create_project(req.title.strip(), req.genre, language=req.language)
-    project.author_intent = f"imitation study\n{req.storyIdea[:12000]}"
-    source_path = project_mgr.get_project_dir(project.id) / "attachments" / "style-reference.txt"
+    project = get_active_project_manager().create_project(req.title.strip(), req.genre, language=req.language)
+    intent = f"imitation study\n{req.storyIdea[:12000]}"
+    source_path = get_active_project_manager().get_project_dir(project.id) / "attachments" / "style-reference.txt"
     source_path.write_text(req.referenceText, encoding="utf-8")
-    project_mgr.save_project(project)
-    queued = _queue_world_bootstrap(project, project.author_intent)
+    _stage_derived_creation_inputs(
+        project,
+        entry="imitation",
+        intent=intent,
+        sources=[(
+            "reference",
+            "style-reference.txt",
+            req.referenceText,
+            {"sourceRole": "style_reference"},
+        )],
+    )
+    queued = _queue_world_bootstrap(project, intent, initiated_by=actor)
     return {"bookId": project.id, **queued}
 
 @app.post("/api/v1/books/{book_id}/import/chapters")
@@ -5123,6 +9679,8 @@ async def import_chapters(book_id: str, request: Request):
     if not validate_project_id(book_id):
         raise HTTPException(400, "无效的项目ID")
     get_project(book_id)
+    require_authoritative_project(book_id, "chapter source import")
+    actor = _require_author_principal(request)
     try:
         content_type = request.headers.get("content-type", "").lower()
         if content_type.startswith("multipart/"):
@@ -5142,14 +9700,15 @@ async def import_chapters(book_id: str, request: Request):
             payload = text.encode("utf-8")
             filename = "chapters.md"
             mime_type = "text/markdown"
-        document, deduplicated = document_repository.create_upload(
+        document, deduplicated = get_document_repository().create_upload(
             book_id, filename, payload, doc_type="chapter", mime_type=mime_type
         )
         task = task_runtime.enqueue(
             "ingest-document", project_id=book_id, book_id=get_authoritative_book_id(book_id), data={"document_id": document["id"]},
+            initiated_by=actor,
             idempotency_key=f"ingest-document:{document['id']}:{document['source_fingerprint']}",
         )
-        document_repository.mark_task(document["id"], task["id"])
+        get_document_repository().mark_task(document["id"], task["id"])
         return {
             "documentId": document["id"], "taskId": task["id"], "status": task["status"],
             "deduplicated": deduplicated,
@@ -5194,6 +9753,16 @@ async def get_story_bible(book_id: str):
         bible_repo = get_story_bible_repository()
         result = bible_repo.get(book_id)
         if result is None:
+            if not story_repository.is_authoritative_project(book_id):
+                # Do not create the 25-step workspace as a side effect of
+                # opening a legacy project. Migration must remain explicit.
+                return {
+                    "workspace": None,
+                    "steps": [],
+                    "snapshots": [],
+                    "readOnly": True,
+                    "legacyProject": True,
+                }
             result = bible_repo.ensure(book_id)
         return result
     except StoryBibleError as exc:
@@ -5201,11 +9770,18 @@ async def get_story_bible(book_id: str):
 
 
 @app.put("/api/v1/books/{book_id}/story-bible/steps/{step_key}")
-async def save_story_bible_step(book_id: str, step_key: str, body: StoryBibleStepRequest):
+async def save_story_bible_step(
+    book_id: str,
+    step_key: str,
+    body: StoryBibleStepRequest,
+    request: Request,
+):
     """Save an author draft for a Story Bible step."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "Story Bible draft")
+    _require_author_principal(request)
     try:
         return get_story_bible_repository().save_draft(book_id, step_key, body.payload)
     except StoryBibleError as exc:
@@ -5213,11 +9789,13 @@ async def save_story_bible_step(book_id: str, step_key: str, body: StoryBibleSte
 
 
 @app.post("/api/v1/books/{book_id}/story-bible/steps/{step_key}/confirm")
-async def confirm_story_bible_step(book_id: str, step_key: str):
+async def confirm_story_bible_step(book_id: str, step_key: str, request: Request):
     """Confirm a Story Bible step; all preceding steps must be confirmed first."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "Story Bible confirmation")
+    _require_author_principal(request)
     try:
         return get_story_bible_repository().confirm(book_id, step_key)
     except StoryBibleError as exc:
@@ -5225,11 +9803,13 @@ async def confirm_story_bible_step(book_id: str, step_key: str):
 
 
 @app.post("/api/v1/books/{book_id}/story-bible/publish")
-async def publish_story_bible(book_id: str):
+async def publish_story_bible(book_id: str, request: Request):
     """Publish the Story Bible when all 25 steps are confirmed."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "Story Bible publish")
+    actor = _require_author_principal(request)
     require_model_setup(book_id)
     try:
         result = get_story_bible_repository().publish(book_id)
@@ -5245,12 +9825,17 @@ async def publish_story_bible(book_id: str):
             project_id=book_id,
             book_id=get_authoritative_book_id(book_id),
             data={"source": "story-bible-publish"},
+            initiated_by=actor,
             idempotency_key=f"planning-views:story-bible:{book_id}:{workflow.get('updated_at')}",
         )
         result["architectureViews"] = len(views)
         result["planningReadiness"] = readiness
         result["aiTaskId"] = task["id"]
-        synthesis_task = _queue_planning_synthesis(book_id, "story-bible-publish")
+        synthesis_task = _queue_planning_synthesis(
+            book_id,
+            "story-bible-publish",
+            initiated_by=actor,
+        )
         result["synthesisTaskId"] = synthesis_task["id"]
         result["synthesisTaskStatus"] = synthesis_task["status"]
         return result
@@ -5259,10 +9844,17 @@ async def publish_story_bible(book_id: str):
 
 
 @app.post("/api/v1/books/{book_id}/story-bible/steps/{step_key}/suggest")
-async def suggest_story_bible_step(book_id: str, step_key: str, body: StoryBibleSuggestRequest):
+async def suggest_story_bible_step(
+    book_id: str,
+    step_key: str,
+    body: StoryBibleSuggestRequest,
+    request: Request,
+):
     """Queue an AI suggestion task for a Story Bible step."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
+    require_authoritative_project(book_id, "Story Bible suggestion")
+    actor = _require_author_principal(request)
     require_model_setup(book_id)
     # Validate step_key is a valid Story Bible step.
     valid_steps = {key for _, key in STORY_BIBLE_STEPS}
@@ -5277,12 +9869,217 @@ async def suggest_story_bible_step(book_id: str, step_key: str, body: StoryBible
         "story-bible-suggest",
         project_id=book_id, book_id=get_authoritative_book_id(book_id),
         data={"step_key": step_key, "brief": body.brief},
+        initiated_by=actor,
         idempotency_key=f"bible-suggest:{book_id}:{step_key}",
     )
     return {"taskId": task["id"], "status": task["status"], "step": step_key}
 
 
 # ========== v1 API - Review ==========
+
+def _review_workspace_chapter(
+    project_id: str,
+    authoritative_book_id: str,
+    chapter: dict[str, Any],
+    *,
+    review_repo: ReviewRepository,
+    tasks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Assemble the native Review-to-Canon handoff for one chapter.
+
+    This is a read model only.  It exposes the latest immutable ChapterVersion,
+    its latest Review, pending StoryCommits, and related task state; Canon is
+    changed only by the guarded acceptance endpoint below.
+    """
+    chapter_number = int(chapter["number"])
+    latest_review = review_repo.get_latest_review(project_id, chapter_number)
+    latest_version_id = chapter.get("version_id")
+    pending_rows = story_repository.db.fetchall(
+        """SELECT sc.*
+           FROM story_commits sc
+           WHERE sc.chapter_id=? AND sc.status='pending'
+           ORDER BY sc.created_at DESC, sc.id DESC""",
+        (chapter["id"],),
+    )
+
+    def decode(value: Any, fallback: Any) -> Any:
+        if value is None:
+            return fallback
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return fallback
+        return parsed
+
+    pending_commits: list[dict[str, Any]] = []
+    for row in pending_rows:
+        commit = dict(row)
+        commit["facts"] = decode(commit.pop("facts_extracted", None), [])
+        commit["stateChanges"] = decode(commit.pop("state_changes", None), {})
+        commit["overrideProvenance"] = decode(commit.pop("override_provenance", None), {})
+        commit["reviewId"] = commit.get("review_id")
+        commit["chapterVersionId"] = commit.get("chapter_version_id")
+        commit["blockingIssues"] = int(commit.get("blocking_issues") or 0)
+        pending_commits.append(commit)
+
+    issues = (latest_review or {}).get("issues") or []
+    actionable_issues = [
+        issue for issue in issues
+        if (issue.get("status") or "open") not in {"resolved", "fixed", "ignored"}
+        and (bool(issue.get("blocking")) or issue.get("severity") in {"major", "critical", "blocking"})
+    ]
+    review_matches_version = bool(
+        latest_review
+        and latest_version_id
+        and latest_review.get("chapter_version_id") == latest_version_id
+    )
+    review_passed = bool(
+        latest_review
+        and latest_review.get("passed")
+        and latest_review.get("verdict") == "pass"
+        and review_matches_version
+        and not actionable_issues
+    )
+    acceptable_commit_ids = {
+        commit["id"] for commit in pending_commits
+        if latest_review
+        and commit.get("review_id") == latest_review.get("id")
+        and commit.get("chapter_version_id") == latest_version_id
+        and not int(commit.get("blocking_issues") or 0)
+    }
+    chapter_tasks = [
+        {
+            "id": task.get("id"),
+            "type": task.get("type"),
+            "status": task.get("status"),
+            "stage": task.get("stage"),
+            "errorCode": task.get("error_code"),
+        }
+        for task in tasks
+        if task.get("type") in {"review-chapter", "write", "write-next", "continuous"}
+        and (
+            (task.get("data") or {}).get("chapter") == chapter_number
+            or (task.get("data") or {}).get("chapter_number") == chapter_number
+            or task.get("type") == "continuous"
+        )
+    ]
+    return {
+        "number": chapter_number,
+        "chapterId": chapter["id"],
+        "title": chapter.get("title") or "",
+        "status": chapter.get("status") or "draft",
+        "latestVersion": {
+            "id": latest_version_id,
+            "version": chapter.get("version"),
+            "wordCount": chapter.get("word_count") or 0,
+            "createdAt": chapter.get("version_created_at"),
+        } if latest_version_id else None,
+        "latestReview": latest_review,
+        "pendingCommits": pending_commits,
+        "tasks": chapter_tasks,
+        "blockingIssueCount": len(actionable_issues),
+        "canAccept": bool(review_passed and acceptable_commit_ids),
+        "acceptableCommitIds": sorted(acceptable_commit_ids),
+        "bookId": authoritative_book_id,
+    }
+
+
+@app.get("/api/v1/books/{book_id}/review-workspace")
+async def get_review_workspace(book_id: str, chapter: Optional[int] = Query(None, ge=1)):
+    """Return the native Review and guarded Canon handoff state."""
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "invalid project id")
+    get_project(book_id)
+    authoritative_book_id = get_authoritative_book_id(book_id)
+    clauses = ["c.book_id=?"]
+    params: list[Any] = [authoritative_book_id]
+    if chapter is not None:
+        clauses.append("c.number=?")
+        params.append(chapter)
+    rows = story_repository.db.fetchall(
+        f"""SELECT c.id, c.number, c.title, c.status,
+                   cv.id AS version_id, cv.version, cv.word_count,
+                   cv.created_at AS version_created_at
+            FROM chapters c
+            LEFT JOIN chapter_versions cv ON cv.id=(
+                SELECT latest.id FROM chapter_versions latest
+                WHERE latest.chapter_id=c.id
+                ORDER BY latest.version DESC LIMIT 1
+            )
+            WHERE {' AND '.join(clauses)}
+            ORDER BY c.number LIMIT 200""",
+        tuple(params),
+    )
+    tasks = task_runtime.list(project_id=book_id, limit=200)
+    review_repo = get_review_repository()
+    chapters = [
+        _review_workspace_chapter(
+            book_id,
+            authoritative_book_id,
+            row,
+            review_repo=review_repo,
+            tasks=tasks,
+        )
+        for row in rows
+    ]
+    return {
+        "bookId": authoritative_book_id,
+        "projectId": book_id,
+        "chapterFilter": chapter,
+        "chapters": chapters,
+        "count": len(chapters),
+    }
+
+
+@app.post("/api/v1/books/{book_id}/chapters/{num}/accept-reviewed-commit")
+async def accept_reviewed_story_commit(
+    book_id: str,
+    num: int,
+    body: ReviewedStoryCommitAcceptanceRequest,
+    request: Request,
+):
+    """Accept an existing reviewed StoryCommit after author confirmation."""
+    if not validate_project_id(book_id):
+        raise HTTPException(400, "invalid project id")
+    get_project(book_id)
+    require_authoritative_project(book_id, "StoryCommit acceptance")
+    actor = _require_author_principal(request)
+    authoritative_book_id = get_authoritative_book_id(book_id)
+    commit = story_repository.db.fetchone(
+        """SELECT sc.id, sc.status, sc.review_id, sc.chapter_version_id,
+                  c.number, c.book_id, b.project_id
+           FROM story_commits sc
+           JOIN chapters c ON c.id=sc.chapter_id
+           JOIN books b ON b.id=c.book_id
+           WHERE sc.id=?""",
+        (body.commitId,),
+    )
+    if commit is None:
+        raise HTTPException(404, "StoryCommit not found")
+    if commit["project_id"] != book_id or commit["book_id"] != authoritative_book_id or int(commit["number"]) != num:
+        raise HTTPException(409, "StoryCommit does not belong to this project, book, or chapter")
+    if not body.authorConfirmed:
+        raise HTTPException(
+            409,
+            {"code": "AUTHOR_CONFIRMATION_REQUIRED", "message": "作者确认后才能接受 StoryCommit"},
+        )
+    try:
+        result = story_repository.accept_reviewed_story_commit(
+            body.commitId,
+            body.reviewId,
+            author_confirmed=body.authorConfirmed,
+        )
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        **result,
+        "commitId": body.commitId,
+        "reviewId": result.get("review_id") or body.reviewId,
+    }
 
 @app.get("/api/v1/books/{book_id}/chapters/{num}/reviews")
 async def get_chapter_reviews(book_id: str, num: int):
@@ -5291,7 +10088,7 @@ async def get_chapter_reviews(book_id: str, num: int):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
     try:
-        reviews = review_repository.get_chapter_reviews(book_id, num)
+        reviews = get_review_repository().get_chapter_reviews(book_id, num)
         return {"reviews": reviews, "count": len(reviews)}
     except Exception as exc:
         raise HTTPException(500, f"Failed to get reviews: {exc}") from exc
@@ -5304,8 +10101,18 @@ async def get_review(book_id: str, review_id: str):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
     try:
-        review = review_repository.get_review(review_id)
+        review = get_review_repository().get_review(review_id)
         if not review:
+            raise HTTPException(404, "Review not found")
+        review_scope = story_repository.db.fetchone(
+            """SELECT b.project_id FROM reviews r
+               JOIN chapters c ON c.id=r.chapter_id
+               JOIN books b ON b.id=c.book_id
+               WHERE r.id=?""",
+            (review_id,),
+        )
+        if review_scope is None or review_scope["project_id"] != book_id:
+            # Do not reveal whether a review id exists in another project.
             raise HTTPException(404, "Review not found")
         return review
     except HTTPException:
@@ -5321,7 +10128,7 @@ async def get_latest_review(book_id: str, num: int):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
     try:
-        review = review_repository.get_latest_review(book_id, num)
+        review = get_review_repository().get_latest_review(book_id, num)
         if not review:
             return {"review": None, "message": "No reviews found for this chapter"}
         return {"review": review}
@@ -5330,15 +10137,18 @@ async def get_latest_review(book_id: str, num: int):
 
 
 @app.post("/api/v1/books/{book_id}/chapters/{num}/review")
-async def trigger_review(book_id: str, num: int):
+async def trigger_review(book_id: str, num: int, request: Request):
     """Trigger a new review task for a chapter."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "chapter review")
+    actor = _require_author_principal(request)
     task = task_runtime.enqueue(
         "review-chapter",
         project_id=book_id, book_id=get_authoritative_book_id(book_id),
         data={"chapter": num},
+        initiated_by=actor,
         idempotency_key=f"review:{book_id}:{num}",
     )
     return {"taskId": task["id"], "status": task["status"], "chapter": num}
@@ -5358,7 +10168,10 @@ async def export_book(
     get_project(book_id)
     try:
         from src.export.export_service import ExportService
-        export_service = ExportService(story_repository.db, workspace_root / "exports")
+        export_service = ExportService(
+            story_repository.db,
+            _active_workspace_root_for(story_repository.db) / "exports",
+        )
         authoritative_book_id = get_authoritative_book_id(book_id)
         result = export_service.export_book(
             book_id,
@@ -5392,7 +10205,10 @@ async def get_export_history(book_id: str):
     get_project(book_id)
     try:
         from src.export.export_service import ExportService
-        export_service = ExportService(story_repository.db, workspace_root / "exports")
+        export_service = ExportService(
+            story_repository.db,
+            _active_workspace_root_for(story_repository.db) / "exports",
+        )
         exports = export_service.get_export_history(book_id)
         return {"exports": exports, "count": len(exports)}
     except Exception as exc:
@@ -5404,7 +10220,10 @@ async def get_export(export_id: str):
     """Get a specific export record."""
     try:
         from src.export.export_service import ExportService
-        export_service = ExportService(story_repository.db, workspace_root / "exports")
+        export_service = ExportService(
+            story_repository.db,
+            _active_workspace_root_for(story_repository.db) / "exports",
+        )
         export = export_service.get_export(export_id)
         if not export:
             raise HTTPException(404, "Export not found")
@@ -5425,7 +10244,10 @@ async def export_story_bible(book_id: str, format: str = Query("md")):
     get_project(book_id)
     try:
         from src.export.export_service import ExportService
-        export_service = ExportService(story_repository.db, workspace_root / "exports")
+        export_service = ExportService(
+            story_repository.db,
+            _active_workspace_root_for(story_repository.db) / "exports",
+        )
         result = export_service.export_story_bible(
             book_id, get_authoritative_book_id(book_id), format=format
         )
@@ -5446,7 +10268,10 @@ async def export_review_report(book_id: str, format: str = Query("md")):
     get_project(book_id)
     try:
         from src.export.export_service import ExportService
-        export_service = ExportService(story_repository.db, workspace_root / "exports")
+        export_service = ExportService(
+            story_repository.db,
+            _active_workspace_root_for(story_repository.db) / "exports",
+        )
         result = export_service.export_review_report(
             book_id, get_authoritative_book_id(book_id), format=format
         )
@@ -5471,7 +10296,10 @@ async def export_foreshadowing(
     get_project(book_id)
     try:
         from src.export.export_service import ExportService
-        export_service = ExportService(story_repository.db, workspace_root / "exports")
+        export_service = ExportService(
+            story_repository.db,
+            _active_workspace_root_for(story_repository.db) / "exports",
+        )
         result = export_service.export_foreshadowing(
             book_id,
             get_authoritative_book_id(book_id),
@@ -5494,23 +10322,35 @@ class JointReviewRequest(BaseModel):
     end_chapter: int
 
 @app.post("/api/v1/books/{book_id}/joint-review-sync")
-async def trigger_joint_review(book_id: str, body: JointReviewRequest):
-    """Trigger a joint review across multiple chapters."""
+async def trigger_joint_review(
+    book_id: str,
+    body: JointReviewRequest,
+    request: Request,
+):
+    """Run a joint review synchronously through the durable task worker."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
-    get_project(book_id)
+    project = get_project(book_id)
+    require_authoritative_project(book_id, "joint review")
+    actor = _require_author_principal(request)
     authoritative_book_id = get_authoritative_book_id(book_id)
-    try:
-        from src.review.joint_review_service import JointReviewService
-        service = JointReviewService(story_repository.db, model_mgr)
-        result = service.review_chapters(
-            book_id, authoritative_book_id, body.start_chapter, body.end_chapter
-        )
-        return result
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(500, f"Joint review failed: {exc}") from exc
+    latest = project.get_latest_chapter_number()
+    if body.start_chapter < 1 or body.end_chapter < 1:
+        raise HTTPException(422, "chapter range must use positive integers")
+    if body.end_chapter < body.start_chapter:
+        raise HTTPException(422, "end chapter must not precede start chapter")
+    if latest < 1 or body.end_chapter > latest:
+        raise HTTPException(422, f"joint review range must be within existing chapters (currently {latest})")
+    require_model_setup(book_id)
+    task = await _execute_studio_task(
+        "joint-review",
+        project_id=book_id,
+        book_id=authoritative_book_id,
+        data={"start": body.start_chapter, "end": body.end_chapter},
+        worker_label="studio-joint-review-sync",
+        initiated_by=actor,
+    )
+    return _studio_task_payload(task, "joint review")
 
 
 @app.get("/api/v1/books/{book_id}/joint-reviews")
@@ -5521,7 +10361,7 @@ async def get_joint_reviews(book_id: str):
     get_project(book_id)
     try:
         from src.review.joint_review_service import JointReviewService
-        service = JointReviewService(story_repository.db, model_mgr)
+        service = JointReviewService(story_repository.db, get_active_model_manager(story_repository.db))
         reviews = service.get_joint_reviews(book_id)
         return {"reviews": reviews, "count": len(reviews)}
     except Exception as exc:
@@ -5536,9 +10376,12 @@ async def get_joint_review(book_id: str, review_id: str):
     get_project(book_id)
     try:
         from src.review.joint_review_service import JointReviewService
-        service = JointReviewService(story_repository.db, model_mgr)
+        service = JointReviewService(story_repository.db, get_active_model_manager(story_repository.db))
         review = service.get_joint_review(review_id)
         if not review:
+            raise HTTPException(404, "Joint review not found")
+        if review.get("project_id") != book_id:
+            # Keep the resource boundary opaque across projects.
             raise HTTPException(404, "Joint review not found")
         return review
     except HTTPException:
@@ -5562,22 +10405,15 @@ async def list_tasks(status: Optional[str] = Query(None), limit: int = Query(50)
 # ========== v1 API - Backup (BACKUP-001/002/003/004) ==========
 
 @app.post("/api/v1/backup")
-async def create_backup(data: dict | None = None):
+async def create_backup(request: Request, data: dict | None = None):
     """Create a manual backup of the database (BACKUP-002)."""
+    _require_host_principal(request)
     try:
         backup_manager = _studio_backup_manager()
 
-        # 获取项目ID（如果提供）
-        project_id = data.get("project_id") if data else None
+        # Validate the project before creating a filesystem snapshot.
+        project_id = _resolve_backup_project(data.get("project_id") if data else None)
         description = data.get("description", "手动备份") if data else "手动备份"
-
-        # 如果没有指定项目，使用第一个项目
-        if not project_id:
-            projects = story_repository.db.fetchall("SELECT id FROM projects LIMIT 1")
-            if projects:
-                project_id = projects[0]["id"]
-            else:
-                raise HTTPException(400, "没有可用的项目")
 
         result = backup_manager.create_backup(
             project_id=project_id,
@@ -5589,10 +10425,14 @@ async def create_backup(data: dict | None = None):
             "status": "success",
             "backup_id": result["backup_id"],
             "backup_path": result["file_path"],
+            "manifest_path": result.get("manifest_path"),
+            "sha256": result.get("sha256"),
             "size": result["size_bytes"],
             "integrity": result["integrity"],
             "created_at": result["created_at"],
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(500, f"Backup failed: {exc}") from exc
 
@@ -5603,8 +10443,11 @@ async def list_backups(project_id: str | None = None, backup_type: str | None = 
     try:
         backup_manager = _studio_backup_manager()
 
+        scoped_project_id = (
+            _require_backup_project(project_id) if project_id is not None else None
+        )
         backups = backup_manager.list_backups(
-            project_id=project_id,
+            project_id=scoped_project_id,
             backup_type=backup_type,
         )
 
@@ -5612,6 +10455,8 @@ async def list_backups(project_id: str | None = None, backup_type: str | None = 
             "backups": backups,
             "count": len(backups),
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(500, f"Failed to list backups: {exc}") from exc
 
@@ -5622,8 +10467,10 @@ async def get_backup_statistics(project_id: str | None = None):
     try:
         backup_manager = _studio_backup_manager()
 
+        if project_id is not None:
+            project_id = _require_backup_project(project_id)
         # 如果没有指定项目，使用第一个项目
-        if not project_id:
+        if project_id is None:
             projects = story_repository.db.fetchall("SELECT id FROM projects LIMIT 1")
             if projects:
                 project_id = projects[0]["id"]
@@ -5634,6 +10481,8 @@ async def get_backup_statistics(project_id: str | None = None):
         assert project_id is not None
         stats = backup_manager.get_backup_statistics(project_id)
         return stats
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(500, f"Failed to get backup statistics: {exc}") from exc
 
@@ -5656,8 +10505,9 @@ async def get_backup_detail(backup_id: str):
 
 
 @app.post("/api/v1/backups/{backup_id}/restore")
-async def restore_backup(backup_id: str):
+async def restore_backup(backup_id: str, request: Request):
     """Restore from a backup (BACKUP-003)."""
+    _require_host_principal(request)
     try:
         backup_manager = _studio_backup_manager()
 
@@ -5668,14 +10518,24 @@ async def restore_backup(backup_id: str):
             "message": result["message"],
             "backup_id": result["backup_id"],
             "pre_restore_backup_id": result["pre_restore_backup_id"],
+            "manifest": result.get("manifest"),
+            "recovered_tasks": result.get("recovered_tasks", []),
+            "projection_rebuild": result.get("projection_rebuild"),
+            "rebound_database_sha256": result.get("rebound_database_sha256"),
         }
+    except FileNotFoundError as exc:
+        raise HTTPException(404, f"Restore failed: {exc}") from exc
+    except RuntimeError as exc:
+        status_code = 409 if "active durable tasks" in str(exc) else 422
+        raise HTTPException(status_code, f"Restore failed: {exc}") from exc
     except Exception as exc:
         raise HTTPException(500, f"Restore failed: {exc}") from exc
 
 
 @app.delete("/api/v1/backups/{backup_id}")
-async def delete_backup(backup_id: str):
+async def delete_backup(backup_id: str, request: Request):
     """Delete a backup."""
+    _require_host_principal(request)
     try:
         backup_manager = _studio_backup_manager()
 
@@ -5686,18 +10546,31 @@ async def delete_backup(backup_id: str):
         return {"status": "success", "message": "备份已删除"}
     except HTTPException:
         raise
+    except RuntimeError as exc:
+        status_code = 409 if any(
+            marker in str(exc) for marker in ("last verifiable backup", "catalog row retained")
+        ) else 500
+        raise HTTPException(status_code, f"Failed to delete backup: {exc}") from exc
     except Exception as exc:
         raise HTTPException(500, f"Failed to delete backup: {exc}") from exc
 
 
 @app.post("/api/v1/backups/cleanup")
-async def cleanup_old_backups(project_id: str | None = None, keep_count: int = 10, keep_days: int = 30):
+async def cleanup_old_backups(
+    request: Request,
+    project_id: str | None = None,
+    keep_count: int = 10,
+    keep_days: int = 30,
+):
     """Cleanup old backups."""
+    _require_host_principal(request)
     try:
         backup_manager = _studio_backup_manager()
 
+        if project_id is not None:
+            project_id = _require_backup_project(project_id)
         # 如果没有指定项目，使用第一个项目
-        if not project_id:
+        if project_id is None:
             projects = story_repository.db.fetchall("SELECT id FROM projects LIMIT 1")
             if projects:
                 project_id = projects[0]["id"]
@@ -5713,24 +10586,57 @@ async def cleanup_old_backups(project_id: str | None = None, keep_count: int = 1
         )
 
         return result
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(500, f"Failed to cleanup backups: {exc}") from exc
 
 
+@app.get("/api/health")
+async def liveness_check():
+    """Minimal public liveness probe with no database or runtime details."""
+    return {"status": "ok", "service": "novelforge-studio"}
+
+
 @app.get("/api/v1/health")
 async def health_check():
-    """Health check endpoint."""
+    """Authenticated readiness and durable runtime diagnostics endpoint."""
     try:
         # Check database connectivity.
         story_repository.db.fetchone("SELECT 1")
+        projection_reports = [
+            story_repository.projection_health(str(row["id"]))
+            for row in story_repository.db.fetchall("SELECT id FROM books ORDER BY id")
+        ]
+        projections_healthy = all(item["healthy"] for item in projection_reports)
+        worker_disabled = os.environ.get("NOVELFORGE_DISABLE_STUDIO_WORKER", "").lower() in {
+            "1", "true", "yes",
+        }
+        worker_running = _daemon_is_running()
+        worker_status = "ok" if worker_running else "warning" if worker_disabled else "error"
+        queue_counts = {
+            str(row["status"]): int(row["count"])
+            for row in story_repository.db.fetchall(
+                "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status ORDER BY status"
+            )
+        }
+        model_readiness = get_model_setup_readiness()
+        worker_details = {
+            "status": worker_status,
+            "running": worker_running,
+            "disabledByEnvironment": worker_disabled,
+            "workerId": studio_daemon_state.get("worker_id") if worker_running else None,
+        }
         return {
-            "status": "healthy",
+            "status": "healthy" if projections_healthy and worker_status != "error" else "unhealthy",
             "database": "connected",
             "checks": [
                 {"name": "数据库连接", "status": "ok", "message": "SQLite 连接正常"},
-                {"name": "任务队列", "status": "ok", "message": "TaskRuntime 就绪"},
-                {"name": "模型配置", "status": "ok" if model_repository.configuration()["providers"] else "warning", "message": "已配置 Provider" if model_repository.configuration()["providers"] else "未配置 Provider"},
+                {"name": "任务队列", "status": worker_status, "message": "TaskRuntime 就绪" if worker_status != "error" else "Studio Worker 未运行", "details": {"counts": queue_counts, **worker_details}},
+                {"name": "模型配置", "status": "ok" if model_readiness["ready"] else "warning", "message": model_readiness["message"], "details": model_readiness},
+                {"name": "Canon projections", "status": "ok" if projections_healthy else "error", "details": projection_reports},
             ],
+            "runtime": {"worker": worker_details, "queue": queue_counts, "projection": studio_daemon_state.get("projection")},
             "timestamp": datetime.now().isoformat(),
         }
     except Exception as exc:
@@ -5738,7 +10644,7 @@ async def health_check():
             "status": "unhealthy",
             "database": "disconnected",
             "checks": [
-                {"name": "数据库连接", "status": "error", "message": str(exc)},
+                {"name": "数据库连接", "status": "error", "message": "health check failed", "errorType": type(exc).__name__},
             ],
             "timestamp": datetime.now().isoformat(),
         }
@@ -5754,17 +10660,31 @@ class ChatRequest(BaseModel):
     skillIds: list[str] = Field(default_factory=list)
 
 
-def _chat_session_path(book_id: str, session_id: str) -> Path:
+def get_studio_chat_service() -> StudioChatService:
+    """Bind Studio chat to the active Host repositories and runtime manager."""
+    return StudioChatService(
+        project_loader=get_project,
+        skill_loader=lambda skill_ids, *, project_id=None: get_skill_repository().instructions_for(
+            list(skill_ids), project_id=project_id,
+        ),
+        model_manager=get_active_model_manager(story_repository.db),
+        story_repository=story_repository,
+        story_bible_repository=StoryBibleRepository(story_repository.db),
+    )
+
+
+def _chat_session_path(book_id: str, session_id: str, *, create_parent: bool = False) -> Path:
     if session_id and not re.fullmatch(r"[A-Za-z0-9-]{1,80}", session_id):
         raise HTTPException(400, "invalid chat session id")
     if book_id and not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     base = (
-        project_mgr.get_project_dir(book_id) / "studio" / "sessions"
+        get_active_project_manager().get_project_dir(book_id) / "studio" / "sessions"
         if book_id
-        else workspace_root / "studio" / "sessions"
+        else _active_workspace_root_for(story_repository.db) / "studio" / "sessions"
     )
-    base.mkdir(parents=True, exist_ok=True)
+    if create_parent:
+        base.mkdir(parents=True, exist_ok=True)
     return base / f"{session_id}.json"
 
 
@@ -5789,7 +10709,7 @@ def _read_chat_session(book_id: str, session_id: str) -> dict[str, Any]:
 
 
 def _write_chat_session(book_id: str, session: dict[str, Any]) -> None:
-    path = _chat_session_path(book_id, session["id"])
+    path = _chat_session_path(book_id, session["id"], create_parent=True)
     session["updatedAt"] = datetime.now().isoformat()
     path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -5799,9 +10719,9 @@ async def list_chat_sessions(bookId: str = Query("")):
     if bookId:
         get_project(bookId)
     base = (
-        project_mgr.get_project_dir(bookId) / "studio" / "sessions"
+        get_active_project_manager().get_project_dir(bookId) / "studio" / "sessions"
         if bookId
-        else workspace_root / "studio" / "sessions"
+        else _active_workspace_root_for(story_repository.db) / "studio" / "sessions"
     )
     if not base.exists():
         return {"sessions": [], "count": 0}
@@ -5833,79 +10753,38 @@ async def get_chat_session(session_id: str, bookId: str = Query("")):
     return _read_chat_session(bookId, session_id)
 
 @app.post("/api/v1/chat")
-async def chat_with_ai(req: ChatRequest):
+async def chat_with_ai(req: ChatRequest, request: Request):
+    actor = _require_author_principal(request)
     """Context-aware AI chat for creative assistance."""
     if not req.message.strip():
         raise HTTPException(400, "消息不能为空")
     if req.bookId and not validate_project_id(req.bookId):
         raise HTTPException(400, "invalid project id")
     if req.bookId:
+        get_project(req.bookId)
+        require_authoritative_project(req.bookId, "chat")
         require_model_setup(req.bookId)
 
-    # Build context from selected book
-    context_parts = []
-    if req.bookId:
-        try:
-            project = get_project(req.bookId)
-            context_parts.append(f"当前作品：{project.name}，题材：{project.genre or '未设定'}")
-            context_parts.append(f"已写章节：{project.get_chapter_count()}，目标章节：{project.target_chapters}")
-            if project.writing_style:
-                context_parts.append(f"写作风格：{project.writing_style}")
-            if project.author_intent:
-                context_parts.append(f"创作意图：{project.author_intent}")
-            # Include world info
-            if project.world and project.world.core_conflict:
-                context_parts.append(f"核心矛盾：{project.world.core_conflict[:300]}")
-            # Include character names
-            if project.characters:
-                char_summaries = []
-                for name, char in list(project.characters.items())[:8]:
-                    role = char.role or "角色"
-                    char_summaries.append(f"{name}({role})")
-                context_parts.append(f"主要角色：{'、'.join(char_summaries)}")
-            # Include open foreshadowing
-            if project.foreshadowing:
-                open_fs = [f.title for f in project.foreshadowing.values()
-                           if hasattr(f, 'status') and f.status != 'resolved'][:5]
-                if open_fs:
-                    context_parts.append(f"未解伏笔：{'、'.join(open_fs)}")
-        except Exception:
-            pass  # Continue without book context
-
-    system_prompt = "你是 NovelForge 创作助手，专精于长篇小说创作。你熟悉世界观搭建、人物弧光设计、伏笔编织、审查修订等创作流程。回答要具体、可操作，必要时给出示例。"
-    mode_prompts = {
-        "thought": "当前模式是念头创作：由规划师主持访谈，每次只追问一个能推进人物、冲突、世界规则、代价或结局的问题；不要直接替作者拍板。",
-        "short": "当前模式是短篇小说：围绕单一冲突、有限角色和明确结尾推进，先确认篇幅与结构再写作。",
-        "script": "当前模式是剧本：输出场景、动作、对白和镜头/舞台说明，不把剧本格式混写成长篇散文。",
-        "storyboard": "当前模式是分镜：按镜头编号给出画面、景别、动作、对白、音效和转场，保持镜头可执行。",
-        "interactive-film": "当前模式是互动影像：把场景拆成节点和可选分支，明确触发条件、状态变化与结局。",
-        "play-guided": "当前模式是引导式互动：每轮只推进一个场景，给出有因果差异的选项，等待作者选择后再继续。",
-        "play-open": "当前模式是开放式互动：依据当前作品事实回应作者的自由行动，不能越过已确认的世界规则。",
-        "fanfic": "当前模式是同人创作：尊重作者提供的原作资料和人物边界，明确哪些内容是新增设定。",
-        "spinoff": "当前模式是衍生创作：从当前作品的既有事实出发，设计独立主线并标明与原作的连接点。",
-        "imitation": "当前模式是风格研究：只提炼可描述的叙事技法、句式和节奏，不复制原文或具体角色。",
-        "cover-brief": "当前模式是封面策划：产出可交给设计师或图像模型的封面简报、构图、文字层级和禁用元素；不宣称已经生成图片。",
-    }
-    mode = req.mode.strip()
-    if mode and mode not in mode_prompts:
-        raise HTTPException(400, "unknown chat mode")
-    if mode:
-        system_prompt += f"\n\nStudio mode guidance: {mode_prompts[mode]}"
-    if context_parts:
-        system_prompt += "\n\n当前作品上下文：\n" + "\n".join(context_parts)
-
-    selected_skills = get_skill_repository().instructions_for(req.skillIds, project_id=req.bookId or None)
-    if selected_skills:
-        system_prompt += "\n\n已启用的用户 Skill（仅作为本次对话的额外约束）：\n" + "\n\n".join(
-            f"## {item['name']}\n{item['instructions']}" for item in selected_skills
+    try:
+        chat_service = get_studio_chat_service()
+        preparation = chat_service.prepare(
+            book_id=req.bookId,
+            mode=req.mode,
+            skill_ids=req.skillIds,
         )
+    except StudioChatValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, "作品上下文读取失败") from exc
 
     session_id = req.sessionId.strip() if req.sessionId else ""
     if not session_id:
         session_id = str(uuid.uuid4())
     session = _read_chat_session(req.bookId, session_id)
-    if mode:
-        session["mode"] = mode
+    if preparation.mode:
+        session["mode"] = preparation.mode
     history = [
         {"role": item["role"], "content": item["content"]}
         for item in session.get("messages", [])[-20:]
@@ -5915,56 +10794,62 @@ async def chat_with_ai(req: ChatRequest):
     # Chat is synchronous at the HTTP boundary, but the model call still
     # needs a durable task scope so the selected Agent route and GenerationRun
     # have the same audit semantics as queued creation workflows.
-    chat_task = task_runtime.enqueue(
-        "chat",
+    chat_task_type = preparation.task_type
+    chat_data = {
+        "mode": preparation.mode,
+        "role": preparation.role,
+        "taskType": preparation.task_type,
+        "systemPrompt": preparation.system_prompt,
+        "messages": history,
+        "skill_ids": req.skillIds,
+        "session_id": session_id,
+        "contextManifest": preparation.context_manifest,
+        "maxTokens": 2000,
+    }
+    completed_task = await _execute_studio_task(
+        chat_task_type,
         project_id=req.bookId or None,
-        data={"mode": mode, "skill_ids": req.skillIds, "session_id": session_id},
+        book_id=preparation.context_manifest.get("bookId"),
+        data=chat_data,
+        worker_label="studio-chat",
         stage="blocked",
+        idempotency_key=f"studio-chat:{req.bookId or 'workspace'}:{session_id}:{hashlib.sha256(req.message.encode('utf-8')).hexdigest()}",
+        initiated_by=actor,
     )
-    chat_worker_id = f"studio-chat-{uuid.uuid4().hex}"
-    if task_runtime.claim_by_id(chat_task["id"], chat_worker_id) is None:
-        raise HTTPException(409, "chat task could not be claimed")
-    try:
-        with model_mgr.task_scope(chat_task["id"]):
-            client = model_mgr.get_client("planner" if mode == "thought" else "primary")
-            response = client.chat(
-                messages=history,
-                system=system_prompt,
-                max_tokens=2000,
-            )
+    result = _studio_task_payload(completed_task, "chat")
+    response_content = result.get("content")
+    if not isinstance(response_content, str) or not response_content.strip():
+        raise HTTPException(
+            500,
+            detail={
+                "code": "CHAT_RESULT_INVALID",
+                "message": "chat completed without content",
+                "taskId": completed_task.get("id"),
+            },
+        )
+    response_model = str(result.get("model") or "")
+    task_id = str(completed_task["id"])
+    if not any(item.get("taskId") == task_id for item in session["messages"] if isinstance(item, dict)):
         session["messages"].append({
             "role": "user",
             "content": req.message,
+            "taskId": task_id,
             "createdAt": datetime.now().isoformat(),
         })
         session["messages"].append({
             "role": "assistant",
-            "content": response.content,
-            "model": response.model,
+            "content": response_content,
+            "taskId": task_id,
+            "model": response_model,
             "createdAt": datetime.now().isoformat(),
         })
-        _write_chat_session(req.bookId, session)
-        task_runtime.transition(
-            chat_task["id"],
-            "completed",
-            result={"sessionId": session_id, "model": response.model},
-            lease_owner=chat_worker_id,
-        )
-        return {"reply": response.content, "model": response.model, "sessionId": session_id, "taskId": chat_task["id"]}
-    except Exception as exc:
-        with contextlib.suppress(Exception):
-            task_runtime.fail(
-                chat_task["id"],
-                getattr(exc, "code", "CHAT_FAILED"),
-                str(exc)[:500],
-                lease_owner=chat_worker_id,
-            )
-        error_msg = str(exc)
-        if "MODEL_CONFIGURATION" in error_msg or "No provider" in error_msg.lower():
-            raise HTTPException(503, "未配置 AI 模型，请先在「模型配置」中设置 Provider 和 API Key")
-        if "RATE_LIMIT" in error_msg:
-            raise HTTPException(429, "请求过于频繁，请稍后再试")
-        raise HTTPException(500, f"AI 服务异常：{error_msg[:200]}")
+    _write_chat_session(req.bookId, session)
+    return {
+        "reply": response_content,
+        "model": response_model,
+        "sessionId": session_id,
+        "taskId": task_id,
+    }
 
 
 # ========== v1 API - Translation Studio ==========
@@ -6036,7 +10921,12 @@ async def get_translation(translation_id: str):
 
 
 @app.post("/api/v1/translations/{translation_id}/run")
-async def run_translation(translation_id: str, req: TranslationRunRequest):
+async def run_translation(
+    translation_id: str,
+    req: TranslationRunRequest,
+    request: Request,
+):
+    actor = _require_author_principal(request)
     if isinstance(req.batchSize, bool) or not 1 <= req.batchSize <= 32:
         raise HTTPException(422, "batchSize must be between 1 and 32")
     try:
@@ -6052,6 +10942,7 @@ async def run_translation(translation_id: str, req: TranslationRunRequest):
         task = task_runtime.enqueue(
             "translation-run",
             data={"translation_id": translation_id, "batch_size": req.batchSize},
+            initiated_by=actor,
         )
         payload["lastRunTaskId"] = task["id"]
         get_translation_store().save(payload)
@@ -6109,8 +11000,13 @@ async def get_prompt(task_type: str, project_id: Optional[str] = Query(None)):
 
 
 @app.post("/api/v1/prompts")
-async def save_prompt(body: PromptSaveRequest, project_id: Optional[str] = Query(None)):
+async def save_prompt(
+    body: PromptSaveRequest,
+    request: Request,
+    project_id: Optional[str] = Query(None),
+):
     """Save a new prompt."""
+    _require_host_principal(request)
     try:
         from src.prompts.prompt_repository import PromptRepository
         repo = PromptRepository(story_repository.db)
@@ -6127,8 +11023,9 @@ async def save_prompt(body: PromptSaveRequest, project_id: Optional[str] = Query
 
 
 @app.delete("/api/v1/prompts/{prompt_id}")
-async def delete_prompt(prompt_id: str):
+async def delete_prompt(prompt_id: str, request: Request):
     """Delete a prompt by ID."""
+    _require_host_principal(request)
     try:
         from src.prompts.prompt_repository import PromptRepository
         repo = PromptRepository(story_repository.db)
@@ -6157,8 +11054,14 @@ async def get_prompt_versions(task_type: str, project_id: Optional[str] = Query(
 
 
 @app.post("/api/v1/prompts/{task_type}/rollback/{version}")
-async def rollback_prompt(task_type: str, version: int, project_id: Optional[str] = Query(None)):
+async def rollback_prompt(
+    task_type: str,
+    version: int,
+    request: Request,
+    project_id: Optional[str] = Query(None),
+):
     """Rollback to a specific version (PROMPT-002)."""
+    _require_host_principal(request)
     try:
         from src.prompts.prompt_repository import PromptRepository
         repo = PromptRepository(story_repository.db)
@@ -6196,10 +11099,12 @@ async def export_prompts(
 @app.post("/api/v1/prompts/import")
 async def import_prompts(
     data: dict,
+    request: Request,
     project_id: Optional[str] = Query(None),
     overwrite: bool = Query(False),
 ):
     """Import prompts (PROMPT-004)."""
+    _require_host_principal(request)
     try:
         from src.prompts.prompt_repository import PromptRepository
         repo = PromptRepository(story_repository.db)
@@ -6213,10 +11118,12 @@ async def import_prompts(
 
 @app.post("/api/v1/prompts/restore-defaults")
 async def restore_default_prompts(
+    request: Request,
     project_id: Optional[str] = Query(None),
     task_types: Optional[str] = Query(None),
 ):
     """Restore default prompts (PROMPT-005)."""
+    _require_host_principal(request)
     try:
         from src.prompts.prompt_repository import PromptRepository
         repo = PromptRepository(story_repository.db)
@@ -6259,69 +11166,102 @@ async def get_wizard_state(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    if not story_repository.is_authoritative_project(book_id):
+        return {
+            "workspace_id": None,
+            "current_step": 1,
+            "total_steps": 25,
+            "status": "legacy_read_only",
+            "steps": [],
+            "readOnly": True,
+            "legacyProject": True,
+        }
     try:
         from src.wizard.world_bootstrap_service import WorldBootstrapService
-        service = WorldBootstrapService(story_repository.db, model_mgr)
+        service = WorldBootstrapService(story_repository.db, get_active_model_manager(story_repository.db))
         return service.get_wizard_state(book_id)
     except Exception as exc:
         raise HTTPException(500, f"Failed to get wizard state: {exc}") from exc
 
 
 @app.post("/api/v1/books/{book_id}/wizard/steps/{step_key}")
-async def submit_wizard_step(book_id: str, step_key: str, body: WizardStepRequest):
+async def submit_wizard_step(
+    book_id: str,
+    step_key: str,
+    body: WizardStepRequest,
+    request: Request,
+):
     """Submit a draft for a wizard step."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "wizard draft")
+    _require_author_principal(request)
     require_model_setup(book_id)
     try:
         from src.wizard.world_bootstrap_service import WorldBootstrapService
-        service = WorldBootstrapService(story_repository.db, model_mgr)
+        service = WorldBootstrapService(story_repository.db, get_active_model_manager(story_repository.db))
         return service.submit_step(book_id, step_key, body.draft, source=body.source)
     except Exception as exc:
         raise HTTPException(500, f"Failed to submit step: {exc}") from exc
 
 
 @app.post("/api/v1/books/{book_id}/wizard/steps/{step_key}/confirm")
-async def confirm_wizard_step(book_id: str, step_key: str):
+async def confirm_wizard_step(book_id: str, step_key: str, request: Request):
     """Confirm a wizard step."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "wizard confirmation")
+    _require_author_principal(request)
     require_model_setup(book_id)
     try:
         from src.wizard.world_bootstrap_service import WorldBootstrapService
-        service = WorldBootstrapService(story_repository.db, model_mgr)
+        service = WorldBootstrapService(story_repository.db, get_active_model_manager(story_repository.db))
         return service.confirm_step(book_id, step_key)
     except Exception as exc:
         raise HTTPException(500, f"Failed to confirm step: {exc}") from exc
 
 
 @app.post("/api/v1/books/{book_id}/wizard/steps/{step_key}/generate")
-async def generate_wizard_step(book_id: str, step_key: str, body: WizardGenerateRequest):
-    """Generate an AI suggestion for a wizard step."""
+async def generate_wizard_step(
+    book_id: str,
+    step_key: str,
+    body: WizardGenerateRequest,
+    request: Request,
+):
+    """Generate a Story Bible suggestion through the durable task worker."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "wizard suggestion")
+    actor = _require_author_principal(request)
     require_model_setup(book_id)
-    try:
-        from src.wizard.world_bootstrap_service import WorldBootstrapService
-        service = WorldBootstrapService(story_repository.db, model_mgr)
-        return service.generate_step(book_id, step_key, brief=body.brief)
-    except Exception as exc:
-        raise HTTPException(500, f"Failed to generate step: {exc}") from exc
+    if step_key not in {key for _, key in STORY_BIBLE_STEPS}:
+        raise HTTPException(400, f"invalid step_key: {step_key}")
+    task = await _execute_studio_task(
+        "story-bible-suggest",
+        project_id=book_id,
+        book_id=get_authoritative_book_id(book_id),
+        data={"step_key": step_key, "brief": body.brief},
+        worker_label="studio-story-bible-suggest",
+        initiated_by=actor,
+    )
+    return _studio_task_payload(task, "Story Bible suggestion")
 
 
 @app.post("/api/v1/books/{book_id}/wizard/publish")
-async def publish_wizard(book_id: str):
+async def publish_wizard(book_id: str, request: Request):
     """Publish the story bible when all steps are confirmed."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "wizard publish")
+    actor = _require_author_principal(request)
     require_model_setup(book_id)
     try:
         from src.wizard.world_bootstrap_service import WorldBootstrapService
-        service = WorldBootstrapService(story_repository.db, model_mgr)
+        service = WorldBootstrapService(story_repository.db, get_active_model_manager(story_repository.db))
         result = service.publish(book_id)
         views = _refresh_architecture_views(book_id)
         readiness = get_planning_readiness(book_id)
@@ -6335,12 +11275,17 @@ async def publish_wizard(book_id: str):
             project_id=book_id,
             book_id=get_authoritative_book_id(book_id),
             data={"source": "wizard-publish"},
+            initiated_by=actor,
             idempotency_key=f"planning-views:wizard:{book_id}:{workflow.get('updated_at')}",
         )
         result["architectureViews"] = len(views)
         result["planningReadiness"] = readiness
         result["aiTaskId"] = task["id"]
-        synthesis_task = _queue_planning_synthesis(book_id, "wizard-publish")
+        synthesis_task = _queue_planning_synthesis(
+            book_id,
+            "wizard-publish",
+            initiated_by=actor,
+        )
         result["synthesisTaskId"] = synthesis_task["id"]
         result["synthesisTaskStatus"] = synthesis_task["status"]
         return result
@@ -6357,7 +11302,11 @@ class DialogueRequest(BaseModel):
     context: str = ""
 
 @app.post("/api/v1/books/{book_id}/dialogue/write")
-async def generate_dialogue(book_id: str, body: DialogueRequest):
+async def generate_dialogue(
+    book_id: str,
+    body: DialogueRequest,
+    request: Request,
+):
     """Generate character dialogue using AI."""
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
@@ -6366,7 +11315,9 @@ async def generate_dialogue(book_id: str, body: DialogueRequest):
     if not body.sceneDescription.strip():
         raise HTTPException(400, "sceneDescription is required")
 
-    project = get_project(book_id)
+    get_project(book_id)
+    require_authoritative_project(book_id, "dialogue generation")
+    actor = _require_author_principal(request)
 
     # Rate limiting.
     from src.llm.rate_limiter import get_rate_limiter, RateLimitError
@@ -6389,31 +11340,20 @@ async def generate_dialogue(book_id: str, body: DialogueRequest):
     if cached:
         return {**cached, "cached": True}
 
-    # Get character context from project.
-    book_context = None
-    char = project.characters.get(body.characterName)
-    if char:
-        book_context = {
-            "personality": getattr(char, "personality", ""),
-            "background": getattr(char, "background", ""),
-            "appearance": getattr(char, "appearance", ""),
-        }
-
-    # Generate dialogue.
-    from src.llm.dialogue import DialogueWriter, DialogueWriterError
-    writer = DialogueWriter(model_mgr)
-    try:
-        result = writer.generate(
-            character_name=body.characterName,
-            scene_description=body.sceneDescription,
-            tone=body.tone,
-            context=body.context,
-            book_context=book_context,
-        )
-    except DialogueWriterError as exc:
-        raise HTTPException(
-            429 if exc.code == "RATE_LIMIT" else 500, exc.code
-        ) from exc
+    task = await _execute_studio_task(
+        "dialogue-write",
+        project_id=book_id,
+        book_id=get_authoritative_book_id(book_id),
+        data={
+            "character_name": body.characterName,
+            "scene_description": body.sceneDescription,
+            "tone": body.tone,
+            "context": body.context,
+        },
+        worker_label="studio-dialogue",
+        initiated_by=actor,
+    )
+    result = _studio_task_payload(task, "dialogue generation")
 
     # Cache result.
     cache.set(result, characterName=body.characterName,
@@ -6463,6 +11403,7 @@ async def create_theme(book_id: str, body: ThemeCreateRequest):
     if not body.name.strip():
         raise HTTPException(400, "name is required")
     get_project(book_id)
+    require_authoritative_project(book_id, "character theme creation")
     from src.themes.theme_repository import CharacterThemeRepository
     repo = CharacterThemeRepository(story_repository.db)
     theme = repo.create(
@@ -6484,6 +11425,7 @@ async def update_theme(book_id: str, theme_id: str, body: ThemeUpdateRequest):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "character theme update")
     from src.themes.theme_repository import CharacterThemeRepository
     repo = CharacterThemeRepository(story_repository.db)
     fields = {}
@@ -6512,6 +11454,7 @@ async def delete_theme(book_id: str, theme_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "character theme deletion")
     from src.themes.theme_repository import CharacterThemeRepository
     repo = CharacterThemeRepository(story_repository.db)
     if not repo.delete(theme_id):
@@ -6529,7 +11472,11 @@ async def list_interactive_films():
 
 
 @app.post("/api/v1/interactive-films")
-async def create_interactive_film(body: InteractiveFilmCreateRequest):
+async def create_interactive_film(
+    body: InteractiveFilmCreateRequest,
+    request: Request,
+):
+    actor = _require_author_principal(request)
     if not body.title.strip():
         raise HTTPException(422, "interactive film title is required")
     project_id = body.bookId.strip()
@@ -6538,7 +11485,7 @@ async def create_interactive_film(body: InteractiveFilmCreateRequest):
             raise HTTPException(400, "invalid bookId")
         get_project(project_id)
     else:
-        project = project_mgr.create_project(body.title, genre="interactive-film", target_chapters=1)
+        project = get_active_project_manager().create_project(body.title, genre="interactive-film", target_chapters=1)
         project_id = project.id
     store = get_interactive_film_store()
     try:
@@ -6550,6 +11497,7 @@ async def create_interactive_film(body: InteractiveFilmCreateRequest):
         task = task_runtime.enqueue(
             "interactive-film-generate", project_id=project_id, book_id=project_id,
             data={"title": body.title, "brief": body.brief},
+            initiated_by=actor,
         )
         result["taskId"] = task["id"]
     return result
@@ -6565,7 +11513,12 @@ async def get_interactive_film_graph(project_id: str):
 
 
 @app.post("/api/v1/projects/{project_id}/story-graph/delta")
-async def apply_interactive_film_delta(project_id: str, body: GraphDeltaRequest):
+async def apply_interactive_film_delta(
+    project_id: str,
+    body: GraphDeltaRequest,
+    request: Request,
+):
+    _require_author_principal(request)
     try:
         graph, revision = get_interactive_film_store().apply_delta(project_id, body.delta, expected_rev=body.expectedRev)
         return {"graph": graph, "revision": revision}
@@ -6574,7 +11527,12 @@ async def apply_interactive_film_delta(project_id: str, body: GraphDeltaRequest)
 
 
 @app.post("/api/v1/projects/{project_id}/story-graph/generate")
-async def generate_interactive_film_graph(project_id: str, body: InteractiveFilmCreateRequest):
+async def generate_interactive_film_graph(
+    project_id: str,
+    body: InteractiveFilmCreateRequest,
+    request: Request,
+):
+    actor = _require_author_principal(request)
     if not validate_project_id(project_id):
         raise HTTPException(400, "invalid project id")
     get_project(project_id)
@@ -6589,6 +11547,7 @@ async def generate_interactive_film_graph(project_id: str, body: InteractiveFilm
     task = task_runtime.enqueue(
         "interactive-film-generate", project_id=project_id, book_id=project_id,
         data={"title": body.title or project_id, "brief": body.brief},
+        initiated_by=actor,
     )
     return {"taskId": task["id"], "projectId": project_id}
 
@@ -6652,7 +11611,13 @@ async def export_interactive_film_package(project_id: str):
 
 
 @app.post("/api/v1/projects/{project_id}/nodes/{node_id}/image")
-async def generate_interactive_film_node_image(project_id: str, node_id: str, body: NodeImageGenerateRequest):
+async def generate_interactive_film_node_image(
+    project_id: str,
+    node_id: str,
+    body: NodeImageGenerateRequest,
+    request: Request,
+):
+    actor = _require_author_principal(request)
     try:
         graph, _ = get_interactive_film_store().load(project_id)
     except InteractiveFilmError as exc:
@@ -6662,6 +11627,7 @@ async def generate_interactive_film_node_image(project_id: str, node_id: str, bo
     task = task_runtime.enqueue(
         "interactive-film-node-image", project_id=project_id, book_id=project_id,
         data={"node_id": node_id, "prompt": body.prompt, "size": body.size},
+        initiated_by=actor,
     )
     return {"taskId": task["id"], "projectId": project_id, "nodeId": node_id}
 
@@ -6677,7 +11643,8 @@ async def get_interactive_film_asset(project_id: str, asset_path: str):
 
 
 @app.post("/api/v1/projects/{project_id}/play/start")
-async def start_interactive_film_player(project_id: str):
+async def start_interactive_film_player(project_id: str, request: Request):
+    _require_author_principal(request)
     try:
         return get_interactive_film_store().start_session(project_id)
     except InteractiveFilmError as exc:
@@ -6694,7 +11661,13 @@ async def get_interactive_film_player(project_id: str, session_id: str):
 
 
 @app.post("/api/v1/projects/{project_id}/play/sessions/{session_id}/choose")
-async def choose_interactive_film_player(project_id: str, session_id: str, body: PlayChoiceRequest):
+async def choose_interactive_film_player(
+    project_id: str,
+    session_id: str,
+    body: PlayChoiceRequest,
+    request: Request,
+):
+    _require_author_principal(request)
     try:
         return get_interactive_film_store().choose(project_id, session_id, body.choiceId)
     except InteractiveFilmError as exc:
@@ -6708,7 +11681,8 @@ async def get_book_cover(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
-    manifest_path = workspace_root / "covers" / book_id / "manifest.json"
+    active_workspace_root = _active_workspace_root_for(story_repository.db)
+    manifest_path = active_workspace_root / "covers" / book_id / "manifest.json"
     if not manifest_path.is_file():
         return {"available": False, "bookId": book_id}
     try:
@@ -6722,13 +11696,14 @@ async def get_book_cover_file(book_id: str):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
-    manifest_path = workspace_root / "covers" / book_id / "manifest.json"
+    active_workspace_root = _active_workspace_root_for(story_repository.db)
+    manifest_path = active_workspace_root / "covers" / book_id / "manifest.json"
     if not manifest_path.is_file():
         raise HTTPException(404, "cover has not been generated")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        path = (workspace_root / str(manifest["file"])).resolve()
-        cover_root = (workspace_root / "covers" / book_id).resolve()
+        path = (active_workspace_root / str(manifest["file"])).resolve()
+        cover_root = (active_workspace_root / "covers" / book_id).resolve()
         if not path.is_relative_to(cover_root) or not path.is_file():
             raise HTTPException(404, "cover file is unavailable")
     except (OSError, json.JSONDecodeError, KeyError) as exc:
@@ -6738,796 +11713,24 @@ async def get_book_cover_file(book_id: str):
 
 
 @app.post("/api/v1/books/{book_id}/cover/generate")
-async def generate_book_cover(book_id: str, body: CoverGenerateRequest):
+async def generate_book_cover(
+    book_id: str,
+    body: CoverGenerateRequest,
+    request: Request,
+):
     if not validate_project_id(book_id):
         raise HTTPException(400, "invalid project id")
     get_project(book_id)
+    require_authoritative_project(book_id, "cover generation")
+    actor = _require_author_principal(request)
     task = task_runtime.enqueue(
         "cover-image-generate", project_id=book_id, book_id=book_id,
         data={"prompt": body.prompt, "size": body.size, "quality": body.quality, "style": body.style},
+        initiated_by=actor,
     )
     return {"taskId": task["id"], "bookId": book_id}
 
 
-# ========== Studio HTML ==========
-
-STUDIO_HTML = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NovelForge Studio</title>
-    <style>
-        :root {
-            --bg: #0d1117; --bg-card: #161b22; --bg-hover: #1c2128;
-            --text: #e6edf3; --text-muted: #8b949e; --text-dim: #484f58;
-            --primary: #e94560; --primary-hover: #d63851;
-            --secondary: #21262d; --border: #30363d;
-            --success: #3fb950; --warning: #d29922; --error: #f85149;
-            --accent: #58a6ff;
-        }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-               background: var(--bg); color: var(--text); min-height: 100vh; }
-        .app { display: flex; height: 100vh; }
-        .sidebar { width: 260px; background: var(--bg-card); border-right: 1px solid var(--border);
-                   display: flex; flex-direction: column; }
-        .sidebar-header { padding: 20px; border-bottom: 1px solid var(--border); }
-        .sidebar-header h1 { font-size: 20px; color: var(--primary); }
-        .sidebar-nav { flex: 1; padding: 12px; overflow-y: auto; }
-        .nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px;
-                    border-radius: 8px; cursor: pointer; color: var(--text-muted);
-                    transition: all 0.2s; margin-bottom: 2px; }
-        .nav-item:hover { background: var(--bg-hover); color: var(--text); }
-        .nav-item.active { background: var(--primary); color: white; }
-        .nav-item svg { width: 18px; height: 18px; }
-        .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-        .header { padding: 16px 24px; border-bottom: 1px solid var(--border);
-                  display: flex; justify-content: space-between; align-items: center; }
-        .content { flex: 1; overflow-y: auto; padding: 24px; }
-        .btn { padding: 8px 16px; border-radius: 8px; border: none; cursor: pointer;
-               font-size: 14px; font-weight: 500; transition: all 0.2s; }
-        .btn-primary { background: var(--primary); color: white; }
-        .btn-primary:hover { background: var(--primary-hover); }
-        .btn-secondary { background: var(--secondary); color: var(--text); border: 1px solid var(--border); }
-        .btn-secondary:hover { border-color: var(--accent); }
-        .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
-                padding: 20px; margin-bottom: 16px; }
-        .card:hover { border-color: var(--accent); }
-        .input { width: 100%; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border);
-                 border-radius: 8px; color: var(--text); font-size: 14px; }
-        .input:focus { outline: none; border-color: var(--accent); }
-        .textarea { min-height: 100px; resize: vertical; }
-        .grid { display: grid; gap: 16px; }
-        .grid-2 { grid-template-columns: repeat(2, 1fr); }
-        .grid-3 { grid-template-columns: repeat(3, 1fr); }
-        .badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
-                 font-size: 12px; font-weight: 500; }
-        .badge-success { background: rgba(63,185,80,0.2); color: var(--success); }
-        .badge-warning { background: rgba(210,153,34,0.2); color: var(--warning); }
-        .badge-error { background: rgba(248,81,73,0.2); color: var(--error); }
-        .badge-info { background: rgba(88,166,255,0.2); color: var(--accent); }
-        .progress { height: 4px; background: var(--secondary); border-radius: 2px; overflow: hidden; }
-        .progress-bar { height: 100%; background: var(--primary); transition: width 0.3s; }
-        .chat-container { display: flex; flex-direction: column; height: 100%; }
-        .chat-messages { flex: 1; overflow-y: auto; padding: 16px; }
-        .chat-input { padding: 16px; border-top: 1px solid var(--border); }
-        .message { margin-bottom: 16px; }
-        .message-user { text-align: right; }
-        .message-content { display: inline-block; padding: 12px 16px; border-radius: 12px;
-                          max-width: 80%; text-align: left; }
-        .message-user .message-content { background: var(--primary); color: white; }
-        .message-assistant .message-content { background: var(--bg-card); border: 1px solid var(--border); }
-        .stat-card { text-align: center; padding: 24px; }
-        .stat-value { font-size: 32px; font-weight: bold; color: var(--primary); }
-        .stat-label { color: var(--text-muted); margin-top: 8px; }
-        .table { width: 100%; border-collapse: collapse; }
-        .table th, .table td { padding: 12px; text-align: left; border-bottom: 1px solid var(--border); }
-        .table th { color: var(--text-muted); font-weight: 500; }
-        .empty-state { text-align: center; padding: 60px 20px; color: var(--text-muted); }
-        .empty-state svg { width: 64px; height: 64px; margin-bottom: 16px; opacity: 0.3; }
-        .loading { display: flex; align-items: center; justify-content: center; padding: 40px; }
-        .spinner { width: 24px; height: 24px; border: 3px solid var(--border);
-                   border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex;
-                        align-items: center; justify-content: center; z-index: 100; }
-        .modal { background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px;
-                padding: 24px; max-width: 600px; width: 90%; max-height: 80vh; overflow-y: auto; }
-        .tabs { display: flex; gap: 4px; margin-bottom: 16px; }
-        .tab { padding: 8px 16px; border-radius: 8px; cursor: pointer; color: var(--text-muted); }
-        .tab.active { background: var(--primary); color: white; }
-        .tooltip { position: relative; }
-        .tooltip:hover::after { content: attr(data-tip); position: absolute; bottom: 100%;
-                               left: 50%; transform: translateX(-50%); padding: 4px 8px;
-                               background: var(--text); color: var(--bg); font-size: 12px;
-                               border-radius: 4px; white-space: nowrap; }
-    </style>
-</head>
-<body>
-    <div class="app" id="app">
-        <aside class="sidebar">
-            <div class="sidebar-header">
-                <h1>NovelForge Studio</h1>
-                <p style="font-size:12px;color:var(--text-muted);margin-top:4px">AI小说创作平台</p>
-            </div>
-            <nav class="sidebar-nav">
-                <div class="nav-item active" onclick="showPage('dashboard')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
-                    我的创作
-                </div>
-                <div class="nav-item" onclick="showPage('create')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
-                    新建书籍
-                </div>
-                <div class="nav-item" onclick="showPage('chat')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
-                    AI助手
-                </div>
-                <div class="nav-item" onclick="showPage('genres')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
-                    题材库
-                </div>
-                <div class="nav-item" onclick="showPage('services')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
-                    模型配置
-                </div>
-                <div class="nav-item" onclick="showPage('settings')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-                    项目设置
-                </div>
-                <div class="nav-item" onclick="showPage('doctor')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-                    诊断
-                </div>
-                <div class="nav-item" onclick="showPage('wizard')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-                    Story Bible
-                </div>
-                <div class="nav-item" onclick="showPage('tasks')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/></svg>
-                    任务管理
-                </div>
-            </nav>
-        </aside>
-        <main class="main">
-            <div id="page-content"></div>
-        </main>
-    </div>
-
-    <script>
-        let currentPage = 'dashboard';
-        let books = [];
-        let selectedBook = null;
-
-        async function api(method, path, body) {
-            const opts = { method, headers: {'Content-Type': 'application/json'} };
-            if (body) opts.body = JSON.stringify(body);
-            const res = await fetch('/api/v1' + path, opts);
-            if (!res.ok) {
-                const err = await res.json().catch(() => ({detail: res.statusText}));
-                throw new Error(err.detail || err.message || '请求失败');
-            }
-            return res.json();
-        }
-
-        function showPage(page) {
-            currentPage = page;
-            document.querySelectorAll('.nav-item').forEach((el, i) => {
-                el.classList.toggle('active', ['dashboard','create','chat','genres','services','settings','doctor'][i] === page);
-            });
-            renderPage();
-        }
-
-        async function renderPage() {
-            const content = document.getElementById('page-content');
-            switch(currentPage) {
-                case 'dashboard': content.innerHTML = await renderDashboard(); break;
-                case 'create': content.innerHTML = renderCreate(); break;
-                case 'chat': content.innerHTML = renderChat(); break;
-                case 'genres': content.innerHTML = await renderGenres(); break;
-                case 'services': content.innerHTML = await renderServices(); break;
-                case 'settings': content.innerHTML = await renderSettings(); break;
-                case 'doctor': content.innerHTML = await renderDoctor(); break;
-                case 'book': content.innerHTML = await renderBookDetail(); break;
-                case 'analytics': content.innerHTML = await renderAnalytics(); break;
-                case 'continuous': content.innerHTML = renderContinuous(); break;
-                case 'forecast': content.innerHTML = renderForecast(); break;
-                case 'chapter': content.innerHTML = await renderChapterEditor(); break;
-                case 'wizard': content.innerHTML = await renderWizard(); break;
-                case 'tasks': content.innerHTML = await renderTasks(); break;
-            }
-        }
-
-        async function renderDashboard() {
-            try {
-                const data = await api('GET', '/books');
-                books = data.books || [];
-                if (!books.length) {
-                    return `<div class="empty-state">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
-                        <h2>还没有作品</h2>
-                        <p>点击"新建书籍"开始你的创作之旅</p>
-                        <button class="btn btn-primary" style="margin-top:16px" onclick="showPage('create')">新建书籍</button>
-                    </div>`;
-                }
-                return `<div class="header">
-                    <h2>我的创作</h2>
-                    <button class="btn btn-primary" onclick="showPage('create')">+ 新建书籍</button>
-                </div>
-                <div class="content">
-                    <div class="grid">${books.map(b => `
-                        <div class="card" onclick="selectBook('${b.id}')" style="cursor:pointer">
-                            <div style="display:flex;justify-content:space-between;align-items:start">
-                                <div>
-                                    <h3 style="font-size:18px;margin-bottom:8px">${b.title}</h3>
-                                    <div style="display:flex;gap:8px;align-items:center">
-                                        <span class="badge badge-info">${b.genre || '未分类'}</span>
-                                        <span style="color:var(--text-muted);font-size:13px">${b.chaptersWritten}章</span>
-                                    </div>
-                                </div>
-                                <div style="display:flex;gap:8px">
-                                    <button class="btn btn-secondary" onclick="event.stopPropagation();writeNext('${b.id}')">写下一章</button>
-                                    <button class="btn btn-secondary" onclick="event.stopPropagation();exportBook('${b.id}')">导出</button>
-                                </div>
-                            </div>
-                        </div>
-                    `).join('')}</div>
-                </div>`;
-            } catch(e) {
-                return `<div class="content"><div class="card"><p style="color:var(--error)">${e.message}</p></div></div>`;
-            }
-        }
-
-        function renderCreate() {
-            return `<div class="header"><h2>新建书籍</h2></div>
-            <div class="content">
-                <div class="card" style="max-width:600px">
-                    <h3 style="margin-bottom:16px">创建新作品</h3>
-                    <div style="margin-bottom:16px">
-                        <label style="display:block;margin-bottom:6px;color:var(--text-muted)">书名</label>
-                        <input class="input" id="new-title" placeholder="输入书名">
-                    </div>
-                    <div style="margin-bottom:16px">
-                        <label style="display:block;margin-bottom:6px;color:var(--text-muted)">类型</label>
-                        <input class="input" id="new-genre" placeholder="如：玄幻修仙、都市异能">
-                    </div>
-                    <div style="margin-bottom:16px">
-                        <label style="display:block;margin-bottom:6px;color:var(--text-muted)">创作简报（可选）</label>
-                        <textarea class="input textarea" id="new-brief" placeholder="描述你的小说设定、主角、核心矛盾等..."></textarea>
-                    </div>
-                    <button class="btn btn-primary" onclick="createBook()">创建</button>
-                </div>
-            </div>`;
-        }
-
-        async function createBook() {
-            const title = document.getElementById('new-title').value;
-            const genre = document.getElementById('new-genre').value;
-            const brief = document.getElementById('new-brief').value;
-            if (!title) return alert('请输入书名');
-            try {
-                await api('POST', '/books/create', {title, genre, brief});
-                alert('创建成功！');
-                showPage('dashboard');
-            } catch(e) { alert(e.message); }
-        }
-
-        async function selectBook(id) {
-            selectedBook = id;
-            showPage('book');
-        }
-
-        async function renderBookDetail() {
-            if (!selectedBook) return '';
-            try {
-                const book = await api('GET', '/books/' + selectedBook);
-                return `<div class="header">
-                    <div>
-                        <button class="btn btn-secondary" onclick="showPage('dashboard')" style="margin-right:12px">← 返回</button>
-                        <span style="font-size:20px;font-weight:bold">${book.title}</span>
-                        <span class="badge badge-info" style="margin-left:8px">${book.genre}</span>
-                    </div>
-                    <div style="display:flex;gap:8px">
-                        <button class="btn btn-primary" onclick="writeNext('${book.id}')">写下一章</button>
-                        <button class="btn btn-secondary" onclick="showPage('continuous')">连续创作</button>
-                        <button class="btn btn-secondary" onclick="showPage('forecast')">剧情推演</button>
-                        <button class="btn btn-secondary" onclick="exportBook('${book.id}')">导出</button>
-                        <button class="btn btn-secondary" onclick="viewMindmap('${book.id}')">思维导图</button>
-                        <button class="btn btn-secondary" onclick="viewTimeline('${book.id}')">时间轴</button>
-                    </div>
-                </div>
-                <div class="content">
-                    <div class="grid grid-3">
-                        <div class="card stat-card">
-                            <div class="stat-value">${book.chaptersWritten}</div>
-                            <div class="stat-label">章节</div>
-                        </div>
-                        <div class="card stat-card">
-                            <div class="stat-value">${Object.keys(book.characters || {}).length}</div>
-                            <div class="stat-label">角色</div>
-                        </div>
-                        <div class="card stat-card">
-                            <div class="stat-value">${Object.keys(book.foreshadowing || {}).length}</div>
-                            <div class="stat-label">伏笔</div>
-                        </div>
-                    </div>
-                    <div class="card">
-                        <h3 style="margin-bottom:12px">世界观</h3>
-                        <p>${book.world?.coreConflict || '暂无'}</p>
-                    </div>
-                    <div class="card">
-                        <h3 style="margin-bottom:12px">章节列表</h3>
-                        ${book.chaptersWritten > 0 ? `
-                            <div id="chapter-list">加载中...</div>
-                            <script>
-                                (async function() {
-                                    try {
-                                        const data = await api('GET', '/books/${book.id}/chapters');
-                                        const chapters = data.chapters || [];
-                                        document.getElementById('chapter-list').innerHTML = chapters.map(c =>
-                                            '<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">' +
-                                            '<div><strong>第' + c.number + '章</strong> ' + (c.title || '') + ' <span class="badge badge-' + (c.status === 'committed' ? 'success' : 'warning') + '">' + (c.status || 'draft') + '</span></div>' +
-                                            '<button class="btn btn-secondary" onclick="editChapter(' + c.number + ')">编辑</button>' +
-                                            '</div>'
-                                        ).join('');
-                                    } catch(e) { document.getElementById('chapter-list').innerHTML = '<p style="color:var(--error)">' + e.message + '</p>'; }
-                                })();
-                            </script>
-                        ` : '<p style="color:var(--text-muted)">暂无章节</p>'}
-                    </div>
-                    <div class="card">
-                        <h3 style="margin-bottom:12px">角色列表</h3>
-                        ${Object.entries(book.characters || {}).map(([name, c]) => `
-                            <div style="padding:8px 0;border-bottom:1px solid var(--border)">
-                                <strong>${name}</strong> <span class="badge badge-info">${c.role}</span>
-                                <p style="color:var(--text-muted);font-size:13px;margin-top:4px">${c.personality || ''}</p>
-                            </div>
-                        `).join('') || '<p style="color:var(--text-muted)">暂无角色</p>'}
-                    </div>
-                </div>`;
-            } catch(e) {
-                return `<div class="content"><div class="card"><p style="color:var(--error)">${e.message}</p></div></div>`;
-            }
-        }
-
-        async function writeNext(bookId) {
-            try {
-                const res = await api('POST', '/books/' + bookId + '/write-next', {count: 1});
-                alert(res.message);
-            } catch(e) { alert(e.message); }
-        }
-
-        async function exportBook(bookId) {
-            window.open('/api/v1/books/' + bookId + '/export?format=docx');
-        }
-
-        function viewMindmap(bookId) {
-            window.open('/api/v1/books/' + bookId + '/mindmap');
-        }
-
-        function viewTimeline(bookId) {
-            window.open('/api/v1/books/' + bookId + '/timeline');
-        }
-
-        function renderChat() {
-            return `<div class="chat-container">
-                <div class="header"><h2>AI助手</h2></div>
-                <div class="chat-messages" id="chat-messages">
-                    <div class="message message-assistant">
-                        <div class="message-content">你好！我是NovelForge AI助手，可以帮你规划故事、创作章节、分析设定。有什么可以帮你的？</div>
-                    </div>
-                </div>
-                <div class="chat-input">
-                    <div style="display:flex;gap:8px">
-                        <input class="input" id="chat-input" placeholder="输入消息..." onkeypress="if(event.key==='Enter')sendMessage()">
-                        <button class="btn btn-primary" onclick="sendMessage()">发送</button>
-                    </div>
-                </div>
-            </div>`;
-        }
-
-        async function sendMessage() {
-            const input = document.getElementById('chat-input');
-            const msg = input.value.trim();
-            if (!msg) return;
-            input.value = '';
-
-            const messages = document.getElementById('chat-messages');
-            messages.innerHTML += `<div class="message message-user"><div class="message-content">${msg}</div></div>`;
-
-            try {
-                const res = await api('POST', '/agent', {message: msg, bookId: selectedBook || ''});
-                messages.innerHTML += `<div class="message message-assistant"><div class="message-content">${res.response || res.message || '处理完成'}</div></div>`;
-            } catch(e) {
-                messages.innerHTML += `<div class="message message-assistant"><div class="message-content" style="color:var(--error)">${e.message}</div></div>`;
-            }
-            messages.scrollTop = messages.scrollHeight;
-        }
-
-        async function renderGenres() {
-            try {
-                const data = await api('GET', '/genres');
-                return `<div class="header"><h2>题材库</h2></div>
-                <div class="content">
-                    <div class="grid grid-2">
-                        ${(data.genres || []).map(g => `
-                            <div class="card">
-                                <h3>${g.name}</h3>
-                                <p style="color:var(--text-muted);font-size:13px;margin-top:8px">${g.rules}条规则 | ${g.taboos}条禁忌</p>
-                            </div>
-                        `).join('')}
-                    </div>
-                </div>`;
-            } catch(e) { return `<div class="content"><div class="card"><p>${e.message}</p></div></div>`; }
-        }
-
-        async function renderServices() {
-            try {
-                const data = await api('GET', '/services/config');
-                return `<div class="header"><h2>模型配置</h2></div>
-                <div class="content">
-                    <div class="card">
-                        <h3 style="margin-bottom:16px">主创作模型</h3>
-                        <div style="margin-bottom:12px">
-                            <label style="display:block;margin-bottom:6px;color:var(--text-muted)">模型</label>
-                            <input class="input" id="svc-model" value="${data.primary?.model || ''}">
-                        </div>
-                        <div style="margin-bottom:12px">
-                            <label style="display:block;margin-bottom:6px;color:var(--text-muted)">Base URL</label>
-                            <input class="input" id="svc-url" value="${data.primary?.base_url || ''}">
-                        </div>
-                        <div style="margin-bottom:12px">
-                            <label style="display:block;margin-bottom:6px;color:var(--text-muted)">API Key</label>
-                            <input class="input" id="svc-key" type="password" value="${data.primary?.api_key || ''}">
-                        </div>
-                        <button class="btn btn-primary" onclick="saveServiceConfig()">保存</button>
-                        <button class="btn btn-secondary" onclick="testService()">测试连接</button>
-                    </div>
-                </div>`;
-            } catch(e) { return `<div class="content"><div class="card"><p>${e.message}</p></div></div>`; }
-        }
-
-        async function saveServiceConfig() {
-            try {
-                await api('PUT', '/services/config', {
-                    primary: {
-                        model: document.getElementById('svc-model').value,
-                        base_url: document.getElementById('svc-url').value,
-                        api_key: document.getElementById('svc-key').value,
-                    }
-                });
-                alert('保存成功');
-            } catch(e) { alert(e.message); }
-        }
-
-        async function testService() {
-            try {
-                const res = await api('POST', '/services/primary/test');
-                alert(res.connected ? '连接成功: ' + res.model : '连接失败: ' + res.error);
-            } catch(e) { alert(e.message); }
-        }
-
-        async function renderSettings() {
-            try {
-                const data = await api('GET', '/project');
-                return `<div class="header"><h2>项目设置</h2></div>
-                <div class="content">
-                    <div class="card" style="max-width:600px">
-                        <h3 style="margin-bottom:16px">创作参数</h3>
-                        <div style="margin-bottom:12px">
-                            <label style="display:block;margin-bottom:6px;color:var(--text-muted)">每章最小字数</label>
-                            <input class="input" id="set-min-words" type="number" value="${data.chapterWordsMin}">
-                        </div>
-                        <div style="margin-bottom:12px">
-                            <label style="display:block;margin-bottom:6px;color:var(--text-muted)">每章最大字数</label>
-                            <input class="input" id="set-max-words" type="number" value="${data.chapterWordsMax}">
-                        </div>
-                        <div style="margin-bottom:12px">
-                            <label style="display:block;margin-bottom:6px;color:var(--text-muted)">审查通过分数</label>
-                            <input class="input" id="set-pass-score" type="number" value="${data.passScore}">
-                        </div>
-                        <div style="margin-bottom:12px">
-                            <label style="display:block;margin-bottom:6px;color:var(--text-muted)">最大修订轮数</label>
-                            <input class="input" id="set-max-rounds" type="number" value="${data.maxRevisionRounds}">
-                        </div>
-                        <div style="margin-bottom:12px">
-                            <label style="display:block;margin-bottom:6px;color:var(--text-muted)">联合审查间隔（章）</label>
-                            <input class="input" id="set-joint-interval" type="number" value="${data.jointReviewInterval}">
-                        </div>
-                        <button class="btn btn-primary" onclick="saveSettings()">保存</button>
-                    </div>
-                </div>`;
-            } catch(e) { return `<div class="content"><div class="card"><p>${e.message}</p></div></div>`; }
-        }
-
-        async function saveSettings() {
-            try {
-                await api('PUT', '/project', {
-                    chapterWordsMin: parseInt(document.getElementById('set-min-words').value),
-                    chapterWordsMax: parseInt(document.getElementById('set-max-words').value),
-                    passScore: parseInt(document.getElementById('set-pass-score').value),
-                    maxRevisionRounds: parseInt(document.getElementById('set-max-rounds').value),
-                    jointReviewInterval: parseInt(document.getElementById('set-joint-interval').value),
-                });
-                alert('保存成功');
-            } catch(e) { alert(e.message); }
-        }
-
-        async function renderDoctor() {
-            try {
-                const data = await api('GET', '/doctor');
-                return `<div class="header"><h2>系统诊断</h2></div>
-                <div class="content">
-                    <div class="card">
-                        <h3 style="margin-bottom:16px">诊断结果</h3>
-                        ${(data.checks || []).map(c => `
-                            <div style="padding:12px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">
-                                <span>${c.name}</span>
-                                <span class="badge badge-${c.status === 'ok' ? 'success' : c.status === 'warning' ? 'warning' : 'error'}">${c.message}</span>
-                            </div>
-                        `).join('')}
-                    </div>
-                </div>`;
-            } catch(e) { return `<div class="content"><div class="card"><p>${e.message}</p></div></div>`; }
-        }
-
-        function renderContinuous() {
-            if (!selectedBook) return '<div class="content"><p>请先选择一本书</p></div>';
-            return `<div class="header"><h2>连续创作模式</h2></div>
-            <div class="content">
-                <div class="card" style="max-width:600px">
-                    <div style="background:var(--warning);color:var(--bg);padding:12px;border-radius:8px;margin-bottom:16px">
-                        ⚠️ 连续创作模式由于AI的反复审核与修订会消耗海量token
-                    </div>
-                    <div style="margin-bottom:16px">
-                        <label style="display:block;margin-bottom:6px;color:var(--text-muted)">创作章数 (5-200)</label>
-                        <input class="input" id="cont-count" type="number" value="10" min="5" max="200">
-                    </div>
-                    <div style="margin-bottom:16px">
-                        <label style="display:block;margin-bottom:6px;color:var(--text-muted)">额外指导（可选）</label>
-                        <textarea class="input textarea" id="cont-context" placeholder="本卷重点写..."></textarea>
-                    </div>
-                    <button class="btn btn-primary" onclick="startContinuous()">开始连续创作</button>
-                </div>
-            </div>`;
-        }
-
-        async function startContinuous() {
-            const count = parseInt(document.getElementById('cont-count').value);
-            const context = document.getElementById('cont-context').value;
-            if (!confirm(`确认开始连续创作${count}章？这将消耗大量token。`)) return;
-            try {
-                const res = await api('POST', '/books/' + selectedBook + '/continuous', {count, context});
-                alert(res.message);
-            } catch(e) { alert(e.message); }
-        }
-
-        function renderForecast() {
-            if (!selectedBook) return '<div class="content"><p>请先选择一本书</p></div>';
-            return `<div class="header"><h2>剧情多线推演</h2></div>
-            <div class="content">
-                <div class="card" style="max-width:600px">
-                    <h3 style="margin-bottom:16px">生成候选分支</h3>
-                    <div style="margin-bottom:16px">
-                        <label style="display:block;margin-bottom:6px;color:var(--text-muted)">分支数量 (2-5)</label>
-                        <input class="input" id="forecast-count" type="number" value="3" min="2" max="5">
-                    </div>
-                    <button class="btn btn-primary" onclick="createForecast()">生成推演</button>
-                </div>
-            </div>`;
-        }
-
-        async function createForecast() {
-            const count = parseInt(document.getElementById('forecast-count').value);
-            try {
-                const res = await api('POST', '/books/' + selectedBook + '/forecast', {branchCount: count});
-                alert(JSON.stringify(res.branches, null, 2));
-            } catch(e) { alert(e.message); }
-        }
-
-        async function renderAnalytics() {
-            if (!selectedBook) return '';
-            try {
-                const data = await api('GET', '/books/' + selectedBook + '/analytics');
-                return `<div class="header">
-                    <button class="btn btn-secondary" onclick="showPage('book')" style="margin-right:12px">← 返回</button>
-                    <h2>数据分析</h2>
-                </div>
-                <div class="content">
-                    <div class="grid grid-3">
-                        <div class="card stat-card"><div class="stat-value">${data.totalChapters}</div><div class="stat-label">总章节</div></div>
-                        <div class="card stat-card"><div class="stat-value">${data.totalWords}</div><div class="stat-label">总字数</div></div>
-                        <div class="card stat-card"><div class="stat-value">${data.averageScore}</div><div class="stat-label">平均分</div></div>
-                        <div class="card stat-card"><div class="stat-value">${data.approvedChapters}</div><div class="stat-label">已通过</div></div>
-                        <div class="card stat-card"><div class="stat-value">${data.characters}</div><div class="stat-label">角色</div></div>
-                        <div class="card stat-card"><div class="stat-value">${data.openForeshadowing}</div><div class="stat-label">未解伏笔</div></div>
-                    </div>
-                    <div class="card">
-                        <h3 style="margin-bottom:12px">章节评分</h3>
-                        <table class="table">
-                            <tr><th>章节</th><th>评分</th></tr>
-                            ${(data.chapterScores || []).map(c => `
-                                <tr><td>第${c.chapter}章</td><td>${c.score || '-'}</td></tr>
-                            `).join('')}
-                        </table>
-                    </div>
-                </div>`;
-            } catch(e) { return `<div class="content"><div class="card"><p>${e.message}</p></div></div>`; }
-        }
-
-        // 章节编辑器
-        let currentChapter = null;
-        async function renderChapterEditor() {
-            if (!selectedBook || !currentChapter) return '<div class="content"><p>请先选择一个章节</p></div>';
-            try {
-                const chapters = await api('GET', '/books/' + selectedBook + '/chapters');
-                const chapter = chapters.chapters?.find(c => c.number === currentChapter);
-                if (!chapter) return '<div class="content"><p>章节未找到</p></div>';
-                return `<div class="header">
-                    <button class="btn btn-secondary" onclick="showPage('book')" style="margin-right:12px">← 返回</button>
-                    <h2>第${chapter.number}章 ${chapter.title || ''}</h2>
-                    <div style="display:flex;gap:8px">
-                        <span class="badge badge-info">${chapter.wordCount || 0}字</span>
-                        <span class="badge badge-${chapter.status === 'committed' ? 'success' : 'warning'}">${chapter.status || 'draft'}</span>
-                    </div>
-                </div>
-                <div class="content">
-                    <div class="card">
-                        <h3 style="margin-bottom:12px">章节内容</h3>
-                        <textarea class="input textarea" id="chapter-content" style="min-height:400px">${chapter.content || ''}</textarea>
-                        <div style="margin-top:12px;display:flex;gap:8px">
-                            <button class="btn btn-primary" onclick="saveChapter(${chapter.number})">保存</button>
-                            <button class="btn btn-secondary" onclick="reviewChapter(${chapter.number})">审查</button>
-                        </div>
-                    </div>
-                </div>`;
-            } catch(e) { return `<div class="content"><div class="card"><p>${e.message}</p></div></div>`; }
-        }
-
-        async function saveChapter(num) {
-            const content = document.getElementById('chapter-content').value;
-            try {
-                await api('PUT', '/books/' + selectedBook + '/chapters/' + num, {content});
-                alert('保存成功');
-            } catch(e) { alert(e.message); }
-        }
-
-        async function reviewChapter(num) {
-            try {
-                const res = await api('POST', '/books/' + selectedBook + '/chapters/' + num + '/review');
-                alert('审查任务已创建: ' + res.taskId);
-            } catch(e) { alert(e.message); }
-        }
-
-        function editChapter(num) {
-            currentChapter = num;
-            showPage('chapter');
-        }
-
-        // Story Bible 向导
-        let wizardState = null;
-        async function renderWizard() {
-            if (!selectedBook) return '<div class="content"><p>请先选择一本书</p></div>';
-            try {
-                wizardState = await api('GET', '/books/' + selectedBook + '/wizard/state');
-                const steps = wizardState.steps || [];
-                const current = wizardState.current_step;
-                return `<div class="header">
-                    <button class="btn btn-secondary" onclick="showPage('book')" style="margin-right:12px">← 返回</button>
-                    <h2>Story Bible 向导</h2>
-                    <span class="badge badge-info">步骤 ${current}/25</span>
-                </div>
-                <div class="content">
-                    <div class="progress" style="margin-bottom:24px">
-                        <div class="progress-bar" style="width:${(current/25*100).toFixed(1)}%"></div>
-                    </div>
-                    <div class="grid grid-2">
-                        ${steps.map(s => `
-                            <div class="card" style="opacity:${s.status === 'confirmed' ? 1 : 0.7}">
-                                <div style="display:flex;justify-content:space-between;align-items:center">
-                                    <h4>${s.number}. ${s.key}</h4>
-                                    <span class="badge badge-${s.status === 'confirmed' ? 'success' : s.status === 'draft' ? 'warning' : 'info'}">${s.status}</span>
-                                </div>
-                                <div style="margin-top:12px;display:flex;gap:8px">
-                                    <button class="btn btn-secondary" onclick="wizardSubmit('${s.key}')">编辑</button>
-                                    ${s.status === 'draft' ? `<button class="btn btn-primary" onclick="wizardConfirm('${s.key}')">确认</button>` : ''}
-                                    <button class="btn btn-secondary" onclick="wizardGenerate('${s.key}')">AI生成</button>
-                                </div>
-                            </div>
-                        `).join('')}
-                    </div>
-                    ${current > 25 ? `<div style="margin-top:24px;text-align:center">
-                        <button class="btn btn-primary" onclick="wizardPublish()">发布 Story Bible</button>
-                    </div>` : ''}
-                </div>`;
-            } catch(e) { return `<div class="content"><div class="card"><p>${e.message}</p></div></div>`; }
-        }
-
-        async function wizardSubmit(stepKey) {
-            const draft = prompt('请输入设定内容 (JSON格式):');
-            if (!draft) return;
-            try {
-                let parsed;
-                try { parsed = JSON.parse(draft); } catch { parsed = draft; }
-                await api('POST', '/books/' + selectedBook + '/wizard/steps/' + stepKey, {draft: parsed, source: 'author'});
-                showPage('wizard');
-            } catch(e) { alert(e.message); }
-        }
-
-        async function wizardConfirm(stepKey) {
-            try {
-                await api('POST', '/books/' + selectedBook + '/wizard/steps/' + stepKey + '/confirm');
-                showPage('wizard');
-            } catch(e) { alert(e.message); }
-        }
-
-        async function wizardGenerate(stepKey) {
-            const brief = prompt('请输入特别要求 (可选):');
-            try {
-                const res = await api('POST', '/books/' + selectedBook + '/wizard/steps/' + stepKey + '/generate', {brief: brief || ''});
-                alert('AI建议: ' + JSON.stringify(res.suggestion, null, 2));
-                showPage('wizard');
-            } catch(e) { alert(e.message); }
-        }
-
-        async function wizardPublish() {
-            if (!confirm('确认发布 Story Bible？所有25步必须已确认。')) return;
-            try {
-                await api('POST', '/books/' + selectedBook + '/wizard/publish');
-                alert('Story Bible 已发布');
-                showPage('book');
-            } catch(e) { alert(e.message); }
-        }
-
-        // 任务管理
-        async function renderTasks() {
-            try {
-                const data = await api('GET', '/tasks');
-                const tasks = data.tasks || [];
-                return `<div class="header"><h2>任务管理</h2></div>
-                <div class="content">
-                    ${tasks.length ? `<table class="table">
-                        <thead><tr><th>ID</th><th>类型</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
-                        <tbody>${tasks.map(t => `
-                            <tr>
-                                <td>${t.id?.slice(0,8)}</td>
-                                <td>${t.type}</td>
-                                <td><span class="badge badge-${t.status === 'completed' ? 'success' : t.status === 'running' ? 'warning' : 'info'}">${t.status}</span></td>
-                                <td>${t.created_at?.slice(0,19)}</td>
-                                <td>
-                                    ${t.status === 'running' ? `<button class="btn btn-secondary" onclick="pauseTask('${t.id}')">暂停</button>` : ''}
-                                    ${t.status === 'paused' ? `<button class="btn btn-secondary" onclick="resumeTask('${t.id}')">恢复</button>` : ''}
-                                    ${['running','queued'].includes(t.status) ? `<button class="btn btn-secondary" onclick="cancelTask('${t.id}')">取消</button>` : ''}
-                                </td>
-                            </tr>
-                        `).join('')}</tbody>
-                    </table>` : '<div class="empty-state"><h2>暂无任务</h2><p>开始创作后任务会显示在这里</p></div>'}
-                </div>`;
-            } catch(e) { return `<div class="content"><div class="card"><p>${e.message}</p></div></div>`; }
-        }
-
-        async function pauseTask(taskId) {
-            try { await api('POST', '/tasks/' + taskId + '/pause'); showPage('tasks'); }
-            catch(e) { alert(e.message); }
-        }
-
-        async function resumeTask(taskId) {
-            try { await api('POST', '/tasks/' + taskId + '/resume'); showPage('tasks'); }
-            catch(e) { alert(e.message); }
-        }
-
-        async function cancelTask(taskId) {
-            if (!confirm('确认取消此任务？')) return;
-            try { await api('POST', '/tasks/' + taskId + '/cancel'); showPage('tasks'); }
-            catch(e) { alert(e.message); }
-        }
-
-        // 初始化
-        showPage('dashboard');
-    </script>
-</body>
-</html>"""
 
 if __name__ == "__main__":
     import uvicorn

@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .database import Database, generate_id, get_db
+from .task_workflow import (
+    initial_workflow_state,
+    is_chapter_workflow_task,
+    story_commit_id,
+    workflow_state_for_checkpoint,
+)
+from .narrative_events import ACCEPTANCE_EVENT_TYPES, active_events
+from src.runtime.contracts import AgentTask, AgentTaskProfile, RuntimeEvent, default_agent_task_profile
+from src.runtime.events import RuntimeEventStore
 
 
 class TaskStateError(ValueError):
@@ -32,9 +43,13 @@ class TaskFailure(RuntimeError):
 
 TERMINAL = {"completed", "cancelled", "needs_author_decision"}
 WAITING_ON_CHILD = "waiting_on_child"
+INITIAL_TASK_STATUSES = {"queued", "needs_author_decision"}
 RECOVERY_REQUIRES_AUTHOR = {"world-bootstrap", "write", "write-next"}
 TRANSITIONS = {
     "queued": {"running", "cancelled"},
+    # Databases created before the durable runtime used ``pending``. Treat it
+    # as queued at claim/cancel boundaries without rewriting the user's rows.
+    "pending": {"running", "cancelled"},
     "running": {"paused", "cancelling", "completed", "failed", "needs_author_decision", WAITING_ON_CHILD},
     "paused": {"queued", "cancelled"},
     "cancelling": {"cancelled", "needs_author_decision"},
@@ -60,11 +75,16 @@ TASK_OPERATION_LABELS = {
     "plan-chapter": "章节规划",
     "compose-chapter": "上下文编排",
     "joint-review": "联合审查",
+    "dialogue-write": "生成角色对白",
     "world-bootstrap": "世界观构建",
     "planning-synthesis": "理解规划资料",
     "planning-views-generate": "整理规划视图",
     "forecast": "剧情推演",
     "storyflow-analyze": "StoryFlow 分析",
+    "storyflow-planning-change": "StoryFlow 规划变更",
+    "simulation-analyst-query": "Simulation Analyst 查询",
+    "simulation-character-chat": "Character Chat",
+    "simulation-survey": "Simulation Survey",
     "draft-import": "初稿分析",
     "document-index": "文档索引",
     "model-connection-test": "测试模型连接",
@@ -105,6 +125,7 @@ _TASK_PROGRESS = {
     "compose-chapter": {"queued": 0, "plan": 42, "compose": 82, "completed": 100},
     "world-bootstrap": {"queued": 0, "world-bootstrap": 82, "completed": 100},
     "joint-review": {"queued": 0, "joint-review": 82, "completed": 100},
+    "dialogue-write": {"queued": 0, "dialogue-model-call": 82, "completed": 100},
     "planning-synthesis": {"queued": 0, "planning-synthesis-model-call": 55, "completed": 100},
     "planning-views-generate": {"queued": 0, "planning-views-model-call": 55, "planning-views-saved": 92, "completed": 100},
     "model-connection-test": {"queued": 0, "provider-test": 82, "completed": 100},
@@ -112,6 +133,106 @@ _TASK_PROGRESS = {
     "document-index": {"queued": 0, "parsing": 45, "indexed": 88, "completed": 100},
     "forecast": {"queued": 0, "forecast-complete": 92, "completed": 100},
     "storyflow-analyze": {"queued": 0, "storyflow-selection": 24, "storyflow-model-call": 72, "completed": 100},
+    "storyflow-planning-change": {
+        "needs_author_decision": 82,
+        "completed": 100,
+        "rejected": 100,
+    },
+}
+
+
+# These task types execute through a model/runtime adapter.  Keeping the
+# classification at the durable queue boundary means HTTP, CLI, and
+# continuous-writing callers all receive the same AgentTask envelope without
+# making each caller know about a provider-specific runtime.
+_AGENT_TASK_TYPES = {
+    "chat",
+    "continuous",
+    "write",
+    "write-next",
+    "draft-chapter",
+    "audit-chapter",
+    "review-chapter",
+    "review",
+    "revise-chapter",
+    "revise",
+    "rewrite-chapter",
+    "plan-chapter",
+    "compose-chapter",
+    "joint-review",
+    "dialogue-write",
+    "interactive-film-node-image",
+    "cover-image-generate",
+    "world-bootstrap",
+    "planning-synthesis",
+    "planning-views-generate",
+    "forecast",
+    "storyflow-analyze",
+    "storyflow-planning-change",
+    "simulation-analyst-query",
+    "simulation-character-chat",
+    "simulation-survey",
+    "draft-import",
+    "draft-import-analysis",
+    "draft-import-adjustment-plan",
+    "fact-extraction",
+    "revision",
+    "story-bible-suggest",
+    "radar",
+    "radar-scan",
+    "translation",
+    "translation-run",
+    "interactive-film",
+    "interactive-film-generate",
+    "cover-brief",
+    "model-connection-test",
+    "model-discovery",
+    "thought-clarify",
+    "thought-framework",
+    # Provider-backed simulation rounds are still NovelForge-owned agent work;
+    # explicit-only rounds use the same envelope even when no model is called.
+    "simulation-round",
+}
+
+_AGENT_TASK_ROLES = {
+    "audit-chapter": "reviewer",
+    "review-chapter": "reviewer",
+    "review": "reviewer",
+    "joint-review": "reviewer",
+    "dialogue-write": "writer",
+    "revise-chapter": "reviser",
+    "revise": "reviser",
+    "rewrite-chapter": "reviser",
+    "plan-chapter": "planner",
+    "planning-synthesis": "planner",
+    "planning-views-generate": "planner",
+    "forecast": "planner",
+    "storyflow-analyze": "planner",
+    "storyflow-planning-change": "planner",
+    "simulation-analyst-query": "planner",
+    "simulation-survey": "planner",
+    "simulation-character-chat": "writer",
+    "compose-chapter": "context",
+    "draft-import": "reviewer",
+    "draft-import-analysis": "reviewer",
+    "draft-import-adjustment-plan": "reviewer",
+    "fact-extraction": "fact_extraction",
+    "revision": "reviser",
+    "story-bible-suggest": "planner",
+    "radar": "planner",
+    "radar-scan": "planner",
+    "translation-run": "writer",
+    "interactive-film-generate": "planner",
+    "translation": "writer",
+    "interactive-film": "planner",
+    "cover-brief": "planner",
+    "interactive-film-node-image": "image",
+    "cover-image-generate": "image",
+    "model-connection-test": "planner",
+    "model-discovery": "planner",
+    "thought-clarify": "planner",
+    "thought-framework": "planner",
+    "simulation-round": "planner",
 }
 
 
@@ -122,10 +243,37 @@ class TaskRuntime:
         self.db = db or get_db()
 
     def enqueue(self, task_type: str, *, project_id: Optional[str] = None, book_id: Optional[str] = None,
-                data: Optional[dict[str, Any]] = None, stage: str = "queued",
-                idempotency_key: Optional[str] = None) -> dict[str, Any]:
+                chapter_number: Optional[int] = None, data: Optional[dict[str, Any]] = None, stage: str = "queued",
+                idempotency_key: Optional[str] = None, initiated_by: Optional[str] = None,
+                initial_status: str = "queued") -> dict[str, Any]:
+        initial_status = str(initial_status or "queued").strip().lower()
+        if initial_status not in INITIAL_TASK_STATUSES:
+            raise ValueError(
+                f"invalid initial task status: {initial_status}; "
+                f"expected one of {sorted(INITIAL_TASK_STATUSES)}"
+            )
+        if initial_status == "needs_author_decision" and task_type != "storyflow-planning-change":
+            raise ValueError(
+                "initial needs_author_decision is reserved for StoryFlow planning proposals"
+            )
         task_id = generate_id()
         now = datetime.now().isoformat()
+        task_data = dict(data or {})
+        if initiated_by is not None:
+            # A Host caller is the authority for provenance.  A nested
+            # payload may carry compatibility metadata, but it must not be
+            # able to impersonate the actor that actually enqueued the task.
+            task_data["initiatedBy"] = str(initiated_by).strip() or "system"
+        else:
+            task_data.setdefault(
+                "initiatedBy",
+                str(
+                    task_data.get("initiated_by")
+                    or task_data.get("source")
+                    or "system"
+                ).strip() or "system",
+            )
+        workflow_state = initial_workflow_state(task_type, stage=stage, data=task_data)
         with self.db.transaction() as conn:
             # Idempotency check inside the transaction to prevent TOCTOU races.
             if idempotency_key:
@@ -133,16 +281,327 @@ class TaskRuntime:
                     "SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
                 ).fetchone()
                 if previous:
-                    return self._task_dict(previous)
+                    result = self._task_dict(previous)
+                    self._attach_agent_task_projection(conn, previous["id"], result)
+                    return result
             conn.execute(
-                """INSERT INTO tasks(id, type, status, project_id, book_id, stage, data, idempotency_key,
-                   created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
-                (task_id, task_type, project_id, book_id, stage, json.dumps(data or {}, ensure_ascii=False),
-                 idempotency_key, now, now),
+                """INSERT INTO tasks(id, type, status, project_id, book_id, chapter_number, stage, data,
+                   workflow_state, workflow_state_updated_at, idempotency_key, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, task_type, initial_status, project_id, book_id, chapter_number, stage,
+                 json.dumps(task_data, ensure_ascii=False), workflow_state,
+                 now if workflow_state else None, idempotency_key, now, now),
             )
-            self._append_event(conn, task_id, "queued", {"stage": stage, "type": task_type})
+            agent_task = self._maybe_create_agent_task(
+                conn,
+                durable_task_id=task_id,
+                task_type=task_type,
+                project_id=project_id,
+                task_data=task_data,
+                created_at=now,
+            )
+            self._sync_agent_task_status(conn, task_id, initial_status)
+            self._append_event(conn, task_id, initial_status, {"stage": stage, "type": task_type})
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        return self._task_dict(row)
+        result = self._task_dict(row)
+        if agent_task is not None:
+            result["agentTaskId"] = agent_task.task_id
+        return result
+
+    def enqueue_agent_task(
+        self,
+        agent_task: AgentTask,
+        *,
+        book_id: Optional[str] = None,
+        chapter_number: Optional[int] = None,
+        stage: str = "queued",
+        idempotency_key: Optional[str] = None,
+        initiated_by: Optional[str] = None,
+        initial_status: str = "queued",
+    ) -> dict[str, Any]:
+        """Atomically create a durable TaskRuntime row and its AgentTask envelope.
+
+        Existing ``enqueue`` callers remain unchanged.  This bridge makes the
+        vendor-independent AgentTask a first-class child of the durable task
+        state machine, so a process restart can recover the same work without
+        relying on a provider thread.
+        """
+        if initiated_by is not None:
+            agent_task = replace(agent_task, initiated_by=initiated_by)
+        initial_status = str(initial_status or "queued").strip().lower()
+        if initial_status not in INITIAL_TASK_STATUSES:
+            raise ValueError(
+                f"invalid initial task status: {initial_status}; "
+                f"expected one of {sorted(INITIAL_TASK_STATUSES)}"
+            )
+        if initial_status == "needs_author_decision" and agent_task.task_type != "storyflow-planning-change":
+            raise ValueError(
+                "initial needs_author_decision is reserved for StoryFlow planning proposals"
+            )
+        task_id = generate_id()
+        now = datetime.now().isoformat()
+        task_input = dict(agent_task.input_payload)
+        task_input.setdefault("initiatedBy", agent_task.initiated_by)
+        with self.db.transaction() as conn:
+            if idempotency_key:
+                previous = conn.execute(
+                    "SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
+                ).fetchone()
+                if previous:
+                    result = self._task_dict(previous)
+                    agent_row = conn.execute(
+                        "SELECT id FROM agent_tasks WHERE task_id=?", (previous["id"],)
+                    ).fetchone()
+                    if agent_row:
+                        result["agentTaskId"] = agent_row["id"]
+                    return result
+            conn.execute(
+                """INSERT INTO tasks(id, type, status, project_id, book_id, chapter_number,
+                   stage, data, workflow_state, workflow_state_updated_at,
+                   idempotency_key, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    task_id, agent_task.task_type, initial_status, agent_task.project_id, book_id,
+                    chapter_number, stage,
+                    json.dumps(task_input, ensure_ascii=False),
+                    initial_workflow_state(agent_task.task_type, stage=stage, data=task_input),
+                    now if is_chapter_workflow_task(agent_task.task_type) else None,
+                    idempotency_key, now, now,
+                ),
+            )
+            self._insert_agent_task(conn, agent_task, task_id, now)
+            self._sync_agent_task_status(conn, task_id, initial_status)
+            self._append_event(conn, task_id, initial_status, {
+                "stage": stage, "type": agent_task.task_type, "agent_task_id": agent_task.task_id,
+            })
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        result = self._task_dict(row)
+        result["agentTaskId"] = agent_task.task_id
+        result["agentTask"] = agent_task.to_dict()
+        return result
+
+    def complete_author_decision_task(
+        self,
+        task_id: str,
+        result: Mapping[str, Any],
+        *,
+        actor: str,
+        _connection: Any | None = None,
+    ) -> dict[str, Any]:
+        """Complete a non-executing planning task after Host confirmation.
+
+        StoryFlow preview tasks deliberately start at ``needs_author_decision``
+        and must never be claimed by the generic provider worker.  This narrow
+        completion seam lets the author-bound planning command close that task
+        only after its Proposal and overlay update succeed in the same SQLite
+        transaction.  It is intentionally not a general escape hatch for
+        chapter or provider-backed tasks.
+        """
+        from src.runtime.approvals import is_author_approval_actor
+
+        if not is_author_approval_actor(actor):
+            raise ValueError("only an author-facing Host actor can complete this task")
+        if not isinstance(result, Mapping):
+            raise ValueError("author decision task result must be an object")
+        if result.get("completed") is not True:
+            raise TaskStateError(
+                "author decision task completion requires result.completed=true"
+            )
+
+        def complete(conn) -> dict[str, Any]:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            if str(row["type"]) != "storyflow-planning-change":
+                raise TaskStateError(
+                    "author decision completion is only available for StoryFlow planning tasks"
+                )
+            if row["status"] == "completed":
+                return dict(row)
+            if row["status"] != "needs_author_decision":
+                raise TaskStateError(
+                    f"StoryFlow planning task must await author decision, got {row['status']}"
+                )
+            now = datetime.now().isoformat()
+            encoded = json.dumps(dict(result), ensure_ascii=False)
+            conn.execute(
+                """UPDATE tasks SET status='completed', error_code=NULL, error=NULL,
+                   result=?, progress=100, total_steps=CASE WHEN total_steps=0 THEN 1 ELSE total_steps END,
+                   lease_owner=NULL, lease_expires_at=NULL, completed_at=?, updated_at=?
+                   WHERE id=?""",
+                (encoded, now, now, task_id),
+            )
+            self._sync_agent_task_status(conn, task_id, "completed")
+            self._append_event(conn, task_id, "completed", {
+                "reason": "author_confirmed_storyflow_proposal",
+                "actor": str(actor).strip().lower(),
+            })
+            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            return dict(updated)
+
+        if _connection is not None:
+            return complete(_connection)
+        with self.db.transaction() as conn:
+            complete(conn)
+        return self.get(task_id) or {}
+
+    def _maybe_create_agent_task(
+        self,
+        conn,
+        *,
+        durable_task_id: str,
+        task_type: str,
+        project_id: Optional[str],
+        task_data: Mapping[str, Any],
+        created_at: str,
+    ) -> AgentTask | None:
+        if task_type not in _AGENT_TASK_TYPES:
+            return None
+
+        # ``tasks.project_id`` has historically been used as the project
+        # identifier by the API.  The AgentTask FK is stricter, so only carry a
+        # project value into the envelope when it is a real project row.
+        safe_project_id = project_id
+        if safe_project_id and conn.execute(
+            "SELECT 1 FROM projects WHERE id=?", (safe_project_id,)
+        ).fetchone() is None:
+            safe_project_id = None
+
+        raw_constraints = task_data.get("constraints")
+        constraints = dict(raw_constraints) if isinstance(raw_constraints, Mapping) else {}
+        for key in (
+            "critical", "irreversibility", "mutation_risk", "failure_cost",
+            "verifiability", "context_span", "output_size", "tool_depth",
+        ):
+            if key in task_data:
+                constraints[key] = task_data[key]
+
+        parent_task_id = task_data.get("parent_task_id") or task_data.get("parentTaskId")
+        parent_agent_task_id = None
+        if parent_task_id:
+            parent = conn.execute(
+                "SELECT id FROM agent_tasks WHERE task_id=?", (str(parent_task_id),)
+            ).fetchone()
+            parent_agent_task_id = parent["id"] if parent else None
+
+        chapter_id = task_data.get("chapter_id") or task_data.get("chapterId")
+        if chapter_id and conn.execute(
+            "SELECT 1 FROM chapters WHERE id=?", (chapter_id,)
+        ).fetchone() is None:
+            chapter_id = None
+
+        context_bundle_id = task_data.get("context_bundle_id") or task_data.get("contextBundleId")
+        if context_bundle_id and conn.execute(
+            "SELECT 1 FROM context_bundles WHERE id=?", (context_bundle_id,)
+        ).fetchone() is None:
+            context_bundle_id = None
+
+        role = _AGENT_TASK_ROLES.get(task_type, "writer")
+        if task_type == "simulation-round":
+            # Provider-mode simulation decisions are role-scoped.  Preserve
+            # the queued decision role in the durable AgentTask so Compute
+            # Policy and audit views do not silently report every round as a
+            # planner task.
+            decision_role = str(task_data.get("decisionRole") or "").strip().lower()
+            if decision_role in {"planner", "writer", "reviewer"}:
+                role = decision_role
+        default_profile = default_agent_task_profile(role, task_type)
+        raw_profile = task_data.get("profile")
+        if isinstance(raw_profile, Mapping):
+            def profile_tuple(*keys: str, default: tuple[str, ...]) -> tuple[str, ...]:
+                value = next((raw_profile[key] for key in keys if key in raw_profile), default)
+                if not isinstance(value, (list, tuple)):
+                    return ()
+                return tuple(str(item) for item in value if str(item).strip())
+
+            compute_profile_keys = ("allowed_compute_tools", "allowedComputeTools")
+            compute_default = (
+                ()
+                if any(key in raw_profile for key in compute_profile_keys)
+                else default_profile.allowed_compute_tools
+            )
+            profile = AgentTaskProfile(
+                role=str(raw_profile.get("role") or role),
+                task_type=str(raw_profile.get("task_type") or raw_profile.get("taskType") or task_type),
+                allowed_tools=profile_tuple(
+                    "allowed_tools", "allowedTools", default=default_profile.allowed_tools,
+                ),
+                forbidden_tools=profile_tuple(
+                    "forbidden_tools", "forbiddenTools", default=default_profile.forbidden_tools,
+                ),
+                allowed_compute_tools=profile_tuple(
+                    "allowed_compute_tools", "allowedComputeTools", default=compute_default,
+                ),
+                minimum_capability=str(raw_profile.get("minimum_capability") or raw_profile.get("minimumCapability") or default_profile.minimum_capability),
+                preferred_capability=str(raw_profile.get("preferred_capability") or raw_profile.get("preferredCapability") or default_profile.preferred_capability),
+                maximum_capability=str(raw_profile.get("maximum_capability") or raw_profile.get("maximumCapability") or default_profile.maximum_capability),
+                minimum_reasoning=str(raw_profile.get("minimum_reasoning") or raw_profile.get("minimumReasoning") or default_profile.minimum_reasoning),
+                preferred_reasoning=str(raw_profile.get("preferred_reasoning") or raw_profile.get("preferredReasoning") or default_profile.preferred_reasoning),
+                maximum_reasoning=str(raw_profile.get("maximum_reasoning") or raw_profile.get("maximumReasoning") or default_profile.maximum_reasoning),
+            )
+        else:
+            profile = default_profile
+        input_payload = dict(task_data)
+        input_payload.setdefault("durableTaskId", durable_task_id)
+        agent_task = AgentTask(
+            task_id=f"agent-{durable_task_id}",
+            task_type=task_type,
+            role=role,
+            project_id=safe_project_id,
+            chapter_id=str(chapter_id) if chapter_id else None,
+            intent_id=str(task_data.get("intent_id") or task_data.get("intentId"))
+            if task_data.get("intent_id") or task_data.get("intentId") else None,
+            context_bundle_id=str(context_bundle_id) if context_bundle_id else None,
+            constraints=constraints,
+            expected_output=str(task_data.get("expected_output") or task_data.get("expectedOutput") or "AgentArtifact"),
+            input_payload=input_payload,
+            profile=profile,
+            parent_task_id=parent_agent_task_id,
+            created_at=created_at,
+            initiated_by=str(
+                task_data.get("initiatedBy")
+                or task_data.get("initiated_by")
+                or task_data.get("source")
+                or "system"
+            ).strip() or "system",
+        )
+        self._insert_agent_task(conn, agent_task, durable_task_id, created_at)
+        return agent_task
+
+    @staticmethod
+    def _insert_agent_task(conn, agent_task: AgentTask, durable_task_id: str, now: str) -> None:
+        task_input = dict(agent_task.input_payload)
+        task_input.setdefault("initiatedBy", agent_task.initiated_by)
+        conn.execute(
+            """INSERT INTO agent_tasks(
+                   id, task_id, task_type, role, project_id, chapter_id, intent_id,
+                   context_bundle_id, constraints, expected_output, input_payload,
+                   profile, parent_task_id, status, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?)""",
+            (
+                agent_task.task_id, durable_task_id, agent_task.task_type, agent_task.role,
+                agent_task.project_id, agent_task.chapter_id, agent_task.intent_id,
+                agent_task.context_bundle_id,
+                json.dumps(agent_task.constraints, ensure_ascii=False),
+                agent_task.expected_output,
+                json.dumps(task_input, ensure_ascii=False),
+                json.dumps(agent_task.profile.to_dict() if agent_task.profile else {}, ensure_ascii=False),
+                agent_task.parent_task_id, now, now,
+            ),
+        )
+
+    @staticmethod
+    def _attach_agent_task_projection(conn, durable_task_id: str, result: dict[str, Any]) -> None:
+        try:
+            row = conn.execute(
+                "SELECT id FROM agent_tasks WHERE task_id=?", (durable_task_id,)
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return
+            raise
+        if row:
+            result["agentTaskId"] = row["id"]
 
     def enqueue_continuous(
         self,
@@ -151,6 +610,7 @@ class TaskRuntime:
         book_id: str,
         data: dict[str, Any],
         idempotency_key: str,
+        initiated_by: Optional[str] = None,
     ) -> dict[str, Any]:
         """Atomically enqueue one exclusive continuous-writing session.
 
@@ -161,17 +621,31 @@ class TaskRuntime:
         """
         task_id = generate_id()
         now = datetime.now().isoformat()
+        task_data = dict(data or {})
+        if initiated_by is not None:
+            task_data["initiatedBy"] = str(initiated_by).strip() or "system"
+        else:
+            task_data.setdefault(
+                "initiatedBy",
+                str(
+                    task_data.get("initiated_by")
+                    or task_data.get("source")
+                    or "system"
+                ).strip() or "system",
+            )
         with self.db.transaction() as conn:
             previous = conn.execute(
                 "SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
             ).fetchone()
             if previous:
-                return self._task_dict(previous)
+                result = self._task_dict(previous)
+                self._attach_agent_task_projection(conn, previous["id"], result)
+                return result
 
             existing = conn.execute(
                 """SELECT id FROM tasks
                    WHERE book_id=? AND type='continuous'
-                     AND status IN ('queued', 'running', 'waiting_on_child', 'paused', 'cancelling')
+                     AND status IN ('queued', 'pending', 'running', 'waiting_on_child', 'paused', 'cancelling')
                    ORDER BY created_at LIMIT 1""",
                 (book_id,),
             ).fetchone()
@@ -189,32 +663,73 @@ class TaskRuntime:
                     task_id,
                     project_id,
                     book_id,
-                    json.dumps(data, ensure_ascii=False),
+                    json.dumps(task_data, ensure_ascii=False),
                     idempotency_key,
                     now,
                     now,
                 ),
             )
+            agent_task = self._maybe_create_agent_task(
+                conn,
+                durable_task_id=task_id,
+                task_type="continuous",
+                project_id=project_id,
+                task_data=task_data,
+                created_at=now,
+            )
             self._append_event(conn, task_id, "queued", {"stage": "queued", "type": "continuous"})
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        return self._task_dict(row)
+        result = self._task_dict(row)
+        if agent_task is not None:
+            result["agentTaskId"] = agent_task.task_id
+        return result
 
     def get(self, task_id: str) -> Optional[dict[str, Any]]:
         row = self.db.fetchone("SELECT * FROM tasks WHERE id = ?", (task_id,))
         return self._task_dict(row) if row else None
 
-    def list(self, *, project_id: Optional[str] = None, status: Optional[str] = None,
+    def list(self, *, project_id: Optional[str] = None, book_id: Optional[str] = None,
+             task_type: Optional[str] = None, status: Optional[str] = None,
              limit: int = 100) -> list[dict[str, Any]]:
         clauses, params = [], []
         if project_id:
             clauses.append("project_id = ?")
             params.append(project_id)
+        if book_id:
+            clauses.append("book_id = ?")
+            params.append(book_id)
+        if task_type:
+            clauses.append("type = ?")
+            params.append(task_type)
         if status:
-            clauses.append("status = ?")
-            params.append(status)
+            if status == "queued":
+                clauses.append("status IN ('queued', 'pending')")
+            else:
+                clauses.append("status = ?")
+                params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.db.fetchall(f"SELECT * FROM tasks {where} ORDER BY created_at DESC LIMIT ?", (*params, limit))
         return [self._task_dict(row) for row in rows]
+
+    def status_counts(self, *, book_id: Optional[str] = None) -> dict[str, int]:
+        """Return durable task counts for compatibility read models."""
+        clauses = ["1=1"]
+        params: list[Any] = []
+        if book_id:
+            clauses.append("book_id=?")
+            params.append(book_id)
+        rows = self.db.fetchall(
+            f"SELECT status, COUNT(*) AS count FROM tasks WHERE {' AND '.join(clauses)} GROUP BY status",
+            tuple(params),
+        )
+        counts = {status: 0 for status in (
+            "queued", "running", "paused", "completed", "failed", "cancelled",
+            "cancelling", "waiting_on_child", "needs_author_decision",
+        )}
+        for row in rows:
+            status = "queued" if row["status"] == "pending" else row["status"]
+            counts[status] = counts.get(status, 0) + int(row["count"])
+        return counts
 
     def claim(self, worker_id: str, *, lease_seconds: int = 60) -> Optional[dict[str, Any]]:
         """Atomically claim one runnable task for a worker lease.
@@ -228,7 +743,7 @@ class TaskRuntime:
         with self.db.transaction() as conn:
             row = conn.execute(
                 """SELECT t.* FROM tasks t WHERE
-                   ((t.status='queued' AND t.stage != 'blocked') OR
+                   ((t.status IN ('queued', 'pending') AND t.stage != 'blocked') OR
                     (t.status='waiting_on_child' AND t.waiting_for_task_id IS NOT NULL AND
                      EXISTS (SELECT 1 FROM tasks child
                             WHERE child.id=t.waiting_for_task_id
@@ -244,7 +759,7 @@ class TaskRuntime:
                    attempt=attempt+1, started_at=COALESCE(started_at, ?),
                    waiting_for_task_id=NULL, updated_at=?
                    WHERE id=? AND
-                     (status='queued' OR
+                     (status IN ('queued', 'pending') OR
                       (status='waiting_on_child' AND waiting_for_task_id IS NOT NULL AND
                        EXISTS (SELECT 1 FROM tasks child
                               WHERE child.id=tasks.waiting_for_task_id
@@ -253,6 +768,7 @@ class TaskRuntime:
             )
             if updated.rowcount != 1:
                 return None
+            self._sync_agent_task_status(conn, row["id"], "running")
             self._append_event(conn, row["id"], "claimed", {
                 "worker_id": worker_id,
                 "lease_expires_at": expires,
@@ -270,7 +786,7 @@ class TaskRuntime:
         now = datetime.now()
         with self.db.transaction() as conn:
             row = conn.execute(
-                """SELECT * FROM tasks WHERE id=? AND status='queued' AND
+                """SELECT * FROM tasks WHERE id=? AND status IN ('queued', 'pending') AND
                    (next_attempt_at IS NULL OR next_attempt_at <= ?)""",
                 (task_id, now.isoformat()),
             ).fetchone()
@@ -280,11 +796,12 @@ class TaskRuntime:
             updated = conn.execute(
                 """UPDATE tasks SET status='running', lease_owner=?, lease_expires_at=?,
                    attempt=attempt+1, started_at=COALESCE(started_at, ?), updated_at=?
-                   WHERE id=? AND status='queued'""",
+                   WHERE id=? AND status IN ('queued', 'pending')""",
                 (worker_id, expires, now.isoformat(), now.isoformat(), task_id),
             )
             if updated.rowcount != 1:
                 return None
+            self._sync_agent_task_status(conn, task_id, "running")
             self._append_event(conn, task_id, "claimed", {"worker_id": worker_id, "lease_expires_at": expires})
             claimed = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task_dict(claimed)
@@ -306,15 +823,35 @@ class TaskRuntime:
             row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row is None:
                 raise KeyError(f"task not found: {task_id}")
+            row_data = dict(row)
             current = row["status"]
             if target not in TRANSITIONS.get(current, set()):
                 raise TaskStateError(f"illegal task transition: {current} -> {target}")
-            # Lease fencing: if caller supplies lease_owner, verify it matches.
+            # Lease fencing is the caller's first authority check.  A stale
+            # worker must never be able to advance far enough into a
+            # workflow-specific validation path to look like an authorized
+            # finalizer (or to receive a misleading completion error).
             if lease_owner is not None and row["lease_owner"] != lease_owner:
                 raise TaskStateError(
                     f"lease owner mismatch: task owned by {row['lease_owner']}, "
                     f"caller claims {lease_owner}"
                 )
+            if target == "completed":
+                if result is None:
+                    raise TaskStateError("completed task result is required")
+                if not isinstance(result, dict) or not result:
+                    raise TaskStateError(
+                        "completed task result must be a non-empty object"
+                    )
+                if result.get("completed") is False:
+                    raise TaskStateError("incomplete task result cannot enter completed state")
+                reported_status = str(result.get("status") or "").strip().lower()
+                if reported_status in {"failed", "error", "incomplete"}:
+                    raise TaskStateError(
+                        "failed task result cannot enter completed state"
+                    )
+                if is_chapter_workflow_task(row_data.get("type")):
+                    self._validate_chapter_completion(conn, row_data, result)
             now = datetime.now().isoformat()
             completed_at = now if target in TERMINAL or target == "failed" else None
             conn.execute(
@@ -328,12 +865,17 @@ class TaskRuntime:
                 (target, error_code, error, json.dumps(result, ensure_ascii=False) if result is not None else None,
                  target, target, target, target, completed_at, now, task_id),
             )
-            self._append_event(conn, task_id, target, detail or {"error_code": error_code, "error": error})
+            self._sync_agent_task_status(conn, task_id, target)
+            event_detail = dict(detail or {"error_code": error_code, "error": error})
+            if is_chapter_workflow_task(row_data.get("type")):
+                event_detail.setdefault("workflow_state", row_data.get("workflow_state"))
+            self._append_event(conn, task_id, target, event_detail)
             updated_row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task_dict(updated_row)
 
     def checkpoint(self, task_id: str, stage: str, state: dict[str, Any],
-                   *, lease_owner: Optional[str] = None) -> dict[str, Any]:
+                   *, lease_owner: Optional[str] = None,
+                   workflow_state: Optional[str] = None) -> dict[str, Any]:
         with self.db.transaction() as conn:
             task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if task is None:
@@ -347,22 +889,67 @@ class TaskRuntime:
                 )
             checkpoint_id = generate_id()
             now = datetime.now().isoformat()
+            task_data = json.loads(task["data"] or "{}")
+            current_workflow_state = task["workflow_state"]
+            if is_chapter_workflow_task(task["type"]):
+                if not current_workflow_state:
+                    current_workflow_state = initial_workflow_state(
+                        task["type"], stage=task["stage"] or "queued", data=task_data
+                    )
+                try:
+                    next_workflow_state = workflow_state_for_checkpoint(
+                        task["type"], current_workflow_state, stage, state, workflow_state
+                    )
+                except ValueError as exc:
+                    raise TaskStateError(str(exc)) from exc
+                if next_workflow_state == "COMMITTED":
+                    # Checkpoint payloads wrap the pipeline result under
+                    # ``context``.  Validate the actual result object at the
+                    # completion seam; validating the wrapper would reject a
+                    # genuine accepted StoryCommit as if it were incomplete.
+                    raw_completion_state = state.get("context", state)
+                    completion_state = (
+                        dict(raw_completion_state)
+                        if isinstance(raw_completion_state, Mapping)
+                        else {}
+                    )
+                    self._validate_chapter_completion(
+                        conn,
+                        {**dict(task), "workflow_state": "COMMITTED"},
+                        completion_state,
+                    )
+            else:
+                next_workflow_state = None
             conn.execute(
                 """INSERT INTO task_checkpoints(id, task_id, stage, state, created_at)
                    VALUES (?, ?, ?, ?, ?)""",
                 (checkpoint_id, task_id, stage, json.dumps(state, ensure_ascii=False), now),
             )
-            task_data = json.loads(task["data"] or "{}")
             progress, total_steps = self._progress_snapshot(
                 task["type"], task_data, task["status"], stage, state,
                 persisted_progress=task["progress"], persisted_total=task["total_steps"],
             )
             conn.execute(
-                """UPDATE tasks SET stage=?, progress=?, total_steps=?, updated_at=? WHERE id=?""",
-                (stage, progress, total_steps, now, task_id),
+                """UPDATE tasks SET stage=?, progress=?, total_steps=?,
+                   workflow_state=?, workflow_state_updated_at=?, updated_at=? WHERE id=?""",
+                (
+                    stage, progress, total_steps,
+                    next_workflow_state if is_chapter_workflow_task(task["type"]) else task["workflow_state"],
+                    now if is_chapter_workflow_task(task["type"]) and next_workflow_state else task["workflow_state_updated_at"],
+                    now, task_id,
+                ),
             )
-            self._append_event(conn, task_id, "checkpoint", {"checkpoint_id": checkpoint_id, "stage": stage})
-        return {"id": checkpoint_id, "stage": stage, "state": state}
+            self._append_event(conn, task_id, "checkpoint", {
+                "checkpoint_id": checkpoint_id,
+                "stage": stage,
+                "workflow_state": next_workflow_state,
+            })
+        return {
+            "id": checkpoint_id,
+            "stage": stage,
+            "state": state,
+            "workflow_state": next_workflow_state,
+        }
 
     def defer_until_child(
         self,
@@ -416,7 +1003,7 @@ class TaskRuntime:
             row = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row is None:
                 raise KeyError(f"task not found: {task_id}")
-            if row["status"] not in {"queued", "paused", "needs_author_decision", WAITING_ON_CHILD, "running"}:
+            if row["status"] not in {"queued", "pending", "paused", "needs_author_decision", WAITING_ON_CHILD, "running"}:
                 raise TaskStateError("task data can only be updated at a safe boundary")
             if row["status"] == "running" and lease_owner is not None:
                 owner = conn.execute("SELECT lease_owner FROM tasks WHERE id=?", (task_id,)).fetchone()["lease_owner"]
@@ -442,6 +1029,63 @@ class TaskRuntime:
         row["state"] = json.loads(row["state"])
         return row
 
+    def list_checkpoints(self, task_id: str) -> list[dict[str, Any]]:
+        """Return checkpoint history through the durable runtime boundary."""
+        rows = self.db.fetchall(
+            "SELECT * FROM task_checkpoints WHERE task_id=? ORDER BY created_at DESC, id DESC",
+            (task_id,),
+        )
+        for row in rows:
+            row["state"] = json.loads(row["state"])
+        return rows
+
+    def clear_checkpoints(self, task_id: str) -> None:
+        """Clear compatibility checkpoints without bypassing task ownership.
+
+        New workers never need to delete checkpoints.  This method exists only
+        for the legacy adapter and records the operation in the same durable
+        task event stream so the deletion is observable.
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            deleted = conn.execute(
+                "DELETE FROM task_checkpoints WHERE task_id=?", (task_id,)
+            ).rowcount
+            self._append_event(conn, task_id, "checkpoints_cleared", {"deleted": deleted})
+
+    def update_metadata(
+        self,
+        task_id: str,
+        *,
+        progress: Optional[int] = None,
+        total_steps: Optional[int] = None,
+        chapter_number: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Update the small compatibility read-model fields transactionally."""
+        updates: dict[str, Any] = {}
+        if progress is not None:
+            updates["progress"] = max(0, min(100, int(progress)))
+        if total_steps is not None:
+            updates["total_steps"] = max(0, int(total_steps))
+        if chapter_number is not None:
+            updates["chapter_number"] = int(chapter_number)
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            if updates:
+                now = datetime.now().isoformat()
+                assignments = ", ".join(f"{field}=?" for field in updates)
+                conn.execute(
+                    f"UPDATE tasks SET {assignments}, updated_at=? WHERE id=?",
+                    (*updates.values(), now, task_id),
+                )
+                self._append_event(conn, task_id, "metadata_updated", updates)
+            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task_dict(updated)
+
     def pause(self, task_id: str) -> dict[str, Any]:
         return self.transition(task_id, "paused")
 
@@ -456,7 +1100,7 @@ class TaskRuntime:
             if row["status"] in {"completed", "cancelled", "failed"}:
                 raise TaskStateError("a terminal task cannot be cancelled")
             now = datetime.now().isoformat()
-            if row["status"] in {"queued", "paused", "needs_author_decision", WAITING_ON_CHILD}:
+            if row["status"] in {"queued", "pending", "paused", "needs_author_decision", WAITING_ON_CHILD}:
                 target = "cancelled"
                 conn.execute("UPDATE tasks SET status=?, cancel_requested=TRUE, waiting_for_task_id=NULL, completed_at=?, updated_at=? WHERE id=?",
                              (target, now, now, task_id))
@@ -490,7 +1134,31 @@ class TaskRuntime:
         return self._task_dict(result)
 
     def retry(self, task_id: str) -> dict[str, Any]:
-        return self.transition(task_id, "queued", detail={"reason": "author_retry"})
+        """Requeue a stopped task with a clean active-task read model.
+
+        ``failed`` and ``needs_author_decision`` are terminal decision
+        boundaries, so retrying them starts a new execution attempt.  The
+        prior failure remains in ``task_events``; it must not remain in the
+        current task row as a stale completion timestamp, cancellation flag,
+        backoff deadline, or result from an earlier attempt.
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"task not found: {task_id}")
+            if "queued" not in TRANSITIONS.get(row["status"], set()):
+                raise TaskStateError(f"illegal task transition: {row['status']} -> queued")
+            now = datetime.now().isoformat()
+            conn.execute(
+                """UPDATE tasks SET status='queued', error_code=NULL, error=NULL,
+                   result=NULL, cancel_requested=FALSE, next_attempt_at=NULL,
+                   completed_at=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                   updated_at=? WHERE id=?""",
+                (now, task_id),
+            )
+            self._append_event(conn, task_id, "queued", {"reason": "author_retry"})
+            updated = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task_dict(updated)
 
     def fail(self, task_id: str, error_code: str, error: str, *, retryable: bool = False,
              max_attempts: int = 3, retry_delay_seconds: int = 5,
@@ -547,11 +1215,31 @@ class TaskRuntime:
         return self._task_dict(result)
 
     def recover_expired_leases(self, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
-        now = now or datetime.now()
+        return self._recover_leases(now=now or datetime.now(), force_all=False)
+
+    def recover_all_leases_for_restore(self, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
+        """Reconcile every lease in a restored snapshot at the process boundary.
+
+        A restored database can contain a lease whose expiry is still in the
+        future even though the process that owned it no longer exists.  The
+        restore boundary therefore fences every running lease, but records
+        the recovery with the real current time rather than using a sentinel
+        timestamp that would corrupt the task read model.
+        """
+        return self._recover_leases(now=now or datetime.now(), force_all=True)
+
+    def _recover_leases(self, *, now: datetime, force_all: bool) -> list[dict[str, Any]]:
         recovered: list[dict[str, Any]] = []
         with self.db.transaction() as conn:
-            rows = conn.execute("SELECT * FROM tasks WHERE status IN ('running', 'cancelling') AND lease_expires_at < ?",
-                                (now.isoformat(),)).fetchall()
+            if force_all:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE status IN ('running', 'cancelling')"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE status IN ('running', 'cancelling') AND lease_expires_at < ?",
+                    (now.isoformat(),),
+                ).fetchall()
             for row in rows:
                 # Cancelling tasks must never be recovered to queued; they
                 # should be cancelled or escalated to author decision.
@@ -563,17 +1251,217 @@ class TaskRuntime:
                     target = "queued"
                 conn.execute("UPDATE tasks SET status=?, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?",
                              (target, now.isoformat(), row["id"]))
+                self._interrupt_agent_runs_for_task(conn, row, now)
+                self._sync_agent_task_status(conn, row["id"], target)
                 self._append_event(conn, row["id"], target,
                                    {"reason": "expired_lease", "recoverable": target == "queued"})
                 result = conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
                 recovered.append(self._task_dict(result))
         return recovered
 
+    def _interrupt_agent_runs_for_task(self, conn, task_row, now: datetime) -> None:
+        """Fence provider runs when the durable task lease is recovered."""
+        try:
+            runs = conn.execute(
+                """SELECT ar.id, ar.agent_task_id, ar.runtime_type, at.task_type, at.role,
+                          at.project_id
+                   FROM agent_runs ar
+                   JOIN agent_tasks at ON at.id=ar.agent_task_id
+                   WHERE ar.task_id=? AND ar.status IN ('created', 'running', 'paused')""",
+                (task_row["id"],),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return
+            raise
+        if not runs:
+            return
+        event_store = RuntimeEventStore(self.db)
+        timestamp = now.isoformat()
+        for run in runs:
+            conn.execute(
+                """UPDATE agent_runs SET status='interrupted', error_code=?, error_detail=?,
+                   finished_at=? WHERE id=?""",
+                (
+                    "TASK_INTERRUPTED",
+                    "durable task lease recovered",
+                    timestamp,
+                    run["id"],
+                ),
+            )
+            # ``RuntimeEventStore.append_in_transaction`` only needs its
+            # translator here; the db handle is intentionally not used.
+            task = AgentTask(
+                task_id=run["agent_task_id"],
+                task_type=run["task_type"],
+                role=run["role"],
+                project_id=run["project_id"],
+            )
+            event_store.append_in_transaction(
+                conn,
+                RuntimeEvent(
+                    runtime_type=run["runtime_type"],
+                    event_type="error",
+                    payload={
+                        "code": "TASK_INTERRUPTED",
+                        "detail": "durable task lease recovered",
+                        "reason": "expired_lease",
+                    },
+                    agent_run_id=run["id"],
+                    timestamp=timestamp,
+                ),
+                task,
+            )
+
     def events(self, task_id: str, *, after_id: int = 0) -> list[dict[str, Any]]:
-        rows = self.db.fetchall("SELECT * FROM task_events WHERE task_id=? AND id>? ORDER BY id", (task_id, after_id))
+        rows = self.db.fetchall(
+            "SELECT * FROM task_events WHERE task_id=? AND id>? ORDER BY id",
+            (task_id, after_id),
+        )
         for row in rows:
-            row["payload"] = json.loads(row["payload"])
+            row["payload"] = self._decode_event_payload(row.get("payload"))
         return rows
+
+    def events_since(
+        self,
+        *,
+        after_id: int = 0,
+        task_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Read the durable event ledger in one globally ordered cursor.
+
+        ``task_events.id`` is an AUTOINCREMENT key shared by every task.  A
+        subscriber must query that ledger directly rather than scanning tasks
+        in UI order: advancing one cursor while visiting tasks can otherwise
+        skip events belonging to a task visited later in the scan.  The
+        optional task filter keeps task-scoped subscriptions on the same
+        cross-process-safe cursor semantics.
+        """
+        bounded_limit = max(1, min(1000, int(limit)))
+        clauses = ["event.id > ?"]
+        params: list[Any] = [int(after_id)]
+        if task_id is not None:
+            clauses.append("event.task_id = ?")
+            params.append(task_id)
+        rows = self.db.fetchall(
+            f"""SELECT event.*, task.status AS task_status
+                FROM task_events AS event
+                JOIN tasks AS task ON task.id = event.task_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY event.id
+                LIMIT ?""",
+            (*params, bounded_limit),
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append({
+                "id": int(row["id"]),
+                "task_id": row["task_id"],
+                "sequence": int(row["sequence"]),
+                "event_type": row["event_type"],
+                "payload": self._decode_event_payload(row.get("payload")),
+                "created_at": row.get("created_at"),
+                "task_status": row.get("task_status"),
+            })
+        return result
+
+    @staticmethod
+    def _decode_event_payload(raw: Any) -> dict[str, Any]:
+        try:
+            payload = json.loads(raw or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _validate_chapter_completion(
+        conn,
+        task_row: Mapping[str, Any],
+        result: Optional[dict[str, Any]],
+    ) -> None:
+        """Require a real accepted StoryCommit at the task completion seam."""
+        if not isinstance(result, dict) or result.get("completed") is not True:
+            raise TaskStateError(
+                "chapter workflow completion requires result.completed=true"
+            )
+        workflow_state = task_row.get("workflow_state")
+        if workflow_state != "COMMITTED":
+            raise TaskStateError(
+                "chapter workflow cannot complete before workflow_state=COMMITTED"
+            )
+        commit_id = story_commit_id(result)
+        if not commit_id:
+            raise TaskStateError(
+                "chapter workflow completion requires an accepted StoryCommit reference"
+            )
+        commit = conn.execute(
+            """SELECT sc.status, sc.chapter_version_id, c.book_id, c.id AS chapter_id, c.number, b.project_id,
+                      EXISTS(
+                          SELECT 1 FROM narrative_events e
+                           WHERE e.commit_id=sc.id
+                             AND e.event_type IN ('StoryCommitAccepted', 'story_commit_accepted')
+                             AND e.book_id=c.book_id
+                             AND e.chapter_id=c.id
+                             AND (sc.chapter_version_id IS NULL
+                                  OR e.chapter_version_id=sc.chapter_version_id)
+                      ) AS accepted_event
+               FROM story_commits sc
+               JOIN chapters c ON c.id=sc.chapter_id
+               JOIN books b ON b.id=c.book_id
+               WHERE sc.id=?""",
+            (commit_id,),
+        ).fetchone()
+        if commit is None or commit["status"] != "accepted":
+            raise TaskStateError(
+                f"chapter workflow StoryCommit is not accepted: {commit_id}"
+            )
+        if not bool(commit["accepted_event"]):
+            raise TaskStateError(
+                "chapter workflow StoryCommit has no accepted NarrativeEvent: "
+                f"{commit_id}"
+            )
+        active_acceptance = next(
+            (
+                event for event in active_events(conn, commit["book_id"])
+                if event.get("event_type") in ACCEPTANCE_EVENT_TYPES
+                and str(event.get("commit_id") or event.get("source_commit_id") or "") == str(commit_id)
+                and str(event.get("chapter_id") or "") == str(commit["chapter_id"])
+                and (
+                    commit["chapter_version_id"] is None
+                    or str(event.get("chapter_version_id") or "") == str(commit["chapter_version_id"])
+                )
+            ),
+            None,
+        )
+        if active_acceptance is None:
+            raise TaskStateError(
+                "chapter workflow StoryCommit has no active accepted NarrativeEvent: "
+                f"{commit_id}"
+            )
+        if task_row.get("book_id") and task_row["book_id"] != commit["book_id"]:
+            raise TaskStateError("chapter workflow StoryCommit belongs to another book")
+        task_data = task_row.get("data")
+        try:
+            task_data = json.loads(task_data or "{}") if isinstance(task_data, str) else task_data
+        except json.JSONDecodeError:
+            task_data = {}
+        task_project = task_row.get("project_id")
+        if task_project is None and isinstance(task_data, Mapping):
+            task_project = task_data.get("project_id") or task_data.get("projectId")
+        if task_project and task_project != commit["project_id"]:
+            raise TaskStateError("chapter workflow StoryCommit belongs to another project")
+        task_chapter = task_row.get("chapter_number")
+        if task_chapter is None and isinstance(task_data, Mapping):
+            task_chapter = task_data.get("chapter_number") or task_data.get("chapterNumber")
+        if task_chapter is not None:
+            try:
+                if int(task_chapter) != int(commit["number"]):
+                    raise TaskStateError(
+                        "chapter workflow StoryCommit belongs to another chapter"
+                    )
+            except (TypeError, ValueError) as exc:
+                raise TaskStateError("chapter workflow chapter number is invalid") from exc
 
     @staticmethod
     def _append_event(conn, task_id: str, event_type: str, payload: dict[str, Any]) -> None:
@@ -581,6 +1469,34 @@ class TaskRuntime:
         sequence = conn.execute("SELECT event_sequence FROM tasks WHERE id=?", (task_id,)).fetchone()["event_sequence"]
         conn.execute("INSERT INTO task_events(task_id, sequence, event_type, payload) VALUES (?, ?, ?, ?)",
                      (task_id, sequence, event_type, json.dumps(payload, ensure_ascii=False)))
+
+    @staticmethod
+    def _sync_agent_task_status(conn, task_id: str, status: str) -> None:
+        """Mirror durable task lifecycle into the optional AgentTask row."""
+        mapped = {
+            "queued": "planned",
+            "pending": "planned",
+            "running": "running",
+            "paused": "paused",
+            "completed": "completed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "cancelling": "cancelling",
+            "waiting_on_child": "waiting_on_child",
+            "needs_author_decision": "needs_author_decision",
+        }.get(status, status)
+        try:
+            conn.execute(
+                "UPDATE agent_tasks SET status=?, updated_at=? WHERE task_id=?",
+                (mapped, datetime.now().isoformat(), task_id),
+            )
+        except sqlite3.OperationalError as exc:
+            # Compatibility with a database connection opened before the
+            # additive migration was applied.  Database initialization normally
+            # guarantees this table exists; the guard keeps legacy adapters
+            # readable during a rolling upgrade.
+            if "no such table" not in str(exc).lower():
+                raise
 
     def _task_dict(self, row) -> dict[str, Any]:
         task = dict(row)
@@ -591,6 +1507,18 @@ class TaskRuntime:
         task["bookId"] = task.get("book_id")
         task["projectId"] = task.get("project_id")
         task["taskId"] = task["id"]
+        try:
+            agent_task = self.db.fetchone(
+                "SELECT id FROM agent_tasks WHERE task_id=?", (task["id"],)
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            agent_task = None
+        if agent_task:
+            task["agentTaskId"] = agent_task["id"]
+        task["workflowState"] = task.get("workflow_state")
+        task["workflowStateUpdatedAt"] = task.get("workflow_state_updated_at")
         task["checkpoint"] = self.latest_checkpoint(task["id"])
         checkpoint_state = task["checkpoint"].get("state", {}) if task["checkpoint"] else {}
         progress, total_steps = self._progress_snapshot(
@@ -650,6 +1578,8 @@ class TaskRuntime:
             stored_total = max(0, int(persisted_total or 0))
         except (TypeError, ValueError):
             stored_total = 0
+        if status == "pending":
+            status = "queued"
         if status == "completed":
             return 100, max(stored_total, 1)
 
@@ -665,6 +1595,12 @@ class TaskRuntime:
                 requested, completed = 0, 0
             if requested:
                 return min(100, round(completed / requested * 100)), requested
+
+        # A compatibility caller may update the persisted progress while a
+        # task is still at the queue boundary. Do not let the default queued
+        # stage erase that durable read-model value.
+        if stage in {"queued", "pending"} and stored_progress:
+            return stored_progress, max(stored_total, 1)
 
         stages = _TASK_PROGRESS.get(task_type)
         if stages:

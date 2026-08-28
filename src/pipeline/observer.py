@@ -258,11 +258,16 @@ class Observer:
 
         response = client.chat_json(messages, system)
 
-        # 检查JSON解析是否失败
-        if "error" in response and "raw" in response:
-            # JSON解析失败，返回空事实但记录错误
-            facts = ChapterFacts(chapter_number=chapter_number)
-            return facts
+        # A parser-error envelope is not an empty fact set.  Returning an empty
+        # set would let the deprecated compatibility pipeline continue as if
+        # the model had found no facts and could eventually persist a misleading
+        # success result.
+        if not isinstance(response, dict):
+            raise ValueError("FACT_EXTRACTION_OUTPUT_INVALID: expected a JSON object")
+        if "error" in response:
+            raise ValueError(
+                "FACT_EXTRACTION_OUTPUT_INVALID: model returned invalid JSON"
+            )
 
         # 解析为结构化事实
         return self._parse_facts(chapter_number, response)

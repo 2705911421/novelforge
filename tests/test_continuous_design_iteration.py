@@ -13,7 +13,7 @@ from src.core.config import Config
 from src.core.database import Database
 from src.core.project import ProjectManager
 from src.core.story_repository import StoryRepository
-from src.core.task_runtime import TaskRuntime
+from src.core.task_runtime import TaskRuntime, TaskStateError
 from src.core.task_worker import PersistentTaskWorker
 from src.creation.continuous_service import ContinuousWritingService
 from src.creation.task_handlers import LegacyTaskHandlers
@@ -225,3 +225,19 @@ def test_author_override_accepts_beta_without_faking_review_score(iteration_deps
     assert commit["author_override"] == 1
     assert "author accepted" in commit["override_reason"]
     assert commit["review_score"] == 0
+
+
+def test_author_decision_rejects_a_newer_chapter_version(iteration_deps):
+    database, repository, runtime, _manager, project_id, book_id, _tmp_path = iteration_deps
+    parent = runtime.enqueue(
+        "continuous", project_id=project_id, book_id=book_id,
+        data={"start_chapter": 1, "count": 1, "quality_policy": {"max_revisions": 0}},
+    )
+    worker = _worker(iteration_deps, IterationModel(chapter_verdict="fail"))
+    settled, _ = _run_until(runtime, worker, parent["id"])
+    assert settled["status"] == "needs_author_decision"
+
+    repository.append_chapter_version(book_id, 1, "A newer concurrent candidate.")
+    service = ContinuousWritingService(database, IterationModel(), repository, runtime)
+    with pytest.raises(TaskStateError, match="candidate version changed"):
+        service.author_decision(parent["id"], "override", "stale candidate probe")

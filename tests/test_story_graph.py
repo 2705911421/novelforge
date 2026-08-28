@@ -126,6 +126,12 @@ def _seed_book(tmp_path):
     return db, project_id, book_id, chapter_one, chapter_two, aster, mira
 
 
+def _count(db: Database, query: str, params: tuple[object, ...] = ()) -> int:
+    row = db.fetchone(query, params)
+    assert row is not None
+    return int(row["count"])
+
+
 def _publish_story_bible(db: Database, project_id: str) -> tuple[StoryBibleRepository, str]:
     repository = StoryBibleRepository(db)
     repository.ensure(project_id)
@@ -1746,7 +1752,7 @@ def test_accepted_story_commit_is_visible_on_next_story_graph_projection(tmp_pat
         facts=[{"fact_type": "reveal", "content": "The hidden mark is visible", "entities": ["Aster"]}],
         state_changes={"chapter": 1, "last_reveal": "hidden-mark"},
     )
-    accepted = repository.accept_story_commit(commit_id)
+    accepted = repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
     assert accepted["accepted"] is True
 
     graph = StoryGraphProjector(db).project(book_id, view="story", focus=f"chapter:{chapter_one}", depth=2)
@@ -1769,7 +1775,7 @@ def test_story_graph_freshness_feed_detects_accepted_commit_and_resyncs(tmp_path
         }],
         state_changes={"freshness": "updated"},
     )
-    accepted = StoryRepository(db).accept_story_commit(commit_id)
+    accepted = StoryRepository(db).accept_story_commit_legacy(commit_id, reason="story graph fixture")
     assert accepted["graph_snapshot"]["captured"] is True
 
     changed = StoryGraphProjector(db).changes_since_snapshot(
@@ -2026,7 +2032,7 @@ def test_story_graph_impact_exposes_authoritative_evidence_boundaries(tmp_path):
         }],
         state_changes={"last_reveal": "hidden-mark"},
     )
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
 
     projector = StoryGraphProjector(db)
     canonical = projector.impact(book_id, f"chapter:{chapter_one}", depth=2)
@@ -2087,7 +2093,7 @@ def test_chapter_edit_impact_reports_version_commit_state_and_dependencies(tmp_p
         state_changes={"seal_open": True},
         chapter_version_id=first["version_id"],
     )
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
     second = repository.append_chapter_version(
         book_id, 1, "The edited version changes the reveal.", expected_version=1
     )
@@ -2132,7 +2138,7 @@ def test_chapter_version_compare_reports_immutable_text_and_current_impact_surfa
         state_changes={"seal_open": True},
         chapter_version_id=first["version_id"],
     )
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
     second = repository.append_chapter_version(
         book_id, 1, "The revised version.\nThe seal opens for Mira.", expected_version=1
     )
@@ -2197,7 +2203,7 @@ def test_chapter_version_compare_exposes_canonical_commit_projection_boundaries(
         state_changes={"seal_phrase": "old", "trust": 61},
         chapter_version_id=first["version_id"],
     )
-    repository.accept_story_commit(first_commit)
+    repository.accept_story_commit_legacy(first_commit, reason="story graph fixture")
 
     second = repository.append_chapter_version(
         book_id, 1, "Canonical revised version.", expected_version=1
@@ -2212,7 +2218,7 @@ def test_chapter_version_compare_exposes_canonical_commit_projection_boundaries(
         state_changes={"seal_phrase": "revised", "trust": 48},
         chapter_version_id=second["version_id"],
     )
-    repository.accept_story_commit(second_commit)
+    repository.accept_story_commit_legacy(second_commit, reason="story graph fixture")
 
     before = {}
     for table in ("story_facts", "story_states", "story_projections"):
@@ -2278,7 +2284,7 @@ def test_story_graph_history_exposes_accepted_graph_boundaries(tmp_path):
         state_changes={"boundary": "first"},
         chapter_version_id=first["version_id"],
     )
-    first_accept = repository.accept_story_commit(first_commit)
+    first_accept = repository.accept_story_commit_legacy(first_commit, reason="story graph fixture")
 
     second = repository.append_chapter_version(
         book_id, 1, "Graph history revised.", expected_version=1
@@ -2289,7 +2295,7 @@ def test_story_graph_history_exposes_accepted_graph_boundaries(tmp_path):
         state_changes={"boundary": "second"},
         chapter_version_id=second["version_id"],
     )
-    second_accept = repository.accept_story_commit(second_commit)
+    second_accept = repository.accept_story_commit_legacy(second_commit, reason="story graph fixture")
 
     def count_rows(query: str) -> int:
         row = db.fetchone(query, (book_id,))
@@ -2376,7 +2382,7 @@ def test_story_graph_snapshot_history_returns_observed_projection_diff(tmp_path)
         facts=[{"fact_type": "reveal", "content": "Observed graph delta", "entities": ["Aster"]}],
         state_changes={"observed_delta": True},
     )
-    StoryRepository(db).accept_story_commit(commit_id)
+    StoryRepository(db).accept_story_commit_legacy(commit_id, reason="story graph fixture")
     projector.project(book_id, view="story", focus=f"chapter:{chapter_one}", depth=2)
 
     history = projector.history(book_id, f"chapter:{chapter_one}", limit=30)
@@ -2402,7 +2408,7 @@ def test_story_graph_snapshot_diff_compares_exact_observed_states(tmp_path):
         facts=[{"fact_type": "reveal", "content": "Exact snapshot delta", "entities": ["Aster"]}],
         state_changes={"exact_delta": True},
     )
-    StoryRepository(db).accept_story_commit(commit_id)
+    StoryRepository(db).accept_story_commit_legacy(commit_id, reason="story graph fixture")
     after = projector.project(book_id, view="story", focus=f"chapter:{chapter_one}", depth=2)
 
     diff = projector.snapshot_diff(
@@ -2428,13 +2434,13 @@ def test_story_graph_canonical_replay_and_diff_use_accepted_commit_ledger(tmp_pa
         facts=[{"fact_type": "reveal", "content": "The first seal opens", "entities": ["Aster"]}],
         state_changes={"location": "Old City", "trust": 61},
     )
-    repository.accept_story_commit(first)
+    repository.accept_story_commit_legacy(first, reason="story graph fixture")
     second = repository.create_story_commit(
         chapter_two,
         facts=[{"fact_type": "suspicion", "content": "Mira suspects the witness", "entities": ["Mira"]}],
         state_changes={"trust": 48, "suspicion": True},
     )
-    repository.accept_story_commit(second)
+    repository.accept_story_commit_legacy(second, reason="story graph fixture")
 
     projector = StoryGraphProjector(db)
     replay = projector.canonical_replay(book_id, second, limit=20)
@@ -2474,7 +2480,7 @@ def test_canonical_replay_keeps_accepted_graph_snapshot_after_current_catalog_ch
         facts=[{"fact_type": "reveal", "content": "Snapshot-bound reveal", "entities": ["Mira"]}],
         state_changes={"snapshot_boundary": True},
     )
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
 
     db.execute("UPDATE characters SET name=? WHERE id=?", ("Current Mira", mira))
     replay = StoryGraphProjector(db).canonical_replay(
@@ -2508,7 +2514,7 @@ def test_story_commit_accept_captures_observed_graph_boundary_for_history(tmp_pa
         }],
         state_changes={"boundary": "accepted"},
     )
-    accepted = repository.accept_story_commit(commit_id)
+    accepted = repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
 
     snapshot_result = accepted["graph_snapshot"]
     assert snapshot_result["captured"] is True
@@ -2548,7 +2554,7 @@ def test_story_commit_accept_keeps_canon_when_graph_snapshot_capture_fails(tmp_p
         raise RuntimeError("synthetic StoryFlow capture failure")
 
     monkeypatch.setattr(StoryGraphProjector, "capture_accepted_commit_snapshot", fail_capture)
-    accepted = repository.accept_story_commit(commit_id)
+    accepted = repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
 
     assert accepted["accepted"] is True
     assert accepted["graph_snapshot"]["captured"] is False
@@ -2587,7 +2593,7 @@ def test_idempotent_accept_recovers_failed_graph_snapshot_at_same_source_boundar
 
     with monkeypatch.context() as patch:
         patch.setattr(StoryGraphProjector, "capture_accepted_commit_snapshot", fail_capture)
-        first = repository.accept_story_commit(commit_id)
+        first = repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
 
     assert first["accepted"] is True
     assert first["graph_snapshot"]["captured"] is False
@@ -2609,7 +2615,7 @@ def test_idempotent_accept_recovers_failed_graph_snapshot_at_same_source_boundar
     assert observed_read_replay["graphReplayComplete"] is False
     assert observed_read_replay["historicalGraph"]["available"] is False
 
-    retry = repository.accept_story_commit(commit_id)
+    retry = repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
     assert retry["accepted"] is True
     assert retry["idempotent"] is True
     assert retry["graph_snapshot"]["captured"] is True
@@ -2643,10 +2649,10 @@ def test_failed_graph_snapshot_is_not_backfilled_after_mutable_source_change(
 
     with monkeypatch.context() as patch:
         patch.setattr(StoryGraphProjector, "capture_accepted_commit_snapshot", fail_capture)
-        repository.accept_story_commit(commit_id)
+        repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
 
     db.execute("UPDATE characters SET name=? WHERE id=?", ("Current Mira", mira))
-    retry = repository.accept_story_commit(commit_id)
+    retry = repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
 
     assert retry["idempotent"] is True
     assert retry["graph_snapshot"]["captured"] is False
@@ -3878,6 +3884,123 @@ def test_storyflow_planning_overlay_is_revisioned_and_semantic(tmp_path):
     assert service.load(book_id)[1] == revision
 
 
+def test_storyflow_planning_preview_is_read_only_and_reports_diff_and_impact(tmp_path):
+    db, _, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    service = StoryFlowPlanningService(db)
+
+    before_workspace = db.fetchone(
+        "SELECT revision, graph FROM plot_workspaces WHERE book_id=?",
+        (book_id,),
+    )
+    before_canon = {
+        table: _count(db, f"SELECT COUNT(*) AS count FROM {table} WHERE book_id=?", (book_id,))
+        for table in ("story_facts", "story_states")
+    }
+    delta = {
+        "operations": [{
+            "op": "move_node",
+            "id": f"chapter:{chapter_one}",
+            "x": 910,
+            "y": 320,
+        }],
+    }
+
+    preview = service.preview_delta(book_id, delta, expected_revision=1)
+
+    assert preview["proposal"]["proposalType"] == "storyflow_planning_change"
+    assert preview["proposal"]["status"] == "PROPOSED"
+    assert preview["proposal"]["requiresAuthorConfirmation"] is True
+    assert preview["proposal"]["canonicalMutation"] is False
+    assert preview["revision"] == 1
+    assert preview["previewDiff"]["hasChanges"] is True
+    assert preview["previewDiff"]["nodes"]["counts"]["changed"] == 1
+    changed = preview["previewDiff"]["nodes"]["changed"][0]
+    assert changed["id"] == f"chapter:{chapter_one}"
+    assert changed["after"]["x"] == 910.0
+    assert preview["impactAnalysis"]["canonicalMutation"] is False
+    assert preview["impactAnalysis"]["affectedNodeIds"] == [f"chapter:{chapter_one}"]
+    assert preview["nextAction"] == "confirm_planning_update"
+
+    assert db.fetchone(
+        "SELECT revision, graph FROM plot_workspaces WHERE book_id=?",
+        (book_id,),
+    ) == before_workspace
+    after_canon = {
+        table: _count(db, f"SELECT COUNT(*) AS count FROM {table} WHERE book_id=?", (book_id,))
+        for table in ("story_facts", "story_states")
+    }
+    assert after_canon == before_canon
+
+
+def test_storyflow_preview_persists_proposal_and_author_apply_closes_task(tmp_path):
+    db, project_id, book_id, chapter_one, _, _, _ = _seed_book(tmp_path)
+    service = StoryFlowPlanningService(db)
+    service.load(book_id)
+    before_canon = {
+        "story_facts": _count(db, "SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?", (book_id,)),
+        "story_states": _count(db, "SELECT COUNT(*) AS count FROM story_states WHERE book_id=?", (book_id,)),
+        "story_commits": _count(db,
+            "SELECT COUNT(*) AS count FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id WHERE c.book_id=?",
+            (book_id,)),
+        "narrative_events": _count(db, "SELECT COUNT(*) AS count FROM narrative_events WHERE book_id=?", (book_id,)),
+    }
+    delta = {
+        "operations": [{
+            "op": "move_node",
+            "id": f"chapter:{chapter_one}",
+            "x": 1200,
+            "y": 420,
+        }],
+    }
+
+    preview = service.preview_delta(book_id, delta, expected_revision=1, persist=True)
+
+    proposal_id = preview["proposal"]["proposalId"]
+    proposal_row = db.fetchone("SELECT * FROM agent_proposals WHERE id=?", (proposal_id,))
+    assert proposal_row is not None
+    assert proposal_row["status"] == "PROPOSED"
+    assert proposal_row["project_id"] == project_id
+    task_id = proposal_row["task_id"]
+    assert task_id
+    task = service.task_runtime.get(task_id)
+    assert task is not None
+    assert task["status"] == "needs_author_decision"
+    assert task["agentTaskId"]
+    assert task["type"] == "storyflow-planning-change"
+    workspace_row = db.fetchone("SELECT revision FROM plot_workspaces WHERE book_id=?", (book_id,))
+    assert workspace_row is not None
+    assert workspace_row["revision"] == 1
+
+    applied = service.apply_proposal(
+        book_id,
+        proposal_id,
+        expected_revision=1,
+        decided_by="author",
+    )
+
+    assert applied["completed"] is True
+    assert applied["canonicalMutation"] is False
+    assert applied["revision"] == 2
+    assert applied["proposal"]["status"] == "ACCEPTED"
+    assert applied["task"]["status"] == "completed"
+    assert applied["task"]["result"]["proposalId"] == proposal_id
+    accepted_proposal = db.fetchone("SELECT status FROM agent_proposals WHERE id=?", (proposal_id,))
+    assert accepted_proposal is not None
+    assert accepted_proposal["status"] == "ACCEPTED"
+    completed_task = db.fetchone("SELECT status FROM tasks WHERE id=?", (task_id,))
+    assert completed_task is not None
+    assert completed_task["status"] == "completed"
+    after_canon = {
+        "story_facts": _count(db, "SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?", (book_id,)),
+        "story_states": _count(db, "SELECT COUNT(*) AS count FROM story_states WHERE book_id=?", (book_id,)),
+        "story_commits": _count(db,
+            "SELECT COUNT(*) AS count FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id WHERE c.book_id=?",
+            (book_id,)),
+        "narrative_events": _count(db, "SELECT COUNT(*) AS count FROM narrative_events WHERE book_id=?", (book_id,)),
+    }
+    assert after_canon == before_canon
+
+
 def test_storyflow_plan_is_fulfilled_by_accepted_story_commit(tmp_path):
     db, _, book_id, chapter_one, chapter_two, _, _ = _seed_book(tmp_path)
     service = StoryFlowPlanningService(db)
@@ -3893,7 +4016,7 @@ def test_storyflow_plan_is_fulfilled_by_accepted_story_commit(tmp_path):
         facts=[{"fact_type": "event", "content": "The plan became a canonical chapter."}],
         state_changes={"chapter": 2},
     )
-    accepted = StoryRepository(db).accept_story_commit(commit_id)
+    accepted = StoryRepository(db).accept_story_commit_legacy(commit_id, reason="story graph fixture")
     assert accepted["accepted"] is True
 
     graph, fulfilled_revision = service.mark_intent_accepted(
@@ -3962,7 +4085,7 @@ def test_storyflow_fulfillment_rejects_untrusted_commit_and_illegal_lifecycle(tm
         chapter_one,
         facts=[{"fact_type": "event", "content": "This belongs to chapter one."}],
     )
-    StoryRepository(db).accept_story_commit(wrong_chapter_commit)
+    StoryRepository(db).accept_story_commit_legacy(wrong_chapter_commit, reason="story graph fixture")
     with pytest.raises(StoryFlowPlanningError, match="chapter number"):
         service.mark_intent_accepted(
             book_id,
@@ -3993,7 +4116,7 @@ def test_storyflow_reconcile_reads_completed_task_result_and_is_idempotent(tmp_p
         facts=[{"fact_type": "event", "content": "The durable task fulfilled the plan."}],
         state_changes={"plan_fulfilled": True},
     )
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
 
     runtime = TaskRuntime(db)
     task = runtime.enqueue(
@@ -4006,10 +4129,17 @@ def test_storyflow_reconcile_reads_completed_task_result_and_is_idempotent(tmp_p
         },
     )
     runtime.transition(task["id"], "running")
+    runtime.checkpoint(
+        task["id"],
+        "DONE",
+        {"completed": True, "story_commit_id": commit_id},
+        workflow_state="COMMITTED",
+    )
     completed = runtime.transition(
         task["id"],
         "completed",
         result={
+            "completed": True,
             "chapter_id": chapter_two,
             "chapter_number": 2,
             "story_commit_id": commit_id,
@@ -4052,7 +4182,7 @@ def test_storyflow_reconcile_api_uses_durable_task_output(tmp_path, monkeypatch)
         chapter_two,
         facts=[{"fact_type": "event", "content": "API recovery accepts the canonical chapter."}],
     )
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="story graph fixture")
     runtime = TaskRuntime(db)
     task = runtime.enqueue(
         "write-next",
@@ -4061,10 +4191,17 @@ def test_storyflow_reconcile_api_uses_durable_task_output(tmp_path, monkeypatch)
         data={"chapter_number": 2, "storyflow_plan_node_id": plan_node["id"]},
     )
     runtime.transition(task["id"], "running")
+    runtime.checkpoint(
+        task["id"],
+        "DONE",
+        {"completed": True, "story_commit_id": commit_id},
+        workflow_state="COMMITTED",
+    )
     runtime.transition(
         task["id"],
         "completed",
         result={
+            "completed": True,
             "chapter_id": chapter_two,
             "chapter_number": 2,
             "story_commit_id": commit_id,
@@ -5244,7 +5381,7 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
             chapter_id,
             facts=[{"fact_type": "reveal", "content": "API observed delta", "entities": []}],
         )
-        repository.accept_story_commit(observed_commit)
+        repository.accept_story_commit_legacy(observed_commit, reason="story graph fixture")
         changed_graph = client.get(
             f"/api/v1/books/{project.id}/story-graph?view=story&focus=chapter:{chapter_id}"
         )
@@ -5305,7 +5442,7 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
 
         with monkeypatch.context() as patch:
             patch.setattr(StoryGraphProjector, "capture_accepted_commit_snapshot", fail_capture)
-            failed_capture = repository.accept_story_commit(failed_capture_commit)
+            failed_capture = repository.accept_story_commit_legacy(failed_capture_commit, reason="story graph fixture")
         assert failed_capture["graph_snapshot"]["captured"] is False
 
         retry_snapshot = client.post(
@@ -5345,7 +5482,7 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
             state_changes={"api_freshness": "accepted"},
             chapter_version_id=accepted_version,
         )
-        repository.accept_story_commit(accepted_commit)
+        repository.accept_story_commit_legacy(accepted_commit, reason="story graph fixture")
         changed_response = client.get(
             f"/api/v1/books/{project.id}/story-graph/changes?fromSnapshot={first_snapshot_id}"
         )
@@ -5514,6 +5651,29 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         planning = client.get(f"/api/v1/books/{project.id}/story-graph/planning")
         assert planning.status_code == 200
         assert planning.json()["revision"] == 1
+        planning_preview = client.post(
+            f"/api/v1/books/{project.id}/story-graph/planning/preview",
+            json={
+                "delta": {
+                    "operations": [{
+                        "op": "move_node",
+                        "id": f"chapter:{chapter_id}",
+                        "x": 760,
+                        "y": 280,
+                    }]
+                },
+                "expectedRevision": 1,
+            },
+        )
+        assert planning_preview.status_code == 200
+        planning_preview_payload = planning_preview.json()
+        assert planning_preview_payload["proposal"]["status"] == "PROPOSED"
+        assert planning_preview_payload["proposal"]["taskId"]
+        assert planning_preview_payload["proposal"]["agentTaskId"]
+        assert planning_preview_payload["task"]["status"] == "needs_author_decision"
+        assert planning_preview_payload["previewDiff"]["hasChanges"] is True
+        assert planning_preview_payload["impactAnalysis"]["canonicalMutation"] is False
+        assert client.get(f"/api/v1/books/{project.id}/story-graph/planning").json()["revision"] == 1
         created_plan = client.post(
             f"/api/v1/books/{project.id}/story-graph/planning/node",
             json={
@@ -5531,6 +5691,8 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
         assert plan_node["type"] == "PlanningNode"
         assert created_plan.json()["anchorEdge"]["type"] == "originates_from"
         assert created_plan.json()["revision"] == 2
+        assert created_plan.json()["proposal"]["status"] == "ACCEPTED"
+        assert created_plan.json()["task"]["status"] == "completed"
         linked = client.post(
             f"/api/v1/books/{project.id}/story-graph/planning/edge",
             json={
@@ -5541,6 +5703,8 @@ def test_story_graph_api_uses_real_sqlite_and_layout_endpoint(tmp_path, monkeypa
             },
         )
         assert linked.status_code == 200
+        assert linked.json()["proposal"]["status"] == "ACCEPTED"
+        assert linked.json()["task"]["status"] == "completed"
         invalid_anchor = client.post(
             f"/api/v1/books/{project.id}/story-graph/planning/node",
             json={

@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from src.core.database import Database, generate_id
 from src.core.narrative_events import CANONICAL_IMPORT_ACCEPTED, append_event
 from src.core.story_repository import StoryRepository
+from src.runtime.approvals import is_author_approval_actor
 
 
 class CanonicalImportError(ValueError):
@@ -166,10 +167,41 @@ class CanonicalImportService:
         self._refresh_status(import_id)
         return self.get(import_id) or {}
 
-    def accept(self, import_id: str, *, item_ids: Optional[Iterable[str]] = None, actor_id: str = "author") -> dict[str, Any]:
+    def accept(
+        self,
+        import_id: str,
+        *,
+        item_ids: Optional[Iterable[str]] = None,
+        actor_id: str = "author",
+        review_ids: Optional[Mapping[str, str]] = None,
+        author_confirmed: bool = False,
+    ) -> dict[str, Any]:
         record = self.get(import_id)
         if record is None:
             raise CanonicalImportError("IMPORT_NOT_FOUND", "canonical import was not found")
+        review_map = {
+            str(commit_id): str(review_id)
+            for commit_id, review_id in (review_ids or {}).items()
+            if str(commit_id).strip() and str(review_id).strip()
+        }
+        pending_commits = record.get("report", {}).get("pendingCommits", [])
+        if isinstance(pending_commits, list) and pending_commits:
+            if not review_map:
+                result = dict(record)
+                result["reviewRequired"] = True
+                return result
+            if author_confirmed is not True:
+                raise CanonicalImportError(
+                    "IMPORT_AUTHOR_CONFIRMATION_REQUIRED",
+                    "author confirmation is required before imported StoryCommits enter Canon",
+                )
+            if not is_author_approval_actor(actor_id):
+                raise CanonicalImportError(
+                    "IMPORT_AUTHOR_ACTOR_REQUIRED",
+                    "canonical import acceptance requires an author-facing Host actor",
+                )
+            return self._finalize_pending_commits(record, pending_commits, review_map, actor_id)
+
         selected = {str(item) for item in item_ids} if item_ids is not None else None
         candidates = [
             item for item in record["items"]
@@ -184,8 +216,7 @@ class CanonicalImportService:
                 conflicts.append({"itemId": item["id"], "reason": "chapter_number_missing"})
                 continue
             grouped[int(item["chapter_number"])].append(item)
-        accepted_items: list[tuple[str, str]] = []
-        commits: list[dict[str, Any]] = []
+        pending_descriptors: list[dict[str, Any]] = []
         project_id = record["project_id"]
         book = self.story_repository.book_for_project(project_id)
         if book is None:
@@ -237,42 +268,147 @@ class CanonicalImportService:
                 version["chapter_id"], chapter_version_id=version["version_id"], facts=facts,
                 state_changes=state_changes,
             )
-            accepted = self.story_repository.accept_story_commit(commit_id)
-            with self.db.transaction() as conn:
-                import_event = append_event(
-                    conn,
-                    book_id=book["id"],
-                    event_type=CANONICAL_IMPORT_ACCEPTED,
-                    payload={
-                        "importId": import_id,
-                        "commitId": commit_id,
-                        "eventId": accepted["event_id"],
-                        "chapterNumber": chapter_number,
-                        "itemIds": [item["id"] for item in items],
-                    },
-                    aggregate_type="canonical_import",
-                    aggregate_id=import_id,
-                    chapter_id=version["chapter_id"],
-                    chapter_version_id=version["version_id"],
-                    source_event_id=accepted["event_id"],
-                    source_commit_id=commit_id,
-                    reason="author accepted imported canonical proposal",
-                    actor_type="author",
-                    actor_id=actor_id,
-                )
-                for item in items:
-                    conn.execute(
-                        "UPDATE canonical_import_items SET status='accepted', accepted_event_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                        (accepted["event_id"], item["id"]),
+            pending_descriptors.append({
+                "commitId": commit_id,
+                "chapterId": version["chapter_id"],
+                "chapterVersionId": version["version_id"],
+                "chapterNumber": chapter_number,
+                "itemIds": [item["id"] for item in items],
+            })
+
+        report = {
+            "stage": "review_required" if pending_descriptors else "proposed",
+            "acceptedItems": [],
+            "commits": [],
+            "pendingCommits": pending_descriptors,
+            "conflicts": conflicts,
+        }
+        status = "proposed"
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE canonical_imports SET status=?, report=?, version=version+1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, _dump(report), import_id),
+            )
+        result = self.get(import_id) or {}
+        if pending_descriptors:
+            result["reviewRequired"] = True
+        return result
+
+    def _finalize_pending_commits(
+        self,
+        record: dict[str, Any],
+        pending_commits: list[dict[str, Any]],
+        review_ids: Mapping[str, str],
+        actor_id: str,
+    ) -> dict[str, Any]:
+        """Bind Reviews and advance a prepared import through normal Canon."""
+        import_id = str(record["id"])
+        missing_reviews = [
+            str(item.get("commitId")) for item in pending_commits
+            if str(item.get("commitId")) not in review_ids
+        ]
+        if missing_reviews:
+            raise CanonicalImportError(
+                "IMPORT_REVIEW_REQUIRED",
+                "a passing Review is required for every pending imported StoryCommit: "
+                + ", ".join(missing_reviews),
+            )
+        book = self.story_repository.book_for_project(record["project_id"])
+        if book is None:
+            raise CanonicalImportError("PROJECT_NOT_FOUND", "project has no authoritative book")
+        item_by_id = {str(item["id"]): item for item in record.get("items", [])}
+        accepted_items: list[str] = []
+        commits: list[dict[str, Any]] = []
+        for pending in pending_commits:
+            commit_id = str(pending["commitId"])
+            review_id = str(review_ids[commit_id])
+            commit = self.db.fetchone("SELECT * FROM story_commits WHERE id=?", (commit_id,))
+            if commit is None:
+                raise CanonicalImportError("IMPORT_COMMIT_NOT_FOUND", f"pending StoryCommit not found: {commit_id}")
+            try:
+                if commit["status"] == "pending":
+                    self.story_repository.bind_story_commit_review(commit_id, review_id)
+                elif commit["status"] != "accepted":
+                    raise CanonicalImportError(
+                        "IMPORT_COMMIT_NOT_PENDING",
+                        f"imported StoryCommit {commit_id} is no longer pending",
                     )
+                elif commit["review_id"] != review_id:
+                    raise CanonicalImportError(
+                        "IMPORT_REVIEW_MISMATCH",
+                        f"accepted StoryCommit {commit_id} is bound to a different Review",
+                    )
+                accepted = self.story_repository.accept_story_commit(commit_id)
+            except (KeyError, ValueError) as exc:
+                raise CanonicalImportError("IMPORT_REVIEW_GATE", str(exc)) from exc
+            import_event: dict[str, Any] | None = None
+            with self.db.transaction() as conn:
+                existing_import_event = conn.execute(
+                    """SELECT * FROM narrative_events
+                       WHERE book_id=? AND event_type=? AND aggregate_type='canonical_import'
+                         AND aggregate_id=? AND source_commit_id=? AND source_event_id=?
+                       ORDER BY sequence LIMIT 1""",
+                    (
+                        book["id"], CANONICAL_IMPORT_ACCEPTED, import_id,
+                        commit_id, accepted["event_id"],
+                    ),
+                ).fetchone()
+                if existing_import_event is not None:
+                    import_event = dict(existing_import_event)
+                else:
+                    import_event = append_event(
+                        conn,
+                        book_id=book["id"],
+                        event_type=CANONICAL_IMPORT_ACCEPTED,
+                        payload={
+                            "importId": import_id,
+                            "commitId": commit_id,
+                            "eventId": accepted["event_id"],
+                            "chapterNumber": pending["chapterNumber"],
+                            "itemIds": pending.get("itemIds", []),
+                            "reviewId": review_id,
+                        },
+                        aggregate_type="canonical_import",
+                        aggregate_id=import_id,
+                        chapter_id=pending["chapterId"],
+                        chapter_version_id=pending["chapterVersionId"],
+                        source_event_id=accepted["event_id"],
+                        source_commit_id=commit_id,
+                        reason="author accepted imported canonical proposal after review",
+                        actor_type="author",
+                        actor_id=actor_id,
+                    )
+                for item_id in pending.get("itemIds", []):
+                    if str(item_id) in item_by_id:
+                        conn.execute(
+                            """UPDATE canonical_import_items
+                               SET status='accepted', accepted_event_id=?, updated_at=CURRENT_TIMESTAMP
+                               WHERE id=? AND import_id=?""",
+                            (accepted["event_id"], item_id, import_id),
+                        )
                 conn.execute(
                     "UPDATE canonical_imports SET accepted_event_id=? WHERE id=?",
                     (import_event["id"], import_id),
                 )
-            commits.append({"commitId": commit_id, "eventId": accepted["event_id"], "importEventId": import_event["id"], "chapterNumber": chapter_number})
-            accepted_items.extend((item["id"], accepted["event_id"]) for item in items)
-        report = {"acceptedItems": [item[0] for item in accepted_items], "commits": commits, "conflicts": conflicts}
-        status = "accepted" if not conflicts else "partially_accepted" if commits else "proposed"
+            accepted_item_ids = [str(item_id) for item_id in pending.get("itemIds", [])]
+            accepted_items.extend(accepted_item_ids)
+            commits.append({
+                "commitId": commit_id,
+                "eventId": accepted["event_id"],
+                "importEventId": import_event["id"],
+                "chapterNumber": pending["chapterNumber"],
+                "reviewId": review_id,
+            })
+        conflicts = list(record.get("report", {}).get("conflicts", []))
+        stage = "accepted" if not conflicts else "partially_accepted"
+        report = {
+            "stage": stage,
+            "acceptedItems": accepted_items,
+            "commits": commits,
+            "pendingCommits": [],
+            "conflicts": conflicts,
+        }
+        status = "accepted" if not conflicts else "partially_accepted"
         with self.db.transaction() as conn:
             conn.execute(
                 "UPDATE canonical_imports SET status=?, report=?, version=version+1, updated_at=CURRENT_TIMESTAMP WHERE id=?",

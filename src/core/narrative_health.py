@@ -62,8 +62,9 @@ class NarrativeHealthService:
                 "SELECT status, COUNT(*) AS count FROM narrative_memory WHERE book_id=? GROUP BY status", (book_id,)
             ).fetchall()
             rag_counts = conn.execute(
-                """SELECT status, COUNT(*) AS count FROM embedding_projections
-                   WHERE book_id=? AND source_type='narrative_memory' GROUP BY status""", (book_id,)
+                """SELECT source_type, status, COUNT(*) AS count FROM embedding_projections
+                   WHERE book_id=? AND source_type IN ('narrative_memory', 'reference_chunk')
+                   GROUP BY source_type, status ORDER BY source_type, status""", (book_id,)
             ).fetchall()
             issue_count = conn.execute(
                 """SELECT COUNT(*) AS count FROM review_issues ri JOIN reviews r ON r.id=ri.review_id
@@ -102,7 +103,18 @@ class NarrativeHealthService:
             key.endswith(f":{status}") for status in ("pending", "stale", "failed")
         ))
         memory = {row["status"]: int(row["count"]) for row in memory_counts}
-        rag = {row["status"]: int(row["count"]) for row in rag_counts}
+        rag_by_source: dict[str, dict[str, int]] = {}
+        for row in rag_counts:
+            source_type = str(row["source_type"] or "unknown")
+            status = str(row["status"] or "unknown")
+            rag_by_source.setdefault(source_type, {})[status] = int(row["count"])
+        rag = {
+            status: sum(source_counts.get(status, 0) for source_counts in rag_by_source.values())
+            for status in sorted({
+                status for source_counts in rag_by_source.values() for status in source_counts
+            })
+        }
+        rag_unhealthy = any(status in {"pending", "failed", "stale"} for status in rag)
         attempt_status = {row["status"]: int(row["count"]) for row in attempts}
         context_runs = 0
         exact_manifest_runs = 0
@@ -133,7 +145,11 @@ class NarrativeHealthService:
             "projection": self._metric({"byStatus": projection, "lag": lag}, source="projection_ledger", canonical_source="sqlite.projection_ledger", status="degraded" if lag else "ok"),
             "replay": self._metric({"match": replay_match, "hash": replay_hash}, source="narrative_events + story_states", canonical_source="sqlite.narrative_events", status="ok" if replay_match else "degraded"),
             "memory": self._metric(memory, source="narrative_memory", canonical_source="sqlite.narrative_memory", status="degraded" if memory.get("superseded", 0) else "ok"),
-            "rag": self._metric({"byStatus": rag, "embeddingRouteConfigured": bool(embedding_routes)}, source="embedding_projections + agent_model_routes", canonical_source="sqlite.embedding_projections", status="ok" if embedding_routes or not rag.get("failed") else "degraded"),
+            "rag": self._metric({
+                "byStatus": rag,
+                "bySourceType": rag_by_source,
+                "embeddingRouteConfigured": bool(embedding_routes),
+            }, source="embedding_projections + agent_model_routes", canonical_source="sqlite.embedding_projections", status="degraded" if rag_unhealthy else "ok"),
             "context": self._metric({"generationRuns": context_runs, "exactManifestRuns": exact_manifest_runs}, source="generation_runs.input_reference.context_manifest", canonical_source="sqlite.generation_runs", status="ok" if context_runs == exact_manifest_runs else "degraded"),
             "reviews": self._metric({"unresolvedMajorIssues": int(issue_count)}, source="review_issues", canonical_source="sqlite.review_issues", status="degraded" if issue_count else "ok"),
             "storyHealthSignals": self._metric({"openForeshadows": int(open_foreshadows), "activeHooks": int(active_hooks)}, source="foreshadows + hooks", canonical_source="sqlite.foreshadows", status="ok"),

@@ -1687,7 +1687,31 @@
       hideEdgeChooser();
       try {
         const planning = await api('GET', `/books/${currentBook()}/story-graph/planning`);
+        const edgeId = storyflowClientId('planning-edge');
+        const preview = await api('POST', `/books/${currentBook()}/story-graph/planning/preview`, {
+          delta: { operations: [{
+            op: 'add_edge',
+            edge: {
+              id: edgeId,
+              source: connection.sourceNodeId,
+              target: targetNode.id,
+              type: edgeType,
+              kind: edgeType,
+              edgeType,
+              label: edgeType,
+              status: 'planned',
+              sourcePort: connection.sourcePort,
+              targetPort,
+              sourceRef: 'storyflow',
+              metadata: { createdFrom: 'storyflow-canvas' },
+            },
+          }] },
+          expectedRevision: Number(planning.revision || 1),
+        });
+        if (!confirmStoryFlowPreview(preview)) return;
         await api('POST', `/books/${currentBook()}/story-graph/planning/edge`, {
+          edgeId,
+          proposalId: preview.proposal?.proposalId,
           sourceNodeId: connection.sourceNodeId,
           targetNodeId: targetNode.id,
           edgeType,
@@ -1707,6 +1731,23 @@
   }
 
   function hideEdgeChooser() { document.getElementById('sf-edge-chooser')?.remove(); }
+
+  function storyflowClientId(prefix) {
+    const generated = globalThis.crypto?.randomUUID?.();
+    return `${prefix}:${generated || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+  }
+
+  function confirmStoryFlowPreview(preview) {
+    const diff = preview?.previewDiff || {};
+    const nodes = diff.nodes?.counts || {};
+    const edges = diff.edges?.counts || {};
+    return window.confirm(
+      `确认写入 StoryFlow planning overlay？\n` +
+      `节点：新增 ${nodes.added || 0}、修改 ${nodes.changed || 0}、移除 ${nodes.removed || 0}\n` +
+      `关系：新增 ${edges.added || 0}、修改 ${edges.changed || 0}、移除 ${edges.removed || 0}\n` +
+      `影响分析仅基于已记录语义证据；不会写入 Canon。`
+    );
+  }
 
   function onCanvasContextMenu(event) {
     event.preventDefault();
@@ -3853,7 +3894,7 @@
   }
 
   async function checkGraphFreshness() {
-    if (!state || !S.book || !state.graphSnapshotId || state.loading || state.graphFreshnessLoading) return;
+    if (!state || !S.book || !state.graphSnapshotId || state.loading || state.graphFreshnessLoading || state.graphFreshnessDisabled) return;
     state.graphFreshnessLoading = true;
     try {
       const query = new URLSearchParams({ fromSnapshot: state.graphSnapshotId });
@@ -3882,6 +3923,14 @@
     } catch (error) {
       if (!state) return;
       state.graphFreshnessError = error.message;
+      // Empty projects have a truthful graph projection but no authoritative
+      // book yet.  Do not retry the same permanent 409 every 12 seconds;
+      // leave the boundary visible and wait for a new workspace load.
+      if (error?.status === 409 && /authoritative book/i.test(String(error.message || ''))) {
+        state.graphFreshnessDisabled = true;
+        window.clearInterval(state.graphFreshnessTimer);
+        state.graphFreshnessTimer = null;
+      }
       renderToolbar();
     } finally {
       if (state) state.graphFreshnessLoading = false;
@@ -4306,7 +4355,52 @@
       submit.disabled = true;
         try {
         const revision = await planningRevision();
+        const nodeId = storyflowClientId('planning');
+        const anchorEdgeId = linkToAnchor ? storyflowClientId('planning-edge') : null;
+        const previewOperations = [{
+          op: 'add_node',
+          node: {
+            id: nodeId,
+            kind: 'planning-node',
+            type: 'PlanningNode',
+            label: title,
+            title,
+            summary,
+            description: summary,
+            status: status.toLowerCase(),
+            source: 'author',
+            sourceRef: 'storyflow',
+            metadata: { createdFrom: 'storyflow-canvas' },
+          },
+        }];
+        if (linkToAnchor) {
+          previewOperations.push({
+            op: 'add_edge',
+            edge: {
+              id: anchorEdgeId,
+              source: nodeId,
+              target: anchor.id,
+              type: anchorRelation.type,
+              kind: anchorRelation.type,
+              edgeType: anchorRelation.type,
+              label: anchorRelation.label,
+              status: status.toLowerCase(),
+              sourceRef: 'storyflow',
+              metadata: { createdFrom: 'storyflow-canvas' },
+            },
+          });
+        }
+        const preview = await api('POST', `/books/${currentBook()}/story-graph/planning/preview`, {
+          delta: { operations: previewOperations },
+          expectedRevision: revision,
+        });
+        if (!confirmStoryFlowPreview(preview)) {
+          submit.disabled = false;
+          return;
+        }
         const result = await api('POST', `/books/${currentBook()}/story-graph/planning/node`, {
+          nodeId,
+          proposalId: preview.proposal?.proposalId,
           title,
           summary,
           subtype: 'author-flow-node',
@@ -4319,6 +4413,7 @@
           },
           anchorNodeId: linkToAnchor ? anchor.id : null,
           anchorEdgeType: linkToAnchor ? anchorRelation.type : null,
+          anchorEdgeId,
           anchorLabel: linkToAnchor ? anchorRelation.label : '',
           anchorMetadata: linkToAnchor ? {
             createdFrom: 'storyflow-canvas',
@@ -4978,6 +5073,7 @@
       contextEvidence: null, generationRunTrace: null, generationContextGraph: null, reconciliationCandidates: null, selectionProjection: null, drag: null, pan: null, box: null, connection: null, layoutDirty: false, searchTimer: null, candidateTimer: null, candidateTaskId: null, analysisTimer: null, analysisTaskId: null, analysisResult: null, analysisTrace: null, generationTimer: null, generationTaskId: null, chapterImpact: null, chapterVersionCompare: null, modelWorkObserver: null,
       analysisHistory: [], analysisHistoryLoaded: false, candidateSets: [], candidateSetsRevision: 0, candidateSetsLoading: false, candidateSetsError: null, recoverableForecastTasks: [], recoverableForecastTasksLoading: false, recoverableForecastTasksError: null, recoveringForecastTaskId: null, candidateComparison: null, candidateLineage: null, snapshotDiff: null, canonicalReplay: null, canonicalDiff: null,
       storyHealth: null, storyHealthLoading: false, storyHealthError: null, storyHealthLookback: 8, storyHealthRequestId: 0,
+      graphFreshnessDisabled: false,
     };
     if (state.focus) state.selected = new Set([state.focus]);
     if (!S.book) {
@@ -4997,6 +5093,7 @@
   };
 
   window.storyflow = {
+    destroy,
     reload: loadGraph,
     focus(id) { if (!state) return; state.focus = id; state.selected = new Set([id]); loadGraph(); },
     open(view, id) {
@@ -5028,7 +5125,10 @@
         focus: existingIntent.focus || '',
         sourcePage: existingIntent.sourcePage || (legacyRouteViews[S.page] ? S.page : ''),
       };
-      window.setTimeout(() => go('storyflow'), 0);
+      // The Workbench loader now starts this module before the shell and lets
+      // the shell own the first render. Calling the legacy router here would
+      // race that deep-link render and could put Dashboard back over Canvas.
+      window.__storyflowRouteIntentPending = true;
     }
   }
 }());

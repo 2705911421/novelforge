@@ -175,7 +175,7 @@ def test_version_diff_and_restore_append_history_and_stale_committed_state(nativ
     )
     assert chapter is not None
     commit_id = repository.create_story_commit(chapter["id"], state_changes={"hero": "at home"})
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="chapter-core fixture")
 
     second = client.put(f"/api/v1/books/{project_id}/chapters/1", json={
         "content": "Second line\nShared line", "baseVersion": 1,
@@ -221,7 +221,7 @@ def test_deleting_a_committed_chapter_marks_its_story_state_stale(native_workspa
     )
     assert chapter is not None
     commit_id = repository.create_story_commit(chapter["id"], state_changes={"location": "harbor"})
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="chapter-core fixture")
 
     assert manager.delete_chapter(project.id, 1) is True
     book = repository.book_for_project(project.id)

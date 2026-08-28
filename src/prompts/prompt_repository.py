@@ -10,6 +10,23 @@ from src.core.database import Database, generate_id
 
 # Default prompts for each task type.
 DEFAULT_PROMPTS: dict[str, dict[str, str]] = {
+    "plan-chapter": {
+        "system": "你是 NovelForge 的规划师，只负责本章结构化安排，不写正文。",
+        "user_template": (
+            "请读取第{chapter_number}章设计，生成提示词 A1。\n\n"
+            "## 本章设计\n{plan}\n\n"
+            "## 已知上下文\n{context}"
+        ),
+    },
+    "compose-chapter": {
+        "system": "你是 NovelForge 的规划师。把 A1 与 A2 合成为交给写作模型的提示词 A，不写正文。",
+        "user_template": (
+            "请把以下提示词 A1 与 A2 合成为提示词 A。保留所有硬性禁令、事实边界和结构要求。\n\n"
+            "## 提示词 A1\n{prompt_a1}\n\n"
+            "## 提示词 A2\n{prompt_a2}\n\n"
+            "## 本章设计\n{plan}"
+        ),
+    },
     "write-next": {
         "system": "你是一位专业的网络小说作家，擅长创作引人入胜的长篇小说。请直接输出章节正文，不要包含标题或元信息。",
         "user_template": "请创作第{chapter_number}章的完整正文。\n\n## 章节计划\n{plan}\n\n## 创作背景\n{context}\n\n{extra}",

@@ -39,6 +39,10 @@ class ChapterWriter:
         Returns:
             创作完成的Chapter对象
         """
+        if not isinstance(chapter_plan, dict):
+            raise ValueError("CHAPTER_PLAN_OUTPUT_INVALID: expected a JSON object")
+        if "error" in chapter_plan:
+            raise ValueError("CHAPTER_PLAN_OUTPUT_INVALID: model returned invalid JSON")
         client = self.models.get_writer()
 
         # 构建世界设定
@@ -75,14 +79,17 @@ class ChapterWriter:
                   "你的作品节奏紧凑、人物鲜活、情节跌宕起伏。")
 
         response = client.chat(messages, system)
+        content = getattr(response, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("CHAPTER_WRITER_OUTPUT_INVALID: generated content is empty")
 
         # 构建章节对象
         chapter = Chapter(
             number=chapter_number,
             title=chapter_plan.get("title", f"第{chapter_number}章"),
-            content=response.content,
+            content=content,
             status=ChapterStatus.DRAFTED,
-            word_count=len(response.content),
+            word_count=len(content),
             task_brief=plan_text,
         )
 
@@ -119,10 +126,13 @@ class ChapterWriter:
         system = "你是一位专业的小说修订编辑，擅长精准修改而不破坏原有内容。"
 
         response = client.chat(messages, system)
+        content = getattr(response, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("CHAPTER_REVISER_OUTPUT_INVALID: generated content is empty")
 
         # 更新章节
-        chapter.content = response.content
-        chapter.word_count = len(response.content)
+        chapter.content = content
+        chapter.word_count = len(content)
         chapter.revision_count += 1
         chapter.status = ChapterStatus.REVISING
 

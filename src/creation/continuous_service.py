@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, ContextManager, cast
 
 from src.core.database import Database
 from src.core.story_repository import StoryRepository
@@ -39,6 +40,7 @@ class ContinuousWritingService:
         child_lease_seconds: int = DEFAULT_CHILD_LEASE_SECONDS,
         score_threshold: int | None = None,
         max_revisions: int | None = None,
+        enqueue_task: Callable[..., dict[str, Any]] | None = None,
     ):
         if (
             isinstance(joint_review_interval, bool)
@@ -69,6 +71,7 @@ class ContinuousWritingService:
         self.model_manager = model_manager
         self.story_repo = story_repository
         self.runtime = task_runtime
+        self.enqueue_task = enqueue_task
         self.joint_review_interval = joint_review_interval
         self.child_lease_seconds = child_lease_seconds
         pipeline_options = {}
@@ -152,6 +155,7 @@ class ContinuousWritingService:
         *,
         strict_planning: bool = False,
         planning_snapshot_id: str | None = None,
+        initiated_by: str | None = None,
     ) -> dict[str, Any]:
         """Atomically start one exclusive continuous-writing session."""
         if isinstance(start_chapter, bool) or not isinstance(start_chapter, int) or start_chapter < 1:
@@ -168,19 +172,45 @@ class ContinuousWritingService:
         )
 
         context_fingerprint = hashlib.sha256(context.encode("utf-8")).hexdigest()[:16]
-        task = self.runtime.enqueue_continuous(
-            project_id=project_id,
-            book_id=book_id,
-            data={
-                "start_chapter": start_chapter,
-                "count": count,
-                "context": context,
-                **run_config,
-            },
-            idempotency_key=(
-                f"continuous:{book_id}:{start_chapter}:{count}:{context_fingerprint}"
-            ),
+        configuration_fingerprint = hashlib.sha256(
+            json.dumps(
+                run_config,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        task_data = {
+            "start_chapter": start_chapter,
+            "count": count,
+            "context": context,
+            **run_config,
+        }
+        idempotency_key = (
+            f"continuous:{book_id}:{start_chapter}:{count}:"
+            f"{context_fingerprint}:{configuration_fingerprint}"
         )
+        if self.enqueue_task is not None:
+            enqueue_kwargs: dict[str, Any] = {
+                "project_id": project_id,
+                "book_id": book_id,
+                "data": task_data,
+                "idempotency_key": idempotency_key,
+            }
+            if initiated_by is not None:
+                enqueue_kwargs["initiated_by"] = initiated_by
+            task = self.enqueue_task(
+                "continuous",
+                **enqueue_kwargs,
+            )
+        else:
+            task = self.runtime.enqueue_continuous(
+                project_id=project_id,
+                book_id=book_id,
+                data=task_data,
+                idempotency_key=idempotency_key,
+                initiated_by=initiated_by,
+            )
         # Keep both spellings while the HTTP/CLI adapters converge on the
         # service. ``taskId`` is the public contract; ``id`` preserves the
         # legacy adapter response shape during the transition.
@@ -244,6 +274,12 @@ class ContinuousWritingService:
                         "chapter_number": chapter_number,
                         "context": context,
                         "parent_task_id": task["id"],
+                        "strict_planning": bool(data.get("strict_planning")),
+                        "planning_snapshot_id": data.get("planning_snapshot_id"),
+                        "planning_snapshot_version": data.get("planning_snapshot_version"),
+                        "planning_snapshot_checksum": data.get("planning_snapshot_checksum"),
+                        "prompt_policy_versions": data.get("prompt_policy_versions", {}),
+                        "quality_policy": data.get("quality_policy", {}),
                     },
                     stage="blocked",
                     idempotency_key=f"continuous-child:{task['id']}:{chapter_number}",
@@ -573,6 +609,12 @@ class ContinuousWritingService:
         if not isinstance(chapter_number, int):
             raise TaskStateError("chapter decision is missing chapter_number")
         latest = self._latest_chapter_version(parent.get("book_id"), chapter_number)
+        expected_version_id = context.get("draft_version_id")
+        if expected_version_id is not None:
+            if latest is None or str(latest.get("version_id")) != str(expected_version_id):
+                raise TaskStateError(
+                    "chapter candidate version changed; author must review the current version"
+                )
         if latest:
             context.update({
                 "chapter_id": latest["chapter_id"],
@@ -791,7 +833,17 @@ class ContinuousWritingService:
         self, parent_task: dict[str, Any], child_task: dict[str, Any]
     ) -> dict[str, Any] | None:
         if child_task["status"] == "completed":
-            result = child_task.get("result") or {"completed": True}
+            result = child_task.get("result")
+            # A historical compatibility row may say ``completed`` while its
+            # result is missing or lacks the accepted StoryCommit marker.  Do
+            # not reconstruct success from the status alone: the parent must
+            # surface the inconsistency and stop at the author decision gate.
+            if not isinstance(result, dict) or result.get("completed") is not True:
+                return {
+                    "completed": False,
+                    "recovered": True,
+                    "error": "completed child has no valid committed result",
+                }
             return {**result, "recovered": True}
         if child_task["status"] in {"failed", "needs_author_decision"}:
             # Parent retry (automatic or author-requested) is the single retry
@@ -810,7 +862,9 @@ class ContinuousWritingService:
         try:
             result = self._with_child_heartbeat(
                 claimed,
-                lambda: self.pipeline.execute(claimed),
+                lambda: self._with_model_task_scope(
+                    claimed["id"], lambda: self.pipeline.execute(claimed)
+                ),
             )
             if not result.get("completed", False):
                 current = self.runtime.get(child_task["id"])
@@ -958,12 +1012,15 @@ class ContinuousWritingService:
             )
             review = self._with_child_heartbeat(
                 claimed,
-                lambda: JointReviewService(self.db, self.model_manager).review_chapters(
-                    project_id,
-                    book_id,
-                    start_chapter,
-                    end_chapter,
-                    prompt_policy_versions=(parent_task.get("data") or {}).get("prompt_policy_versions"),
+                lambda: self._with_model_task_scope(
+                    claimed["id"],
+                    lambda: JointReviewService(self.db, self.model_manager).review_chapters(
+                        project_id,
+                        book_id,
+                        start_chapter,
+                        end_chapter,
+                        prompt_policy_versions=(parent_task.get("data") or {}).get("prompt_policy_versions"),
+                    ),
                 ),
             )
             result = {
@@ -1106,6 +1163,20 @@ class ContinuousWritingService:
         finally:
             stop.set()
             thread.join(timeout=2)
+
+    def _with_model_task_scope(self, task_id: str, operation: Callable[[], Any]) -> Any:
+        """Attribute nested provider calls to the child task being executed.
+
+        Continuous writing runs a durable parent and executes one child at a
+        time in the same worker thread.  The model manager's context variable
+        must follow the child boundary or every nested AgentRun and
+        GenerationRun would be recorded against the parent task.
+        """
+        scope_factory = getattr(self.model_manager, "task_scope", None)
+        if not callable(scope_factory):
+            return operation()
+        with cast(Callable[[str], ContextManager[None]], scope_factory)(task_id):
+            return operation()
 
     @staticmethod
     def _checkpoint_state(task: dict[str, Any]) -> dict[str, Any]:

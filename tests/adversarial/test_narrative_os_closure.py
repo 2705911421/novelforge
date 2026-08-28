@@ -34,7 +34,7 @@ def _accept_chapter(repository: StoryRepository, database: Database, book_id: st
         facts=[{"fact_type": "event", "content": fact}],
         state_changes=state,
     )
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="narrative OS fixture")
     return commit_id
 
 
@@ -127,6 +127,29 @@ def test_durable_hybrid_retrieval_survives_reinstantiation_and_delete(closure_de
     assert all(result["source_id"] != "memory-1" for result in after_delete["results"])
 
 
+def test_embedding_failure_keeps_bm25_fallback_and_reports_degraded_projection(closure_deps):
+    database, _repository, book_id = closure_deps
+
+    def fail(_text: str) -> list[float]:
+        raise RuntimeError("embedding provider unavailable")
+
+    retriever = DurableHybridRetriever(database, model_key="failing-embed-v1", embedder=fail)
+    stored = retriever.upsert(
+        book_id, "narrative_memory", "memory-failed", "1", "the hero opens the gate"
+    )
+    assert stored["status"] == "failed"
+    assert stored["embedding_available"] is False
+    result = retriever.query(book_id, "hero gate", top_k=1)
+
+    assert result["strategy"] == "bm25_fallback"
+    assert result["degraded"] is True
+    assert result["embedding_available"] is False
+    assert result["embedding_failure_count"] == 1
+    assert result["resultCount"] == 1
+    assert result["results"][0]["source_id"] == "memory-failed"
+    assert result["results"][0]["status"] == "failed"
+
+
 def test_restore_rebinds_and_rebuilds_missing_derived_rows(closure_deps):
     database, repository, book_id = closure_deps
     _accept_chapter(repository, database, book_id, 1, "opening", "the gate opens", {"gate": "open"})
@@ -158,7 +181,7 @@ def test_edit_and_delete_reconcile_canonical_memory_without_destroying_history(c
         facts=[{"fact_type": "event", "content": "B dies"}],
         state_changes={"B": "dead"},
     )
-    accepted = repository.accept_story_commit(commit_id)
+    accepted = repository.accept_story_commit_legacy(commit_id, reason="narrative OS fixture")
     event_id = accepted["event_id"]
     assert database.count("narrative_memory", "source_event_id=? AND status='active'", (event_id,)) == 1
 

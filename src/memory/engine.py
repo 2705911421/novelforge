@@ -231,8 +231,14 @@ class MemoryEngine:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             self.import_from_dict(data)
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
+        except FileNotFoundError:
+            logger.debug("Memory persistence file does not exist yet: %s", path)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "Memory persistence file is invalid JSON; starting with an empty store: %s (%s)",
+                path,
+                exc,
+            )
 
     def _auto_save(self):
         """自动保存到持久化文件"""
@@ -3561,7 +3567,7 @@ def load_memory_from_file(file_path: str) -> MemoryEngine:
             data = json.load(f)
         engine.import_from_dict(data)
     except FileNotFoundError:
-        pass
+        logger.debug("Memory persistence file does not exist: %s", file_path)
     
     return engine
 

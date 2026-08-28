@@ -40,6 +40,13 @@ class DeterministicAuditModel:
                 "dimensions": {},
                 "issues": [],
             })
+        elif task_type == "joint-review":
+            response.content = json.dumps({
+                "overall_score": 95,
+                "verdict": "pass",
+                "summary": "chapters remain consistent",
+                "issues": [],
+            })
         elif task_type == "fact-extraction":
             response.content = json.dumps([{"fact_type": "event", "content": "the gate opens"}])
         else:
@@ -71,7 +78,7 @@ def test_invalidated_facts_are_excluded_from_writer_context(audit_deps):
         facts=[{"fact_type": "event", "content": "B dies"}],
         state_changes={"B": "dead"},
     )
-    repository.accept_story_commit(commit_id)
+    repository.accept_story_commit_legacy(commit_id, reason="missing-runtime fixture")
     repository.append_chapter_version(book_id, 1, "B survives and escapes")
 
     task = runtime.enqueue(
