@@ -42,7 +42,5 @@ __pycache__/
 coverage.xml
 htmlcov/
 
-# Large tracked audit material; keep it under explicit evidence review
+# Large tracked evidence material; keep it under explicit evidence review
 docs/storyflow-canvas/evidence/
-docs/fable5-global-audit/
-docs/high-end-audit/
