@@ -132,9 +132,9 @@ def test_enqueue_profile_preserves_default_and_explicit_compute_allowlists(tmp_p
             },
         },
     )
-    inherited_raw = json.loads(
-        db.fetchone("SELECT profile FROM agent_tasks WHERE task_id=?", (inherited["id"],))["profile"]
-    )
+    inherited_row = db.fetchone("SELECT profile FROM agent_tasks WHERE task_id=?", (inherited["id"],))
+    assert inherited_row is not None
+    inherited_raw = json.loads(inherited_row["profile"])
     assert inherited_raw["allowedComputeTools"] == ["request_compute_escalation"]
     inherited_contract = AgentTaskStore(db).contract_for_durable_task(inherited["id"])
     assert inherited_contract is not None
@@ -153,9 +153,9 @@ def test_enqueue_profile_preserves_default_and_explicit_compute_allowlists(tmp_p
             },
         },
     )
-    denied_raw = json.loads(
-        db.fetchone("SELECT profile FROM agent_tasks WHERE task_id=?", (denied["id"],))["profile"]
-    )
+    denied_row = db.fetchone("SELECT profile FROM agent_tasks WHERE task_id=?", (denied["id"],))
+    assert denied_row is not None
+    denied_raw = json.loads(denied_row["profile"])
     assert denied_raw["allowedComputeTools"] == []
     denied_contract = AgentTaskStore(db).contract_for_durable_task(denied["id"])
     assert denied_contract is not None

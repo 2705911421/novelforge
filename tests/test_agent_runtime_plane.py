@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 from dataclasses import replace
+from typing import cast
 
 import pytest
 
@@ -121,8 +122,12 @@ def test_agent_task_store_cannot_bypass_task_runtime_lifecycle(tmp_path):
     with pytest.raises(ValueError, match="TaskRuntime"):
         store.update_status(task.task_id, "completed")
 
-    assert store.get(task.task_id)["status"] == "planned"
-    assert db.fetchone("SELECT status FROM tasks WHERE id=?", (durable["id"],))["status"] == "queued"
+    stored = store.get(task.task_id)
+    assert stored is not None
+    assert stored["status"] == "planned"
+    task_row = db.fetchone("SELECT status FROM tasks WHERE id=?", (durable["id"],))
+    assert task_row is not None
+    assert task_row["status"] == "queued"
 
     assert runtime.claim_by_id(durable["id"], "lifecycle-worker") is not None
     mirrored = store.update_status(task.task_id, "running")
@@ -330,7 +335,7 @@ def test_context_bundle_cache_is_bounded_and_returns_detached_snapshots(tmp_path
     monkeypatch.setattr(db, "fetchone", counted_fetchone)
     first = store.get(bundle.bundle_id)
     assert first is not None
-    first.provenance["mutatedByCaller"] = True
+    cast(dict[str, object], first.provenance)["mutatedByCaller"] = True
     second = store.get(bundle.bundle_id)
 
     assert second is not None
@@ -582,6 +587,7 @@ def test_default_profile_tools_are_registered_and_proposals_do_not_touch_canon(t
     )
 
     assert [item["name"] for item in gateway.catalog(writer)] == list(writer_profile.allowed_tools)
+    assert reviewer.profile is not None
     assert [item["name"] for item in gateway.catalog(reviewer)] == list(reviewer.profile.allowed_tools)
 
     async def exercise():
@@ -654,7 +660,9 @@ def test_default_profile_tools_are_registered_and_proposals_do_not_touch_canon(t
             }],
         },
     )
-    issue_id = db.fetchone("SELECT id FROM review_issues WHERE review_id=?", (review_id,))["id"]
+    issue_row = db.fetchone("SELECT id FROM review_issues WHERE review_id=?", (review_id,))
+    assert issue_row is not None
+    issue_id = issue_row["id"]
     reviser = AgentTask(
         task_id="narrative-tools-reviser",
         task_type="revision",
@@ -689,8 +697,12 @@ def test_default_profile_tools_are_registered_and_proposals_do_not_touch_canon(t
     assert [(item["proposal_type"], item["status"]) for item in proposals] == [
         ("draft", "PROPOSED"), ("revision", "PROPOSED"),
     ]
-    assert db.fetchone("SELECT COUNT(*) AS count FROM story_commits")["count"] == 0
-    assert db.fetchone("SELECT COUNT(*) AS count FROM narrative_events")["count"] == 0
+    story_commits = db.fetchone("SELECT COUNT(*) AS count FROM story_commits")
+    assert story_commits is not None
+    assert story_commits["count"] == 0
+    narrative_events = db.fetchone("SELECT COUNT(*) AS count FROM narrative_events")
+    assert narrative_events is not None
+    assert narrative_events["count"] == 0
 
 
 def test_compute_escalation_tool_is_separate_from_narrative_role_allowlist():
@@ -932,12 +944,14 @@ def test_compatibility_model_runtime_requires_persisted_codex_readiness_and_path
     db_path = tmp_path / "compatibility-runtime.sqlite3"
     db = Database(str(db_path))
     _repository, _runtime, manager = build_model_runtime(db, tmp_path)
+    router = manager._router
+    assert router is not None
     task = TaskRuntime(db).enqueue("draft-chapter")
     agent_task = AgentTaskStore(db).contract_for_durable_task(task["id"])
     assert agent_task is not None
-    assert "codex-app-server" not in manager._router._runtimes
+    assert "codex-app-server" not in router._runtimes
     with pytest.raises(CapabilityUnavailable):
-        manager._router.plan(agent_task, reserve_budget=False)
+        router.plan(agent_task, reserve_budget=False)
 
     registry = RuntimeRegistry(db)
     manifest = RuntimeManifest(
@@ -968,7 +982,9 @@ def test_compatibility_model_runtime_requires_persisted_codex_readiness_and_path
     registry.mark_health(manifest.runtime_type, healthy=True)
 
     _repository, _runtime, ready_manager = build_model_runtime(db, tmp_path)
-    codex = ready_manager._router.get("codex-app-server")
+    ready_router = ready_manager._router
+    assert ready_router is not None
+    codex = ready_router.get("codex-app-server")
     assert codex.process.command == ("C:/managed/codex.exe", "app-server")
 
 

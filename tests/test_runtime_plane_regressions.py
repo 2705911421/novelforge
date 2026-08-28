@@ -798,8 +798,12 @@ def test_codex_runtime_restarts_lost_thread_from_checkpoint_and_context_bundle(t
     assert runs[1]["runtime_thread_id"] == "recovered-thread"
     assert runs[1]["prompt_version"] == "codex-app-server-1-recovery"
     assert runs[1]["context_bundle_id"] == bundle.bundle_id
-    assert db.fetchone("SELECT COUNT(*) AS count FROM story_commits")["count"] == 0
-    assert db.fetchone("SELECT COUNT(*) AS count FROM narrative_events")["count"] == 0
+    story_commits = db.fetchone("SELECT COUNT(*) AS count FROM story_commits")
+    assert story_commits is not None
+    assert story_commits["count"] == 0
+    narrative_events = db.fetchone("SELECT COUNT(*) AS count FROM narrative_events")
+    assert narrative_events is not None
+    assert narrative_events["count"] == 0
     asyncio.run(second_runtime.shutdown())
 
 
@@ -852,7 +856,9 @@ def test_codex_runtime_scopes_provider_threads_by_host_session_key(tmp_path):
     thread_starts = [item for item in writes if item.get("method") == "thread/start"]
     assert len(thread_starts) == 2
     assert len(popen_calls) == 1, "sequential turns should reuse the supervised Codex process"
-    assert db.fetchone("SELECT COUNT(*) AS count FROM agent_runs WHERE task_id=?", (durable["id"],))["count"] == 2
+    run_count = db.fetchone("SELECT COUNT(*) AS count FROM agent_runs WHERE task_id=?", (durable["id"],))
+    assert run_count is not None
+    assert run_count["count"] == 2
     asyncio.run(runtime.shutdown())
 
 
@@ -1076,6 +1082,7 @@ def test_structured_cli_runtime_rejects_empty_artifact(tmp_path):
         "SELECT status, error_code, context_bundle_id FROM agent_runs WHERE task_id=?",
         (durable["id"],),
     )
+    assert run is not None
     assert run["status"] == "interrupted"
     assert run["error_code"] == "RUNTIME_CRASHED"
     assert run["context_bundle_id"]
@@ -1916,7 +1923,9 @@ def test_agent_run_events_are_fenced_to_task_and_runtime_scope(tmp_path):
             RuntimeEvent("fake", "turn.started", {}, agent_run_id=run_two["id"]),
         )
 
-    assert runs.get(run_one["id"])["eventCount"] == 0
+    run_audit = runs.get(run_one["id"])
+    assert run_audit is not None
+    assert run_audit["eventCount"] == 0
 
 
 def test_context_bundle_round_trips_rich_manifest_and_invalid_scope_as_provenance(tmp_path):
@@ -2003,7 +2012,9 @@ def test_agent_run_context_bundle_is_fenced_to_task_project_scope(tmp_path):
             context_bundle_id=foreign_bundle.bundle_id,
         )
 
-    assert db.fetchone("SELECT COUNT(*) AS count FROM agent_runs")["count"] == 0
+    run_count = db.fetchone("SELECT COUNT(*) AS count FROM agent_runs")
+    assert run_count is not None
+    assert run_count["count"] == 0
 
 
 def test_compatibility_context_binding_rejects_foreign_existing_bundle(tmp_path):
@@ -2029,9 +2040,11 @@ def test_compatibility_context_binding_rejects_foreign_existing_bundle(tmp_path)
             context_manifest={"bundleId": foreign_bundle.bundle_id},
         )
 
-    assert db.fetchone(
+    task_row = db.fetchone(
         "SELECT context_bundle_id FROM agent_tasks WHERE id=?", (task.task_id,)
-    )["context_bundle_id"] is None
+    )
+    assert task_row is not None
+    assert task_row["context_bundle_id"] is None
 
 
 def test_compute_telemetry_aggregates_agent_run_provenance(tmp_path):
@@ -2389,6 +2402,7 @@ def test_agent_run_creation_rejects_spoofed_scope_constraints_and_policy(tmp_pat
             durable_task_id=durable["id"],
             compute_plan=ComputePlan("policy-constraint-plan", "fake", "model", "medium", "C2"),
         )
+    assert task.profile is not None
     expanded_profile = replace(
         task.profile,
         allowed_tools=(*task.profile.allowed_tools, "unregistered-tool"),
@@ -2429,7 +2443,9 @@ def test_proposal_decisions_are_host_bound_scoped_and_non_canonical(tmp_path):
                 actor="author",
             )
         )
-    assert store.get(planning["id"])["status"] == "PROPOSED"
+    planning_row = store.get(planning["id"])
+    assert planning_row is not None
+    assert planning_row["status"] == "PROPOSED"
 
     world = store.create(
         proposal_id="proposal-decision-world",
@@ -2445,7 +2461,9 @@ def test_proposal_decisions_are_host_bound_scoped_and_non_canonical(tmp_path):
                 actor="author",
             )
         )
-    assert store.get(world["id"])["status"] == "PROPOSED"
+    world_row = store.get(world["id"])
+    assert world_row is not None
+    assert world_row["status"] == "PROPOSED"
 
     with pytest.raises(ValueError, match="Host actor"):
         control.commands.dispatch(
@@ -2455,7 +2473,9 @@ def test_proposal_decisions_are_host_bound_scoped_and_non_canonical(tmp_path):
                 actor="agent",
             )
         )
-    assert store.get(proposal["id"])["status"] == "PROPOSED"
+    proposal_row = store.get(proposal["id"])
+    assert proposal_row is not None
+    assert proposal_row["status"] == "PROPOSED"
 
     other_task = _agent_task("proposal-decision-other-agent")
     other_durable = task_runtime.enqueue_agent_task(other_task)
@@ -2467,7 +2487,9 @@ def test_proposal_decisions_are_host_bound_scoped_and_non_canonical(tmp_path):
                 actor="author",
             )
         )
-    assert store.get(proposal["id"])["status"] == "PROPOSED"
+    proposal_row = store.get(proposal["id"])
+    assert proposal_row is not None
+    assert proposal_row["status"] == "PROPOSED"
 
     accepted = control.commands.dispatch(
         ControlCommand(
@@ -2478,8 +2500,12 @@ def test_proposal_decisions_are_host_bound_scoped_and_non_canonical(tmp_path):
     )
     assert accepted["status"] == "ACCEPTED"
     assert accepted["canonicalMutation"] is False
-    assert db.fetchone("SELECT COUNT(*) AS count FROM story_commits")["count"] == 0
-    assert db.fetchone("SELECT COUNT(*) AS count FROM narrative_events")["count"] == 0
+    story_commits = db.fetchone("SELECT COUNT(*) AS count FROM story_commits")
+    assert story_commits is not None
+    assert story_commits["count"] == 0
+    narrative_events = db.fetchone("SELECT COUNT(*) AS count FROM narrative_events")
+    assert narrative_events is not None
+    assert narrative_events["count"] == 0
     assert any(
         event["name"] == "proposal.accepted"
         and event["payload"]["proposalId"] == proposal["id"]
@@ -2533,7 +2559,9 @@ def test_proposal_decisions_are_host_bound_scoped_and_non_canonical(tmp_path):
         )
     )
     assert superseded["status"] == "SUPERSEDED"
-    assert store.get(successor["id"])["status"] == "PROPOSED"
+    successor_row = store.get(successor["id"])
+    assert successor_row is not None
+    assert successor_row["status"] == "PROPOSED"
 
 
 def test_runtime_router_rejects_unpersisted_or_cross_task_compute_plan(tmp_path):
@@ -3580,7 +3608,9 @@ def test_uninstall_without_supervised_action_cannot_claim_success(tmp_path):
     assert "uninstall action" in plan.explanation
     with pytest.raises(RuntimeUnavailable, match="uninstall action"):
         broker.uninstall("system-runtime", approved=True)
-    assert registry.get_installation("system-runtime").state is InstallState.INSTALLED
+    installation = registry.get_installation("system-runtime")
+    assert installation is not None
+    assert installation.state is InstallState.INSTALLED
 
 
 def test_approved_escalation_extends_reasoning_and_durable_budget(tmp_path):
@@ -3801,7 +3831,9 @@ def test_agent_escalation_request_cannot_spoof_runtime_audit_scope(tmp_path):
             ToolCallContext(task=task),
         )
 
-    assert db.fetchone("SELECT COUNT(*) AS count FROM runtime_approvals")["count"] == 0
+    approval_count = db.fetchone("SELECT COUNT(*) AS count FROM runtime_approvals")
+    assert approval_count is not None
+    assert approval_count["count"] == 0
 
 
 def test_reasoning_escalation_records_effective_capability_upgrade(tmp_path):
@@ -4033,5 +4065,7 @@ def test_agent_escalation_request_respects_disabled_compute_policy(tmp_path):
             ToolCallContext(task=task),
         )
 
-    assert db.fetchone("SELECT COUNT(*) AS count FROM runtime_approvals") ["count"] == 0
+    approval_count = db.fetchone("SELECT COUNT(*) AS count FROM runtime_approvals")
+    assert approval_count is not None
+    assert approval_count["count"] == 0
     assert router.plans.list(task.task_id)

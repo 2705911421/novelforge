@@ -55,6 +55,7 @@ from src.llm.model_runtime import (
     CredentialStore,
     ModelConfigurationError,
     ModelRepository,
+    PersistentModelRuntime,
     PersistentMultiModelManager,
     build_model_runtime,
 )
@@ -1340,7 +1341,7 @@ def get_document_repository() -> DocumentRepository:
         getattr(candidate, "db", None) is story_repository.db
         and (candidate_root is None or candidate_root == active_root)
     ):
-        return candidate
+        return cast(DocumentRepository, candidate)
     return DocumentRepository(
         story_repository.db,
         active_root,
@@ -1360,14 +1361,14 @@ def get_model_repository() -> ModelRepository:
     # Preserve the established injection seam used by embedded deployments
     # and isolated tests when they explicitly replace only this repository.
     if candidate is not None and candidate is not globals().get("_default_model_repository"):
-        return candidate
+        return cast(ModelRepository, candidate)
     active_root = _active_workspace_root_for(story_repository.db)
     candidate_root = _model_repository_workspace_root(candidate)
     if (
         getattr(candidate, "db", None) is story_repository.db
         and (candidate_root is None or candidate_root == active_root)
     ):
-        return candidate
+        return cast(ModelRepository, candidate)
     return ModelRepository(
         story_repository.db,
         CredentialStore(active_root),
@@ -1443,6 +1444,8 @@ def _active_model_runtime_components_for(
     current_runtime_repository = getattr(current_runtime, "repository", None)
     current_runtime_root = _model_repository_workspace_root(current_runtime_repository)
     if (
+        current_runtime is not None
+        and
         getattr(current_runtime_repository, "db", None) is database
         and (current_runtime_root is None or current_runtime_root == active_root)
     ):
@@ -1456,10 +1459,14 @@ def _active_model_runtime_components_for(
             manager_runtime is current_runtime
             or getattr(manager_repository, "db", None) is database
         ):
-            manager = current_manager
+            manager = cast(PersistentMultiModelManager, current_manager)
         else:
-            manager = PersistentMultiModelManager(current_runtime)
-        return current_repository, current_runtime, manager
+            manager = PersistentMultiModelManager(cast(PersistentModelRuntime, current_runtime))
+        return (
+            cast(ModelRepository, current_repository),
+            cast(PersistentModelRuntime, current_runtime),
+            manager,
+        )
 
     cache_key = id(database)
     cached = _model_runtime_bindings.get(cache_key)
@@ -1489,9 +1496,9 @@ def get_active_project_manager(database: Optional[Database] = None) -> ProjectMa
         and getattr(candidate_repository, "db", None) is active_database
         and (candidate_root is None or candidate_root == active_root)
     ):
-        return candidate
+        return cast(ProjectManager, candidate)
     if active_database is None or active_repository is None:
-        return candidate
+        return cast(ProjectManager, candidate)
     return ProjectManager(
         str(active_root),
         repository=active_repository,
@@ -2487,7 +2494,7 @@ def _get_studio_task_worker() -> PersistentTaskWorker:
     """
     candidate_worker = globals().get("task_worker")
     if candidate_worker is not _default_task_worker:
-        return candidate_worker
+        return cast(PersistentTaskWorker, candidate_worker)
 
     active_repository = globals().get("story_repository")
     database = getattr(active_repository, "db", None)
@@ -2524,7 +2531,8 @@ def _get_studio_task_worker() -> PersistentTaskWorker:
     )
     config_candidate = globals().get("config")
     try:
-        config_root = Path(config_candidate.project_path).resolve()
+        config_project_path = getattr(config_candidate, "project_path", None)
+        config_root = Path(config_project_path).resolve() if config_project_path is not None else None
     except (AttributeError, TypeError, ValueError, OSError):
         config_root = None
     config_source = config_candidate if config_root == active_root else None
@@ -2574,10 +2582,11 @@ def _get_studio_task_worker() -> PersistentTaskWorker:
     else:
         active_config = Config(project_path=str(active_root))
 
+    active_runtime: TaskRuntime
     if isinstance(runtime_candidate, _StudioTaskRuntimeProxy):
         active_runtime = runtime_candidate._target()
     elif getattr(runtime_candidate, "db", None) is database:
-        active_runtime = runtime_candidate
+        active_runtime = cast(TaskRuntime, runtime_candidate)
     else:
         active_runtime = TaskRuntime(database)
 
@@ -3446,7 +3455,7 @@ async def update_book(book_id: str, data: UpdateBookRequest, request: Request):
 
     if project_metadata_changed:
         get_active_project_manager().save_project(project)
-    result = {"message": "更新成功"}
+    result: dict[str, Any] = {"message": "更新成功"}
     if drafted_steps:
         result.update({
             "storyBibleDrafted": drafted_steps,
@@ -5078,7 +5087,7 @@ async def import_runtime_catalog(body: dict[str, Any], request: Request):
 
 
 @app.post("/api/v1/runtime/catalog/fetch")
-async def fetch_runtime_catalog(body: dict[str, Any], request: Request = None):
+async def fetch_runtime_catalog(body: dict[str, Any], request: Request = cast(Request, None)):
     """Fetch and verify a remote catalog before importing any manifest."""
     if request is None:
         if _NOVELFORGE_AUTH_REQUIRED:

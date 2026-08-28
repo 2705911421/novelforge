@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,6 +19,7 @@ from src.core.task_worker import PersistentTaskWorker
 from src.creation.continuous_service import ContinuousWritingService
 from src.creation import task_handlers as task_handlers_module
 from src.creation.task_handlers import LegacyTaskHandlers
+from src.pipeline.writing_pipeline import WritingPipeline
 
 
 class RecordingModel:
@@ -147,7 +149,7 @@ def test_nested_continuous_provider_call_uses_child_task_scope(continuous_deps):
             model.chat([], task_type="write-next")
             return {"completed": False, "quality_gate": "TEST_SCOPE_ONLY"}
 
-    service.pipeline = ChildPipeline()
+    service.pipeline = cast(WritingPipeline, ChildPipeline())
     child = runtime.enqueue(
         "write-next",
         project_id=project_id,

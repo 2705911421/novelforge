@@ -133,7 +133,7 @@ class ApiModelRuntime:
                         "embedding": vector,
                         "dimension": len(vector),
                         "model": compute_plan.model_id,
-                        "provider": self.runtime.runtime_type if hasattr(self.runtime, "runtime_type") else "api",
+                        "provider": self.runtime_type,
                     }
                 elif operation == "embedding_batch":
                     vectors = await asyncio.to_thread(
@@ -144,7 +144,7 @@ class ApiModelRuntime:
                         "count": len(vectors),
                         "dimension": len(vectors[0]) if vectors else 0,
                         "model": compute_plan.model_id,
-                        "provider": self.runtime.runtime_type if hasattr(self.runtime, "runtime_type") else "api",
+                        "provider": self.runtime_type,
                     }
                 elif operation == "chat":
                     response = await asyncio.to_thread(self._invoke, task, compute_plan, durable_task_id, run_id)

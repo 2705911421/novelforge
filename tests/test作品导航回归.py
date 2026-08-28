@@ -115,14 +115,18 @@ def test_planning_synthesis_requires_author_acceptance_before_projection_apply(t
     world = db.fetchone("SELECT world_setting FROM projects WHERE id=?", (project_id,))
     assert world is not None
     assert world["world_setting"] == initial_world["world_setting"]
-    assert db.fetchone("SELECT COUNT(*) AS count FROM characters WHERE book_id=?", (book["id"],))["count"] == 0
+    character_count = db.fetchone("SELECT COUNT(*) AS count FROM characters WHERE book_id=?", (book["id"],))
+    assert character_count is not None
+    assert character_count["count"] == 0
 
     authority = PlanningSynthesisAuthority(repository)
     with pytest.raises(ValueError, match="author confirmation"):
         authority.accept(result["proposalId"], project_id, actor="studio", author_confirmed=False)
     with pytest.raises(ValueError, match="author-facing Host"):
         authority.accept(result["proposalId"], project_id, actor="codex", author_confirmed=True)
-    assert db.fetchone("SELECT status FROM agent_proposals WHERE id=?", (result["proposalId"],))["status"] == "PROPOSED"
+    proposal_status = db.fetchone("SELECT status FROM agent_proposals WHERE id=?", (result["proposalId"],))
+    assert proposal_status is not None
+    assert proposal_status["status"] == "PROPOSED"
 
     accepted = authority.accept(
         result["proposalId"], project_id, actor="studio", author_confirmed=True,

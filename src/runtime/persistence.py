@@ -1217,15 +1217,18 @@ class AgentRunStore:
 
         if task.role == persisted.role and task.task_type == persisted.task_type:
             effective_profile = task.profile or default_agent_task_profile(task.role, task.task_type)
+            persisted_profile = persisted.profile or default_agent_task_profile(
+                persisted.role, persisted.task_type
+            )
             if task.profile is not None and AgentRunStore._is_bare_profile(task.profile):
                 host_default = default_agent_task_profile(task.role, task.task_type)
                 # Prefer the task-shaped default for legacy callers, but do
                 # not let that compatibility substitution widen a persisted
                 # custom envelope.  In that case the bare profile remains a
                 # narrower view and is checked as supplied.
-                if AgentRunStore._profile_is_contained(host_default, persisted.profile):
+                if AgentRunStore._profile_is_contained(host_default, persisted_profile):
                     effective_profile = host_default
-            if not AgentRunStore._profile_is_contained(effective_profile, persisted.profile):
+            if not AgentRunStore._profile_is_contained(effective_profile, persisted_profile):
                 raise ValueError("AgentTask profile does not match the persisted envelope")
         elif task.profile != default_agent_task_profile(task.role, task.task_type):
             raise ValueError(

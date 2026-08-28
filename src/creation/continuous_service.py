@@ -6,7 +6,7 @@ import hashlib
 import json
 import logging
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, ContextManager, cast
 
 from src.core.database import Database
 from src.core.story_repository import StoryRepository
@@ -1175,7 +1175,7 @@ class ContinuousWritingService:
         scope_factory = getattr(self.model_manager, "task_scope", None)
         if not callable(scope_factory):
             return operation()
-        with scope_factory(task_id):
+        with cast(Callable[[str], ContextManager[None]], scope_factory)(task_id):
             return operation()
 
     @staticmethod

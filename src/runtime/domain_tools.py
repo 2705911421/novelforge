@@ -774,10 +774,10 @@ class NarrativeToolService:
         severity = str(arguments.get("severity") or "major").strip().lower()
         if severity not in {"blocking", "critical", "major", "minor"}:
             raise ValueError("severity is invalid")
-        review_kind = str(review.get("reviewKind") or "chapter") if review else "chapter"
+        review_kind = str(review.get("reviewKind") or "chapter") if review is not None else "chapter"
         issue = {
-            "reviewId": review.get("id") if review and review_kind == "chapter" else None,
-            "jointReviewId": review.get("id") if review and review_kind == "joint" else None,
+            "reviewId": review.get("id") if review is not None and review_kind == "chapter" else None,
+            "jointReviewId": review.get("id") if review is not None and review_kind == "joint" else None,
             "reviewKind": review_kind,
             "dimension": str(arguments.get("dimension") or "general")[:200],
             "severity": severity,
@@ -786,14 +786,18 @@ class NarrativeToolService:
             "description": description[:20_000],
             "suggestion": str(arguments.get("suggestion") or "")[:20_000],
         }
-        target_chapter = int(
-            review.get("chapterNumber")
-            if review and review.get("chapterNumber")
-            else self._chapter_number(arguments, context, book_id=str(book["id"]))
-        )
+        review_chapter = review.get("chapterNumber") if review is not None else None
+        if review_chapter is None:
+            target_chapter = self._chapter_number(arguments, context, book_id=str(book["id"]))
+        else:
+            target_chapter = int(review_chapter)
         if review_kind == "joint":
-            start = int(review.get("start_chapter") or 0)
-            end = int(review.get("end_chapter") or 0)
+            if review is None:
+                raise KeyError("a joint review is required for a joint review issue")
+            start_value = review.get("start_chapter")
+            end_value = review.get("end_chapter")
+            start = int(start_value) if start_value is not None else 0
+            end = int(end_value) if end_value is not None else 0
             if target_chapter < start or target_chapter > end:
                 raise ValueError("review issue chapter is outside the joint review range")
         proposal_payload = {"proposalType": "review_issue", **issue}

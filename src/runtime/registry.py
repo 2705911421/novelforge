@@ -56,7 +56,7 @@ class _ValidatedRedirectHandler(HTTPRedirectHandler):
         super().__init__()
         self._validator = validator
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:  # type: ignore[override]
         self._validator(str(newurl or ""))
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -585,12 +585,12 @@ class DependencyResolver:
                         f"{probe_detail}; minimum version {minimum} cannot be verified",
                     ))
                     continue
-            if minimum and self._version_key(available_version) < self._version_key(minimum):
-                checks.append(PrerequisiteCheck(
-                    name, required, False,
-                    f"version {available_version} is below {minimum}", available_version,
-                ))
-                continue
+                if self._version_key(available_version) < self._version_key(minimum):
+                    checks.append(PrerequisiteCheck(
+                        name, required, False,
+                        f"version {available_version} is below {minimum}", available_version,
+                    ))
+                    continue
             checks.append(PrerequisiteCheck(name, required, True, probe_detail, available_version))
         return PrerequisiteResult(
             ready=all(item.available or not item.required for item in checks),

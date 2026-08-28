@@ -344,6 +344,8 @@ class StoryFlowPlanningService:
             raise StoryFlowPlanningError("planning proposal payload is invalid")
         delta = deepcopy(payload["delta"])
         recorded_revision = payload.get("expectedRevision")
+        if isinstance(recorded_revision, bool) or not isinstance(recorded_revision, (int, str)):
+            raise StoryFlowPlanningError("planning proposal revision is invalid")
         try:
             recorded_revision = int(recorded_revision)
         except (TypeError, ValueError) as exc:

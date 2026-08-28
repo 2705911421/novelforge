@@ -126,7 +126,9 @@ def test_runtime_manager_reconnect_can_clear_recoverable_failure_state(tmp_path,
 
     assert result["ready"] is True
     assert result["installation"]["state"] == "ready"
-    assert registry.get_installation("probe-runtime").state is InstallState.READY
+    installation = registry.get_installation("probe-runtime")
+    assert installation is not None
+    assert installation.state is InstallState.READY
 
 
 def test_runtime_manager_reauthenticate_preserves_not_authenticated_truth(tmp_path):

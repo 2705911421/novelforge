@@ -581,7 +581,9 @@ def test_incomplete_world_bootstrap_proposal_fails_before_proposal_ready(tmp_pat
     assert result["status"] == "failed"
     assert result["error_code"] == "HANDLER_ERROR"
     assert "missing fields" in (result["error"] or "")
-    assert database.fetchone(
+    checkpoint = database.fetchone(
         "SELECT COUNT(*) AS count FROM task_checkpoints WHERE task_id=? AND stage=?",
         (queued["id"], "proposal-ready"),
-    )["count"] == 0
+    )
+    assert checkpoint is not None
+    assert checkpoint["count"] == 0

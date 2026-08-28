@@ -19,7 +19,7 @@ from contextvars import ContextVar
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, ContextManager, Iterator, Optional
+from typing import Any, Callable, ContextManager, Iterable, Iterator, Optional, cast
 
 import httpx
 
@@ -2058,19 +2058,7 @@ class PersistentMultiModelManager:
                 provider_id=provider_id,
                 model_id=model_id,
             )
-        embed_many = getattr(self.runtime, "embed_many", None)
-        if callable(embed_many):
-            return embed_many(texts, provider_id=provider_id, model_id=model_id)
-        embed = getattr(self.runtime, "embed", None)
-        if not callable(embed):
-            raise ModelConfigurationError(
-                "MODEL_RUNTIME_UNAVAILABLE",
-                "embedding runtime does not support batch or scalar invocation",
-            )
-        return [
-            embed(text, provider_id=provider_id, model_id=model_id)
-            for text in texts
-        ]
+        return self.runtime.embed_many(texts, provider_id=provider_id, model_id=model_id)
 
     def chat(self, messages: list[dict[str, Any]], system: str = "", *, task_type: Optional[str] = None,
              **kwargs: Any) -> LLMResponse:
@@ -2465,7 +2453,10 @@ class PersistentMultiModelManager:
             # refresh visible to operators.
             logger.warning("could not read API runtime during capability refresh: %s", exc, exc_info=exc)
             return 0
-        get_models = getattr(api_runtime, "get_models_sync", None)
+        get_models = cast(
+            Callable[[], Iterable[ModelDescriptor]] | None,
+            getattr(api_runtime, "get_models_sync", None),
+        )
         if not callable(get_models):
             return 0
         health = registry.runtime_health("api", default="unknown") if hasattr(registry, "runtime_health") else "ready"

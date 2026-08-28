@@ -4,6 +4,11 @@ The runtime package owns execution contracts only.  Narrative authority stays
 in ``src.core.story_repository`` and is reached through the Tool Gateway.
 """
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .router import RuntimeFallbackPolicy, RuntimeRouter
+
 from .contracts import (
     AgentRunStatus,
     AgentTask,

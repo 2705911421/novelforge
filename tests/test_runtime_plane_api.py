@@ -144,9 +144,15 @@ def test_authenticated_http_propagates_principal_to_studio_task_proxy(tmp_path, 
     response = asyncio.run(studio.APIKeyMiddleware(studio.app).dispatch(request, call_next))
 
     assert response.status_code == 200
-    row = database.fetchone("SELECT data FROM tasks WHERE id=?", (response.body.decode(),))
+    response_body = response.body
+    task_id = response_body.tobytes().decode() if isinstance(response_body, memoryview) else response_body.decode()
+    row = database.fetchone("SELECT data FROM tasks WHERE id=?", (task_id,))
     assert row is not None
-    assert json.loads(row["data"])["initiatedBy"] == "operator"
+    task_data = row["data"]
+    if isinstance(task_data, memoryview):
+        task_data = task_data.tobytes()
+    assert isinstance(task_data, (str, bytes, bytearray))
+    assert json.loads(task_data)["initiatedBy"] == "operator"
     assert studio.current_request_principal() is None
 
 
@@ -179,7 +185,11 @@ def test_authenticated_http_runtime_principal_cannot_approve_narrative(monkeypat
     })
     response = asyncio.run(studio.APIKeyMiddleware(studio.app).dispatch(request, call_next))
     assert response.status_code == 403
-    assert json.loads(response.body)["error"]["code"] == "HOST_PRINCIPAL_REQUIRED"
+    error_body = response.body
+    if isinstance(error_body, memoryview):
+        error_body = error_body.tobytes()
+    assert isinstance(error_body, (str, bytes, bytearray))
+    assert json.loads(error_body)["error"]["code"] == "HOST_PRINCIPAL_REQUIRED"
     assert called is False
 
 
@@ -241,10 +251,12 @@ def test_global_event_stream_uses_durable_cursor_without_skipping_tasks(tmp_path
 
     async def collect_four():
         iterator = response.body_iterator
-        try:
-            return [await anext(iterator) for _ in range(4)]
-        finally:
-            await iterator.aclose()
+        chunks = []
+        async for chunk in iterator:
+            chunks.append(chunk)
+            if len(chunks) == 4:
+                break
+        return chunks
 
     body = "".join(asyncio.run(collect_four()))
     payloads = [

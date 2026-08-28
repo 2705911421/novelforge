@@ -126,6 +126,12 @@ def _seed_book(tmp_path):
     return db, project_id, book_id, chapter_one, chapter_two, aster, mira
 
 
+def _count(db: Database, query: str, params: tuple[object, ...] = ()) -> int:
+    row = db.fetchone(query, params)
+    assert row is not None
+    return int(row["count"])
+
+
 def _publish_story_bible(db: Database, project_id: str) -> tuple[StoryBibleRepository, str]:
     repository = StoryBibleRepository(db)
     repository.ensure(project_id)
@@ -3887,7 +3893,7 @@ def test_storyflow_planning_preview_is_read_only_and_reports_diff_and_impact(tmp
         (book_id,),
     )
     before_canon = {
-        table: db.fetchone(f"SELECT COUNT(*) AS count FROM {table} WHERE book_id=?", (book_id,))["count"]
+        table: _count(db, f"SELECT COUNT(*) AS count FROM {table} WHERE book_id=?", (book_id,))
         for table in ("story_facts", "story_states")
     }
     delta = {
@@ -3920,7 +3926,7 @@ def test_storyflow_planning_preview_is_read_only_and_reports_diff_and_impact(tmp
         (book_id,),
     ) == before_workspace
     after_canon = {
-        table: db.fetchone(f"SELECT COUNT(*) AS count FROM {table} WHERE book_id=?", (book_id,))["count"]
+        table: _count(db, f"SELECT COUNT(*) AS count FROM {table} WHERE book_id=?", (book_id,))
         for table in ("story_facts", "story_states")
     }
     assert after_canon == before_canon
@@ -3931,13 +3937,12 @@ def test_storyflow_preview_persists_proposal_and_author_apply_closes_task(tmp_pa
     service = StoryFlowPlanningService(db)
     service.load(book_id)
     before_canon = {
-        "story_facts": db.fetchone("SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?", (book_id,))["count"],
-        "story_states": db.fetchone("SELECT COUNT(*) AS count FROM story_states WHERE book_id=?", (book_id,))["count"],
-        "story_commits": db.fetchone(
+        "story_facts": _count(db, "SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?", (book_id,)),
+        "story_states": _count(db, "SELECT COUNT(*) AS count FROM story_states WHERE book_id=?", (book_id,)),
+        "story_commits": _count(db,
             "SELECT COUNT(*) AS count FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id WHERE c.book_id=?",
-            (book_id,),
-        )["count"],
-        "narrative_events": db.fetchone("SELECT COUNT(*) AS count FROM narrative_events WHERE book_id=?", (book_id,))["count"],
+            (book_id,)),
+        "narrative_events": _count(db, "SELECT COUNT(*) AS count FROM narrative_events WHERE book_id=?", (book_id,)),
     }
     delta = {
         "operations": [{
@@ -3958,10 +3963,13 @@ def test_storyflow_preview_persists_proposal_and_author_apply_closes_task(tmp_pa
     task_id = proposal_row["task_id"]
     assert task_id
     task = service.task_runtime.get(task_id)
+    assert task is not None
     assert task["status"] == "needs_author_decision"
     assert task["agentTaskId"]
     assert task["type"] == "storyflow-planning-change"
-    assert db.fetchone("SELECT revision FROM plot_workspaces WHERE book_id=?", (book_id,))["revision"] == 1
+    workspace_row = db.fetchone("SELECT revision FROM plot_workspaces WHERE book_id=?", (book_id,))
+    assert workspace_row is not None
+    assert workspace_row["revision"] == 1
 
     applied = service.apply_proposal(
         book_id,
@@ -3976,16 +3984,19 @@ def test_storyflow_preview_persists_proposal_and_author_apply_closes_task(tmp_pa
     assert applied["proposal"]["status"] == "ACCEPTED"
     assert applied["task"]["status"] == "completed"
     assert applied["task"]["result"]["proposalId"] == proposal_id
-    assert db.fetchone("SELECT status FROM agent_proposals WHERE id=?", (proposal_id,))["status"] == "ACCEPTED"
-    assert db.fetchone("SELECT status FROM tasks WHERE id=?", (task_id,))["status"] == "completed"
+    accepted_proposal = db.fetchone("SELECT status FROM agent_proposals WHERE id=?", (proposal_id,))
+    assert accepted_proposal is not None
+    assert accepted_proposal["status"] == "ACCEPTED"
+    completed_task = db.fetchone("SELECT status FROM tasks WHERE id=?", (task_id,))
+    assert completed_task is not None
+    assert completed_task["status"] == "completed"
     after_canon = {
-        "story_facts": db.fetchone("SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?", (book_id,))["count"],
-        "story_states": db.fetchone("SELECT COUNT(*) AS count FROM story_states WHERE book_id=?", (book_id,))["count"],
-        "story_commits": db.fetchone(
+        "story_facts": _count(db, "SELECT COUNT(*) AS count FROM story_facts WHERE book_id=?", (book_id,)),
+        "story_states": _count(db, "SELECT COUNT(*) AS count FROM story_states WHERE book_id=?", (book_id,)),
+        "story_commits": _count(db,
             "SELECT COUNT(*) AS count FROM story_commits sc JOIN chapters c ON c.id=sc.chapter_id WHERE c.book_id=?",
-            (book_id,),
-        )["count"],
-        "narrative_events": db.fetchone("SELECT COUNT(*) AS count FROM narrative_events WHERE book_id=?", (book_id,))["count"],
+            (book_id,)),
+        "narrative_events": _count(db, "SELECT COUNT(*) AS count FROM narrative_events WHERE book_id=?", (book_id,)),
     }
     assert after_canon == before_canon
 

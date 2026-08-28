@@ -11,7 +11,7 @@ import copy
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, ContextManager, Mapping, Sequence, cast
 
 
 logger = logging.getLogger(__name__)
@@ -138,7 +138,7 @@ class StudioChatService:
         task_scope = getattr(manager, "task_scope", None)
         if not callable(task_scope):
             raise RuntimeError("chat runtime manager exposes no task scope")
-        with task_scope(task_id):
+        with cast(Callable[[str], ContextManager[None]], task_scope)(task_id):
             return self._invoke_runtime(
                 manager,
                 role=preparation.role,
@@ -334,7 +334,7 @@ class StudioChatService:
         count_method = getattr(project, "get_chapter_count", None)
         if callable(count_method):
             try:
-                return int(count_method())
+                return int(cast(Callable[[], Any], count_method)())
             except (TypeError, ValueError) as exc:
                 logger.debug(
                     "studio chat chapter count probe failed; falling back to mapping length: %s",

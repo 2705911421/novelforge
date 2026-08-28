@@ -378,11 +378,3 @@ class RuntimeEventStore:
             })
             result.append(event)
         return result
-
-    @staticmethod
-    def _decode_payload(raw: Any) -> dict[str, Any]:
-        try:
-            payload = json.loads(raw or "{}")
-        except (TypeError, json.JSONDecodeError):
-            return {}
-        return payload if isinstance(payload, dict) else {}
